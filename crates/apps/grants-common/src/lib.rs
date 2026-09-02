@@ -17,6 +17,7 @@ use pumper_core::resilience::{write_dataset, SourceState};
 use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
 use serde_json::{json, Value};
 
+pub mod fit;
 pub mod programs;
 
 /// Derivation stamp (M12) for a cross-source write. `job_id` is the one fact
@@ -181,6 +182,12 @@ pub struct UnifiedOutcome {
     /// own the corpus pass — the same "we did not look" vs "there were none"
     /// distinction the two link counts draw.
     pub programs: Option<programs::ProgramRollup>,
+    /// The applicant-fit pass over THIS run's delta (N31), or `None` when the
+    /// contribution was diverted to the shadow dataset — the same "we did not
+    /// look" vs "there were none" distinction the two link counts draw. A
+    /// quarantined source's rows are not in the canonical corpus, so scoring
+    /// them would alert on grants the canonical layer does not publish.
+    pub fits: Option<fit::FitPass>,
     /// Whether this run owned (and therefore ran) this cycle's corpus-wide pass.
     pub corpus_pass: bool,
     /// The sync cycle this run belongs to (see [`corpus_cycle`]).
@@ -244,6 +251,12 @@ impl UnifiedOutcome {
                 "programs": self.programs.as_ref().map(|p| p.block()),
             }),
         );
+        // Applicant fit over this run's delta (N31). `null` — not a zeroed block
+        // — on a run whose contribution was diverted to the shadow dataset, for
+        // the same reason `corpusSwept` is: "we did not look" is not "there were
+        // none". With no profiles stored the block is all zeros, which is the
+        // honest reading of an inert feature.
+        map.insert("fits".into(), json!(self.fits.as_ref().map(|f| f.block())));
         // Per-opportunity search docs come from the unified dataset (compact
         // result, one indexed doc per grant) — see worker `dataset_search_docs`.
         // Withheld entirely when the source's health says so: the worker's own
@@ -256,6 +269,12 @@ impl UnifiedOutcome {
             // pass would index an empty window and claim coverage it has not got.
             if self.programs.is_some() {
                 specs.push(json!({ "app": UNIFIED_APP, "dataset": programs::PROGRAMS_DATASET }));
+            }
+            // Same rule for the fit rows: named only by the run that WROTE some,
+            // because `dataset_search_docs` reads this job's revisions and
+            // naming an empty window claims coverage it has not got.
+            if self.fits.as_ref().is_some_and(fit::FitPass::wrote) {
+                specs.push(json!({ "app": UNIFIED_APP, "dataset": fit::FITS_DATASET }));
             }
             map.insert("index_datasets".into(), Value::Array(specs));
         }
@@ -380,9 +399,25 @@ pub async fn finalize_unified(
     } else {
         (None, None, None, None)
     };
+    // Applicant fit (N31), over THIS run's delta — the unified keys just
+    // published as new or changed. Deliberately NOT hung off the corpus-pass
+    // lease above: that lease covers work derived from the STORED corpus and
+    // holds no delta at all, so gating fits on it would drop two of the three
+    // sources' new grants on the floor every day. Canonical dataset only — a
+    // quarantined contribution lives in the shadow dataset and must not alert.
+    let fits = if dataset == UNIFIED_DATASET {
+        let delta: Vec<String> = unified.fresh_keys().cloned().collect();
+        Some(fit::evaluate_fits(ctx, &delta).await?)
+    } else {
+        None
+    };
+
     let mut warnings = drift_warnings(unified_items);
     if let Some(rollup) = &program_rollup {
         warnings.extend(rollup.warnings.iter().cloned());
+    }
+    if let Some(pass) = &fits {
+        warnings.extend(pass.warnings.iter().cloned());
     }
     Ok(UnifiedOutcome {
         unified,
@@ -392,6 +427,7 @@ pub async fn finalize_unified(
         cross_source_dups,
         recurrences,
         programs: program_rollup,
+        fits,
         corpus_pass,
         cycle,
         warnings,
@@ -2979,6 +3015,7 @@ mod tests {
                 cross_source_dups: Some(0),
                 recurrences: Some(0),
                 programs: Some(programs::ProgramRollup::default()),
+                fits: Some(fit::FitPass::default()),
                 corpus_pass: true,
                 cycle: "2026-08-04".to_string(),
                 warnings: vec![],

@@ -320,6 +320,9 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
         .routes(routes!(list_programs))
+        // N31: the applicant fit surface over the same virtual namespace.
+        .routes(routes!(list_grant_profiles, create_grant_profile))
+        .routes(routes!(list_fits))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
         .routes(routes!(catalog_reconcile, catalog_reconcile_apply))
@@ -732,6 +735,9 @@ mod api_spec_tests {
         "GET /grants",
         "GET /grants/closing-soon",
         "GET /grants/programs",
+        "GET /grants/profiles",
+        "POST /grants/profiles",
+        "GET /grants/fits",
         "GET /catalog/sources",
         "GET /catalog/health",
         "GET /catalog/reconcile",

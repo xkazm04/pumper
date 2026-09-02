@@ -87,6 +87,121 @@ Writes go through `upsert_many_derived` with **`DerivedPaths` on the replicated 
 - **Reads the canonical datasets.** If the trades namespace is quarantined its rows divert to `operator_economics@q`, and the profile then joins the last healthy canonical rows rather than the shadow ones.
 
 
+## `grants/fits`: the applicant fit engine (N31)
+
+`grants/unified` answers "which grants are open". This answers *"which of them can **I** apply for,
+and why"* — the question that turns 2600 open opportunities into the fourteen worth reading.
+
+The corpus already carried the fields: unified `eligibilities[]`/`categories[]`/money/`aln`, and the
+detail record's `requirements` block with `applicant_types` (honest Null-vs-empty), `cost_sharing`
+and `eligibility_text`. Nothing consumed any of them as a *predicate* — the only standing alert over
+the corpus was a full-text saved search. The engine lives in
+[`grants_common::fit`](../../crates/apps/grants-common/src/fit.rs).
+
+### The two datasets
+
+| Dataset | Key | Written by |
+| --- | --- | --- |
+| `grants/profiles` | the slugged `name` | `POST /grants/profiles` (an operator, not a scrape) |
+| `grants/fits` | `{profile}:{unified_key}` | every grant source's run, over that run's delta |
+
+A profile is `{name, org_type (nonprofit\|gov\|tribal\|smb\|university\|individual), country
+(ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags[],
+cost_share_capacity (true\|false\|null), programs_watched[]}`. Every absent optional field is stored
+as an explicit `null` — **absent means UNKNOWN, and unknown never blocks a fit**. Validation is
+strict: an unknown field is refused rather than dropped, because a typo'd `cost_share_capacty` that
+silently vanishes produces a profile that blocks nothing, matches everything, and never explains
+itself. `ein`/`uei`/`ntee` are stored, never verified (IRS EO BMF is still `planned` in the catalog).
+
+**Why a dataset and not a table.** The fit pass runs inside an app, and an app reaches storage only
+through `AppContext::datasets` — the dependency rule. A `profiles` SQL table would be invisible to
+the very code that exists to read it. Beside that, `grants/fits` has to be a dataset (triggers,
+watches, `index_datasets`), so keeping profiles next to it means one storage plane, one export
+surface (`GET /datasets/grants/profiles`), and revisions/provenance/doctor/retention coverage for
+free. **No migration is used by this feature.**
+
+### The five gates
+
+`fit(profile, unified, detail?) -> {verdict, score, reasons[], blockers[], unknowns[]}` is pure — no
+clock, no I/O — so the same corpus and the same profile always produce the same row, which is what
+lets a `changed` fit mean real news instead of churn.
+
+| Gate | Passes when | Blocks when | Unknown when |
+| --- | --- | --- | --- |
+| status | `open` / `forecasted` | `closed` | no status, or one outside the vocabulary |
+| geography | the profile's country (and state, for `ca-grants`) matches the source's | a national/sub-national mismatch | the profile names no state; the source has no rule; a non-EU country on `eu-sedia` (third-country participation is decided by call text this v1 does not read) |
+| applicant type | a published term maps to the profile's `org_type` | every published term maps, and none matches | `applicant_types` is Null; the agency published `[]`; **any** term is outside the vocabulary map |
+| cost share | not required, or required and the profile declares capacity | required and the profile declares **no** capacity | required and the profile **did not say**; the source publishes no requirement |
+| award band | the smallest award fits the profile's ceiling, or either side is absent | the award floor exceeds the profile's stated ceiling | *never* |
+
+`verdict` composes them: any blocker → `blocked`; else an undecided **applicant** gate → `unknown`;
+else all gates decided → `eligible`; else → `likely`, with every absent field named in `unknowns[]`.
+`score` (0.0–1.0) ranks within a band and bands never overlap, so a `likely` can never outrank an
+`eligible`; it is rounded to two decimals so a float drifting in the 15th place cannot re-hash the
+row and fire a false alert.
+
+### The rules this engine is built around
+
+- **`eligible` needs positive published evidence on every gate.** It is unreachable by absence. The
+  failure mode this feature has to avoid is not a missed grant, it is a confident wrong one.
+- **A vocabulary miss makes the WHOLE applicant gate unknown**, never a partial verdict over the
+  terms we happened to recognise. Dropping the unmapped term is how "3 of 4 terms matched nothing"
+  becomes a `blocked` about a sentence nobody read. Misses are counted into the run's `warnings` and
+  logged, so the map's blind spots are visible rather than laundered.
+- **`[]` is not "nobody is eligible".** The grants-gov normalizer keeps `applicant_types: null`
+  (field absent or drifted) apart from `[]` (the agency published an empty list); the read side keeps
+  them apart too, and both are `unknown`.
+- **A cost-share capacity the profile did not declare is `unknown`, never `blocked`.** Defaulting it
+  to `false` would block every match-requiring federal NOFO for every profile that left the field
+  out — the single most likely fabricated verdict in the design.
+- **The fit row is verdict-shaped.** It copies nothing from the opportunity, so a `changed` revision
+  (and the alert it fires) means the fit moved, not that an agency fixed a typo in a title.
+
+### When it runs, and over what
+
+The pass runs on **every** producer, over **that run's delta** — the unified keys it just published
+as `new` or `changed` — not over the corpus and not off the once-per-cycle corpus-pass lease. The
+lease covers work derived from the *stored* corpus and holds no delta at all, so hanging fits off it
+would drop two of the three sources' new grants every day. The engine is pure, so re-scoring an
+unchanged opportunity could only produce the identical row: the delta is exactly the set whose
+verdict can have moved.
+
+It writes to the **canonical** dataset only. A quarantined source's contribution goes to
+`grants/unified@q`, and scoring it would alert on grants the canonical layer does not publish — so a
+diverted run reports `fits: null` ("we did not look"), not a zeroed block.
+
+Each run's result carries `fits: {profiles, evaluated, eligible, likely, blocked, unknown, fresh}`.
+**`fresh` is the alert set**: the new/changed fit rows. Because `grants` is a registered virtual
+namespace, a dataset trigger or watch on `grants/fits` delivers "a grant you are eligible for just
+opened" with no new delivery code — see [triggers.md](triggers.md) and
+[events-webhooks.md](events-webhooks.md). `grants/fits` joins `index_datasets` only on a run that
+actually wrote rows, so an empty window never claims search coverage.
+
+Bounds, all stated rather than silent: `PROFILE_LIMIT` 200 profiles per pass, `FIT_DELTA_LIMIT` 5000
+delta keys (the remainder keep their previous verdict and are re-evaluated when the source
+republishes them, and the run says so in `warnings`). A profile row whose `org_type`/`country` cannot
+be read is **skipped loudly** — no fits at all, rather than fits against a guessed applicant.
+
+### Reading it
+
+`GET /grants/fits?profile=&verdict=&source=`, `GET /grants/profiles`, and `GET /grants?profile=`
+(the corpus read through one applicant's verdicts, each hit carrying its `fit` block). See
+[http-api.md](http-api.md#get-grantsfits-n31-2026-09-02).
+
+### Known gaps (v1)
+
+- **No Claude refinement over `eligibility_text`.** Every row is `method: "deterministic"`; the field
+  exists so a second arm cannot arrive un-named.
+- **No EIN verification.** `irs-eo-bmf` ("the eligibility ground-truth") is still `planned`, so
+  `ein`/`ntee` are stored and read by nothing. When it ships, a verified 501(c)(3) hardens the
+  nonprofit arm of the applicant gate.
+- **The vocabulary map is substring-based over two portals' phrasing.** A new portal's taxonomy
+  lands in the `unknown` arm — correctly, and visibly — until its terms are added.
+- **`eligibilities[]` is empty for `grants-gov` and `eu-sedia`** (neither search hit carries the
+  facet), so federal verdicts depend entirely on the detail corpus, which only `grants-gov` writes:
+  a federal opportunity with no harvested detail is `unknown`, and that is the honest answer.
+- **No fit history.** The row holds the current verdict; the revision log holds the rest.
+
 ## `transact`: evidence, approval, submit
 
 `transact` runs a declarative browser flow (`steps`: `type`/`click`/`wait_for_selector`/`wait_ms`/`scroll`/`repeat`, reusing `PageAction` verbatim) up to the final confirmation state and **stops before the irreversible action**. `submit_action` lives in its own field, and the staging path has no code path that hands it to the executor — stop-before-submit is structural, not a flag check.

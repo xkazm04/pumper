@@ -222,7 +222,9 @@ impl ScrapeApp for GrantsGov {
                  swept, \
                  crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept, \
-                 programs: {rows, withProjection, withEvents, stamped, complete}}, warnings[], \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, \
+                 fits: {profiles, evaluated, eligible, likely, blocked, unknown, fresh}, \
+                 warnings[], \
                  index_datasets[]} — Search2 sync tallies over the `opportunities` dataset \
                  (keyed by opportunity id). `sweep` names how the walk ended \
                  (`complete` | `capped` | `short_page` | `unknown_total`) and `truncated` is \
@@ -246,7 +248,12 @@ impl ScrapeApp for GrantsGov {
                  PROGRAM (N29), with its recurrence projection, amendment behaviour and \
                  Horizon win history — and the run that writes it also names that dataset in \
                  `index_datasets[]`. `index_datasets[]` is **withheld entirely** when this source's \
-                 extraction health says its rows must not reach the search index",
+                 extraction health says its rows must not reach the search index. \
+                 `fits` is the applicant-fit pass (N31) over THIS run's delta — one verdict per \
+                 `grants/profiles` row x changed opportunity, upserted into `grants/fits`, where \
+                 `fresh` is exactly the alert set; it is null (not a zeroed block) on a run whose \
+                 contribution was diverted to the shadow dataset, and a run that wrote rows also \
+                 names `grants/fits` in `index_datasets[]`",
             ),
             cost_class: CostClass::Free,
         }

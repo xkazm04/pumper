@@ -86,7 +86,9 @@ impl ScrapeApp for CaGrants {
                  sourceState}, \
                  swept, crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept, \
-                 programs: {rows, withProjection, withEvents, stamped, complete}}, warnings[], \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, \
+                 fits: {profiles, evaluated, eligible, likely, blocked, unknown, fresh}, \
+                 warnings[], \
                  index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
                  (keyed by PortalID) plus the shared grants/unified cross-source layer. \
                  `sweep` names how the walk ended — complete|capped|short_page|\
@@ -98,7 +100,12 @@ impl ScrapeApp for CaGrants {
                  that did not own it reports `crossSourceDups`/`recurrenceLinks` and \
                  `corpusPass.programs` as null (not 0) and `corpusPass.ran: false`. \
                  `corpusPass.programs` is the `grants/programs` registry that pass \
-                 materialized — one row per funding PROGRAM (N29)",
+                 materialized — one row per funding PROGRAM (N29). \
+                 `fits` is the applicant-fit pass (N31) over THIS run's delta — one verdict per \
+                 `grants/profiles` row x changed opportunity, upserted into `grants/fits`, where \
+                 `fresh` is exactly the alert set; it is null (not a zeroed block) on a run whose \
+                 contribution was diverted to the shadow dataset, and a run that wrote rows also \
+                 names `grants/fits` in `index_datasets[]`",
             ),
             cost_class: CostClass::Free,
         }

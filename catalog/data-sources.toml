@@ -1067,3 +1067,71 @@ total_market_per_10k_basis = "string"
 
 [source.contract.ranges]
 total_market_per_10k = { min = 0.0 }
+
+# --- N31 applicant fit engine (grants/profiles + grants/fits) ------------------
+#
+# Two rows in the `grants` virtual namespace, neither of them a scrape.
+#
+# `cron` MUST stay empty on both: `Catalog::reconcile` derives desired schedules
+# from `Source::is_scheduled()`, and there is no app called `grants` to schedule.
+# Profiles are written by an operator through `POST /grants/profiles`; fits ride
+# every grant source's own run, over that run's delta.
+#
+# Neither declares `max_row_delta_pct`: both are written with
+# `upsert_stamped` / `upsert_many_derived`, which never tombstone, so the
+# row-delta tripwire could not fire — the same reasoning that removed the inert
+# one from the grants-gov and grants-opportunity-details contracts above.
+[[source]]
+id = "grants-profiles"
+app = "grants"
+market = "us"
+name = "Applicant profiles (operator-authored, POST /grants/profiles)"
+url = "written through POST /grants/profiles"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 5
+dataset = "profiles"
+notes = "N31. One row per applicant: {name, org_type (nonprofit|gov|tribal|smb|university|individual), country, state?, ein?, uei?, ntee?, budget_band, focus_tags[], cost_share_capacity, programs_watched[]}, keyed by the slugged name. NOT a scrape and NOT a table: the fit pass runs inside an app and reaches storage only through AppContext::datasets, so a SQL table would be invisible to the code that reads it. Validation is strict (an unknown field is refused, not dropped) and every absent optional field is stored as an explicit null — absent means UNKNOWN, and unknown never blocks a fit. ein/uei/ntee are stored, never verified: irs-eo-bmf is still planned."
+
+# No `max_staleness_hours`: this dataset is authored by an operator, not
+# refreshed by a source, so a freshness window would report a stable roster of
+# profiles as a broken pipeline. Absence of a bound is the honest declaration.
+[source.contract]
+required_fields = ["name", "org_type", "country"]
+
+[source.contract.types]
+name = "string"
+org_type = "string"
+country = "string"
+
+[[source]]
+id = "grants-fits"
+app = "grants"
+market = "us"
+name = "Applicant fit verdicts (grants/profiles x grants/unified)"
+url = "derived from grants/profiles + grants/unified + grants/opportunity_details"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "fits"
+notes = "N31. One scored, explained verdict per profile x opportunity, keyed {profile}:{unified_key}: {profile, unified_key, source, verdict (eligible|likely|blocked|unknown), score, method, reasons[], blockers[], unknowns[]}. Five pure gates — status, geography, applicant type, cost share, award band — over the eligibility fields the corpus already carried. `eligible` requires positive published evidence on every gate and is unreachable by absence; a Null field, an empty published applicant list, or a term outside the vocabulary map all yield `unknown`, never a fabricated `blocked`. Written by EVERY grant source over THAT run's delta (not the corpus, and not off the once-per-cycle corpus-pass lease, which holds no delta), canonical dataset only — a quarantined contribution reports fits: null rather than alerting on rows the canonical layer does not publish. The new/changed rows of a run are exactly the alert set for a watch or dataset trigger on grants/fits. Deliberately verdict-shaped: it copies nothing from the opportunity, so a changed revision means the FIT moved, not that an agency fixed a typo. Queryable at GET /grants/fits and GET /grants?profile=."
+
+# `verdict` is required beside the two identity fields because a fit row without
+# one is a claim about an applicant with no answer attached — it is the whole
+# payload, and `reasons`/`blockers` only explain it.
+[source.contract]
+required_fields = ["profile", "unified_key", "verdict"]
+max_staleness_hours = 48
+
+[source.contract.types]
+profile = "string"
+unified_key = "string"
+verdict = "string"

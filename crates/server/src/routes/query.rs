@@ -56,6 +56,18 @@ pub(crate) struct GrantsQuery {
     /// and portals, in one query. Rows the identity rules could not name a
     /// program for carry no `program_key` and never match.
     program: Option<String>,
+    /// **Applicant fit (N31)**: the key of a `grants/profiles` row. Switches the
+    /// route to the fit-joined view — every opportunity this applicant has a
+    /// verdict for, each with its `fit` block attached, driven from
+    /// `grants/fits`. Combine it with `verdict=` to narrow; combining it with a
+    /// corpus filter (`status`, `agency`, `source`, `program`, the closing
+    /// window, `min_award`) is a **400**, because the two sides live in
+    /// different datasets and ANDing two capped reads would return part of the
+    /// answer while looking like all of it.
+    profile: Option<String>,
+    /// Narrows `profile=` to one verdict: `eligible` | `likely` | `blocked` |
+    /// `unknown`. Ignored when `profile` is absent.
+    verdict: Option<String>,
     /// Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.
     closing_before: Option<String>,
     /// Closes on or after this `YYYY-MM-DD`. Records with no close date are excluded.
@@ -157,14 +169,19 @@ fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonF
     tag = "grants",
     params(GrantsQuery),
     responses(
-        (status = 200, description = "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty)."),
-        (status = 400, description = "Malformed `closing_before` / `closing_after` date", body = Object),
+        (status = 200, description = "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). With `profile=` set the route instead returns `{profile, grants, retired}` (or `{items, next_cursor, retired}`), driven from `grants/fits`: each element is the unified record plus a `fit` block, and `retired` counts the verdicts whose opportunity has left the corpus."),
+        (status = 400, description = "Malformed `closing_before` / `closing_after` date, an unrecognized `verdict`, or `profile` combined with a corpus filter", body = Object),
     )
 )]
 pub(crate) async fn list_grants(
     State(state): State<AppState>,
     Query(query): Query<GrantsQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    // N31: `profile=` reads the applicant's verdicts, not the corpus. The whole
+    // branch lives at the end of this file with the rest of the fit surface.
+    if let Some(profile) = filter_value(&query.profile) {
+        return grants_for_profile(&state, &query, profile).await;
+    }
     let filters = grant_filters(&query)?;
     let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
     let trust = trust_filter(&query.trust);
@@ -961,5 +978,357 @@ mod market_tests {
         assert_eq!(market_profile_key("Tx", "hvac"), "TX:hvac");
         // Not "TX:HVAC": upper-casing the label would miss the stored row.
         assert_ne!(market_profile_key("tx", "hvac"), "TX:HVAC");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Applicant fit engine (`grants/profiles` + `grants/fits`) — appended for N31.
+// Builders append at the END of this file, in wave order, so two branches
+// touching it merge without reordering anything above.
+//
+// The engine itself is `grants_common::fit`: pure gates, one verdict per
+// (profile, opportunity) pair, written by the producer apps. These routes are
+// the door onto it — the profile writer, the profile reader, the fit reader,
+// and the `profile=` join on `GET /grants`.
+//
+// `POST /grants/profiles` needs no entry in `auth::required_scope`: that
+// function's default for a mutating path is `Admin`, so a route it has never
+// heard of is guarded before anyone remembers the file exists. Adding a case
+// for this path would only weaken it.
+// ---------------------------------------------------------------------------
+
+/// Operator-authored applicant profiles. Mirrors
+/// `grants_common::fit::PROFILES_DATASET`.
+const PROFILES_DATASET: &str = "profiles";
+/// One scored verdict per profile × opportunity. Mirrors
+/// `grants_common::fit::FITS_DATASET`.
+const FITS_DATASET: &str = "fits";
+
+/// The filters that read the CORPUS, and therefore cannot be combined with
+/// `profile=`, which reads the fit set. Named once so the refusal message and
+/// the check cannot drift apart.
+const CORPUS_FILTERS: &[&str] = &[
+    "status",
+    "agency",
+    "source",
+    "program",
+    "closing_before",
+    "closing_after",
+    "min_award",
+];
+
+/// Which corpus filters this query set, in `CORPUS_FILTERS` order.
+///
+/// **Pure**, and extracted because the anti-pattern is the silent version:
+/// applying `profile=` by intersecting two capped reads answers *some* of the
+/// question and states nothing about what fell outside either window. A
+/// grant-seeker who filters "eligible AND closing this month" and silently gets
+/// four of the eleven has been given a wrong answer, not a partial one.
+fn corpus_filters_set(query: &GrantsQuery) -> Vec<&'static str> {
+    let present = [
+        filter_value(&query.status).is_some(),
+        filter_value(&query.agency).is_some(),
+        filter_value(&query.source).is_some(),
+        filter_value(&query.program).is_some(),
+        filter_value(&query.closing_before).is_some(),
+        filter_value(&query.closing_after).is_some(),
+        query.min_award.is_some(),
+    ];
+    CORPUS_FILTERS
+        .iter()
+        .zip(present)
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Validates a `verdict=` param against the closed vocabulary, so a typo is a
+/// 400 rather than a confident empty result set.
+fn verdict_filter(value: &Option<String>) -> Result<Option<&'static str>, ApiError> {
+    let Some(raw) = filter_value(value) else {
+        return Ok(None);
+    };
+    grants_common::fit::Verdict::parse(raw)
+        .map(|v| Some(v.as_str()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "'verdict' must be one of: {}, got '{raw}'",
+                    grants_common::fit::Verdict::ALL
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ),
+            )
+        })
+}
+
+#[utoipa::path(
+    post,
+    path = "/grants/profiles",
+    tag = "grants",
+    request_body = Object,
+    responses(
+        (status = 200, description = "`{key, created, profile}` — the canonical stored profile. Body: `{name, org_type (nonprofit|gov|tribal|smb|university|individual), country (ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags?[], cost_share_capacity? (true|false|null), programs_watched?[]}`. The record key is the slugged `name`, so re-POSTing the same name UPDATES that profile (`created: false`). Every absent optional field is stored as an explicit `null`: absent means UNKNOWN, and unknown never blocks a fit. `ein`/`uei`/`ntee` are stored, never verified — IRS EO BMF verification is not built.", body = Object),
+        (status = 400, description = "Validation failed — every error at once, including any UNKNOWN field (a typo'd field is refused, not dropped)", body = Object),
+    )
+)]
+pub(crate) async fn create_grant_profile(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let (key, profile) = grants_common::fit::validate_profile(&body)
+        .map_err(|errors| ApiError(StatusCode::BAD_REQUEST, errors.join("; ")))?;
+    let existed = state
+        .datasets
+        .get(GRANTS_APP, PROFILES_DATASET, &key)
+        .await?
+        .is_some_and(|r| r.removed_at.is_none());
+    state
+        .datasets
+        .upsert_stamped(GRANTS_APP, PROFILES_DATASET, &key, &profile, None, None)
+        .await?;
+    Ok(Json(json!({
+        "key": key,
+        "created": !existed,
+        "profile": profile,
+    })))
+}
+
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ProfilesQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/grants/profiles",
+    tag = "grants",
+    params(ProfilesQuery),
+    responses((status = 200, description = "`{profiles: [Record]}` — every live applicant profile, newest-updated first."))
+)]
+pub(crate) async fn list_grant_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<ProfilesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let profiles = state
+        .datasets
+        .list_filtered(GRANTS_APP, PROFILES_DATASET, &[], None, limit)
+        .await?;
+    Ok(Json(json!({ "profiles": profiles })))
+}
+
+/// Filters over `grants/fits`.
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct FitsQuery {
+    /// Profile key (the slugged name `POST /grants/profiles` returned).
+    profile: Option<String>,
+    /// `eligible` | `likely` | `blocked` | `unknown`. An unrecognized value is a
+    /// 400, never a confident empty page.
+    verdict: Option<String>,
+    /// Source app of the opportunity the verdict is about.
+    source: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+fn fit_filters(
+    profile: Option<&str>,
+    verdict: Option<&str>,
+    source: Option<&str>,
+) -> Vec<pumper_core::datasets::JsonFilter> {
+    use pumper_core::datasets::JsonFilter;
+    let mut filters = Vec::new();
+    for (path, value) in [
+        ("$.profile", profile),
+        ("$.verdict", verdict),
+        ("$.source", source),
+    ] {
+        if let Some(value) = value {
+            filters.push(JsonFilter::Eq {
+                path: path.into(),
+                value: value.into(),
+            });
+        }
+    }
+    filters
+}
+
+/// **Which grants can this applicant actually apply for, and why.**
+#[utoipa::path(
+    get,
+    path = "/grants/fits",
+    tag = "grants",
+    params(FitsQuery),
+    responses(
+        (status = 200, description = "Live records from `grants/fits`. Dual-mode: `{fits: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` is `{profile, unified_key, source, verdict, score, method, reasons[], blockers[], unknowns[]}`. `verdict` is `eligible` only when every gate had published evidence; `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`. `unknowns[]` names the absent field per gate, which is the list that says which source field to enrich next. The row is deliberately verdict-shaped and copies nothing from the opportunity, so a `changed` revision (and the alert it fires) means the FIT moved, not that an agency fixed a typo.", body = Object),
+        (status = 400, description = "Unrecognized `verdict`", body = Object),
+    )
+)]
+pub(crate) async fn list_fits(
+    State(state): State<AppState>,
+    Query(query): Query<FitsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let verdict = verdict_filter(&query.verdict)?;
+    let filters = fit_filters(
+        filter_value(&query.profile),
+        verdict,
+        filter_value(&query.source),
+    );
+    let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let Some(cursor) = &query.cursor else {
+        let fits = state
+            .datasets
+            .list_filtered(GRANTS_APP, FITS_DATASET, &filters, None, limit)
+            .await?;
+        return Ok(Json(json!({ "fits": fits })));
+    };
+    let after = parse_cursor(cursor);
+    let items = state
+        .datasets
+        .list_filtered(GRANTS_APP, FITS_DATASET, &filters, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |r| {
+        format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+}
+
+/// `GET /grants?profile=` — the corpus read through one applicant's verdicts.
+///
+/// Driven from `grants/fits`, then hydrated from `grants/unified`, so paging is
+/// exact: one fit row in, at most one grant out, and the keyset cursor is the
+/// fit dataset's own.
+///
+/// **It refuses to be combined with the corpus filters**, and that refusal is
+/// the honest half of the feature. The two sides live in different datasets, so
+/// `profile=` + `closing_before=` could only be served by intersecting two
+/// capped reads — which returns *some* of the answer while looking exactly like
+/// all of it. A 400 that names the offending params is a worse UX and a correct
+/// one; narrow with `verdict=` here, or filter the corpus and read
+/// `GET /grants/fits` beside it.
+async fn grants_for_profile(
+    state: &AppState,
+    query: &GrantsQuery,
+    profile: &str,
+) -> Result<Json<Value>, ApiError> {
+    let conflicting = corpus_filters_set(query);
+    if !conflicting.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'profile' reads grants/fits and {} read grants/unified — the two cannot be \
+                 ANDed in one page without silently dropping matches outside either window. \
+                 Narrow this call with 'verdict=', or drop 'profile' and read GET /grants/fits \
+                 beside the filtered corpus.",
+                conflicting.join(", ")
+            ),
+        ));
+    }
+    let verdict = verdict_filter(&query.verdict)?;
+    let filters = fit_filters(Some(profile), verdict, None);
+    let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let after = query.cursor.as_deref().and_then(parse_cursor);
+    let fits = state
+        .datasets
+        .list_filtered(GRANTS_APP, FITS_DATASET, &filters, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&fits, limit, |r| {
+        format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
+    });
+
+    let mut grants = Vec::new();
+    // A fit whose opportunity has left the corpus is COUNTED, not silently
+    // dropped: the gap between "12 fits" and "10 grants" is a real fact about
+    // the store, and swallowing it is how a page quietly shrinks.
+    let mut retired = 0usize;
+    for fit in &fits {
+        let Some(unified_key) = fit.data.get("unified_key").and_then(Value::as_str) else {
+            retired += 1;
+            continue;
+        };
+        match state
+            .datasets
+            .get(GRANTS_APP, GRANTS_DATASET, unified_key)
+            .await?
+        {
+            Some(rec) if rec.removed_at.is_none() => {
+                let mut item = serde_json::to_value(&rec).unwrap_or(Value::Null);
+                if let Value::Object(map) = &mut item {
+                    map.insert("fit".into(), fit.data.clone());
+                }
+                grants.push(item);
+            }
+            _ => retired += 1,
+        }
+    }
+    if query.cursor.is_some() {
+        return Ok(Json(
+            json!({ "items": grants, "next_cursor": next_cursor, "retired": retired }),
+        ));
+    }
+    Ok(Json(json!({
+        "profile": profile,
+        "grants": grants,
+        "retired": retired,
+    })))
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    fn query() -> GrantsQuery {
+        GrantsQuery {
+            status: None,
+            agency: None,
+            source: None,
+            program: None,
+            profile: None,
+            verdict: None,
+            closing_before: None,
+            closing_after: None,
+            min_award: None,
+            trust: default_trust_all(),
+            limit: default_limit(),
+            cursor: None,
+        }
+    }
+
+    /// A blank param (`?status=`) means "unset" everywhere else on this route,
+    /// and it has to mean "unset" here too — otherwise a UI that always
+    /// serializes its whole filter form gets a 400 for a form it never filled
+    /// in, on the one route where the refusal is the feature.
+    #[test]
+    fn a_blank_corpus_filter_does_not_conflict_with_profile() {
+        let mut q = query();
+        q.status = Some(String::new());
+        q.agency = Some("   ".into());
+        assert!(corpus_filters_set(&q).is_empty());
+        q.status = Some("open".into());
+        q.min_award = Some(1.0);
+        assert_eq!(corpus_filters_set(&q), vec!["status", "min_award"]);
+    }
+
+    /// A typo'd verdict is a 400, never a confident empty page — the anti-pattern
+    /// is `?verdict=eligable` reading as "no grants fit you".
+    #[test]
+    fn an_unrecognized_verdict_is_refused_not_an_empty_page() {
+        assert_eq!(
+            verdict_filter(&Some("eligable".into())).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            verdict_filter(&Some("ELIGIBLE".into())).unwrap(),
+            Some("eligible")
+        );
+        assert_eq!(verdict_filter(&None).unwrap(), None);
+        assert_eq!(verdict_filter(&Some(String::new())).unwrap(), None);
     }
 }
