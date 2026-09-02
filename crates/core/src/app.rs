@@ -346,27 +346,37 @@ impl AppContext {
             .and_then(|u| u.host_str().map(str::to_lowercase));
 
         // Learned tier routing: hosts where the HTTP tier persistently loses
-        // start straight at the browser (escalating strategies only).
+        // start straight at the browser; hosts a validated API recipe already
+        // serves consult recipes ahead of the live ladder. Both pins are read
+        // by one pure function so this seam and `GET /hosts` cannot disagree
+        // about what a pin means.
         let mut tier_note = None;
+        let mut recipe_note = None;
         if let Some(host) = &host {
-            if !req.skip_http
-                && matches!(
+            match self.tiers.preferred(host).await {
+                Ok(pref) => match router_pin(
+                    pref.as_deref(),
                     req.strategy,
-                    crate::fetcher::FetchStrategy::Auto
-                        | crate::fetcher::FetchStrategy::AutoWithResearch
-                )
-            {
-                match self.tiers.preferred(host).await {
-                    Ok(Some(pref)) if pref == "browser" => {
+                    req.skip_http,
+                    req.use_recipes,
+                ) {
+                    RouterPin::StartAtBrowser => {
                         req.skip_http = true;
                         tier_note = Some(
                             "http tier skipped: learned host preference (persistent http losses)"
                                 .to_string(),
                         );
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(job = %self.job_id, "tier memory read failed: {e}"),
-                }
+                    RouterPin::ConsultRecipes => {
+                        req.use_recipes = true;
+                        recipe_note = Some(
+                            "api_recipe tier consulted: learned host preference (a validated                              recipe last served this host)"
+                                .to_string(),
+                        );
+                    }
+                    RouterPin::None => {}
+                },
+                Err(e) => tracing::warn!(job = %self.job_id, "tier memory read failed: {e}"),
             }
         }
 
@@ -416,6 +426,12 @@ impl AppContext {
                 cost_usd: None,
                 detail: Some("learned host preference (persistent http losses)".to_string()),
             });
+            outcome.escalations.push(note);
+        }
+        // The recipe pin leaves a trail line only — the recipe tier writes its
+        // own `TierTrace` when it actually runs, and a second synthetic entry
+        // here would report a tier that may never have been reached.
+        if let Some(note) = recipe_note {
             outcome.escalations.push(note);
         }
         if let Some(note) = budget_note {
@@ -785,6 +801,55 @@ impl AppContext {
 /// correlates with a deploy in one query instead of looking like thirty sites
 /// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
 /// else the crate version.
+/// What the learned tier pin for a host does to one fetch request.
+///
+/// The router used to branch on `browser` and nothing else, so the third
+/// learned state N14 introduced — `api_recipe`, earned the moment a validated
+/// recipe actually served a host — was memory the routing decision never read.
+/// A host could be pinned to the cheapest tier in the ladder while every fetch
+/// of it still walked http → browser, because recipes are consulted only when
+/// `[recipes] enabled`, `[fetcher] xray` or the per-request `use_recipes` say
+/// so, and a pin said none of those things. The anti-pattern the tests name:
+/// `api_recipe_pin_not_left_as_decoration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouterPin {
+    /// No pin, or a pin this request already satisfies / must not honour.
+    None,
+    /// `browser`: skip the http tier, it persistently loses here.
+    StartAtBrowser,
+    /// `api_recipe`: consult learned recipes ahead of the live ladder.
+    ConsultRecipes,
+}
+
+/// Reads one host's learned pin against the request that is about to run.
+///
+/// Deliberately total and side-effect free: both pins are *hints* the explicit
+/// strategies override. `Browser` strategy never takes the recipe pin (an API
+/// payload is not the JS render the caller asked for — the same exclusion
+/// [`crate::fetcher::recipes_consulted`] makes), and `Http` never takes the
+/// browser pin (the caller asked for the cheap tier only). A request that has
+/// already opted into the effect gets `None`, so the trail records the pin once
+/// or not at all.
+pub(crate) fn router_pin(
+    preferred: Option<&str>,
+    strategy: crate::fetcher::FetchStrategy,
+    skip_http: bool,
+    use_recipes: bool,
+) -> RouterPin {
+    use crate::fetcher::FetchStrategy as S;
+    match preferred {
+        Some(crate::tiers::PREFERRED_BROWSER)
+            if !skip_http && matches!(strategy, S::Auto | S::AutoWithResearch) =>
+        {
+            RouterPin::StartAtBrowser
+        }
+        Some(crate::tiers::PREFERRED_API_RECIPE) if !use_recipes && strategy != S::Browser => {
+            RouterPin::ConsultRecipes
+        }
+        _ => RouterPin::None,
+    }
+}
+
 fn build_id() -> Option<String> {
     Some(std::env::var("PUMPER_BUILD_ID").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()))
 }
@@ -1003,8 +1068,8 @@ pub trait ScrapeApp: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, safe_path_segment,
-        success_spend_event, FetchOutcome,
+        budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, router_pin,
+        safe_path_segment, success_spend_event, FetchOutcome, RouterPin,
     };
 
     fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
@@ -1102,6 +1167,104 @@ mod tests {
         assert!(
             err.to_string().contains("$1.50") && err.to_string().contains("exhausted"),
             "the message must still name the ceiling: {err}"
+        );
+    }
+
+    /// The carry-forward N14 named as its own first known gap: a host the
+    /// router pinned to `api_recipe` — the cheapest tier in the ladder, earned
+    /// by a validated recipe actually serving that host — was routed exactly
+    /// like an unpinned one, because this seam branched on `browser` alone. The
+    /// pin was learned, exported on `GET /hosts`, and read by nothing.
+    #[test]
+    fn api_recipe_pin_not_left_as_decoration() {
+        use crate::fetcher::FetchStrategy as S;
+        for strategy in [S::Auto, S::AutoWithResearch, S::Http] {
+            assert_eq!(
+                router_pin(
+                    Some(crate::tiers::PREFERRED_API_RECIPE),
+                    strategy,
+                    false,
+                    false
+                ),
+                RouterPin::ConsultRecipes,
+                "{strategy:?} must honour the recipe pin"
+            );
+        }
+    }
+
+    /// An explicit `browser` strategy asked for a JS render; an API payload is
+    /// not one. Same exclusion `recipes_consulted` makes, decided once.
+    #[test]
+    fn api_recipe_pin_not_applied_to_an_explicit_browser_render() {
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_API_RECIPE),
+                crate::fetcher::FetchStrategy::Browser,
+                false,
+                false,
+            ),
+            RouterPin::None
+        );
+    }
+
+    /// A request that already set `use_recipes` gets no pin effect, so the
+    /// trail cannot claim the router did something the caller had done.
+    #[test]
+    fn a_pin_already_satisfied_is_not_reported_twice() {
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_API_RECIPE),
+                crate::fetcher::FetchStrategy::Auto,
+                false,
+                true,
+            ),
+            RouterPin::None
+        );
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_BROWSER),
+                crate::fetcher::FetchStrategy::Auto,
+                true,
+                false,
+            ),
+            RouterPin::None
+        );
+    }
+
+    /// The browser pin's pre-existing rules are unchanged: escalating
+    /// strategies only, and an unknown/absent pin routes normally.
+    #[test]
+    fn browser_pin_still_only_binds_the_escalating_strategies() {
+        use crate::fetcher::FetchStrategy as S;
+        assert_eq!(
+            router_pin(Some(crate::tiers::PREFERRED_BROWSER), S::Auto, false, false),
+            RouterPin::StartAtBrowser
+        );
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_BROWSER),
+                S::AutoWithResearch,
+                false,
+                false
+            ),
+            RouterPin::StartAtBrowser
+        );
+        for strategy in [S::Http, S::Browser] {
+            assert_eq!(
+                router_pin(
+                    Some(crate::tiers::PREFERRED_BROWSER),
+                    strategy,
+                    false,
+                    false
+                ),
+                RouterPin::None,
+                "{strategy:?} is explicit and overrides the pin"
+            );
+        }
+        assert_eq!(router_pin(None, S::Auto, false, false), RouterPin::None);
+        assert_eq!(
+            router_pin(Some("something-else"), S::Auto, false, false),
+            RouterPin::None
         );
     }
 
