@@ -86,7 +86,8 @@
       "doc": "docs/features/events-webhooks.md",
       "sourceGlobs": [
         "crates/server/src/webhook.rs",
-        "crates/server/src/events.rs"
+        "crates/server/src/events.rs",
+        "crates/server/src/routes/watches.rs"
       ]
     },
     {
@@ -100,8 +101,11 @@
       "doc": "docs/features/trigger-plugins.md",
       "sourceGlobs": [
         "crates/server/src/triggers.rs",
+        "crates/engine-wasm/src/caps.rs",
+        "crates/server/src/plugin_caps.rs",
         "plugins-src/trigger-gate/**",
-        "plugins-src/delta-slim/**"
+        "plugins-src/delta-slim/**",
+        "plugins-src/sink-postgrest/**"
       ]
     },
     {
