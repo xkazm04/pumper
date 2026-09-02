@@ -579,6 +579,179 @@ pub fn bfs_sector_category(naics: &str) -> Option<String> {
         .then(|| format!("NAICS{prefix}"))
 }
 
+// ---------------------------------------------------------------------------
+// County -> CBSA (metro) crosswalk (N35).
+//
+// The sub-state launch atlas ranks COUNTIES, but the pricing app it drives
+// prices a MARKET a human would name — "Phoenix, AZ", not "AZ·013". This is
+// the bridge between the two.
+//
+// **It is deliberately PARTIAL, and that is the honest shape.** The full OMB
+// delineation is ~1,900 county<->CBSA rows, refreshed by bulletin; vendoring it
+// here would be a data file pretending to be a constant, stale the moment OMB
+// republishes. The atlas only ever needs the metro of a county that reached a
+// top-N ranking, so this table covers the principal counties of the large
+// metros and answers `None` — never a guess, never the state as a stand-in —
+// for everything else. A county with no metro produces no pricing plan entry,
+// and the run reports how many were unmapped.
+// ---------------------------------------------------------------------------
+
+/// Which OMB delineation the titles below are quoted from. Stamped on every
+/// atlas record that carries a metro, so a title that later changes (OMB
+/// re-titles CBSAs on revision) stays traceable to the vintage that named it.
+pub const CBSA_VINTAGE: &str = "omb_2020";
+
+/// A metropolitan statistical area, as the atlas names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cbsa {
+    /// 5-digit CBSA code.
+    pub code: &'static str,
+    /// CBSA title — also the `locality` string handed to `homewyse-pricing`.
+    pub title: &'static str,
+}
+
+/// `(county FIPS 5, CBSA code, CBSA title)`.
+const COUNTY_CBSA: &[(&str, &str, &str)] = &[
+    ("01073", "13820", "Birmingham-Hoover, AL"),
+    ("02020", "11260", "Anchorage, AK"),
+    ("02090", "21820", "Fairbanks, AK"),
+    ("04013", "38060", "Phoenix-Mesa-Chandler, AZ"),
+    ("04019", "46060", "Tucson, AZ"),
+    ("05119", "30780", "Little Rock-North Little Rock-Conway, AR"),
+    ("06001", "41860", "San Francisco-Oakland-Berkeley, CA"),
+    ("06013", "41860", "San Francisco-Oakland-Berkeley, CA"),
+    ("06037", "31080", "Los Angeles-Long Beach-Anaheim, CA"),
+    ("06059", "31080", "Los Angeles-Long Beach-Anaheim, CA"),
+    ("06065", "40140", "Riverside-San Bernardino-Ontario, CA"),
+    ("06067", "40900", "Sacramento-Roseville-Folsom, CA"),
+    ("06071", "40140", "Riverside-San Bernardino-Ontario, CA"),
+    ("06073", "41740", "San Diego-Chula Vista-Carlsbad, CA"),
+    ("06075", "41860", "San Francisco-Oakland-Berkeley, CA"),
+    ("06085", "41940", "San Jose-Sunnyvale-Santa Clara, CA"),
+    ("08031", "19740", "Denver-Aurora-Lakewood, CO"),
+    ("08041", "17820", "Colorado Springs, CO"),
+    (
+        "10003",
+        "37980",
+        "Philadelphia-Camden-Wilmington, PA-NJ-DE-MD",
+    ),
+    (
+        "11001",
+        "47900",
+        "Washington-Arlington-Alexandria, DC-VA-MD-WV",
+    ),
+    ("12011", "33100", "Miami-Fort Lauderdale-Pompano Beach, FL"),
+    ("12057", "45300", "Tampa-St. Petersburg-Clearwater, FL"),
+    ("12086", "33100", "Miami-Fort Lauderdale-Pompano Beach, FL"),
+    ("12095", "36740", "Orlando-Kissimmee-Sanford, FL"),
+    ("12099", "33100", "Miami-Fort Lauderdale-Pompano Beach, FL"),
+    ("12103", "45300", "Tampa-St. Petersburg-Clearwater, FL"),
+    ("13089", "12060", "Atlanta-Sandy Springs-Alpharetta, GA"),
+    ("13121", "12060", "Atlanta-Sandy Springs-Alpharetta, GA"),
+    ("15003", "46520", "Urban Honolulu, HI"),
+    ("16001", "14260", "Boise City, ID"),
+    ("17031", "16980", "Chicago-Naperville-Elgin, IL-IN-WI"),
+    ("18097", "26900", "Indianapolis-Carmel-Anderson, IN"),
+    ("19153", "19780", "Des Moines-West Des Moines, IA"),
+    ("20091", "28140", "Kansas City, MO-KS"),
+    ("20173", "48620", "Wichita, KS"),
+    ("21111", "31140", "Louisville/Jefferson County, KY-IN"),
+    ("22071", "35380", "New Orleans-Metairie, LA"),
+    ("23005", "38860", "Portland-South Portland, ME"),
+    (
+        "24031",
+        "47900",
+        "Washington-Arlington-Alexandria, DC-VA-MD-WV",
+    ),
+    ("25017", "14460", "Boston-Cambridge-Newton, MA-NH"),
+    ("25025", "14460", "Boston-Cambridge-Newton, MA-NH"),
+    ("26163", "19820", "Detroit-Warren-Dearborn, MI"),
+    ("27053", "33460", "Minneapolis-St. Paul-Bloomington, MN-WI"),
+    ("28049", "27140", "Jackson, MS"),
+    ("29095", "28140", "Kansas City, MO-KS"),
+    ("29189", "41180", "St. Louis, MO-IL"),
+    ("30111", "13740", "Billings, MT"),
+    ("31055", "36540", "Omaha-Council Bluffs, NE-IA"),
+    ("32003", "29820", "Las Vegas-Henderson-Paradise, NV"),
+    ("32031", "39900", "Reno, NV"),
+    ("33011", "31700", "Manchester-Nashua, NH"),
+    ("34013", "35620", "New York-Newark-Jersey City, NY-NJ-PA"),
+    ("35001", "10740", "Albuquerque, NM"),
+    ("36047", "35620", "New York-Newark-Jersey City, NY-NJ-PA"),
+    ("36059", "35620", "New York-Newark-Jersey City, NY-NJ-PA"),
+    ("36061", "35620", "New York-Newark-Jersey City, NY-NJ-PA"),
+    ("36081", "35620", "New York-Newark-Jersey City, NY-NJ-PA"),
+    ("37119", "16740", "Charlotte-Concord-Gastonia, NC-SC"),
+    ("37183", "39580", "Raleigh-Cary, NC"),
+    ("38017", "22020", "Fargo, ND-MN"),
+    ("39035", "17460", "Cleveland-Elyria, OH"),
+    ("39049", "18140", "Columbus, OH"),
+    ("39061", "17140", "Cincinnati, OH-KY-IN"),
+    ("40109", "36420", "Oklahoma City, OK"),
+    ("41051", "38900", "Portland-Vancouver-Hillsboro, OR-WA"),
+    ("41067", "38900", "Portland-Vancouver-Hillsboro, OR-WA"),
+    ("42003", "38300", "Pittsburgh, PA"),
+    (
+        "42101",
+        "37980",
+        "Philadelphia-Camden-Wilmington, PA-NJ-DE-MD",
+    ),
+    ("44007", "39300", "Providence-Warwick, RI-MA"),
+    ("45019", "16700", "Charleston-North Charleston, SC"),
+    ("46099", "43620", "Sioux Falls, SD"),
+    (
+        "47037",
+        "34980",
+        "Nashville-Davidson--Murfreesboro--Franklin, TN",
+    ),
+    ("47157", "32820", "Memphis, TN-MS-AR"),
+    ("48029", "41700", "San Antonio-New Braunfels, TX"),
+    ("48113", "19100", "Dallas-Fort Worth-Arlington, TX"),
+    ("48141", "21340", "El Paso, TX"),
+    ("48201", "26420", "Houston-The Woodlands-Sugar Land, TX"),
+    ("48439", "19100", "Dallas-Fort Worth-Arlington, TX"),
+    ("48453", "12420", "Austin-Round Rock-Georgetown, TX"),
+    ("49035", "41620", "Salt Lake City, UT"),
+    ("50007", "15540", "Burlington-South Burlington, VT"),
+    (
+        "51059",
+        "47900",
+        "Washington-Arlington-Alexandria, DC-VA-MD-WV",
+    ),
+    ("53033", "42660", "Seattle-Tacoma-Bellevue, WA"),
+    ("53053", "42660", "Seattle-Tacoma-Bellevue, WA"),
+    ("54039", "16620", "Charleston, WV"),
+    ("55079", "33340", "Milwaukee-Waukesha, WI"),
+    ("56021", "16940", "Cheyenne, WY"),
+    ("72127", "41980", "San Juan-Bayamon-Caguas, PR"),
+];
+
+/// The 5-digit county FIPS the crosswalk is keyed on: state FIPS + county FIPS,
+/// each zero-padded to the width Census publishes (`"6"` + `"37"` → `"06037"`).
+/// Census returns them already padded; padding here means a caller that
+/// assembled the halves itself cannot miss the table by a leading zero.
+pub fn county_fips5(state_fips: &str, county_fips: &str) -> String {
+    format!("{:0>2}{:0>3}", state_fips.trim(), county_fips.trim())
+}
+
+/// The metro a county belongs to, or `None`.
+///
+/// `None` means "this table does not know", NEVER "this county has no market":
+/// callers must skip the county rather than substitute the state, which is how
+/// a national pricing run gets billed as a metro one.
+pub fn cbsa_for_county(fips5: &str) -> Option<Cbsa> {
+    COUNTY_CBSA
+        .iter()
+        .find(|(c, _, _)| *c == fips5)
+        .map(|(_, code, title)| Cbsa { code, title })
+}
+
+/// How many counties the crosswalk knows — reported next to the number of
+/// unmapped counties so the table's coverage is visible, not assumed.
+pub fn cbsa_crosswalk_len() -> usize {
+    COUNTY_CBSA.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -945,5 +1118,63 @@ mod tests {
         assert_eq!(bfs_sector_category("56"), Some("NAICS56".into()));
         assert_eq!(bfs_sector_category("5"), None);
         assert_eq!(bfs_sector_category("ab12"), None);
+    }
+
+    /// The anti-pattern the crosswalk exists to refuse: a county the table does
+    /// not know resolving to *something* — the state, the nearest metro, the
+    /// county label itself — and a metered pricing run being billed for a
+    /// market nobody chose. An unknown county is `None`.
+    #[test]
+    fn an_unknown_county_has_no_metro_rather_than_a_substituted_one() {
+        let la = super::cbsa_for_county("06037").expect("a known metro county");
+        assert_eq!(la.code, "31080");
+        assert_eq!(la.title, "Los Angeles-Long Beach-Anaheim, CA");
+        // Two counties of one metro answer with the SAME market — the dedupe
+        // the pricing driver relies on.
+        assert_eq!(super::cbsa_for_county("06059"), Some(la));
+        // A real county that is simply not in the (partial, documented) table.
+        assert_eq!(super::cbsa_for_county("06003"), None);
+        // Not a county at all, and a state FIPS in particular: a 2-digit code
+        // must never fall through to a metro.
+        assert_eq!(super::cbsa_for_county("06"), None);
+        assert_eq!(super::cbsa_for_county(""), None);
+        assert!(super::cbsa_crosswalk_len() > 50);
+        assert_eq!(super::CBSA_VINTAGE, "omb_2020");
+    }
+
+    /// A county FIPS assembled from its halves must land on the table, leading
+    /// zeros included — `"6"` + `"37"` is Los Angeles, not a miss.
+    #[test]
+    fn county_fips5_pads_both_halves_instead_of_concatenating_them() {
+        assert_eq!(super::county_fips5("06", "037"), "06037");
+        assert_eq!(super::county_fips5("6", "37"), "06037");
+        assert_eq!(super::county_fips5(" 48 ", "201"), "48201");
+        // Over-wide input is passed through, never truncated: a code this
+        // function cannot explain must stay visible as itself.
+        assert_eq!(super::county_fips5("061", "0371"), "0610371");
+    }
+
+    /// Every row of the crosswalk has to be well-formed, or the atlas silently
+    /// mis-joins: 5-digit county keys, 5-digit CBSA codes, and one title per
+    /// CBSA code (two spellings of one metro would split its pricing plan into
+    /// two paid runs).
+    #[test]
+    fn every_crosswalk_row_is_well_formed_and_one_title_per_cbsa() {
+        let mut seen: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        let mut counties: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (county, code, title) in super::COUNTY_CBSA {
+            assert!(
+                county.len() == 5 && county.chars().all(|c| c.is_ascii_digit()),
+                "county FIPS {county} is not 5 digits"
+            );
+            assert!(
+                code.len() == 5 && code.chars().all(|c| c.is_ascii_digit()),
+                "CBSA code {code} is not 5 digits"
+            );
+            assert!(!title.trim().is_empty(), "CBSA {code} has no title");
+            assert!(counties.insert(county), "county {county} listed twice");
+            let known = seen.entry(code).or_insert(title);
+            assert_eq!(known, title, "CBSA {code} has two titles");
+        }
     }
 }
