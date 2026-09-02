@@ -57,7 +57,7 @@ A `graph` run **fetches nothing**. It reads the `edges` dataset every crawl has 
 
 `POST /jobs {"app":"crawl","params":{"mode":"graph"}}`
 
-**What it computes.** Damped PageRank (`damping`, default 0.85) over the current link graph, `iterations` power passes (default 20), **checkpointed one per pass** through the platform's job checkpoint seam — a reaped or suspended graph run resumes at the pass it reached instead of re-iterating from the top. (The edge scan itself is not checkpointed: it is a keyset read that costs one scan, while the passes cost `iterations × edges`.) A restored checkpoint whose node set no longer matches the loaded graph **restarts** rather than publishing ranks that were never computed over this corpus.
+**What it computes.** Damped PageRank (`damping`, default 0.85) over the current link graph, `iterations` power passes (default 20), **checkpointed one per pass** through the platform's job checkpoint seam (runtime-throttled like every other checkpoint, so a run whose passes are faster than the throttle persists fewer of them — the throttle costs at most one pass of redone work) — a reaped or suspended graph run resumes at the pass it reached instead of re-iterating from the top. (The edge scan itself is not checkpointed: it is a keyset read that costs one scan, while the passes cost `iterations × edges`.) A restored checkpoint whose node set no longer matches the loaded graph **restarts** rather than publishing ranks that were never computed over this corpus.
 
 **`page_rank` dataset** — one record per URL, **key = the URL**:
 

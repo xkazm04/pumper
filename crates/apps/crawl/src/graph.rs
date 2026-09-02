@@ -366,6 +366,11 @@ pub fn structure_change(
 /// The resumable unit of a `graph` run: which pass finished and the rank vector
 /// it produced.
 ///
+/// Saved through the throttled seam (`ctx.checkpoint`, like the extractor
+/// backfill's per-batch save) rather than the unthrottled one: a pass is cheap
+/// to redo — at most one is ever lost — while forcing a write per pass would put
+/// a full rank-vector serialization on every iteration of a fast graph.
+///
 /// The edge scan is NOT checkpointed — it is a keyset read of a dataset that
 /// does not move under the run, so re-reading it on resume costs one scan,
 /// while re-running the passes costs `iterations × edges`. The passes are what
