@@ -188,7 +188,7 @@ The field-level `is_blank` (which decides `FieldStatus::Empty` and `CoercionStat
 | bounds | per **call** fuel + memory, blocking-pool admission | per **job** fuel, wall clock, host-call ceiling, live-instance admission |
 | switch | `[plugins] enabled` (on by default) | `[wasm_apps] enabled` (**off** by default) |
 
-A core module in the app dir stays exactly what it was — listed, `runnable: false`. A component is refused by the plugin host (it has no `extract` ABI) and picked up by the app host. The two are told apart by the wasm header itself (`is_component`: same ` asm` magic, different version/layer word), never by filename.
+A core module in the app dir stays exactly what it was — listed, `runnable: false`. A component is refused by the plugin host (it has no `extract` ABI) and picked up by the app host. The two are told apart by the wasm header itself (`is_component`: same `asm` magic, different version/layer word), never by filename.
 
 Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-src/` holds sources), executed under wasmtime with **fuel + memory limits**. `GET /plugins` lists, `POST /plugins/reload` rescans. `max_memory_mb` bounds **one** store, so the host also enforces a **global concurrency cap** (`[plugins] max_concurrent`, `0` = one per CPU core) via a semaphore acquired before each run — otherwise a wide fan-out admits `max_memory_mb × concurrent_calls` of aggregate wasm memory and can saturate tokio's blocking pool.
 
