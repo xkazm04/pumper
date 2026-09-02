@@ -208,7 +208,7 @@ mod tests {
     }
 
     fn registry() -> HashMap<String, Arc<dyn ScrapeApp>> {
-        crate::registry::apps()
+        crate::registry::apps(&pumper_core::Config::default())
             .into_iter()
             .map(|a| (a.name().to_string(), a))
             .collect()
