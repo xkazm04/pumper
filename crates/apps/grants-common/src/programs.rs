@@ -21,8 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use pumper_core::datasets::{DerivedPaths, RemovalGuard};
-use pumper_core::resilience::SourceState;
+use pumper_core::datasets::DerivedPaths;
 use pumper_core::{AppContext, Result};
 use serde_json::{json, Value};
 
@@ -406,10 +405,13 @@ impl ProgramRollup {
 /// CANONICAL dataset only — like the sweep and the relation pass it is derived
 /// from rows already stored for every source, not from the calling run's fetch.
 ///
-/// **Removal detection is conditional on a complete read**, the cordis
+/// **Retirement is conditional on a complete read**, the cordis
 /// `rollup_is_complete` idiom: the batch is this dataset's whole current state
 /// only when the corpus read was not itself a window, so a truncated read
-/// downgrades to a plain upsert and says so in `warnings`.
+/// upserts and says so in `warnings` instead of retiring programs it never
+/// looked at. Departed programs are tombstoned **by name** (`tombstone_keys`),
+/// because this pass holds both sides of the comparison and therefore has no
+/// business inferring anything about keys it was not given.
 pub async fn roll_up_programs(ctx: &AppContext) -> Result<ProgramRollup> {
     roll_up_programs_within(ctx, PROGRAM_CORPUS_LIMIT).await
 }
@@ -541,16 +543,34 @@ pub async fn roll_up_programs_within(ctx: &AppContext, corpus_limit: i64) -> Res
             )
             .await?;
         if complete {
-            // The batch IS the registry's whole current state, so a program
-            // whose last posting left the corpus has to disappear. The guard is
-            // minted from `Healthy` because this pass reads the STORED corpus
-            // for every source rather than one run's fetch — the corpus is not
-            // short because the calling source is degrading.
-            let present: Vec<String> = items.iter().map(|(k, _)| k.clone()).collect();
-            if let Some(guard) = RemovalGuard::for_source_state(SourceState::Healthy) {
-                ctx.datasets
-                    .detect_removed(UNIFIED_APP, PROGRAMS_DATASET, &present, guard)
-                    .await?;
+            // Retirement is by NAME, not inferred from a snapshot. The registry
+            // is a complete recompute, so a program whose last posting left the
+            // corpus has to disappear — but this pass can *name* the departed
+            // keys (it holds both sides), and `tombstone_keys` is the seam for
+            // exactly that. `detect_removed` would be the wrong tool twice
+            // over: it reasons about every key it was NOT given, and reaching
+            // it requires a source-health guard that means nothing here, since
+            // the rollup reads the stored corpus for all sources rather than
+            // one run's fetch.
+            let present: std::collections::HashSet<&str> =
+                items.iter().map(|(k, _)| k.as_str()).collect();
+            let live = ctx
+                .datasets
+                .list_filtered(UNIFIED_APP, PROGRAMS_DATASET, &[], None, corpus_limit)
+                .await?;
+            // Same rule as the corpus read: a registry read at its own cap is a
+            // window, and a window cannot say which programs are gone.
+            if corpus_read_is_complete(live.len(), corpus_limit) {
+                let gone: Vec<String> = live
+                    .into_iter()
+                    .map(|r| r.key)
+                    .filter(|k| !present.contains(k.as_str()))
+                    .collect();
+                if !gone.is_empty() {
+                    ctx.datasets
+                        .tombstone_keys(UNIFIED_APP, PROGRAMS_DATASET, &gone)
+                        .await?;
+                }
             }
         }
     }
