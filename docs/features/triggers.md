@@ -84,4 +84,12 @@ The set of enabled triggers for a scope — `(dataset|job, app)` or `(external, 
 
 ## Non-goals (by design)
 
-Fan-in/join barriers, `${…}` param templating, per-record fan-out, named pipeline grouping/UI, backfill on create.
+Per-record fan-out, named pipeline grouping/UI, backfill on create.
+
+Fan-in/join barriers and `{{…}}` param templating are **no longer** non-goals of
+the platform — they are what [workflows.md](workflows.md) (N03) adds, as a
+separate primitive. They remain non-goals *of a trigger*: a trigger is a standing
+reactive edge ("when X happens, also do Y"), a workflow is a submitted plan ("run
+this DAG, join here, one budget, one receipt"). A workflow step is an ordinary
+job, so its terminal event still fires whatever triggers watch it; the barrier is
+evaluated beside `fire_terminal_triggers`, never inside it.

@@ -16,6 +16,7 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Events & webhooks | [events-webhooks.md](events-webhooks.md) | `crates/server/src/{webhook,events}.rs`; delivery-log routes live in `routes/triggers.rs`, the `pumper_webhook_*` gauges in `routes/meta.rs` |
 | Reactive pipelines (triggers) | [triggers.md](triggers.md) | `crates/server/src/triggers.rs`, migration 0014 |
 | Trigger plugins (sandboxed WASM hooks) | [trigger-plugins.md](trigger-plugins.md) | `crates/server/src/triggers.rs`, `crates/engine-wasm/`, `plugins-src/{trigger-gate,delta-slim}/` |
+| Workflow runs (declared multi-step DAGs) | [workflows.md](workflows.md) | `crates/server/src/workflow.rs`, `crates/server/src/routes/workflows.rs`, migration 0046 |
 | HTTP API | [http-api.md](http-api.md) | `crates/server/src/routes/` |
 | Identity & tenancy (scoped API keys) | [auth.md](auth.md) | `crates/server/src/auth.rs`, `crates/server/src/routes/principals.rs`, migration 0041 |
 | Observability (logging, error reporting, metrics) | [observability.md](observability.md) | `crates/server/src/main.rs`, `crates/server/src/routes/health.rs` |

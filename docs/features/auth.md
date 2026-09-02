@@ -110,6 +110,14 @@ scheduler tick, a trigger hop, a retry) — those genuinely have no caller, and
 `GET /principals/costs` reports them under `(unattributed)` rather than dropping
 them, so the parts of the report sum to its total.
 
+Three surfaces read the attribution:
+
+| Surface | What it answers |
+| --- | --- |
+| `GET /principals/costs?since=` | `{total_usd, by_principal}` — spend per caller. |
+| `GET /costs?principal=&app=&since=` | The ordinary `(app, engine)` breakdown, restricted to one caller. Pass the literal `(unattributed)` to select the rows that carry no caller — the label the reports print has to be accepted back as a filter, or the largest bucket on most deployments is the one row nobody can drill into. The response echoes `principal` so an empty ledger under a mistyped id cannot read as "this caller spent $0". |
+| `GET /economics` § `by_principal` | The same per-caller spend beside the per-app economics, over the 30d window and all time, largest first. |
+
 ## Audit ledger
 
 With `[auth] audit = true` (the default) every **mutating** request — accepted
@@ -159,14 +167,13 @@ Additive throughout: legacy rows keep a NULL caller and are never re-attributed.
 
 ## Known gaps
 
-- **`jobs.principal_id` is not yet written by the enqueue handler.** The column,
-  the storage entry point (`Storage::enqueue_dedup_as`) and the request
-  extension the door reads all exist and are tested; wiring the door itself
-  touches `routes/jobs.rs`, which this change deliberately did not edit. Until
-  that one call site changes, `cost_events.principal_id` stays NULL and
-  `GET /principals/costs` reports everything as `(unattributed)`.
-- `GET /costs?principal=` and a `by_principal` block on `GET /economics` are not
-  wired; `GET /principals/costs` is the by-principal surface today.
+- **Only the HTTP enqueue door stamps a caller.** `POST /apps/{name}/jobs` reads
+  the `CallerPrincipal` extension and enqueues through
+  `Storage::enqueue_dedup_as`, and a workflow run's step jobs inherit the run's
+  principal (see [workflows.md](workflows.md)). Every other producer — the
+  scheduler tick, a trigger hop, a retry, an MCP `enqueue_job` — still enqueues
+  with no caller, so its spend stays `(unattributed)`. That is honest for the
+  internal producers; for MCP it is a real gap (see below).
 - **MCP is not covered.** `GET /mcp` is merged inside the same layer stack, so
   in `keys` mode it requires a key like any other route, but there are no
   per-session keys and `[mcp] allow_enqueue` is still a global bit rather than a
