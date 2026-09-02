@@ -177,8 +177,15 @@
       "doc": "docs/features/mesh.md",
       "sourceGlobs": [
         "crates/apps/peer/**",
+        "crates/core/src/mesh.rs",
         "crates/server/src/node.rs",
         "crates/server/src/routes/mesh.rs"
+      ]
+    },
+    {
+      "doc": "docs/features/ingress.md",
+      "sourceGlobs": [
+        "crates/server/src/routes/ingress.rs"
       ]
     },
     {

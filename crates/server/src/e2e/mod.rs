@@ -27,6 +27,7 @@ mod harness;
 mod host_memory_reset;
 mod host_weather;
 mod ingress_gates;
+mod janitor_event_retention;
 mod job_budget_floor;
 mod job_control_honesty;
 mod job_receipt;

@@ -15,7 +15,7 @@ The ring is a **read-through cache** over the log, not a separate mechanism. `Ev
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `log_enabled` | `true` | Master switch. `false` restores the pre-N05 bus byte for byte: in-memory ring only, `reset` on an evicted gap, `GET /events/log` and `POST /subscriptions` answer **409**, and watches deliver through the old in-line path. |
-| `log_retention_days` | `7` | Rows older than this are pruned (at most hourly, from the outbox drain). `0` = keep forever. The log's job is *resume*, not archive — what a run produced durably lives in `records`/`record_revisions`. |
+| `log_retention_days` | `7` | Rows older than this are pruned by the hourly **store janitor** (`main.rs`), alongside every other bounded delete and under the same activity gate — it used to run from the outbox drain, so its cadence depended on how often jobs finished. `0` = keep forever (never "keep zero days"). The log's job is *resume*, not archive — what a run produced durably lives in `records`/`record_revisions`. |
 | `outbox_batch` | `200` | Events handed to one subscription per drain pass. |
 | `pending_capacity` | `8192` | Ceiling on events queued in memory awaiting their log write. |
 
@@ -247,7 +247,7 @@ Two opt-in knobs under `[storage]`, both `0` (off) by default:
 - **The log's write is asynchronous within the process.** `emit` queues; the transaction happens at the next outbox pass (a scheduler tick, or the end of a finished job's fan-out). A hard kill between the two loses whatever was queued — bounded by `[events] pending_capacity` and counted, never silent. The alternative (a synchronous SQLite write inside `emit`) would put a store round trip on ~15 call sites that are not async, including the progress announcer's hot loop.
 - **No `POST /subscriptions/{id}/enabled`.** A subscription is created or deleted in v1; the `enabled` column exists and the drain honours it, but nothing over the API flips it.
 - ** events are logged like any other kind.** A long-running job emits one every ~2s, so a busy server writes them at that rate per in-flight job. They are the highest-volume kind by far and the least valuable to retain; nothing filters them out today, and  is the only thing bounding them.
-- **`job.progress` events are logged like any other kind.** A long-running job emits one every ~2s, so a busy server writes them at that rate per in-flight job. They are the highest-volume kind by far and the least valuable to retain; nothing filters them out today, and `[events] log_retention_days` is the only thing bounding them.
+- **`job.progress` events are logged like any other kind.** A long-running job emits one every ~2s, so a busy server writes them at that rate per in-flight job. They are the highest-volume kind by far and the least valuable to retain; nothing filters them out today, and `[events] log_retention_days` (enforced by the store janitor) is the only thing bounding them.
 - **Write amplification was not measured.** One row per emitted event, batched per drain pass under WAL, is the design's claim; no benchmark has been run at volume.
 
 - No per-endpoint success-rate breakdown: the metrics are whole-log aggregates, so "which receiver is failing" still means reading `GET /webhooks/deliveries?status=dead` and looking at `url`.

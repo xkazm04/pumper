@@ -476,6 +476,8 @@ fn load_dotenv() {
 /// - **`http_cache` rows past `[cache] max_rows`**, oldest-confirmed first. A
 ///   continuously-revalidated entry keeps pushing its own `expires_at` out, so
 ///   expiry alone never bounded this table.
+/// - **`events` rows past `[events] log_retention_days`** (default 7, `0` = keep
+///   forever). The durable event log is a resume buffer, not an archive.
 ///
 /// Every pass is bounded work: three indexed deletes plus one `LIMIT`ed
 /// eviction. Nothing here is data an operator would miss, which is what lets it
@@ -493,9 +495,95 @@ fn load_dotenv() {
 /// report* moved. This janitor has no harm bound, so it never escalates past a
 /// busy gauge — see `maintenance::harm_bound_for` for why that direction is the
 /// safe one for a task whose work is deletion.
+/// One store-janitor pass: every bounded delete, each counted, none allowed to
+/// hide another's failure.
+///
+/// Extracted from the loop so the pass is reachable by a test. The loop only
+/// decides WHEN a pass is due and records the outcome; what a pass deletes
+/// lives here, which is what lets a test assert (for instance) that the event
+/// log is pruned in a deployment where every other janitor knob is off.
+pub(crate) async fn store_janitor_pass(state: &AppState) -> (u64, Vec<String>) {
+    let revalidation_days = state.config.refresher.retention_days;
+    // Counted so "ran and found nothing to do" is distinguishable from
+    // "deferred" and from "failed" — three results, never two.
+    let mut purged = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    match state.cache.purge_expired().await {
+        Ok(n) if n > 0 => tracing::info!(purged = n, "store janitor evicted expired entries"),
+        Ok(n) => purged += n,
+        Err(e) => failures.push(format!("cache purge failed: {e}")),
+    }
+    match state.research_cache.purge_expired().await {
+        Ok(n) if n > 0 => {
+            purged += n;
+            tracing::info!(purged = n, "store janitor evicted expired research answers")
+        }
+        Ok(_) => {}
+        Err(e) => failures.push(format!("research cache purge failed: {e}")),
+    }
+    match state.cache.prune_revalidations(revalidation_days).await {
+        Ok(n) => {
+            purged += n;
+            if n > 0 {
+                tracing::info!(
+                    pruned = n,
+                    days = revalidation_days,
+                    "store janitor pruned the revalidation log"
+                );
+            }
+        }
+        Err(e) => failures.push(format!("revalidation prune failed: {e}")),
+    }
+    match state.cache.evict_over_cap().await {
+        Ok(n) => {
+            purged += n;
+            if n > 0 {
+                tracing::info!(
+                    evicted = n,
+                    max_rows = state.cache.max_rows(),
+                    "store janitor evicted over-cap cache entries"
+                );
+            }
+        }
+        Err(e) => failures.push(format!("cache cap eviction failed: {e}")),
+    }
+    match state.tiers.prune_stale().await {
+        Ok(n) => {
+            purged += n;
+            if n > 0 {
+                tracing::info!(pruned = n, "store janitor reclaimed stale host memory");
+            }
+        }
+        Err(e) => failures.push(format!("host memory prune failed: {e}")),
+    }
+    // N05 event log. It used to be pruned from the outbox drain, hourly-gated
+    // by a process-wide `LAST_PRUNE` instant, because THIS janitor was
+    // believed to return early unless one of its own knobs was on (that is
+    // `retention_janitor`, not this loop). The consequence was retention
+    // whose cadence depended on how often jobs finished, running outside the
+    // activity gate every other delete here respects. `[events]
+    // log_retention_days = 0` still means keep forever.
+    let event_days = state.config.events.log_retention_days;
+    if event_days > 0 {
+        match state.storage.prune_events(event_days).await {
+            Ok(n) => {
+                purged += n;
+                if n > 0 {
+                    tracing::info!(
+                        pruned = n,
+                        retention_days = event_days,
+                        "store janitor pruned the event log"
+                    );
+                }
+            }
+            Err(e) => failures.push(format!("event log prune failed: {e}")),
+        }
+    }
+    (purged, failures)
+}
+
 async fn store_janitor(state: AppState) {
     let interval = std::time::Duration::from_secs(3600);
-    let revalidation_days = state.config.refresher.retention_days;
     let instrument = state.storage.instrument();
     let gated = state.config.maintenance.enabled;
     loop {
@@ -527,58 +615,7 @@ async fn store_janitor(state: AppState) {
             );
             continue;
         }
-        // Counted so "ran and found nothing to do" is distinguishable from
-        // "deferred" and from "failed" — three results, never two.
-        let mut purged = 0u64;
-        let mut failures: Vec<String> = Vec::new();
-        match state.cache.purge_expired().await {
-            Ok(n) if n > 0 => tracing::info!(purged = n, "store janitor evicted expired entries"),
-            Ok(n) => purged += n,
-            Err(e) => failures.push(format!("cache purge failed: {e}")),
-        }
-        match state.research_cache.purge_expired().await {
-            Ok(n) if n > 0 => {
-                purged += n;
-                tracing::info!(purged = n, "store janitor evicted expired research answers")
-            }
-            Ok(_) => {}
-            Err(e) => failures.push(format!("research cache purge failed: {e}")),
-        }
-        match state.cache.prune_revalidations(revalidation_days).await {
-            Ok(n) => {
-                purged += n;
-                if n > 0 {
-                    tracing::info!(
-                        pruned = n,
-                        days = revalidation_days,
-                        "store janitor pruned the revalidation log"
-                    );
-                }
-            }
-            Err(e) => failures.push(format!("revalidation prune failed: {e}")),
-        }
-        match state.cache.evict_over_cap().await {
-            Ok(n) => {
-                purged += n;
-                if n > 0 {
-                    tracing::info!(
-                        evicted = n,
-                        max_rows = state.cache.max_rows(),
-                        "store janitor evicted over-cap cache entries"
-                    );
-                }
-            }
-            Err(e) => failures.push(format!("cache cap eviction failed: {e}")),
-        }
-        match state.tiers.prune_stale().await {
-            Ok(n) => {
-                purged += n;
-                if n > 0 {
-                    tracing::info!(pruned = n, "store janitor reclaimed stale host memory");
-                }
-            }
-            Err(e) => failures.push(format!("host memory prune failed: {e}")),
-        }
+        let (purged, failures) = store_janitor_pass(&state).await;
         // `attempted and failed` is its own outcome. Before this, every one of
         // the five arms above logged a `warn!` and the pass reported nothing at
         // all, so a janitor whose every statement had been erroring for a month
