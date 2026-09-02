@@ -21,6 +21,7 @@ mod engine_conformance;
 mod enqueue_door_parity;
 mod error_contract;
 mod event_log;
+mod executor_plane;
 mod fanout_offslot;
 mod fetch_proxy;
 mod harness;
