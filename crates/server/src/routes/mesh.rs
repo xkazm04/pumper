@@ -72,8 +72,8 @@ pub(crate) fn peer_schedule_id(peer_label: &str, stream_slug: &str) -> String {
 pub(crate) fn trust_for(
     peers: &[PeerConfig],
     node_id: Option<&str>,
-) -> app_peer::envelope::PeerTrust {
-    use app_peer::envelope::{fingerprint_hex, PeerTrust};
+) -> pumper_core::mesh::PeerTrust {
+    use pumper_core::mesh::{fingerprint_hex, PeerTrust};
     if peers.is_empty() {
         return PeerTrust {
             public_key: None,
@@ -332,7 +332,7 @@ pub(crate) fn mesh_metrics_lines(totals: &MeshTotals) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use app_peer::envelope::fingerprint;
+    use pumper_core::mesh::fingerprint;
 
     fn peer_with(key: Option<&str>, allow_unsigned: bool) -> PeerConfig {
         PeerConfig {

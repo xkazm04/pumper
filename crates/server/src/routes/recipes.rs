@@ -18,14 +18,13 @@
 //! `consecutive_failures`; at `[recipes] max_failures` the candidate is burned
 //! and never replayed again).
 
-use app_peer::envelope::{open_envelope, SCHEMA_RECIPES_V1};
-// One implementation of the bundle shape, shared with the puller that consumes
-// it (`app_peer::mesh`). Two copies of "what a recipe looks like on the wire"
+// One implementation of the bundle shape, in core, shared with the puller that
+// consumes it (`app-peer`). Two copies of "what a recipe looks like on the wire"
 // is how an export and an import drift apart without either side changing.
-use app_peer::mesh::{exportable_recipe, importable_recipe};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use pumper_core::mesh::{exportable_recipe, importable_recipe, open_envelope, SCHEMA_RECIPES_V1};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::IntoParams;

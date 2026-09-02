@@ -1,19 +1,15 @@
 //! Mesh wire format (N16): signed bundle envelopes and the dataset live-set
 //! digest, shared by the two sides of a pull.
 //!
-//! ## Why this lives in the puller crate
+//! ## Why this lives in core
 //!
-//! The natural home is `pumper_core` — both the serving side (the server's
-//! `/host-weather/export`, `/recipes/export`, `/datasets/.../manifest`) and the
-//! pulling side (this app) need the exact same bytes-to-sign and the exact same
-//! key digest, and a second implementation of either is a silent
-//! interoperability bug waiting to happen. The wave-2 file-scope partition put
-//! `crates/core/**` (except `config.rs`) outside this item's boundary, so the
-//! shared code sits here instead: the server already depends on `app-peer`
-//! (registry), an app depending on an app or an engine is what the dependency
-//! rule forbids, and the reverse edge server -> app crate is explicitly allowed
-//! (see `crates/server/Cargo.toml`, `grants-common`). If a later change is free
-//! to touch core, this module moves to `crates/core/src/mesh.rs` unchanged.
+//! Both sides of a pull need the exact same bytes-to-sign and the exact same
+//! key digest: the serving side (the server's `/host-weather/export`,
+//! `/recipes/export`, `/datasets/.../manifest`) and the pulling side (the
+//! `peer` app). A second implementation of either is a silent interoperability
+//! bug waiting to happen, so there is exactly one — here, in the crate every
+//! other crate already depends on. `app-peer` re-exports this module as
+//! `app_peer::envelope` for its own call sites; nothing re-implements it.
 //!
 //! ## The envelope
 //!
@@ -40,8 +36,11 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::recipes::ApiRecipe;
+use crate::tiers::WeatherEntry;
 
 /// Host-weather bundle, signed (N16). The payload is `{min_observations,
 /// entries: [WeatherEntry]}`.
@@ -319,6 +318,90 @@ pub fn ghost_keys(local_live: &[String], origin_live: &[String]) -> Vec<String> 
     ghosts
 }
 
+// ── bundle shapes ───────────────────────────────────────────────────────────
+
+/// Reads `entries` out of an OPENED weather payload.
+///
+/// Typed only after the envelope verified, never before: the signature is over
+/// the bytes, so letting serde read the body first would put the parser ahead of
+/// the verifier.
+pub fn weather_entries(payload: &Value) -> std::result::Result<Vec<WeatherEntry>, String> {
+    let raw = payload
+        .get("entries")
+        .ok_or_else(|| "bundle payload has no `entries` array".to_string())?;
+    serde_json::from_value(raw.clone()).map_err(|e| format!("bundle `entries` is unreadable: {e}"))
+}
+
+/// Keeps only the recipe fields a peer can act on.
+///
+/// Two columns are deliberately dropped: `validated` is a claim about a replay
+/// THIS node made from ITS egress IP, and `consecutive_failures` counts strikes
+/// against a host from here. A peer adopting either would inherit a verdict it
+/// never earned. The origin's flag travels as `validated_at_origin` —
+/// provenance, not permission.
+pub fn exportable_recipe(row: &Value) -> Option<Value> {
+    let host = row.get("host").and_then(Value::as_str)?;
+    let url_template = row.get("url_template").and_then(Value::as_str)?;
+    if host.trim().is_empty() || url_template.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "host": host,
+        "url_template": url_template,
+        "params": row.get("params").cloned().unwrap_or(Value::Null),
+        "json_paths": row.get("json_paths").cloned().unwrap_or(Value::Null),
+        "score": row.get("score").cloned().unwrap_or(Value::Null),
+        "validated_at_origin": row.get("validated").cloned().unwrap_or(Value::Bool(false)),
+    }))
+}
+
+/// Turns one bundle entry into a LOCAL candidate.
+///
+/// Lossy in one direction on purpose: every imported recipe lands
+/// `validated = false`, whatever the origin claimed. The local validator proves
+/// it here, cheaply, exactly as it would prove a locally-discovered candidate.
+pub fn importable_recipe(entry: &Value) -> std::result::Result<ApiRecipe, String> {
+    let host = entry
+        .get("host")
+        .and_then(Value::as_str)
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "recipe entry has no host".to_string())?;
+    let url_template = entry
+        .get("url_template")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| format!("recipe entry for {host} has no url_template"))?;
+    if !(url_template.starts_with("http://") || url_template.starts_with("https://")) {
+        return Err(format!(
+            "recipe entry for {host}: url_template {url_template:?} is not an http(s) URL"
+        ));
+    }
+    let json_paths: Vec<String> = entry
+        .get("json_paths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ApiRecipe {
+        // Empty: the store mints a LOCAL id. Carrying the origin's would make
+        // two nodes' primary keys collide the first time both discovered the
+        // same endpoint independently.
+        id: String::new(),
+        host,
+        url_template,
+        params: entry.get("params").cloned().unwrap_or(Value::Null),
+        json_paths,
+        score: entry.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+        validated: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +617,52 @@ mod tests {
         // A key the origin has and the mirror does not is NOT a ghost — it is a
         // pull the mirror has not made yet, and tombstoning it would be wrong.
         assert!(ghost_keys(&origin, &origin).is_empty());
+    }
+
+    #[test]
+    fn an_imported_recipe_is_never_validated_however_loudly_the_bundle_claims_it() {
+        let entry = json!({
+            "host": "API.Example",
+            "url_template": "https://api.example/v1?q={q}",
+            "json_paths": ["$.items[*].title"],
+            "score": 0.9,
+            "validated": true,
+            "validated_at_origin": true,
+        });
+        let r = importable_recipe(&entry).expect("imports");
+        assert!(!r.validated);
+        assert_eq!(r.host, "api.example");
+        assert!(
+            r.id.is_empty(),
+            "a local id avoids a cross-node PK collision"
+        );
+    }
+
+    #[test]
+    fn a_non_http_template_is_refused_not_stored() {
+        let err =
+            importable_recipe(&json!({"host": "a.example", "url_template": "file:///etc/passwd"}))
+                .expect_err("must refuse");
+        assert!(err.contains("not an http(s) URL"), "{err}");
+        assert!(importable_recipe(&json!({"url_template": "https://a/"})).is_err());
+        assert!(importable_recipe(&json!({"host": "a"})).is_err());
+    }
+
+    #[test]
+    fn an_exported_recipe_drops_this_nodes_local_verdicts() {
+        let row = json!({
+            "id": "local-uuid",
+            "host": "api.example",
+            "url_template": "https://api.example/v1",
+            "validated": true,
+            "validation_reason": "replay ok",
+            "consecutive_failures": 3,
+        });
+        let out = exportable_recipe(&row).expect("exports");
+        assert!(out.get("id").is_none());
+        assert!(out.get("validated").is_none());
+        assert!(out.get("consecutive_failures").is_none());
+        assert_eq!(out["validated_at_origin"], true);
+        assert!(exportable_recipe(&json!({"host": "a", "url_template": " "})).is_none());
     }
 }

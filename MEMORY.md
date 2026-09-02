@@ -105,19 +105,22 @@ elsewhere gets wrong.
    end — resolve by keeping both sides, and re-check for braces lost at the hunk boundary
    (`5bfad5d`).
 
-9. **The mesh wire format lives in an APP crate, on purpose-under-protest.**
-   `app_peer::envelope` (signing bytes, ed25519 verification, the live-set digest)
-   and `app_peer::mesh` (the bundle shapes) are consumed by
-   `crates/server/src/{node.rs, routes/mesh.rs, routes/host_weather.rs,
-   routes/recipes.rs}`. Server → app-crate is allowed (so is `grants-common`);
-   the natural home is `crates/core/src/mesh.rs` and it was out of the N16 file
-   scope. Do **not** re-implement any of it server-side: two implementations of
-   "what bytes a bundle is" is an interoperability bug that shows up only between
-   two nodes on different builds. Related traps: node identity is memoised per
-   **key-file path**, never a `OnceLock` (the two-node e2e runs both nodes in one
-   process and a shared keypair makes the forgery test pass for the wrong
-   reason); a corrupt `node.key` is a hard error, never a silent re-key; and
-   `[[peer]]` is reconciled into schedules at **boot only**, unlike the catalog.
+9. **The mesh wire format lives in `crates/core/src/mesh.rs` — one implementation, for
+   everyone.** Signing bytes, ed25519 verification, the key fingerprint, the live-set
+   digest, `ghost_keys` and the bundle shapes (`weather_entries`, `exportable_recipe`,
+   `importable_recipe`) are all there; `app_peer::envelope` is a re-export of it, kept so
+   the paths the app and the server have always used keep resolving. Consumers:
+   `crates/server/src/{node.rs, routes/mesh.rs, routes/host_weather.rs, routes/recipes.rs,
+   routes/datasets.rs}` and `crates/apps/peer`. Do **not** re-implement any of it: two
+   implementations of "what bytes a bundle is" is an interoperability bug that shows up only
+   between two nodes on different builds. The module is behind core's `storage` feature
+   (the weather bundle is typed by `tiers::WeatherEntry`), and `ring`/`hex` are optional
+   core deps that feature turns on, so a `default-features = false` embedder still links
+   neither. Related traps: node identity is memoised per **key-file path**, never a
+   `OnceLock` (the two-node e2e runs both nodes in one process and a shared keypair makes
+   the forgery test pass for the wrong reason); a corrupt `node.key` is a hard error, never
+   a silent re-key; and `[[peer]]` is reconciled into schedules at **boot only**, unlike the
+   catalog.
 
 10. **An empty replay ring reports "nothing missed", not "reset".** `EventBus::replay`
    answers `Events([])` when the ring is empty ("no buffered events, so no loss possible"),

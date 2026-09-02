@@ -16,7 +16,7 @@
 //!
 //! ## What each stream trusts
 //!
-//! Everything arrives through [`crate::envelope::open_envelope`] with the trust
+//! Everything arrives through [`pumper_core::mesh::open_envelope`] with the trust
 //! built from the job's own params ([`trust_from_params`]): the scheduler copies
 //! the peer's pinned key and `allow_unsigned` onto every job it enqueues, so the
 //! app never needs config access and an operator can reproduce a scheduled pull
@@ -31,17 +31,18 @@
 
 use std::collections::HashMap;
 
-use pumper_core::recipes::ApiRecipe;
-use pumper_core::{
-    plan_weather_import, AppContext, Error, HttpRequest, Result, WeatherEntry, WeatherPlan,
-};
+use pumper_core::{plan_weather_import, AppContext, Error, HttpRequest, Result, WeatherPlan};
 use serde_json::{json, Value};
 
-use crate::envelope::{
+use crate::tombstones_would_empty_the_mirror;
+/// The bundle shapes moved to `pumper_core::mesh` with the envelope they travel
+/// in; re-exported here so the paths the server and this app already use keep
+/// resolving to the one implementation.
+pub use pumper_core::mesh::{exportable_recipe, importable_recipe, weather_entries};
+use pumper_core::mesh::{
     ghost_keys, manifest_digest, open_envelope, PeerTrust, SCHEMA_RECIPES_V1, SCHEMA_WEATHER_V1,
     SCHEMA_WEATHER_V2,
 };
-use crate::tombstones_would_empty_the_mirror;
 
 /// Dataset (under app `peer`) holding one status record per (peer, stream).
 /// Read by `GET /mesh`; see `crates/server/src/routes/mesh.rs`.
@@ -120,90 +121,6 @@ pub fn cap_imported_penalty(plan_ms: Option<u64>, max_penalty_secs: u64) -> Opti
     }
     let ceiling = max_penalty_secs.saturating_mul(1000);
     Some(ms.min(ceiling))
-}
-
-// ── bundle shapes ───────────────────────────────────────────────────────────
-
-/// Reads `entries` out of an OPENED weather payload.
-///
-/// Typed only after the envelope verified, never before: the signature is over
-/// the bytes, so letting serde read the body first would put the parser ahead of
-/// the verifier.
-pub fn weather_entries(payload: &Value) -> std::result::Result<Vec<WeatherEntry>, String> {
-    let raw = payload
-        .get("entries")
-        .ok_or_else(|| "bundle payload has no `entries` array".to_string())?;
-    serde_json::from_value(raw.clone()).map_err(|e| format!("bundle `entries` is unreadable: {e}"))
-}
-
-/// Keeps only the recipe fields a peer can act on.
-///
-/// Two columns are deliberately dropped: `validated` is a claim about a replay
-/// THIS node made from ITS egress IP, and `consecutive_failures` counts strikes
-/// against a host from here. A peer adopting either would inherit a verdict it
-/// never earned. The origin's flag travels as `validated_at_origin` —
-/// provenance, not permission.
-pub fn exportable_recipe(row: &Value) -> Option<Value> {
-    let host = row.get("host").and_then(Value::as_str)?;
-    let url_template = row.get("url_template").and_then(Value::as_str)?;
-    if host.trim().is_empty() || url_template.trim().is_empty() {
-        return None;
-    }
-    Some(json!({
-        "host": host,
-        "url_template": url_template,
-        "params": row.get("params").cloned().unwrap_or(Value::Null),
-        "json_paths": row.get("json_paths").cloned().unwrap_or(Value::Null),
-        "score": row.get("score").cloned().unwrap_or(Value::Null),
-        "validated_at_origin": row.get("validated").cloned().unwrap_or(Value::Bool(false)),
-    }))
-}
-
-/// Turns one bundle entry into a LOCAL candidate.
-///
-/// Lossy in one direction on purpose: every imported recipe lands
-/// `validated = false`, whatever the origin claimed. The local validator proves
-/// it here, cheaply, exactly as it would prove a locally-discovered candidate.
-pub fn importable_recipe(entry: &Value) -> std::result::Result<ApiRecipe, String> {
-    let host = entry
-        .get("host")
-        .and_then(Value::as_str)
-        .map(|h| h.trim().to_lowercase())
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| "recipe entry has no host".to_string())?;
-    let url_template = entry
-        .get("url_template")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|u| !u.trim().is_empty())
-        .ok_or_else(|| format!("recipe entry for {host} has no url_template"))?;
-    if !(url_template.starts_with("http://") || url_template.starts_with("https://")) {
-        return Err(format!(
-            "recipe entry for {host}: url_template {url_template:?} is not an http(s) URL"
-        ));
-    }
-    let json_paths: Vec<String> = entry
-        .get("json_paths")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(ApiRecipe {
-        // Empty: the store mints a LOCAL id. Carrying the origin's would make
-        // two nodes' primary keys collide the first time both discovered the
-        // same endpoint independently.
-        id: String::new(),
-        host,
-        url_template,
-        params: entry.get("params").cloned().unwrap_or(Value::Null),
-        json_paths,
-        score: entry.get("score").and_then(Value::as_f64).unwrap_or(0.0),
-        validated: false,
-    })
 }
 
 // ── ghost reconcile ─────────────────────────────────────────────────────────
@@ -355,7 +272,7 @@ async fn fetch_bundle(
     schema: &str,
     legacy: Option<&str>,
     trust: &PeerTrust,
-) -> Result<crate::envelope::Opened> {
+) -> Result<pumper_core::mesh::Opened> {
     let mut req = HttpRequest::get(url);
     // A bundle is live intelligence; the TTL cache must not serve yesterday's.
     req.no_cache = true;
@@ -684,53 +601,6 @@ mod tests {
         // 0 = no extra ceiling; core's own cap already applied upstream.
         assert_eq!(cap_imported_penalty(Some(90_000), 0), Some(90_000));
         assert_eq!(cap_imported_penalty(None, 60), None);
-    }
-
-    #[test]
-    fn an_imported_recipe_is_never_validated_however_loudly_the_bundle_claims_it() {
-        let entry = json!({
-            "host": "API.Example",
-            "url_template": "https://api.example/v1?q={q}",
-            "json_paths": ["$.items[*].title"],
-            "score": 0.9,
-            "validated": true,
-            "validated_at_origin": true,
-        });
-        let r = importable_recipe(&entry).expect("imports");
-        assert!(!r.validated);
-        assert_eq!(r.host, "api.example");
-        assert!(
-            r.id.is_empty(),
-            "a local id avoids a cross-node PK collision"
-        );
-    }
-
-    #[test]
-    fn a_non_http_template_is_refused_not_stored() {
-        let err =
-            importable_recipe(&json!({"host": "a.example", "url_template": "file:///etc/passwd"}))
-                .expect_err("must refuse");
-        assert!(err.contains("not an http(s) URL"), "{err}");
-        assert!(importable_recipe(&json!({"url_template": "https://a/"})).is_err());
-        assert!(importable_recipe(&json!({"host": "a"})).is_err());
-    }
-
-    #[test]
-    fn an_exported_recipe_drops_this_nodes_local_verdicts() {
-        let row = json!({
-            "id": "local-uuid",
-            "host": "api.example",
-            "url_template": "https://api.example/v1",
-            "validated": true,
-            "validation_reason": "replay ok",
-            "consecutive_failures": 3,
-        });
-        let out = exportable_recipe(&row).expect("exports");
-        assert!(out.get("id").is_none());
-        assert!(out.get("validated").is_none());
-        assert!(out.get("consecutive_failures").is_none());
-        assert_eq!(out["validated_at_origin"], true);
-        assert!(exportable_recipe(&json!({"host": "a", "url_template": " "})).is_none());
     }
 
     fn keys(list: &[&str]) -> Vec<String> {

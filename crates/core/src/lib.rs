@@ -40,6 +40,11 @@ pub mod job;
 pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
+// N16 mesh wire format: signed bundle envelopes + the dataset live-set digest,
+// shared verbatim by the serving routes and the `peer` app. Under `storage`
+// because the weather bundle shape is typed by `tiers::WeatherEntry`.
+#[cfg(feature = "storage")]
+pub mod mesh;
 pub mod plugin;
 pub mod process_env;
 pub mod recipes;

@@ -101,7 +101,12 @@
 //! server-side `[[peer]]` scheduling — runs are on-demand jobs; a `[[peer]]`
 //! config block that enqueues them on a cron is the documented next slice.
 
-pub mod envelope;
+/// The mesh wire format now lives in `pumper_core::mesh` (one implementation,
+/// shared by the serving routes and this puller). Re-exported under the name
+/// this app and the server have always used so no call site re-implements it.
+pub mod envelope {
+    pub use pumper_core::mesh::*;
+}
 pub mod mesh;
 
 use std::collections::HashSet;

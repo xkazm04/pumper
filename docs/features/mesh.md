@@ -52,7 +52,7 @@ nowhere near the key file.
 
 The signature covers a domain-separated join of schema, node id, timestamp and a
 **recursively key-sorted** serialisation of the payload
-(`app_peer::envelope::signing_bytes`). The sort is the module's own property, not
+(`pumper_core::mesh::signing_bytes`). The sort is the module's own property, not
 `serde_json`'s default, so enabling `preserve_order` anywhere in the tree cannot
 make two nodes disagree about what bytes a payload is.
 
