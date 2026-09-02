@@ -84,6 +84,34 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
             .map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
     }
+    // N18: the executor plane, by liveness state. Emitted only when the plane is
+    // enabled — a series that is always `0` on the 99% of installs that never
+    // run an executor is noise, and its ABSENCE there is the honest signal.
+    // Every state label is present when it IS enabled, for the same reason
+    // `pumper_jobs{status="waiting"}` is: a missing series and a scrape failure
+    // look identical.
+    if state.config.executors.servable() {
+        let executors = state.storage.list_executors().await?;
+        let now = chrono::Utc::now();
+        let offline_after = state.config.executors.offline_after_secs;
+        out.push_str(
+            "# HELP pumper_executors Outbound executors by liveness state\n\
+             # TYPE pumper_executors gauge\n",
+        );
+        for want in ["busy", "idle", "offline"] {
+            let n = executors
+                .iter()
+                .filter(|e| {
+                    crate::executors::executor_state(
+                        crate::executors::age_secs(&e.last_poll_at, now),
+                        e.running,
+                        offline_after,
+                    ) == want
+                })
+                .count();
+            out.push_str(&format!("pumper_executors{{state=\"{want}\"}} {n}\n"));
+        }
+    }
     // Permanent failures per app. DB-derived (current `failed` row count per app),
     // so not strictly monotonic — a retried job leaves the failed set.
     out.push_str(

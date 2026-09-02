@@ -231,6 +231,9 @@ pub(crate) async fn job_receipt(
             "wall_ms": wall_ms(&job),
             "schedule_id": job.schedule_id,
             "trigger_id": job.trigger_id,
+            // N18: WHERE this job ran. `null` = this coordinator's own worker,
+            // which is every job on a single-process install.
+            "executor_id": job.executor_id,
             "error": job.error,
         },
         "stages": stages,
@@ -511,6 +514,7 @@ mod tests {
             waiting_since: None,
             waiting_expires_at: None,
             resumed_input: None,
+            executor_id: None,
             created_at: now,
             available_at: now,
             started_at: None,

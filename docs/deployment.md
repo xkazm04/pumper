@@ -204,6 +204,51 @@ Two guardrails ship *inside* the app; neither replaces the network control:
   coordinator a fallback fetch — the right trade against silently storing a login
   wall as a dataset revision.
 
+### Elastic executor plane (`[executors]`) — the same precondition, one direction further
+
+N18 lets extra pumper processes drain the coordinator's queue: `pumper --executor
+--coordinator <url>`. It inherits the `[remote]` warning above **and sharpens it**,
+because an executor claims whole jobs rather than proxying one fetch.
+
+What changes, and what does not:
+
+- **Direction.** Executors dial *out*. They need no ingress, no port and no
+  address of their own — which is the point: an executor can live behind NAT, on
+  a laptop, or in a cheap VPS with a different IP and a real Chrome. Only the
+  **coordinator** has to be reachable, so this adds exactly one exposed node, not
+  N.
+- **The exposure is the same one `[remote]` documents.** The coordinator must
+  bind off loopback for executors to reach it, and `[executors] secret`
+  authenticates the six executor routes **and nothing else**. Every control in
+  the table above applies unchanged — host firewall, private overlay, or an
+  authenticating reverse proxy. Prefer this one over `[remote]`'s network shape
+  where you can: with `[auth] mode = "keys"` the executor routes additionally
+  require an `admin` principal, so the plane is the one cross-host surface that
+  can be put behind real authentication today.
+- **What crosses the wire.** Job params and results in both directions, plus
+  checkpoints and progress snapshots. Whatever an app puts in its params
+  (credentials in a `params` object, say) reaches every executor allowed to claim
+  that app. There is no TLS of pumper's own — put the coordinator behind a
+  proxy that terminates it if the link is not already private.
+- **What does not cross.** Session profiles (cookie jars are per-node disk, same
+  as the fabric), the dataset store (an executor's `datasets` handle refuses —
+  only result-only apps are eligible), and the queue itself.
+
+**Executor state.** An executor keeps its own `[storage] database_path` — give it
+one, do not point two processes at the same SQLite file. What lives there is
+process-local derived state only (cost ledger, HTTP cache, host weather, recipes,
+research cache) plus the artifact tree of the jobs it ran. Losing it costs cache
+misses and the artifacts of past runs, never a record; it is **not** part of the
+"must survive a machine move" set above.
+
+**Operating it.** `GET /executors` on the coordinator is the fleet view (`busy` /
+`idle` / `offline` per executor); `/metrics` carries `pumper_executors{state}`
+while the plane is enabled. An executor that dies needs no intervention: its lease
+goes stale, the existing reaper re-queues the job with its checkpoint, and the
+dead process's late report is refused by the `(status, attempts, executor_id)`
+fence. Full surface and the v1 boundaries:
+[docs/features/runtime.md § Elastic executor plane](features/runtime.md#elastic-executor-plane-executors).
+
 ### CORS
 
 CORS is **off by default** (`[server] cors_allowed_origins` empty → no CORS layer

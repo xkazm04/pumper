@@ -356,6 +356,10 @@ mod contract_tests {
         ("OK", 200, None),
         ("CREATED", 201, None),
         ("ACCEPTED", 202, None),
+        // N18: `POST /executors/claim` answers 204 when the queue holds
+        // nothing this executor may run. A success with no body, so no
+        // error envelope and no code — like the three above it.
+        ("NO_CONTENT", 204, None),
         ("BAD_REQUEST", 400, Some("bad_request")),
         ("UNAUTHORIZED", 401, Some("unauthorized")),
         ("PAYMENT_REQUIRED", 402, Some("budget_exhausted")),

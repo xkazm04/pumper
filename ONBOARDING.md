@@ -229,12 +229,13 @@ pub trait ScrapeApp: Send + Sync {
     fn requires(&self) -> &'static [Requirement] { &[] }  // preconditions (e.g. an API-key env var)
     fn default_params(&self) -> Value { Value::Object(Default::default()) } // scheduled + body-less runs
     fn manifest(&self) -> AppManifest { AppManifest::default() }            // agent-facing contract
+    fn executor(&self) -> bool { false }          // N18: may run on an outbound executor (result-only)
     async fn run(&self, ctx: AppContext) -> Result<Value>;// returns JSON stored as the job result
 }
 ```
 
-`run()` is the only required method; the other six have defaults. Two are worth
-overriding on purpose:
+`run()` is the only required method; the other seven have defaults. Three are
+worth overriding on purpose:
 
 - **`manifest()`** — `AppManifest { params_schema, examples, output_shape,
   cost_class }`. Declaring `params_schema` (JSON Schema draft 2020-12) makes
@@ -246,6 +247,13 @@ overriding on purpose:
 - **`requires()`** — `&[Requirement]`, surfaced by `GET /apps` as a resolved
   `ready` flag, so a credential-gated app is distinguishable from a working one
   *before* its first failed job.
+- **`executor()`** — declare `true` only if your app is **result-only**: it
+  returns everything it produces in the job result and the artifact tree, and
+  never touches `ctx.upsert*` / `ctx.sync_many` / `ctx.datasets`. Executors
+  (N18) run jobs in a separate process whose dataset handle *refuses*, so this
+  is a checked claim, not a capability advertisement — a server-side inventory
+  test reads your app's source and fails the build if it writes datasets. See
+  [docs/features/runtime.md § Elastic executor plane](docs/features/runtime.md#elastic-executor-plane-executors).
 
 Minimal implementation:
 
