@@ -497,7 +497,6 @@ pub async fn submitted_since(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::CommitRefusal;
 
     fn t(offset_secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + offset_secs, 0).unwrap()
@@ -560,11 +559,6 @@ mod tests {
         // No deadline never expires.
         assert!(ok_approve(TransactionState::Pending, None).is_ok());
     }
-
-    /// The commit-time guard. An approval binds to the digest of what was
-    /// reviewed; a page that drifted afterwards must end as a refusal, never as
-    /// a click on a button nobody saw.
-    #[test]
 
     /// An approval that quotes a digest the row does not hold is approving
     /// something else's evidence.
@@ -649,14 +643,6 @@ mod tests {
         );
     }
 
-    /// The digest must be stable across probe ORDER (two renders of the same
-    /// page can enumerate fields differently) and must change on every fact a
-    /// reviewer actually looked at.
-    #[test]
-
-    /// A redacted password's PLAINTEXT must never be an input to the digest —
-    /// the digest travels in URLs, logs and approval payloads.
-    #[test]
     #[test]
     fn state_round_trips_and_refuses_junk() {
         for s in [

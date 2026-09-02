@@ -77,7 +77,7 @@ mod retention;
 mod runtime;
 mod schedules;
 mod search;
-mod transactions;
+pub(crate) mod transactions;
 mod triggers;
 mod watches;
 

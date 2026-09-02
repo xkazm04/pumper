@@ -48,6 +48,7 @@ mod shutdown_bounds;
 mod shutdown_drain;
 mod sink_delivery;
 mod store_reports;
+mod transaction_approval;
 mod trigger_cache;
 mod trigger_hops;
 mod trigger_ledger;

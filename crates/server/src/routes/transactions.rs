@@ -47,9 +47,10 @@ const CAP_WINDOW_HOURS: i64 = 24;
 
 #[derive(Deserialize, IntoParams)]
 pub(crate) struct ListQuery {
+    // `pub(crate)` so the e2e can construct the extractor directly.
     /// `pending` | `approved` | `submitted` | `rejected` | `expired`. Omitted =
     /// every state, newest first.
-    state: Option<String>,
+    pub(crate) state: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema, Default)]

@@ -2291,6 +2291,10 @@ mod transact_v2_evidence_tests {
         }
     }
 
+    /// The commit-time guard. An approval binds to the digest of what was
+    /// reviewed; a page that drifted afterwards must end as a refusal, never as
+    /// a click on a button nobody saw.
+    #[test]
     fn approved_with_stale_evidence_not_submitted() {
         assert!(commit_guard("sha-a", "sha-a").is_ok());
         let err = commit_guard("sha-a", "sha-b").unwrap_err();
@@ -2305,6 +2309,10 @@ mod transact_v2_evidence_tests {
         assert!(err.message().contains("Nothing was submitted"));
     }
 
+    /// The digest must be stable across probe ORDER (two renders of the same
+    /// page can enumerate fields differently) and must change on every fact a
+    /// reviewer actually looked at.
+    #[test]
     fn digest_is_order_stable_and_moves_on_every_reviewed_fact() {
         let a = field("#email", Some(16), false);
         let b = field("#name", Some(4), false);
@@ -2335,7 +2343,7 @@ mod transact_v2_evidence_tests {
         // A vanished field moves it too.
         assert_ne!(
             base,
-            evidence_digest(Some(&target(Some(true))), &[a.clone()])
+            evidence_digest(Some(&target(Some(true))), std::slice::from_ref(&a))
         );
         // No submit target at all is its own token, not an empty string.
         assert_ne!(
@@ -2344,6 +2352,9 @@ mod transact_v2_evidence_tests {
         );
     }
 
+    /// A redacted password's PLAINTEXT must never be an input to the digest —
+    /// the digest travels in URLs, logs and approval payloads.
+    #[test]
     fn digest_never_hashes_a_field_value() {
         let mut with_value = field("#password", Some(8), true);
         with_value.value = Some("hunter2!".into());

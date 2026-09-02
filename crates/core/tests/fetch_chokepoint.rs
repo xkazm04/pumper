@@ -95,8 +95,13 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // would defeat the point of reading history.
     ("crates/apps/extractor/src/lib.rs::ctx.engines.http", 2),
     // A transact flow is a browser *session* (form fill, evidence capture),
-    // not a fetch; there is no `FetchOutcome` to meter or record.
-    ("crates/apps/transact/src/lib.rs::ctx.engines.browser", 1),
+    // not a fetch; there is no `FetchOutcome` to meter or record. TWO sites
+    // since N01: `transact` stages the flow and `commit` performs the approved
+    // irreversible action. Both still report through `ctx.meter`, so the run
+    // appears in the job's cost trail even though neither is a tiered fetch —
+    // and `commit` deliberately must NOT be routable through the fetch ladder,
+    // which would let a cache or an archive tier answer for a live submission.
+    ("crates/apps/transact/src/lib.rs::ctx.engines.browser", 2),
     // ── Jobless server-side callers: no AppContext exists ────────────────────
     // Materialized-view refresher: a background server task, not a job run.
     ("crates/server/src/refresher.rs::state.engines.http", 1),
