@@ -39,6 +39,7 @@ pub fn apps(config: &pumper_core::Config) -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_eu_sedia::EuSedia),
         Arc::new(app_mpsv_vpm::MpsvVpm),
         Arc::new(app_mpsv_ispv::MpsvIspv),
+        Arc::new(app_mpsv_ciselniky::MpsvCiselniky),
         Arc::new(app_extractor::Extractor),
         Arc::new(app_plugin::Plugin),
         Arc::new(app_crawl::Crawl),

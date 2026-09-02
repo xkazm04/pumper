@@ -49,6 +49,7 @@ app-eu-sedia.workspace = true
 grants-common.workspace = true
 app-mpsv-vpm.workspace = true
 app-mpsv-ispv.workspace = true
+app-mpsv-ciselniky.workspace = true
 app-extractor.workspace = true
 app-plugin.workspace = true
 app-crawl.workspace = true
