@@ -174,7 +174,7 @@ pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json
         // bytes a webhook sink would receive — so one connector module works
         // against every event kind rather than against a sink-specific shape.
         sink if sink.starts_with(PLUGIN_SINK_PREFIX) => {
-            let url = plugin_sink_url(&sink[PLUGIN_SINK_PREFIX.len()..]);
+            let url = plugin_sink_url(&sink[PLUGIN_SINK_PREFIX.len()..], &watch.url);
             dispatch_event(
                 state,
                 "change",
@@ -223,30 +223,44 @@ const FILE_SINK_SCHEME: &str = "file://";
 /// The `watch.sink` prefix that selects a WASM plugin connector (N10).
 pub(crate) const PLUGIN_SINK_PREFIX: &str = "plugin:";
 
-/// The pseudo-URL logged for a plugin-sink delivery: `plugin://<name>`.
+/// The pseudo-URL logged for a plugin-sink delivery: `plugin://<name>`, plus
+/// `?target=<the watch's url>` when the operator configured one. The target
+/// rides HERE rather than in the body so the body stays the unshaped payload —
+/// one connector module then works against every event kind, and a replayed row
+/// reaches the same destination the first attempt did.
 ///
 /// Same move as [`file_sink_url`], for the same reason: the delivery row must
 /// carry everything the DLQ drain and a manual replay need to re-resolve the
 /// transport, and it must carry nothing a tampered row could turn into a
 /// different destination.
-fn plugin_sink_url(name: &str) -> String {
-    format!("{PLUGIN_SINK_SCHEME}{name}")
+fn plugin_sink_url(name: &str, target: &str) -> String {
+    if target.is_empty() {
+        return format!("{PLUGIN_SINK_SCHEME}{name}");
+    }
+    format!("{PLUGIN_SINK_SCHEME}{name}?target={target}")
 }
 
 const PLUGIN_SINK_SCHEME: &str = "plugin://";
 
-/// Resolves a logged plugin-sink URL back to a module name. The name must look
-/// like a plugin file stem (`[A-Za-z0-9._-]`, no `..`) — anything else is
-/// rejected, so nothing in the delivery log can name something that is not a
-/// module in the plugin dir.
-fn plugin_sink_name(url: &str) -> Option<&str> {
-    let name = url.strip_prefix(PLUGIN_SINK_SCHEME)?;
+/// Resolves a logged plugin-sink URL back to `(module name, target)`.
+///
+/// The NAME is validated like a plugin file stem (`[A-Za-z0-9._-]`, no `..`),
+/// so nothing in the delivery log can name something that is not a module in
+/// the plugin dir. Everything after the single `?target=` is the target,
+/// verbatim and unsplit — there is exactly one parameter, so a destination
+/// containing `?` or `&` needs no encoding and cannot be truncated by one.
+fn plugin_sink_route(url: &str) -> Option<(&str, Option<&str>)> {
+    let rest = url.strip_prefix(PLUGIN_SINK_SCHEME)?;
+    let (name, target) = match rest.split_once("?target=") {
+        Some((name, target)) => (name, (!target.is_empty()).then_some(target)),
+        None => (rest, None),
+    };
     let valid = !name.is_empty()
         && !name.contains("..")
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    valid.then_some(name)
+    valid.then_some((name, target))
 }
 
 /// `data/sinks/` — a sibling of the artifacts dir so all on-disk output lives
@@ -789,7 +803,7 @@ async fn deliver_plugin(
     delivery_id: &str,
     body: &[u8],
 ) -> (bool, i64, Option<String>, bool) {
-    let Some(name) = plugin_sink_name(url) else {
+    let Some((name, target)) = plugin_sink_route(url) else {
         // A malformed pseudo-URL will never parse on a retry — permanent.
         return (
             false,
@@ -809,9 +823,13 @@ async fn deliver_plugin(
         "body": serde_json::from_slice::<serde_json::Value>(body)
             .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(body).into_owned())),
     });
-    let outcome = plugins
-        .run(name, &envelope.to_string(), &serde_json::json!({}))
-        .await;
+    // `params` is where the operator's configuration reaches the module: the
+    // watch's url, carried on the pseudo-URL so it survives the DLQ and replay.
+    let params = match target {
+        Some(target) => serde_json::json!({ "target": target }),
+        None => serde_json::json!({}),
+    };
+    let outcome = plugins.run(name, &envelope.to_string(), &params).await;
     plugin_delivery_outcome(outcome)
 }
 
@@ -1427,10 +1445,21 @@ mod tests {
     #[test]
     fn a_tampered_plugin_url_resolves_to_no_module() {
         assert_eq!(
-            plugin_sink_name("plugin://sink-postgrest"),
-            Some("sink-postgrest")
+            plugin_sink_route("plugin://sink-postgrest"),
+            Some(("sink-postgrest", None))
         );
-        assert_eq!(plugin_sink_url("sink-postgrest"), "plugin://sink-postgrest");
+        assert_eq!(
+            plugin_sink_url("sink-postgrest", ""),
+            "plugin://sink-postgrest"
+        );
+        // The target round-trips whole, `?`/`&` and all — one parameter, no
+        // encoding, nothing a second `split` could truncate.
+        let target = "http://localhost:3000/rest/deliveries?on_conflict=id&x=1";
+        let url = plugin_sink_url("sink-postgrest", target);
+        assert_eq!(
+            plugin_sink_route(&url),
+            Some(("sink-postgrest", Some(target)))
+        );
         for bad in [
             "plugin://../../etc/passwd",
             "plugin://a/b",
@@ -1438,7 +1467,7 @@ mod tests {
             "https://evil.example",
             "file://x.ndjson",
         ] {
-            assert_eq!(plugin_sink_name(bad), None, "{bad} must not resolve");
+            assert_eq!(plugin_sink_route(bad), None, "{bad} must not resolve");
         }
     }
 }

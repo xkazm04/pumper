@@ -67,6 +67,11 @@ fn plugins_src() -> PathBuf {
 const EXPECTED_PLUGIN_ABI: &[(&str, &[&str])] = &[
     ("busyloop", &["alloc", "extract"]),
     ("delta-slim", &["alloc", "describe", "extract_v2"]),
+    // N10's reference SINK CONNECTOR: the same core-module ABI, plus a
+    // `capabilities` block in its manifest and one declared host import. It
+    // belongs on this list precisely because a connector that lost `extract_v2`
+    // would load, answer `has() == false`, and dead-letter every delivery.
+    ("sink-postgrest", &["alloc", "describe", "extract_v2"]),
     (
         "title-extractor",
         &["alloc", "describe", "extract", "extract_v2"],
