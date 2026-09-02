@@ -434,9 +434,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "hex",
  "pumper-core",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3859,6 +3862,7 @@ dependencies = [
  "pumper-engine-search",
  "pumper-engine-wasm",
  "reqwest 0.12.28",
+ "ring",
  "sentry",
  "sentry-tracing",
  "serde",

@@ -66,6 +66,8 @@ serde.workspace = true
 serde_json.workspace = true
 jsonschema.workspace = true
 sha2.workspace = true
+# Node identity (N16): the ed25519 keypair under `data/node.key`.
+ring.workspace = true
 hmac.workspace = true
 hex.workspace = true
 anyhow.workspace = true

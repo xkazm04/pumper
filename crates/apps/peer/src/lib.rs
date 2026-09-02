@@ -101,6 +101,8 @@
 //! server-side `[[peer]]` scheduling — runs are on-demand jobs; a `[[peer]]`
 //! config block that enqueues them on a cron is the documented next slice.
 
+pub mod envelope;
+
 use std::collections::HashSet;
 
 use async_trait::async_trait;
