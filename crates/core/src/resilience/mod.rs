@@ -52,6 +52,7 @@ pub mod mutate;
 #[cfg(feature = "storage")]
 pub mod preview;
 pub mod profiles;
+pub mod repair;
 pub mod sketch;
 #[cfg(feature = "storage")]
 pub mod store;
@@ -70,9 +71,14 @@ pub use mutate::{evaluate_corpus, ClassResult, EvalReport, EvalTargets, Mutation
 pub use profiles::{
     known_origin, repairability, rules_source, Repairability, RulesSource, RulesSourceConflict,
 };
+pub use repair::{
+    decide_promotion, diagnosis_hash, judge, probation_outcome, repair_idempotency_key,
+    CandidateEvidence, CandidateVerdict, GoldenDoc, ProbationOutcome, PromotionDecision,
+    PromotionInput,
+};
 pub use sketch::FieldSketch;
 #[cfg(feature = "storage")]
-pub use store::{HealthStore, Resilience, SourceHealth, SourceRun};
+pub use store::{HealthStore, RepairAttempt, RepairGuard, Resilience, SourceHealth, SourceRun};
 
 /// Where a source sits on the health ladder. The unit is `(app, dataset)` —
 /// every existing surface already keys on it (watches, triggers, the change

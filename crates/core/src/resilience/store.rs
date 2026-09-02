@@ -622,6 +622,245 @@ impl HealthStore {
             .collect())
     }
 
+    // ── The repair audit trail (N12 §6.4, §8.3) ────────────────────────────
+    //
+    // Every candidate and every verdict is written, accepted or not. The
+    // design's own falsifier — "of PROMOTED repairs, the fraction that
+    // reproduce the pre-mutation values" — is uncomputable unless the
+    // rejections sit on the record beside the promotions, so a store that kept
+    // only successes would make the safety argument unfalsifiable by
+    // construction.
+
+    /// Binds a source to the profile a repair would write back to. `None`
+    /// clears it, which is how a source reverts to `repairable: false`.
+    pub async fn set_source_profile(&self, source_id: &str, profile: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE sources SET profile = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(source_id)
+            .bind(profile)
+            .bind(ts(Utc::now()))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The anti-oscillation state of one source, as of `now`.
+    ///
+    /// `promotions_30d` is **recomputed from the attempt ledger**, not read
+    /// from the counter column: a counter has to be reset by somebody, and a
+    /// reset that does not happen turns a 30-day budget into a permanent ban.
+    /// The column is refreshed from the same number so `GET /sources` and this
+    /// call can never disagree.
+    pub async fn repair_guard(&self, source_id: &str, now: DateTime<Utc>) -> Result<RepairGuard> {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT repair_blocked_until, profile FROM sources WHERE id = ?1")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let (blocked_until, profile) = row.unwrap_or((None, None));
+        let since = ts(now - Duration::days(30));
+        let promotions_30d: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repair_attempts \
+             WHERE source_id = ?1 AND outcome = 'promoted' AND created_at >= ?2",
+        )
+        .bind(source_id)
+        .bind(&since)
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query("UPDATE sources SET promotions_30d = ?2 WHERE id = ?1")
+            .bind(source_id)
+            .bind(promotions_30d)
+            .execute(&self.pool)
+            .await?;
+        let blocked = blocked_until
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc));
+        Ok(RepairGuard {
+            blocked_until: blocked,
+            blocked: blocked.is_some_and(|b| b > now),
+            promotions_30d: promotions_30d.max(0) as u32,
+            profile,
+        })
+    }
+
+    /// Blocks further repair of this source until `until` — the post-rollback
+    /// cooldown.
+    pub async fn block_repair(&self, source_id: &str, until: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE sources SET repair_blocked_until = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(source_id)
+            .bind(ts(until))
+            .bind(ts(Utc::now()))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Opens a repair attempt and returns its id.
+    pub async fn start_repair_attempt(
+        &self,
+        source_id: &str,
+        job_id: Option<&str>,
+        diagnosis: &str,
+        diagnosis_hash: &str,
+        stage: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO repair_attempts \
+                 (id, source_id, job_id, diagnosis, diagnosis_hash, stage, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&id)
+        .bind(source_id)
+        .bind(job_id)
+        .bind(diagnosis)
+        .bind(diagnosis_hash)
+        .bind(stage)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Records one candidate and the verdict every gate returned.
+    pub async fn record_repair_candidate(
+        &self,
+        attempt_id: &str,
+        idx: i64,
+        origin: &str,
+        rules: &Value,
+        verdict: &super::repair::CandidateVerdict,
+        profile_version: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO repair_candidates \
+                 (attempt_id, idx, origin, rules, holdout_match_rate, golden_exact, golden_total, \
+                  invariant_violations, agreement_group, lint, verdict, evidence, profile_version, \
+                  created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )
+        .bind(attempt_id)
+        .bind(idx)
+        .bind(origin)
+        .bind(rules.to_string())
+        .bind(verdict.holdout.rate)
+        .bind(verdict.golden.exact_ok as i64)
+        .bind(verdict.golden.checked as i64)
+        .bind(verdict.invariant_violations.len() as i64)
+        .bind(verdict.agreement.group as i64)
+        .bind(serde_json::to_string(&verdict.lint).unwrap_or_else(|_| "[]".into()))
+        .bind(
+            verdict
+                .rejected_for
+                .clone()
+                .unwrap_or_else(|| "accepted".to_string()),
+        )
+        .bind(serde_json::to_string(verdict).ok())
+        .bind(profile_version)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Closes an attempt with its outcome.
+    pub async fn finish_repair_attempt(
+        &self,
+        attempt_id: &str,
+        stage: &str,
+        outcome: &str,
+        promoted_version: Option<i64>,
+        cost_usd: f64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE repair_attempts \
+             SET stage = ?2, outcome = ?3, promoted_version = ?4, cost_usd = ?5, finished_at = ?6 \
+             WHERE id = ?1",
+        )
+        .bind(attempt_id)
+        .bind(stage)
+        .bind(outcome)
+        .bind(promoted_version)
+        .bind(cost_usd)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One source's repair attempts, newest first.
+    pub async fn repair_attempts(&self, source_id: &str, limit: i64) -> Result<Vec<RepairAttempt>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            f64,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, diagnosis, diagnosis_hash, stage, outcome, promoted_version, cost_usd, \
+                    created_at, finished_at \
+             FROM repair_attempts WHERE source_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(source_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    diagnosis,
+                    diagnosis_hash,
+                    stage,
+                    outcome,
+                    promoted_version,
+                    cost_usd,
+                    created_at,
+                    finished_at,
+                )| RepairAttempt {
+                    id,
+                    source_id: source_id.to_string(),
+                    diagnosis,
+                    diagnosis_hash,
+                    stage,
+                    outcome,
+                    promoted_version,
+                    cost_usd,
+                    created_at,
+                    finished_at,
+                },
+            )
+            .collect())
+    }
+
+    /// The candidates of one attempt, in proposal order.
+    pub async fn repair_candidates(&self, attempt_id: &str) -> Result<Vec<Value>> {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT idx, origin, verdict, evidence FROM repair_candidates \
+             WHERE attempt_id = ?1 ORDER BY idx",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(idx, origin, verdict, evidence)| {
+                serde_json::json!({
+                    "idx": idx,
+                    "origin": origin,
+                    "verdict": verdict,
+                    "evidence": evidence.and_then(|e| serde_json::from_str::<Value>(&e).ok()),
+                })
+            })
+            .collect())
+    }
+
     /// Stamps which profile version produced a recorded run.
     ///
     /// Separate from `observe` on purpose. `RunReport` is built by the app, and
@@ -692,6 +931,38 @@ impl HealthStore {
         .rows_affected();
         Ok(sketches + runs)
     }
+}
+
+/// A source's anti-oscillation state, as of a moment.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairGuard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<DateTime<Utc>>,
+    /// Whether the cooldown is live right now.
+    pub blocked: bool,
+    /// Promotions inside the trailing 30 days, recomputed from the ledger.
+    pub promotions_30d: u32,
+    /// The profile a repair would write back to; `None` = `repairable: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// One recorded repair attempt.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairAttempt {
+    pub id: String,
+    pub source_id: String,
+    pub diagnosis: String,
+    pub diagnosis_hash: String,
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promoted_version: Option<i64>,
+    pub cost_usd: f64,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 /// Extraction-health detection as an app-facing service: config plus the store.

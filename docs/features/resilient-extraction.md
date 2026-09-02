@@ -813,12 +813,24 @@ test asserting the equivalence.
 
 ## 6. Repair
 
-> **Not built.** No candidate generation, no validation gates, no LLM call, no
-> money spent. A degrading source is detected, quarantined and reported; fixing
-> it is an operator action followed by `POST /sources/{id}/state`. §13's build
-> order puts repair last for exactly this reason: steps 1-5 deliver most of the
-> value at none of the risk, and if the evaluation numbers come back badly steps
-> 6-8 should not land at all.
+> **Partly built (N12 steps 3-5), and OFF by default.** Tier 0 (§6.2) and the
+> seven gates (§6.4) exist as pure, tested functions; Tier 1 (§6.3, the Claude
+> proposal) does **not** — no LLM call, no money spent, and the only seam is
+> that a candidate carries an `origin` of `claude` if one ever writes it.
+>
+> | piece | where | state |
+> |---|---|---|
+> | Tier-0 inversion | `induce::invert` | built |
+> | brittle lint | `induce::lint_selector`, `lint_selector_breadth` | built |
+> | the seven gates | `resilience::repair::{gate_*, judge}` | built |
+> | promotion / rollback machine | `resilience::repair::{decide_promotion, probation_outcome}` | built |
+> | candidate + verdict persistence | `repair_attempts`, `repair_candidates` (migration 0042) | built |
+> | Tier-1 Claude candidates | — | **not built** |
+> | golden documents (§6.4.4) | `GoldenDoc` type only; no `data/golden/` store | **not built** — and gate 4 therefore REJECTS rather than skips |
+>
+> `[resilience.repair] enabled = false` is the shipping default, per §12.3's own
+> rule. With it false nothing is generated, nothing is spent and nothing is
+> written; the tables exist so the seam has a home before it has a caller.
 
 ### 6.1 When repair is even attempted
 
@@ -1018,9 +1030,18 @@ the human reviewer: nobody approves anything, but somebody is told.
 
 ### 8.1 Promotion
 
-> **Not built** (§8.1-8.3). There is nothing to promote or roll back without the
-> profile registry and repair. `POST /sources/{id}/state` is the whole operator
-> surface. It is no longer the *only* way out of `quarantined` — §2.7's
+> **The state machine is built (N12 step 5), the API is not.**
+> `resilience::repair::decide_promotion` and `probation_outcome` are pure
+> functions with the anti-oscillation budget, the cooldown, the stale-candidate
+> drop and the one-tripped-run rollback; `HealthStore::repair_guard` recomputes
+> `promotions_30d` **from the attempt ledger** rather than trusting a counter
+> column, because a 30-day budget behind a counter nobody resets is a permanent
+> ban. There are no `/profiles/extraction/...` routes and no
+> `POST /sources/{id}/reextract` yet, so `POST /sources/{id}/state` is still the
+> whole operator HTTP surface, and the `source.repair_promoted` /
+> `source.rolled_back` webhooks are named in the `repair` app's result but not
+> yet dispatched (`webhook::dispatch_event` lives in the server, above the app
+> boundary). It is no longer the *only* way out of `quarantined` — §2.7's
 > evidence-based recovery is — but it is the shortcut for an operator who already
 > knows the source is fixed.
 

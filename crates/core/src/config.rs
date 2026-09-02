@@ -519,6 +519,10 @@ pub struct ResilienceConfig {
     /// looked at. `0` would let a source un-quarantine itself on the first run
     /// that happened not to trip, so it is rejected.
     pub recovery_runs: u32,
+    /// Closed-loop repair (N12). Its own sub-table, `[resilience.repair]`, and
+    /// `enabled = false` by default — see [`RepairConfig`].
+    #[serde(default)]
+    pub repair: RepairConfig,
 }
 
 impl Default for ResilienceConfig {
@@ -548,7 +552,81 @@ impl Default for ResilienceConfig {
             // to degrade, three consecutive to quarantine): recovery should cost
             // at least what the fall did.
             recovery_runs: 3,
+            repair: RepairConfig::default(),
         }
+    }
+}
+
+/// `[resilience.repair]` — closed-loop extraction repair (N12).
+///
+/// **`enabled = false` is the shipping default and the design's own rule**, not
+/// timidity: `resilient-extraction.md` §12.3 states that auto-promotion must not
+/// ship before the promoted-but-wrong rate has been measured, and that if it
+/// exceeds 5% the mode must default to `off`. With `enabled = false` nothing in
+/// this section constructs anything, spends anything or writes anything, and the
+/// binary behaves byte for byte as it did before the section existed.
+///
+/// The ladder inside it is the second safety property. `mode` is `shadow` even
+/// once `enabled` is flipped, so the first thing an operator gets is a candidate
+/// running ALONGSIDE the live rules on the same batch, writing nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RepairConfig {
+    /// Master switch. `false` = the `repair` app refuses every job with a typed
+    /// reason, nothing is generated, nothing is spent.
+    pub enabled: bool,
+    /// `off` — generate and store candidates, never promote (an explicit API
+    /// call is then the only route). `shadow` — run the candidate alongside the
+    /// live rules for [`Self::probation_runs`] clean runs, then promote.
+    /// `on` — promote immediately on validation, then enter probation.
+    pub mode: String,
+    /// Consecutive clean shadow runs before a candidate may be promoted.
+    pub probation_runs: u32,
+    /// Promotions allowed per source per 30 days. A stuck source is a bad
+    /// outcome; a source oscillating between two wrong rules while pushing
+    /// garbage downstream is a worse one.
+    pub max_promotions_30d: u32,
+    /// How long a rolled-back source is blocked from another attempt.
+    pub repair_cooldown_secs: u64,
+    /// Retained bodies required before a repair is attempted at all.
+    pub holdout_min_docs: usize,
+    /// Candidates that must produce identical holdout output (§6.4.5).
+    pub agreement_min: usize,
+    /// Ceiling on Tier-1 (Claude) spend per day. Unused in v1 — Tier 1 is not
+    /// built — and present so the seam has a budget before it has a caller.
+    pub daily_budget_usd: f64,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            // See the struct doc: OFF until the blind-set number exists.
+            enabled: false,
+            mode: "shadow".into(),
+            probation_runs: 3,
+            max_promotions_30d: 2,
+            repair_cooldown_secs: 86_400,
+            holdout_min_docs: 20,
+            agreement_min: 2,
+            daily_budget_usd: 1.0,
+        }
+    }
+}
+
+impl RepairConfig {
+    /// Whether this config may ever move an `active_version` pointer.
+    ///
+    /// Both `enabled` and a promoting `mode` are required, and an unrecognized
+    /// `mode` string reads as `off` rather than as the permissive default — a
+    /// typo in a config file must not be able to turn promotion on.
+    pub fn may_promote(&self) -> bool {
+        self.enabled && matches!(self.mode.as_str(), "shadow" | "on")
+    }
+
+    /// Whether a validated candidate is promoted immediately (`on`) rather than
+    /// after a shadow streak.
+    pub fn promotes_immediately(&self) -> bool {
+        self.enabled && self.mode == "on"
     }
 }
 
