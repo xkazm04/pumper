@@ -408,7 +408,7 @@ pub(crate) struct TestTriggerQuery {
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), TestTriggerQuery),
     responses(
-        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job}`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
+        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job, jobs}` (every planned hop; `job` is the first). With `bind`/`each` the SAME plan the live path would build is resolved, so `resolved_params` are the bound params of the first hop and `bound_params` / `fan_out: {each, hops, total, truncated, cap}` describe the rest; a plan that cannot be built answers `would_fire: false` with `outcome: \"bind_miss\"` or `\"fan_out_empty\"`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
         (status = 404, description = "Trigger not found", body = Object),
         (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = Object),
     )
