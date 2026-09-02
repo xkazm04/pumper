@@ -2739,6 +2739,14 @@ pub struct TransactConfig {
     pub max_submits_per_profile_per_day: i64,
     /// Rows `GET /transactions` returns at most.
     pub list_limit: i64,
+    /// If set, every ledger transition (`transaction.approved`,
+    /// `transaction.rejected`, `transaction.submitted`) POSTs here. Absent =
+    /// no delivery at all, which is the honest default: there is no global
+    /// event subscriber to borrow, and inventing one would send approvals
+    /// somewhere the operator never named.
+    pub webhook_url: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `webhook_url` deliveries.
+    pub webhook_secret: Option<String>,
 }
 
 impl Default for TransactConfig {
@@ -2748,6 +2756,8 @@ impl Default for TransactConfig {
             approval_ttl_secs: 24 * 60 * 60,
             max_submits_per_profile_per_day: 10,
             list_limit: 100,
+            webhook_url: None,
+            webhook_secret: None,
         }
     }
 }

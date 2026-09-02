@@ -296,10 +296,17 @@ impl Browser for NoFlows {
     }
 }
 
-/// A flow every engine must refuse: `submit: true` is rejected pre-flight by
-/// `TransactRequest::validate`, which the one engine that implements flows
-/// re-runs at its own door before touching Chrome. So this probes the retry
-/// class of a refusal on **both** kinds of engine without launching a browser.
+/// A flow every engine must refuse: a blank `idempotency_key` is rejected
+/// pre-flight by `TransactRequest::validate`, which the one engine that
+/// implements flows re-runs at its own door before touching Chrome. So this
+/// probes the retry class of a refusal on **both** kinds of engine without
+/// launching a browser.
+///
+/// It used to be `submit: true`. N01 made that a legal STAGING request — it
+/// enrolls a flow in the approval lifecycle rather than asking to submit — so
+/// this fixture moved to the deterministic refusal that survives. The property
+/// under test is unchanged: a refusal that is a pure function of the request
+/// must fail ONCE.
 fn refused_flow() -> TransactRequest {
     TransactRequest {
         url: "https://example.test/apply".into(),
@@ -309,8 +316,9 @@ fn refused_flow() -> TransactRequest {
             selector: "#submit".into(),
         },
         submit: true,
-        idempotency_key: "conformance-probe".into(),
+        idempotency_key: "   ".into(),
         wait_for_selector: None,
+        confirm_selector: None,
         extra_wait_ms: None,
         max_body_bytes: None,
     }
@@ -331,8 +339,8 @@ async fn a_flow_refusal_fails_once_instead_of_burning_the_retry_ladder() {
         // The trait default — what every non-opted-in engine inherits.
         ("Browser::transact default body", Arc::new(NoFlows)),
         // The one production engine that DOES implement flows still owes the
-        // same retry class for a request it refuses pre-flight (`submit: true`
-        // is re-validated at the engine door, before any Chrome work).
+        // same retry class for a request it refuses pre-flight (the blank
+        // idempotency key is re-validated at the engine door, before Chrome).
         (
             "engine-browser::BrowserEngine",
             Arc::new(BrowserEngine::new(
