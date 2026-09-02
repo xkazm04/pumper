@@ -102,26 +102,31 @@ sdk: clients-check
 
 # --- the consumer plane: one document, every client generated from it ---------
 
-# Regenerates clients/openapi.json from the ROUTER, which is the only place the
-# document exists. Needs the Rust toolchain, which is why it is separate from
-# `clients` below: the generators are Node-only and run in a job with no cargo.
+# The document exists only inside the router, so this is the one step in the
+# chain that needs the Rust toolchain — which is exactly why it is separate from
+# `clients` below, whose generators are Node-only and run in a job with no cargo.
 #
-# The same test asserts the committed copy matches on every `cargo test`, so a
-# route or DTO change that skips this step fails the Rust suite rather than
+# The same test that writes the file asserts it matches on every `cargo test`, so
+# a route or DTO change that skips this step fails the Rust suite rather than
 # silently shipping clients built from last week's contract.
+#
+# Regenerate clients/openapi.json from the router. Needs cargo.
 openapi:
     UPDATE_OPENAPI=1 cargo test -p pumper-server --bin pumper spec_snapshot
 
-# Regenerate every client's wire types from the committed document: TypeScript
-# (openapi-typescript, a devDependency of clients/typescript), the CLI's copy,
-# and the Python TypedDicts. Node only, seconds, no network.
+# TypeScript through openapi-typescript (a devDependency of clients/typescript,
+# so the SDK's existing `npm ci` installs it), the CLI's own copy of the same
+# output, and the Python TypedDicts from a ~120-line emitter in the script.
+#
+# Regenerate every client's wire types from clients/openapi.json. Node only.
 clients:
     node scripts/gen/generate-clients.mjs
 
-# The generated-client drift gate: regenerate into memory and diff against what
-# is committed. Exit 1 when the spec moved and the clients did not — the failure
-# this whole item exists to make impossible to ship. Part of `sdk`, so `just ci`
-# blocks on it.
+# Regenerates into memory and diffs against the committed output, so a spec
+# change that was not regenerated fails the build instead of shipping clients
+# built from the previous contract. Part of `sdk`, so `just ci` blocks on it.
+#
+# The generated-client drift gate: exit 1 when the clients are stale.
 clients-check:
     node scripts/gen/generate-clients.mjs --check
 
