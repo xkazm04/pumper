@@ -35,6 +35,14 @@ pub(crate) use jobs::merge_params;
 // surfaces: a poisoned advisory cache must not be able to kill the scheduler
 // tick any more than it may permanently 500 an endpoint.
 pub(crate) use error::lock_advisory;
+// The error envelope's code map and its 500 body, re-exported for the identity
+// layer (`crate::auth`): a refusal raised in the middleware must be shaped
+// exactly like one raised in a handler, or clients get two error contracts.
+pub(crate) use error::{error_code, INTERNAL_MESSAGE};
+// The pure token-bucket step, re-exported for the identity layer's
+// per-principal throttle. One implementation, two rails: the ingress
+// per-source limit and the per-principal one cannot drift apart.
+pub(crate) use ingress::bucket_step;
 // The retention plan builder, re-exported for `main.rs`'s janitor: the dry-run
 // endpoint and the loop that actually deletes MUST compute the same plan, so
 // there is exactly one implementation and both call it.
@@ -58,6 +66,7 @@ mod host_weather;
 mod ingress;
 mod jobs;
 mod meta;
+mod principals;
 mod provenance;
 mod provisioner;
 mod query;
@@ -84,6 +93,7 @@ use host_weather::*;
 use ingress::*;
 use jobs::*;
 use meta::*;
+use principals::*;
 use provenance::*;
 use provisioner::*;
 use query::*;
@@ -132,6 +142,7 @@ use watches::*;
         (name = "remote", description = "Distributed fetch fabric: peer nodes proxy fetches through this node's local stack"),
         (name = "retention", description = "Read-only retention dry run: reclaimable artifact bytes per app and ledger sizes"),
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
+        (name = "principals", description = "Identity and tenancy: scoped API keys, their spend, and the audit ledger"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
@@ -268,6 +279,11 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(datahub_governance_preview))
+        .routes(routes!(list_principals, create_principal))
+        .routes(routes!(principal_costs))
+        .routes(routes!(disable_principal))
+        .routes(routes!(rotate_principal))
+        .routes(routes!(list_audit))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -301,6 +317,12 @@ pub fn router(state: AppState) -> Router {
     // rather than in `with_middleware` because it needs the state's gauge, and
     // that function is deliberately state-agnostic so a test can drive the
     // exact stack over a synthetic router.
+    // N20 identity layer. In the default `[auth] mode = "open"` it resolves the
+    // synthetic operator and does nothing else, so this is inert until an
+    // operator flips the key. Applied here rather than in `with_middleware`
+    // because it needs the state, and that function is state-agnostic on
+    // purpose.
+    let router = crate::auth::with_auth(router, state.clone());
     let router = crate::activity::with_activity(router, state.activity.clone());
     with_middleware(router, origins).with_state(state)
 }
@@ -638,6 +660,12 @@ mod api_spec_tests {
         "GET /datahub/status",
         "POST /datahub/sync",
         "GET /datahub/governance/preview",
+        "GET /principals",
+        "POST /principals",
+        "GET /principals/costs",
+        "POST /principals/{id}/disable",
+        "POST /principals/{id}/rotate",
+        "GET /audit",
         "GET /openapi.json",
     ];
 

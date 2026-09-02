@@ -1,4 +1,5 @@
 mod activity;
+mod auth;
 mod datahub;
 #[cfg(test)]
 mod e2e;

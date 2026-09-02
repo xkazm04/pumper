@@ -37,7 +37,7 @@ static BUCKETS: OnceLock<Mutex<HashMap<String, (f64, Instant)>>> = OnceLock::new
 /// Pure token-bucket step: refills `tokens` for `elapsed_secs` at
 /// `per_min`/60 tokens per second (capped at the burst = `per_min`), then takes
 /// one if available. Returns (new_tokens, allowed).
-fn bucket_step(tokens: f64, elapsed_secs: f64, per_min: u32) -> (f64, bool) {
+pub(crate) fn bucket_step(tokens: f64, elapsed_secs: f64, per_min: u32) -> (f64, bool) {
     let cap = per_min as f64;
     let refilled = (tokens + elapsed_secs * cap / 60.0).min(cap);
     if refilled >= 1.0 {

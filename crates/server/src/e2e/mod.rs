@@ -9,6 +9,7 @@
 //! network beyond loopback, no real engines.
 
 mod app_fetch_chokepoint;
+mod auth_gate;
 mod body_limit;
 mod budget_terminal;
 mod datahub_bridge;
