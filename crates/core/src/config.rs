@@ -46,6 +46,9 @@ pub struct Config {
     pub peer: Vec<PeerConfig>,
     /// N01 Transact v2: the live-submission gate. Default OFF.
     pub transact: TransactConfig,
+    /// N25 Research as a living knowledge base: the fan-out rails on the
+    /// research app's per-source side effects. See [`ResearchConfig`].
+    pub research: ResearchConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -3280,5 +3283,35 @@ impl TransactConfig {
     /// `None` for "no cap".
     pub fn daily_cap(&self) -> Option<i64> {
         (self.max_submits_per_profile_per_day > 0).then_some(self.max_submits_per_profile_per_day)
+    }
+}
+
+/// Rails on the research app's **per-source** side effects — N25.
+///
+/// A research run cites an arbitrary number of URLs, and two of the app's
+/// params act once per cited URL: `snapshot_sources` fetches each one through
+/// the metered tiered fetcher, and `watch_sources` proposes a standing monitor
+/// for each. Both are therefore unbounded fan-out driven by model output, which
+/// is exactly the shape that needs an operator ceiling rather than a caller
+/// one. This section holds that ceiling; nothing here turns a behaviour ON (both
+/// params default to `false`), so a node without a `[research]` block behaves
+/// byte-for-byte as it did before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ResearchConfig {
+    /// Max cited sources ONE run may act on — snapshot fetches and proposed
+    /// watches alike. A run that cites more says so (`sources_truncated: true`)
+    /// rather than silently acting on a prefix.
+    ///
+    /// 20 is the default because a source list past that is a survey, not a
+    /// citation set, and every entry past it costs a real metered fetch.
+    pub max_watched_sources: usize,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        Self {
+            max_watched_sources: 20,
+        }
     }
 }
