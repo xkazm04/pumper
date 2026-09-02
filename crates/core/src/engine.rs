@@ -2,6 +2,7 @@
 //! (`engine-http`, `engine-browser`, `engine-claude`) implement them, and the
 //! server wires everything together into an [`EngineSet`].
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -536,10 +537,16 @@ pub struct TransactRequest {
     /// real submit button). **Never executed in v1** — it is captured verbatim
     /// into the evidence bundle as `would_submit` so a human can review it.
     pub submit_action: PageAction,
-    /// Request live submission. `false` (default) = dry-run. `true` is
-    /// REJECTED with a typed [`Error::Transact`]: releasing a live submit needs
-    /// the human-approval slice (pending-approval jobs + an explicit approve
-    /// endpoint), which does not exist yet.
+    /// Request live submission (N01 Transact v2). `false` (default) = a plain
+    /// dry run that ends at the evidence bundle.
+    ///
+    /// `true` does **not** mean "submit now", and no code path treats it that
+    /// way: it enrolls the flow in the approval lifecycle. The staging run is
+    /// byte-for-byte the same dry run, it writes a `pending` row to the
+    /// transactions ledger, and the job then PARKS (N02 `waiting`) with the
+    /// evidence as its `input_request`. Only `POST /transactions/{id}/approve`
+    /// — `admin` scope, `[transact] allow_live = true` — resumes it, and only
+    /// the resumed attempt reaches [`Browser::commit`].
     #[serde(default)]
     pub submit: bool,
     /// Caller-chosen idempotency key. Required non-empty; recorded in the
@@ -549,6 +556,15 @@ pub struct TransactRequest {
     /// Wait for this selector after navigation, before running steps.
     #[serde(default)]
     pub wait_for_selector: Option<String>,
+    /// Selector that proves the submission LANDED, waited for after the
+    /// irreversible action during [`Browser::commit`] (N01). Absent = the
+    /// receipt reports `confirm_selector_found: null` — an honest "nobody said
+    /// what success looks like", never a fabricated success.
+    ///
+    /// Unused by the dry run: there is nothing to confirm until something has
+    /// been submitted.
+    #[serde(default)]
+    pub confirm_selector: Option<String>,
     /// Extra settle time before steps; engine default when `None`.
     #[serde(default)]
     pub extra_wait_ms: Option<u64>,
@@ -558,26 +574,21 @@ pub struct TransactRequest {
 }
 
 impl TransactRequest {
-    /// Rejects flows this slice must not run: `submit: true` (typed
-    /// [`Error::Transact`] pointing at the human-approval design), an empty
-    /// idempotency key (`Error::Transact`), and an unsafe profile name
-    /// ([`Error::BadRequest`], via [`require_safe_profile_name`]). Engines call
-    /// this before touching a browser; apps call it before touching an engine.
+    /// Rejects flows no attempt could ever run: an empty idempotency key
+    /// (`Error::Transact`) and an unsafe profile name ([`Error::BadRequest`],
+    /// via [`require_safe_profile_name`]). Engines call this before touching a
+    /// browser; apps call it before touching an engine.
     ///
-    /// All three are **terminal for the job** ([`Error::is_terminal_for_job`]),
+    /// Both are **terminal for the job** ([`Error::is_terminal_for_job`]),
     /// which is the property that matters here: each is a pure function of a
     /// request that cannot change between attempts, so a refusal fails ONCE.
+    ///
+    /// `submit: true` is deliberately **not** refused here any more (N01). It
+    /// no longer means "submit now" — it enrolls the flow in the approval
+    /// lifecycle, and the staging run it produces is byte-for-byte the same dry
+    /// run. What keeps a stage from submitting is not a check: it is that
+    /// [`Browser::transact`] has no code path that appends `submit_action`.
     pub fn validate(&self) -> Result<()> {
-        if self.submit {
-            return Err(Error::Transact(
-                "live submission (submit: true) is not available: this slice executes flows \
-                 dry-run only, stopping before the irreversible action. Releasing a live submit \
-                 requires the human-approval design (pending-approval transactions + an explicit \
-                 approve endpoint) — the documented next slice. Re-run with submit: false to get \
-                 the evidence bundle for review."
-                    .into(),
-            ));
-        }
         if self.idempotency_key.trim().is_empty() {
             return Err(Error::Transact(
                 "idempotency_key must be a non-empty caller-chosen key: it is recorded with the \
@@ -627,6 +638,7 @@ pub const TRANSACT_FIELDS: &[&str] = &[
     "submit",
     "idempotency_key",
     "wait_for_selector",
+    "confirm_selector",
     "extra_wait_ms",
     "max_body_bytes",
 ];
@@ -1208,6 +1220,100 @@ pub trait HttpClient: Send + Sync {
     }
 }
 
+/// SHA-256 over exactly what a reviewer looked at when they said yes: the
+/// submit target's identity and clickability, and every filled field's
+/// selector, found-ness and **length** (never its value — a redacted password
+/// contributes its length, so a changed password still changes the digest
+/// without the plaintext ever entering it).
+///
+/// The digest is canonical by construction: fields are sorted by selector, so
+/// two probes of the same page in a different DOM order agree. It is the
+/// approval's binding — `approve` quotes it, `commit` re-probes it, and a
+/// mismatch is a refusal instead of a click.
+pub fn evidence_digest(submit_target: Option<&SubmitTarget>, filled: &[FilledField]) -> String {
+    let mut rows: Vec<String> = filled
+        .iter()
+        .map(|f| {
+            format!(
+                "f\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                f.selector,
+                f.found,
+                f.redacted,
+                f.value_len.map(|n| n.to_string()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort();
+    if let Some(t) = submit_target {
+        rows.insert(
+            0,
+            format!(
+                "t\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                t.selector,
+                opt_bool(t.found),
+                opt_bool(t.visible),
+                opt_bool(t.enabled),
+                t.tag.as_deref().unwrap_or(""),
+                t.label.as_deref().unwrap_or(""),
+            ),
+        );
+    } else {
+        rows.insert(0, "t\u{1}none".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(rows.join("\u{2}").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// `Some(true)` / `Some(false)` / `None` as three distinguishable tokens —
+/// "we could not look" must never hash the same as "it is not there".
+fn opt_bool(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+/// The commit-time guard: the live page, re-probed immediately before the
+/// irreversible action, must hash to the digest that was approved.
+///
+/// This is the whole risk surface of the feature. A page that changed between
+/// review and submit ends the run as a **refusal**, never as a click on a
+/// button a human never saw.
+pub fn commit_guard(
+    approved_sha: &str,
+    observed_sha: &str,
+) -> std::result::Result<(), CommitRefusal> {
+    if approved_sha == observed_sha {
+        return Ok(());
+    }
+    Err(CommitRefusal::ProbeMismatch {
+        approved: approved_sha.to_string(),
+        observed: observed_sha.to_string(),
+    })
+}
+
+/// Why a commit refused to click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitRefusal {
+    ProbeMismatch { approved: String, observed: String },
+}
+
+impl CommitRefusal {
+    pub fn message(&self) -> String {
+        match self {
+            CommitRefusal::ProbeMismatch { approved, observed } => format!(
+                "submit blocked: probe_mismatch. The page approved for submission hashed to \
+                 {approved}; re-probed immediately before the click it hashes to {observed}. The \
+                 submit target or a filled field changed after review, so the approved action is \
+                 no longer the action that would run. Nothing was submitted. Re-run the dry run \
+                 to capture fresh evidence and approve that."
+            ),
+        }
+    }
+}
+
 /// The refusal an engine with no flow support owes a caller — one producer, so
 /// a wrapper that wants to refuse explicitly cannot accidentally mint a
 /// *retryable* version of the same sentence.
@@ -1244,6 +1350,89 @@ pub trait Browser: Send + Sync {
     async fn transact(&self, req: TransactRequest) -> Result<TransactEvidence> {
         Err(unsupported_transact(&req.url))
     }
+
+    /// Performs the irreversible action a human approved (N01 Transact v2) —
+    /// the ONLY code path in this codebase that can.
+    ///
+    /// The contract, in order: re-drive the flow to the confirmation state,
+    /// re-probe the live page, and refuse unless the probe hashes to
+    /// `approved.evidence_sha`. Only then is `submit_action` performed, the
+    /// `confirm_selector` waited for, and the post-submit DOM captured as the
+    /// receipt. A drifted page ends as [`Error::Transact`] naming
+    /// `probe_mismatch`, never as a click on a button nobody reviewed.
+    ///
+    /// Default: unsupported, exactly like [`Browser::transact`] — a wrapper or
+    /// mock cannot accidentally acquire the authority to submit by being
+    /// dropped into the engine slot.
+    async fn commit(
+        &self,
+        req: TransactRequest,
+        approved: ApprovedTransaction,
+    ) -> Result<TransactReceipt> {
+        let _ = approved;
+        Err(unsupported_transact(&req.url))
+    }
+}
+
+/// The approval a [`Browser::commit`] is bound to: which ledger row released
+/// it, and the digest of the evidence that was actually read.
+///
+/// Constructed **only** from a ledger row the approve door already moved to
+/// `approved` — never from job params. A caller cannot hand the engine a
+/// digest of its own choosing, because the caller never supplies one.
+#[derive(Debug, Clone)]
+pub struct ApprovedTransaction {
+    /// `transactions.id` the approval belongs to.
+    pub transaction_id: String,
+    /// [`crate::transactions::evidence_digest`] of the reviewed bundle.
+    pub evidence_sha: String,
+}
+
+/// Proof of what a live submission actually did — the post-submit half of the
+/// evidence contract, written to the job's artifacts and pointed at by the
+/// ledger row's `receipt_path`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransactReceipt {
+    /// Whether `submit_action` was performed. A receipt with `false` exists
+    /// only for a flow that reached the engine and was refused there; every
+    /// other refusal is a typed error with no receipt at all.
+    pub submitted: bool,
+    /// The ledger row this receipt discharges.
+    pub transaction_id: String,
+    pub idempotency_key: String,
+    /// The identity the submission ran as — the reviewer approved it *as this*.
+    pub profile: Option<String>,
+    pub url: String,
+    pub final_url: Option<String>,
+    /// The digest that was approved, and the digest the live page produced
+    /// immediately before the click. Equal on every submitted receipt, by
+    /// construction — printed anyway, because a receipt that cannot be checked
+    /// is not evidence.
+    pub approved_evidence_sha: String,
+    pub observed_evidence_sha: String,
+    /// The action that ran, verbatim — the same value the dry run reported as
+    /// `would_submit`.
+    pub submit_action: PageAction,
+    /// Outcome of the irreversible action itself.
+    pub submit_outcome: StepOutcome,
+    /// The selector asked for as proof of landing, and whether it appeared.
+    /// `None`/`None` = none was requested; the receipt does not pretend.
+    pub confirm_selector: Option<String>,
+    pub confirm_selector_found: Option<bool>,
+    /// Honest step accounting for the re-driven flow, same shape as the dry
+    /// run's: `completed` counts successes, never attempts.
+    pub steps_requested: usize,
+    pub steps_attempted: usize,
+    pub steps_completed: usize,
+    pub step_outcomes: Vec<StepOutcome>,
+    pub steps_deadline_hit: bool,
+    /// Post-submit DOM snapshot, truncated (never dropped) over the cap: the
+    /// action already happened, so a fat page degrades the proof rather than
+    /// destroying it.
+    pub dom_html: String,
+    pub dom_bytes: usize,
+    pub dom_truncated: bool,
+    pub nav_timed_out: bool,
 }
 
 /// Agentic web research via Claude Code CLI.
@@ -1464,22 +1653,25 @@ mod tests {
     }
 
     #[test]
-    fn submit_true_is_rejected_with_a_typed_error_naming_the_next_slice() {
+    /// The v1 anti-pattern, inverted by N01: `submit: true` used to be a
+    /// door-level refusal, so the approval lifecycle had nowhere to start. It
+    /// is now a legal STAGING request — and the property that keeps it safe is
+    /// not a validation check but the absence of a code path:
+    /// [`Browser::transact`] never appends `submit_action`, so a staged flow
+    /// cannot submit no matter what its params say. Only `Browser::commit`,
+    /// reachable only from an approved ledger row, can.
+    fn submit_true_is_a_staging_request_not_a_submission() {
         let mut req = dry_run_flow();
         req.submit = true;
-        let err = req.validate().unwrap_err();
-        // Typed (not a generic App/Browser error), and the message points the
-        // caller at the human-approval design rather than a dead end.
-        assert!(matches!(err, Error::Transact(_)), "got {err:?}");
-        let msg = err.to_string();
         assert!(
-            msg.contains("human-approval"),
-            "message must name the next slice: {msg}"
+            req.validate().is_ok(),
+            "submit: true enrolls a flow in the approval lifecycle; it is not a refusal"
         );
-        assert!(
-            msg.contains("dry-run"),
-            "message must explain what v1 does: {msg}"
-        );
+        // The would-be action is still only a value in its own field, never a
+        // member of the step list the executor is handed.
+        let submit = serde_json::to_value(&req.submit_action).unwrap();
+        let steps = serde_json::to_value(&req.steps).unwrap();
+        assert!(!steps.as_array().unwrap().contains(&submit));
     }
 
     #[test]
@@ -2082,5 +2274,107 @@ mod tests {
             None
         );
         assert_eq!(anonymous_profile(&HashMap::new()), None);
+    }
+}
+
+#[cfg(test)]
+mod transact_v2_evidence_tests {
+    use super::*;
+
+    fn field(selector: &str, len: Option<usize>, redacted: bool) -> FilledField {
+        FilledField {
+            selector: selector.into(),
+            value: None,
+            found: true,
+            redacted,
+            value_len: len,
+            truncated: false,
+        }
+    }
+
+    fn target(enabled: Option<bool>) -> SubmitTarget {
+        SubmitTarget {
+            selector: "#go".into(),
+            found: Some(true),
+            visible: Some(true),
+            enabled,
+            tag: Some("button".into()),
+            label: Some("Confirm".into()),
+        }
+    }
+
+    /// The commit-time guard. An approval binds to the digest of what was
+    /// reviewed; a page that drifted afterwards must end as a refusal, never as
+    /// a click on a button nobody saw.
+    #[test]
+    fn approved_with_stale_evidence_not_submitted() {
+        assert!(commit_guard("sha-a", "sha-a").is_ok());
+        let err = commit_guard("sha-a", "sha-b").unwrap_err();
+        assert_eq!(
+            err,
+            CommitRefusal::ProbeMismatch {
+                approved: "sha-a".into(),
+                observed: "sha-b".into()
+            }
+        );
+        assert!(err.message().contains("probe_mismatch"));
+        assert!(err.message().contains("Nothing was submitted"));
+    }
+
+    /// The digest must be stable across probe ORDER (two renders of the same
+    /// page can enumerate fields differently) and must change on every fact a
+    /// reviewer actually looked at.
+    #[test]
+    fn digest_is_order_stable_and_moves_on_every_reviewed_fact() {
+        let a = field("#email", Some(16), false);
+        let b = field("#name", Some(4), false);
+        let base = evidence_digest(Some(&target(Some(true))), &[a.clone(), b.clone()]);
+        assert_eq!(
+            base,
+            evidence_digest(Some(&target(Some(true))), &[b.clone(), a.clone()]),
+            "field order must not change the digest"
+        );
+        // A disabled button is a different page to approve.
+        assert_ne!(
+            base,
+            evidence_digest(Some(&target(Some(false))), &[a.clone(), b.clone()])
+        );
+        // "we could not look" is not "it is not there".
+        assert_ne!(
+            evidence_digest(Some(&target(None)), &[]),
+            evidence_digest(Some(&target(Some(false))), &[])
+        );
+        // A changed value length moves the digest even when the value is redacted.
+        assert_ne!(
+            base,
+            evidence_digest(
+                Some(&target(Some(true))),
+                &[field("#email", Some(17), false), b.clone()]
+            )
+        );
+        // A vanished field moves it too.
+        assert_ne!(
+            base,
+            evidence_digest(Some(&target(Some(true))), std::slice::from_ref(&a))
+        );
+        // No submit target at all is its own token, not an empty string.
+        assert_ne!(
+            evidence_digest(None, &[]),
+            evidence_digest(Some(&target(None)), &[])
+        );
+    }
+
+    /// A redacted password's PLAINTEXT must never be an input to the digest —
+    /// the digest travels in URLs, logs and approval payloads.
+    #[test]
+    fn digest_never_hashes_a_field_value() {
+        let mut with_value = field("#password", Some(8), true);
+        with_value.value = Some("hunter2!".into());
+        let without = field("#password", Some(8), true);
+        assert_eq!(
+            evidence_digest(None, &[with_value]),
+            evidence_digest(None, &[without]),
+            "the digest is over shape and length, never over the value"
+        );
     }
 }

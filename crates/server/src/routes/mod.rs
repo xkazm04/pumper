@@ -85,6 +85,7 @@ mod retention;
 mod runtime;
 mod schedules;
 mod search;
+pub(crate) mod transactions;
 mod triggers;
 mod watches;
 mod workflows;
@@ -114,6 +115,7 @@ use retention::*;
 use runtime::*;
 use schedules::*;
 use search::*;
+use transactions::*;
 use triggers::*;
 use watches::*;
 use workflows::*;
@@ -140,6 +142,7 @@ use workflows::*;
         (name = "derived", description = "Derived datasets: filter/project/lookup specs recomputed on upstream deltas"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
+        (name = "transactions", description = "Approval ledger for live (irreversible) browser actions"),
         (name = "ingress", description = "Inbound event ingress: signed external webhooks as trigger inputs"),
         (name = "webhooks", description = "Outbound delivery log"),
         (name = "search", description = "Full-text search and saved searches"),
@@ -307,6 +310,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_workflow, delete_workflow))
         .routes(routes!(list_workflow_runs, start_workflow_run))
         .routes(routes!(get_workflow_run, cancel_workflow_run))
+        .routes(routes!(list_transactions))
+        .routes(routes!(get_transaction))
+        .routes(routes!(approve_transaction))
+        .routes(routes!(reject_transaction))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -703,6 +710,10 @@ mod api_spec_tests {
         "POST /workflows/{id}/runs",
         "GET /workflow-runs/{run_id}",
         "DELETE /workflow-runs/{run_id}",
+        "GET /transactions",
+        "GET /transactions/{id}",
+        "POST /transactions/{id}/approve",
+        "POST /transactions/{id}/reject",
         "GET /openapi.json",
     ];
 

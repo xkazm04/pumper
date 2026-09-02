@@ -15,6 +15,13 @@
 //! `fetch_readable` / `deep_research` — sit behind the `[mcp] allow_enqueue`
 //! switch and clamp every job budget to `[mcp] max_job_budget_usd`.
 //!
+//! `approve_transaction` (N01) sits behind a THIRD switch, `[mcp]
+//! allow_approve`, and is additionally inert unless `[transact] allow_live` is
+//! on. It is not folded into `allow_enqueue` because the two authorities are
+//! not the same size: an enqueue spends money a ceiling bounds, while an
+//! approval submits a form on a live site under the operator's logged-in
+//! identity and cannot be undone by anything this process controls.
+//!
 //! **Notifications** (the transport's SSE half) live in [`live`]: `GET /mcp`
 //! opens an SSE stream of JSON-RPC `notifications/pumper/*` messages bridged
 //! read-only from the EventBus (subscribe + replay ring, `Last-Event-ID`
@@ -149,7 +156,7 @@ fn initialize_result(params: &Value) -> Value {
             a terminal status OR on 'waiting', a job asking YOU for input, which you answer \
             with resume_job - or open GET /mcp \
             (SSE, optional ?app=/?kind= filters, Last-Event-ID resume) for live \
-            notifications/pumper/* events. Catalog + app manifests are resources.",
+            notifications/pumper/* events. list_pending_transactions is the approval inbox             for transact runs parked on a human decision; approve_transaction releases one and             is offered ONLY when the operator enabled both [mcp] allow_approve and [transact]             allow_live, because it performs a live, irreversible web action under their             logged-in profile. Catalog + app manifests are resources.",
     })
 }
 
@@ -406,6 +413,56 @@ fn server_tools(state: &AppState) -> Vec<Value> {
             "additionalProperties": false
         }
     }));
+    // N01 Transact v2. `list_pending_transactions` is a READ and rides the same
+    // posture as the other reads — an agent may always see what is waiting on a
+    // human. `approve_transaction` is the only tool on this surface that can
+    // release an irreversible action, so it has its own switch: it is offered
+    // only when the operator set BOTH `[mcp] allow_approve` and
+    // `[transact] allow_live`, because a tool that is offered and then always
+    // refuses is worse than one that was never listed.
+    tools.push(json!({
+        "name": "list_pending_transactions",
+        "description": "List transact transactions awaiting a human decision: the ledger row \
+            (id, idempotency_key, profile, state, evidence_sha, expires_at) plus the operator's \
+            allow_live switch. Read the full evidence bundle a run parked on through \
+            wait_job's input_request, or GET /transactions/{id}. Approving is a SEPARATE tool \
+            the operator must enable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": TRANSACTION_LIMIT_CAP }
+            },
+            "additionalProperties": false
+        }
+    }));
+    if state.config.mcp.allow_approve && state.config.transact.allow_live {
+        tools.push(json!({
+            "name": "approve_transaction",
+            "description": "Approve one pending transaction and let its parked job perform the \
+                irreversible action it staged — a live form submission under the operator's \
+                logged-in profile, which nothing in this process can undo. You MUST quote \
+                evidence_sha, the digest of the bundle you actually read, so an approval cannot \
+                be given for evidence you never saw; a mismatch, an expired request, a \
+                non-pending row or the profile's daily cap is a refusal. The commit re-probes \
+                the live page and refuses again if it drifted. One idempotency key submits at \
+                most once, ever.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["transaction_id", "evidence_sha"],
+                "properties": {
+                    "transaction_id": { "type": "string" },
+                    "evidence_sha": {
+                        "type": "string",
+                        "description": "The evidence digest from the transaction row or the \
+                            job's input_request. Required here even though the HTTP door \
+                            treats it as optional: an agent approving without naming what it \
+                            read is the case this gate exists for."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
     // N15 (appended last, per the wave-2 shared-surface rule). Advertised
     // unconditionally: the token, not a config switch, is what makes it usable,
     // and hiding it would leave the self-hosted subprocess unable to discover
@@ -485,6 +542,19 @@ async fn tools_call(
         "enqueue_job" | "fetch_readable" | "deep_research" | "resume_job" | "run_workflow" => Err(
             "enqueue is disabled on this MCP surface — the operator must set \
              [mcp] allow_enqueue = true"
+                .to_string(),
+        ),
+        // N01, appended last: see `server_tools`.
+        "list_pending_transactions" => tool_list_pending_transactions(state, &args).await,
+        "approve_transaction"
+            if state.config.mcp.allow_approve && state.config.transact.allow_live =>
+        {
+            tool_approve_transaction(state, &args).await
+        }
+        "approve_transaction" => Err(
+            "approving live transactions is disabled on this MCP surface — the operator must \
+             set BOTH [mcp] allow_approve = true and [transact] allow_live = true. Nothing \
+             was submitted."
                 .to_string(),
         ),
         // N15, appended last per the wave-2 shared-surface rule.
@@ -964,6 +1034,132 @@ pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), Stri
 /// check itself or the schedule-shaped wrapper around it
 /// (`scheduler::validate_schedule_params`, which resolves the effective params
 /// first and then calls [`validate_app_params`]).
+/// Max rows `list_pending_transactions` will return.
+const TRANSACTION_LIMIT_CAP: i64 = 200;
+
+/// The `list_pending_transactions` tool (N01): the approval inbox, read-only.
+///
+/// Stale mandates are swept before the listing, exactly as the HTTP door does
+/// it, so an agent is never shown a pending row the approve door would refuse.
+async fn tool_list_pending_transactions(state: &AppState, args: &Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(TRANSACTION_LIMIT_CAP)
+        .clamp(1, TRANSACTION_LIMIT_CAP);
+    let pool = state.storage.pool();
+    pumper_core::transactions::expire_stale(&pool, state.config.transact.approval_ttl_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows = pumper_core::transactions::list(
+        &pool,
+        Some(pumper_core::transactions::TransactionState::Pending),
+        limit,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let transactions: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "transaction_id": r.id,
+                "idempotency_key": r.idempotency_key,
+                "app": r.app,
+                "job_id": r.job_id,
+                "profile": r.profile,
+                "state": r.state,
+                "evidence_sha": r.evidence_sha,
+                "expires_at": state.config.transact.approval_deadline(r.created_at),
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "count": transactions.len(),
+        // The honest half: on a node with `allow_live = false` every one of
+        // these is unapprovable, and an agent that did not know that would keep
+        // trying. Absence of the approve tool says it too; this says it in data.
+        "allow_live": state.config.transact.allow_live,
+        "approve_enabled": state.config.mcp.allow_approve && state.config.transact.allow_live,
+        "transactions": transactions,
+    }))
+}
+
+/// The `approve_transaction` tool (N01): the one tool on this surface that can
+/// release an irreversible action.
+///
+/// It goes through the SAME pure decision function and the same SQL guard as
+/// the HTTP door — not a second implementation of the rules — so an agent and a
+/// human cannot get different answers about a stale approval, and a race
+/// between them cannot submit twice.
+async fn tool_approve_transaction(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "transaction_id")?.to_string();
+    let quoted = require_str(args, "evidence_sha")?.to_string();
+    let pool = state.storage.pool();
+    pumper_core::transactions::expire_stale(&pool, state.config.transact.approval_ttl_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = pumper_core::transactions::get(&pool, &id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no transaction '{id}' (see list_pending_transactions)"))?;
+    let submitted_today = pumper_core::transactions::submitted_since(
+        &pool,
+        row.profile.as_deref(),
+        chrono::Utc::now() - chrono::Duration::hours(24),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    pumper_core::approve_decision(
+        state.config.transact.allow_live,
+        row.state,
+        state.config.transact.approval_deadline(row.created_at),
+        chrono::Utc::now(),
+        &row.evidence_sha,
+        Some(quoted.as_str()),
+        submitted_today,
+        state.config.transact.daily_cap(),
+    )
+    .map_err(|refusal| refusal.message())?;
+    if !pumper_core::transactions::mark_approved(&pool, &row.id, None)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            "the transaction stopped being pending while this approval was being decided \
+             (another approver, or the expiry sweep) — nothing was submitted"
+                .to_string(),
+        );
+    }
+    // Release the parked run. Its authority is the ledger row, not this input.
+    let resumed = match row.job_id.as_ref().and_then(|j| j.parse().ok()) {
+        Some(job_id) => {
+            let input = json!({ "transaction_id": row.id, "evidence_sha": row.evidence_sha });
+            match state.storage.resume(job_id, &input).await {
+                Ok(Some(job)) => {
+                    state.events.emit(crate::events::JobEvent::new(
+                        job.id,
+                        job.app.clone(),
+                        "queued",
+                    ));
+                    state.notify.notify_one();
+                    true
+                }
+                _ => false,
+            }
+        }
+        None => false,
+    };
+    Ok(json!({
+        "transaction_id": row.id,
+        "state": "approved",
+        "job_id": row.job_id,
+        "resumed": resumed,
+        "note": "the parked job was released; it re-probes the live page and submits only if \
+                 it still hashes to the approved evidence. Poll it with wait_job.",
+    }))
+}
+
 #[cfg(test)]
 const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
     // POST /apps/{name}/jobs — 422 with pointer paths.

@@ -50,6 +50,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "source_runs",
     "sources",
     "tier_memory",
+    // N01: the approval ledger behind live browser submissions (0046).
+    "transactions",
     "trigger_runs",
     "triggers",
     "watches",

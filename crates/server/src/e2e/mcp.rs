@@ -182,6 +182,7 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
             "search",
             "wait_job",
             "wait_workflow",
+            "list_pending_transactions",
             "fetch"
         ]
     );
@@ -193,6 +194,24 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     assert_eq!(resp["result"]["isError"], true);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("allow_enqueue"), "{text}");
+
+    // N01: approving a live action is withheld behind its OWN pair of switches,
+    // and `allow_enqueue` does not imply it. A default node refuses and names
+    // both keys rather than leaving an agent to guess which one is missing.
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "approve_transaction",
+            json!({ "transaction_id": "tx", "evidence_sha": "sha" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("allow_approve"), "{text}");
+    assert!(text.contains("allow_live"), "{text}");
+    assert!(text.contains("Nothing was submitted"), "{text}");
 
     // Opted in, the tool appears.
     let (state, _store2) = mcp_state(true).await;
@@ -209,6 +228,13 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
             "{gated} must appear once enqueue is opted in"
         );
     }
+    assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
+    // ...but opting into enqueue still does not offer the approval tool: the
+    // two authorities are not the same size.
+    assert!(
+        !tools.iter().any(|t| t["name"] == "approve_transaction"),
+        "allow_enqueue must not imply the authority to release an irreversible action"
+    );
 }
 
 #[tokio::test]

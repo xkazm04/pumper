@@ -95,7 +95,9 @@ let Some(answer) = ctx.restore_input().cloned() else {
 | `expiry_secs` | `0` | How long a parked job may wait before the sweep fails it. **`0` = wait forever**, which is byte-for-byte the behaviour of a build without this feature. A deadline is opt-in on purpose: the alternative default is a timer that fails approvals nobody got to over a weekend. |
 | `expire_batch` | `100` | Rows one sweep pass will fail before stopping (the sweep piggybacks the scheduler tick). |
 
-**Not in this slice:** no app ships a `waiting` flow yet — `apps/transact` still refuses `submit: true` at the door, and porting it (plus `research`'s clarification loop) is the declared next step. The only consumer today is the `approval` test app in `crates/server/src/e2e/waiting_resume.rs`. A deadline is per-server, not per-park: an app cannot ask for its own expiry window.
+**The first production consumer is `transact`** (N01): a flow enqueued with `submit: true` runs its dry run, stages a `pending` row in the transactions ledger, and parks with the evidence bundle as its `input_request`; `POST /transactions/{id}/approve` is what resumes it. Note the shape that door adds on top of the generic one — the resumed run does **not** treat its `input` as authority. It re-reads the ledger and refuses unless the row itself says `approved`, so a hand-posted `POST /jobs/{id}/resume` cannot release an irreversible action. An app whose resume grants real authority should copy that: the resume payload says *which* decision was made, the durable record says *that* it was. See [apps.md § transact](apps.md#transact-evidence-approval-submit). The other consumer is the `approval` test app in `crates/server/src/e2e/waiting_resume.rs`.
+
+**Not in this slice:** `research`'s clarification loop is not ported. A deadline is per-server, not per-park: an app cannot ask for its own expiry window — which is why `transact` carries its own `[transact] approval_ttl_secs` for the *approval*, separate from `[waiting] expiry_secs` for the *park*.
 
 ## Live progress
 

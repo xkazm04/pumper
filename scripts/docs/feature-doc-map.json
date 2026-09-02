@@ -153,7 +153,9 @@
         "crates/apps/**",
         "crates/engine-wasm/wit/**",
         "crates/engine-wasm/src/app_host.rs",
-        "crates/server/src/registry.rs"
+        "crates/server/src/registry.rs",
+        "crates/core/src/transactions.rs",
+        "crates/server/src/routes/transactions.rs"
       ]
     },
     {
