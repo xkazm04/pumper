@@ -100,11 +100,29 @@ environment is never overwritten. Only the `pumper` binary loads it.
 
 ## Auth posture
 
-**There is no inbound authentication on any route.** No API key, no bearer token,
-no session — the HTTP surface is entirely unauthenticated, and this is a recorded
-design decision (`ONBOARDING.md` §2, `docs/features/runtime.md` "Known gaps").
+**By default there is no inbound authentication on any route** — no API key, no
+bearer token, no session. That default is unchanged and deliberate for a
+local-first node, but it is now a *setting* rather than a fact about the server:
 
-The surface is also **fully mutating**, not read-only. Unauthenticated callers can:
+```toml
+[auth]
+mode = "keys"   # default: "open"
+```
+
+flips on scoped API keys (**principals**) with per-principal spend ceilings,
+request throttles and a durable audit ledger in front of every route except
+`/health`, `/metrics` and `/openapi.json`. `mode = "open"` — the default, and
+what an absent `[auth]` section means — consults no table, reads no header and
+throttles nothing, so a node that never edits its config behaves byte for byte
+as it did before. Full surface, scope vocabulary, refusal codes and
+bootstrapping: **[features/auth.md](features/auth.md)**.
+
+Create the first principal while `mode = "open"`, then flip the key and restart:
+minting a principal requires the `admin` scope, and there is deliberately no
+bootstrap escape hatch.
+
+**Everything below describes `mode = "open"`.** In `open` mode the surface is
+**fully mutating**, not read-only, and unauthenticated callers can:
 
 - enqueue and cancel/reset/retry jobs (`POST /apps/{name}/jobs`, `DELETE /jobs/{id}`,
   `POST /jobs/{id}/reset`, `POST /jobs/retry`) — which means driving the browser
@@ -121,12 +139,14 @@ The surface is also **fully mutating**, not read-only. Unauthenticated callers c
 
 The plugin sandbox (wasmtime fuel budget + memory cap, no ambient authority) bounds
 what a *module* can do; it does not authenticate the *caller* who triggers the
-reload.
+reload — `[auth] mode = "keys"` is what does, and under it `POST /plugins/reload`
+requires the `admin` scope like every other mutation.
 
 Inbound bodies are bounded — **1 MiB on every route, 8 MiB on `POST /extract/preview`**,
 over-limit ⇒ `413` before the handler runs (`docs/features/http-api.md` →
 "Request body limits"). That caps how much memory one unauthenticated request can
-make the process buffer; it is not a substitute for auth or rate limiting.
+make the process buffer; it is not a substitute for auth or rate limiting — for
+those, see [features/auth.md](features/auth.md).
 
 **This is defensible only while the bind stays on loopback.** The entire safety
 argument is `[server] host = "127.0.0.1"` — the network, not the application, is

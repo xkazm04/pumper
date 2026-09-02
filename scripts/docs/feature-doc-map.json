@@ -111,6 +111,13 @@
       ]
     },
     {
+      "doc": "docs/features/auth.md",
+      "sourceGlobs": [
+        "crates/server/src/auth.rs",
+        "crates/server/src/routes/principals.rs"
+      ]
+    },
+    {
       "doc": "docs/features/catalog.md",
       "sourceGlobs": [
         "catalog/**",

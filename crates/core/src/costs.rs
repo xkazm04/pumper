@@ -108,9 +108,16 @@ impl CostLedger {
         cost_usd: f64,
         detail: Option<&str>,
     ) -> Result<()> {
+        // `principal_id` is copied from the job row rather than passed in: the
+        // caller identity is already recorded once, at the enqueue door, and a
+        // second parameter threaded through every metered seam is a second
+        // place for it to be wrong. The subselect yields NULL for an
+        // unattributed job (`open` mode, the scheduler, a trigger hop), which
+        // is the honest answer and exactly what the column means.
         sqlx::query(
-            "INSERT INTO cost_events (job_id, app, engine, url, cost_usd, detail, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO cost_events (job_id, app, engine, url, cost_usd, detail, created_at, \
+             principal_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT principal_id FROM jobs WHERE id = ?1))",
         )
         .bind(job_id.to_string())
         .bind(app)
@@ -171,6 +178,76 @@ impl CostLedger {
                 cost_usd,
             })
             .collect())
+    }
+
+    /// Spend grouped by the **calling principal** (N20), optionally windowed.
+    ///
+    /// Rows with no principal are reported under
+    /// [`UNATTRIBUTED_PRINCIPAL`] rather than dropped or folded into some
+    /// caller: every legacy row, and every row produced in `open` mode or by an
+    /// internal producer (scheduler, trigger hop), genuinely has no caller, and
+    /// a by-principal report whose parts do not sum to the total is a lie about
+    /// where the money went.
+    pub async fn summary_by_principal(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<PrincipalCostSummary>> {
+        let rows: Vec<(Option<String>, i64, f64)> = sqlx::query_as(
+            "SELECT principal_id, COUNT(*), COALESCE(SUM(cost_usd), 0) FROM cost_events \
+             WHERE (?1 IS NULL OR created_at > ?1) \
+             GROUP BY principal_id ORDER BY principal_id",
+        )
+        .bind(since.map(ts))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(principal_id, calls, cost_usd)| PrincipalCostSummary {
+                principal_id,
+                calls,
+                cost_usd,
+            })
+            .collect())
+    }
+
+    /// What one principal has spent since `since` — the per-principal daily
+    /// ceiling check, the direct analogue of [`Self::job_total`].
+    pub async fn principal_total_since(
+        &self,
+        principal_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<f64> {
+        let total: Option<f64> = sqlx::query_scalar(
+            "SELECT SUM(cost_usd) FROM cost_events WHERE principal_id = ?1 AND created_at > ?2",
+        )
+        .bind(principal_id)
+        .bind(ts(since))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total.unwrap_or(0.0))
+    }
+}
+
+/// The label a by-principal report gives spend that carries no caller. Not a
+/// principal id and never confusable with one (no id is empty or contains a
+/// space); rendered so the parts of the report sum to its total.
+pub const UNATTRIBUTED_PRINCIPAL: &str = "(unattributed)";
+
+/// Aggregated spend for one caller.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalCostSummary {
+    /// `None` = no caller recorded; renders as [`UNATTRIBUTED_PRINCIPAL`].
+    pub principal_id: Option<String>,
+    pub calls: i64,
+    pub cost_usd: f64,
+}
+
+impl PrincipalCostSummary {
+    /// The label to show for this row — the id, or the honest placeholder.
+    pub fn label(&self) -> &str {
+        self.principal_id
+            .as_deref()
+            .unwrap_or(UNATTRIBUTED_PRINCIPAL)
     }
 }
 

@@ -56,7 +56,10 @@ pub use app::{
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, KeyFreshness, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
-pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
+pub use costs::{
+    extract_yields, CostEvent, CostLedger, CostSummary, PrincipalCostSummary, SpentTotal,
+    YieldEntry, UNATTRIBUTED_PRINCIPAL,
+};
 #[cfg(feature = "storage")]
 pub use datasets::{
     backfill_cursor, derived_spec_fingerprint, derived_would_cycle, diff_values, filters_match,
@@ -87,10 +90,11 @@ pub use retention::{
 };
 #[cfg(feature = "storage")]
 pub use storage::{
-    CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, IngressSource, JobStages,
-    JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule,
-    NewTrigger, PluginHook, QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize,
-    Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    AuditEntry, CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, IngressSource,
+    JobStages, JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec,
+    NewSchedule, NewTrigger, PluginHook, Principal, QueueAges, RevisionCount, SavedSearch,
+    Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary,
+    LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use store_instrument::{

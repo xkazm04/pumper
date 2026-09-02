@@ -35,6 +35,7 @@ pub struct Config {
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
+    pub auth: AuthConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -1714,6 +1715,73 @@ impl Default for SearchConfig {
     }
 }
 
+/// N20 identity & tenancy: caller principals (scoped API keys) in front of the
+/// HTTP surface.
+///
+/// **Default `open` is byte-for-byte today's behaviour** — the same posture
+/// `[ingress]`, `[remote]` and `[mcp]` already take. In `open` every request
+/// resolves a synthetic `operator` principal with every scope and no ceiling,
+/// nothing is looked up, nothing is throttled, and the `principals`/`audit_log`
+/// tables stay empty. Auth exists only once an operator flips this key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// `"open"` (default) or `"keys"`. An unrecognised value is treated as
+    /// `open` by [`Self::keys_required`] — see the note there for why a typo
+    /// must not fail *open* silently at the parse layer instead.
+    pub mode: String,
+    /// Audit every mutating request (non-GET/HEAD/OPTIONS) into `audit_log`.
+    /// Default ON, and it applies in `open` mode too: "who deleted the dataset"
+    /// is a question a single-operator node also wants answered, and the write
+    /// is one INSERT on a verb that already did real work.
+    pub audit: bool,
+    /// Fallback per-principal throttle (requests/minute, also the burst) used
+    /// when a principal row carries no `rate_limit_per_min` of its own.
+    /// `0` = no fallback throttle.
+    pub default_rate_limit_per_min: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AUTH_MODE_OPEN.to_string(),
+            audit: true,
+            default_rate_limit_per_min: 0,
+        }
+    }
+}
+
+/// The unauthenticated mode: today's behaviour, and the default.
+pub const AUTH_MODE_OPEN: &str = "open";
+/// The authenticated mode: every non-public route resolves a principal.
+pub const AUTH_MODE_KEYS: &str = "keys";
+
+impl AuthConfig {
+    /// Whether a key is required on the non-public surface.
+    ///
+    /// The anti-pattern this defends: `mode != "open"` as the predicate. A typo
+    /// (`mode = "key"`, `mode = "Keys "`) would then have switched the server
+    /// into an enforcing mode nobody asked for and locked the operator out of
+    /// their own node — the mirror-image failure of failing open. Enforcement is
+    /// opt-in by an EXACT match on the one string that means it, case- and
+    /// whitespace-insensitive; anything else is `open`, which is also what an
+    /// absent `[auth]` section means.
+    pub fn keys_required(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case(AUTH_MODE_KEYS)
+    }
+
+    /// The mode as it is reported on the wire (`/health`, audit rows): the
+    /// canonical spelling of what is actually enforced, never the raw string —
+    /// echoing `"Keys "` back would suggest a mode this server does not have.
+    pub fn effective_mode(&self) -> &'static str {
+        if self.keys_required() {
+            AUTH_MODE_KEYS
+        } else {
+            AUTH_MODE_OPEN
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2355,5 +2423,65 @@ mod tests {
         .unwrap();
         cfg.normalize();
         assert_eq!(cfg.browser.proxy.as_deref(), Some("http://browser-gw:9090"));
+    }
+}
+
+#[cfg(test)]
+mod auth_config_tests {
+    use super::{AuthConfig, Config, AUTH_MODE_KEYS, AUTH_MODE_OPEN};
+
+    #[test]
+    fn absent_section_is_open() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.auth.mode, AUTH_MODE_OPEN);
+        assert!(
+            !cfg.auth.keys_required(),
+            "the default must not authenticate"
+        );
+        assert!(cfg.auth.audit);
+        assert_eq!(cfg.auth.default_rate_limit_per_min, 0);
+    }
+
+    #[test]
+    fn keys_mode_is_enforced_case_and_space_insensitively() {
+        for spelling in ["keys", "Keys", " KEYS "] {
+            let cfg = AuthConfig {
+                mode: spelling.to_string(),
+                ..Default::default()
+            };
+            assert!(cfg.keys_required(), "{spelling:?} must enforce");
+            assert_eq!(cfg.effective_mode(), AUTH_MODE_KEYS);
+        }
+    }
+
+    /// A typo must fail OPEN, not into an enforcing mode nobody configured:
+    /// `mode != "open"` as the predicate would have locked the operator out of
+    /// their own node over a one-letter slip.
+    #[test]
+    fn typo_stays_open_not_locked_out() {
+        for typo in ["key", "kesy", "on", "true", ""] {
+            let cfg = AuthConfig {
+                mode: typo.to_string(),
+                ..Default::default()
+            };
+            assert!(!cfg.keys_required(), "{typo:?} must not enforce");
+            assert_eq!(cfg.effective_mode(), AUTH_MODE_OPEN);
+        }
+    }
+
+    #[test]
+    fn section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [auth]
+            mode = "keys"
+            audit = false
+            default_rate_limit_per_min = 120
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.auth.keys_required());
+        assert!(!cfg.auth.audit);
+        assert_eq!(cfg.auth.default_rate_limit_per_min, 120);
     }
 }

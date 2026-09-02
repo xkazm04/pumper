@@ -17,6 +17,7 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Reactive pipelines (triggers) | [triggers.md](triggers.md) | `crates/server/src/triggers.rs`, migration 0014 |
 | Trigger plugins (sandboxed WASM hooks) | [trigger-plugins.md](trigger-plugins.md) | `crates/server/src/triggers.rs`, `crates/engine-wasm/`, `plugins-src/{trigger-gate,delta-slim}/` |
 | HTTP API | [http-api.md](http-api.md) | `crates/server/src/routes/` |
+| Identity & tenancy (scoped API keys) | [auth.md](auth.md) | `crates/server/src/auth.rs`, `crates/server/src/routes/principals.rs`, migration 0041 |
 | Observability (logging, error reporting, metrics) | [observability.md](observability.md) | `crates/server/src/main.rs`, `crates/server/src/routes/health.rs` |
 | Data-source catalog | [catalog.md](catalog.md) | `catalog/`, `crates/core/src/catalog.rs` |
 | DataHub metadata emitter | [datahub.md](datahub.md) | `crates/server/src/datahub.rs` |

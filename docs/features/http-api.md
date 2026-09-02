@@ -1,6 +1,6 @@
 # HTTP API
 
-Axum server (default port 8088, `[server]` config). **Local power mode: no auth** — any process that can reach the loopback listener may call it (API-key auth is a parked decision). CORS is **off by default**; a browser UI opts in by listing its exact origin in `[server] cors_allowed_origins` (see [../deployment.md](../deployment.md#cors)). Every route carries a request-body ceiling — see [Request body limits](#request-body-limits).
+Axum server (default port 8088, `[server]` config). **Local power mode: no auth by default** — any process that can reach the loopback listener may call it. That is now a *setting*, not a fact: `[auth] mode = "keys"` puts scoped API keys, per-principal spend ceilings, throttles and an audit ledger in front of every route except `/health`, `/metrics` and `/openapi.json`. The default stays `open`, which behaves byte for byte as before — see [auth.md](auth.md). CORS is **off by default**; a browser UI opts in by listing its exact origin in `[server] cors_allowed_origins` (see [../deployment.md](../deployment.md#cors)). Every route carries a request-body ceiling — see [Request body limits](#request-body-limits).
 
 **Canonical machine-readable surface: `GET /openapi.json`** — a generated OpenAPI 3.1 document covering every route below, with typed request bodies and query params (response bodies are described inline; the ad-hoc JSON envelopes are documented in prose per endpoint). The spec and the router are generated from the same source (`utoipa` `#[utoipa::path]` annotations + `OpenApiRouter`), so a route cannot be added without appearing in the spec; a path-coverage test fails CI if the two ever diverge. Use it for client codegen and CLI agents; the table below is the human summary.
 
@@ -9,14 +9,14 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth*
 | status | `code` | meaning |
 | --- | --- | --- |
 | 400 | `bad_request` | validation — a malformed query, filter, rule, id, or an unusable `profile` |
-| 401 | `unauthorized` | missing/wrong signature on `POST /ingest/{id}` |
-| 402 | `budget_exhausted` | the job's `budget_usd` ceiling is already reached. **Deterministic** — retrying re-reads the same ledger and refuses again |
-| 403 | `forbidden` | the ingress source exists but is disabled |
+| 401 | `unauthorized` | missing/wrong signature on `POST /ingest/{id}`; or, with `[auth] mode = "keys"`, a missing or unknown API key |
+| 402 | `budget_exhausted` | the job's `budget_usd` ceiling, or a principal's `budget_usd_per_day`, is already reached. **Deterministic** — retrying re-reads the same ledger and refuses again |
+| 403 | `forbidden` | the ingress source exists but is disabled; or an API key that is disabled or lacks the route's scope |
 | 404 | `not_found` | no such job/dataset/record/source |
 | 409 | `conflict` | wrong state for the operation (a terminal job, a disabled subsystem, a cassette that cannot serve a replay) |
 | 413 | `too_large` | body over a documented per-route ceiling |
 | 422 | `unprocessable` | understood and deliberately refused (e.g. a transact flow this slice will not run) |
-| 429 | `rate_limited` | per-source ingress rate limit — back off and re-send |
+| 429 | `rate_limited` | per-source ingress rate limit, or a principal's token bucket — back off and re-send |
 | 500 | `internal` | an unexpected failure in this service |
 | 502 | `bad_gateway` | an upstream/engine failure (HTTP, browser, Claude) — **and schema drift** (`Error::SourceDrift`): a source whose response no longer parses is somebody else's failure, so the pre-write refusal that protects the corpus is reported as one rather than as an internal error. See [runtime.md](runtime.md) for why it is also *terminal* for the job |
 | 503 | `unavailable` | the subsystem is switched off in config — e.g. the five source-health routes with `[resilience] enabled = false` |
@@ -65,6 +65,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Provisioner proposals | `GET /provisioner/proposals?limit=&cursor=` (backlog of what `provisioner` compiled; see below) · `POST /provisioner/proposals/{key}/validate` (re-checks against a FRESH fetch) · `POST /provisioner/proposals/{key}/promote` (renders the paste-ready TOML fragment; writes nothing to the catalog file) |
 | Store integrity | `GET /datasets/doctor?skip_artifacts=` (**read-only** audit; `findings` empty on a healthy store, each with its remediation — see [datasets.md § `datasets doctor`](datasets.md). Full scans; on-demand only) |
 | Retention | `GET /retention/preview?days=` (**read-only dry run**: the artifact tree split into four classes that partition it exactly — `reclaimable`/`pinned`/`cassette`/`within_window`, files and bytes, per app and in total — plus ledger row counts and the configured windows. Deletes nothing. See [datasets.md § Retention](datasets.md)) |
+| Principals | `GET /principals` (`{count, mode, caller, principals}`; key digests are never listed) · `POST /principals` (`{name, scopes[], budget_usd_per_day?, rate_limit_per_min?}` ⇒ `{principal, key}` — **the key is shown once**; unknown scope → 400, non-positive `budget_usd_per_day` → 422) · `POST /principals/{id}/disable` · `POST /principals/{id}/rotate` (the new key, shown once; the old one stops working immediately) · `GET /principals/costs?since=` (`{total_usd, by_principal}`; unattributed spend is reported as `(unattributed)`, never dropped) · `GET /audit?principal=&cursor=&limit=` (`{items, next_cursor}`, newest first). All require the `admin` scope. See [auth.md](auth.md) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 
 ## Shutdown behaviour (what a client sees on Ctrl-C / `systemctl stop`)
