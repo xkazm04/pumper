@@ -47,6 +47,9 @@ pub mod resilience;
 pub mod retention;
 pub mod search;
 pub mod simhash;
+// N01 Transact v2: the approval ledger behind live browser submissions.
+#[cfg(feature = "storage")]
+pub mod transactions;
 
 #[cfg(feature = "storage")]
 pub use app::{
@@ -156,3 +159,8 @@ pub use search::{
     SearchRequest, SearchResponse, SearchSort,
 };
 pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
+#[cfg(feature = "storage")]
+pub use transactions::{
+    approve_decision, commit_guard, evidence_digest, reject_decision, ApprovalRefusal,
+    CommitRefusal, NewTransaction, Transaction, TransactionState,
+};

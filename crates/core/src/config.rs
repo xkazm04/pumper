@@ -38,6 +38,8 @@ pub struct Config {
     pub auth: AuthConfig,
     pub waiting: WaitingConfig,
     pub wasm_apps: WasmAppsConfig,
+    /// N01 Transact v2: the live-submission gate. Default OFF.
+    pub transact: TransactConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -229,6 +231,17 @@ pub struct McpConfig {
     /// is clamped, an absent one defaults to this. Bounds how long one MCP
     /// tool call may hold its HTTP response open awaiting a terminal status.
     pub wait_job_max_secs: u64,
+    /// Whether the `approve_transaction` tool is offered (N01). `false`
+    /// (default) = an agent can LIST pending transactions but can never
+    /// release an irreversible action.
+    ///
+    /// A third switch rather than a reuse of `allow_enqueue`, because the two
+    /// authorities are not the same size: enqueueing a job spends money that
+    /// `max_job_budget_usd` bounds, while approving a transaction submits a
+    /// form on a live site under an operator's logged-in identity and cannot
+    /// be undone by anything this process controls. `[transact] allow_live`
+    /// still gates the action itself, so this tool is inert unless BOTH are on.
+    pub allow_approve: bool,
 }
 
 impl Default for McpConfig {
@@ -238,6 +251,7 @@ impl Default for McpConfig {
             allow_enqueue: false,
             max_job_budget_usd: 1.0,
             wait_job_max_secs: 60,
+            allow_approve: false,
         }
     }
 }
@@ -2690,5 +2704,68 @@ impl WasmAppsConfig {
     /// a zero here means "not configured", not "yield constantly".
     pub fn yield_interval_or_none(&self) -> Option<u64> {
         (self.yield_interval > 0).then_some(self.yield_interval)
+    }
+}
+
+/// Live (irreversible) browser submissions — N01 Transact v2.
+///
+/// `allow_live = false` is the default and means the node behaves like a build
+/// without this section: a `transact` job with `submit: true` still runs the
+/// dry run and still writes its `pending` ledger row (so an operator can see
+/// exactly what would be queued for approval), but
+/// `POST /transactions/{id}/approve` answers 409 and no code path can reach a
+/// real submit button. Turning it on is an operator decision about an action
+/// that no part of this process can undo, which is why it is a switch and not
+/// a parameter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TransactConfig {
+    /// Master switch. `false` (default) = every approval is refused (409) and
+    /// nothing can ever move a ledger row to `submitted`.
+    pub allow_live: bool,
+    /// How long a `pending` transaction may wait for a decision before the
+    /// sweep expires it. `0` = never expires.
+    ///
+    /// Non-zero by default, unlike `[waiting] expiry_secs`: the two deadlines
+    /// guard different things. A parked job waiting forever costs nothing; an
+    /// approval waiting forever is a *stale mandate* — evidence describing a
+    /// page as it was days ago, still one click from acting. 24h is long
+    /// enough for a human working day and short enough that a forgotten
+    /// request dies instead of lurking.
+    pub approval_ttl_secs: u64,
+    /// Max transactions ONE profile may submit per rolling 24 hours. `0` = no
+    /// cap. The blast radius of a compromised approval path is bounded per
+    /// identity, because a profile is what a submission acts as.
+    pub max_submits_per_profile_per_day: i64,
+    /// Rows `GET /transactions` returns at most.
+    pub list_limit: i64,
+}
+
+impl Default for TransactConfig {
+    fn default() -> Self {
+        Self {
+            allow_live: false,
+            approval_ttl_secs: 24 * 60 * 60,
+            max_submits_per_profile_per_day: 10,
+            list_limit: 100,
+        }
+    }
+}
+
+impl TransactConfig {
+    /// The approval deadline for a transaction staged `now`, or `None` when
+    /// `approval_ttl_secs = 0` (never expires).
+    pub fn approval_deadline(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        (self.approval_ttl_secs > 0)
+            .then(|| now + chrono::Duration::seconds(self.approval_ttl_secs as i64))
+    }
+
+    /// The per-profile daily cap as the ledger's decision function wants it:
+    /// `None` for "no cap".
+    pub fn daily_cap(&self) -> Option<i64> {
+        (self.max_submits_per_profile_per_day > 0).then_some(self.max_submits_per_profile_per_day)
     }
 }
