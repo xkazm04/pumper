@@ -308,6 +308,28 @@ impl Storage {
     /// Enqueues a job; when `opts.idempotency_key` matches an existing job, the
     /// original is returned instead. The bool reports whether a job was created.
     pub async fn enqueue_dedup(&self, app: &str, opts: EnqueueOptions) -> Result<(Job, bool)> {
+        self.enqueue_dedup_as(app, opts, None).await
+    }
+
+    /// [`Self::enqueue_dedup`] stamping the **calling principal** (N20) onto the
+    /// job row, so the cost ledger can answer "who spent this".
+    ///
+    /// A separate entry point rather than a field on [`EnqueueOptions`]: the
+    /// caller is a fact about the *request*, not about the work, and every
+    /// internal producer of jobs (the scheduler tick, a trigger hop, a retry)
+    /// genuinely has no principal. `None` is therefore the honest answer on
+    /// those paths, not a defaulted one, and the column stays NULL — which is
+    /// exactly what "unattributed" means everywhere it is read.
+    ///
+    /// An idempotency **replay does not re-stamp**: the returned job is the
+    /// original, and re-attributing it to whoever replayed the request would
+    /// rewrite the bill for work someone else already owns.
+    pub async fn enqueue_dedup_as(
+        &self,
+        app: &str,
+        opts: EnqueueOptions,
+        principal_id: Option<&str>,
+    ) -> Result<(Job, bool)> {
         if let Some(key) = &opts.idempotency_key {
             if let Some(existing) = self.get_by_idempotency_key(key).await? {
                 return Ok((existing, false));
@@ -332,8 +354,9 @@ impl Storage {
                 let r = sqlx::query(
                     "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
                      callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-                     trigger_id, source_job_id, created_at, available_at) \
-                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     trigger_id, source_job_id, created_at, available_at, principal_id) \
+                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                     ?14, ?15)",
                 )
                 .bind(id.to_string())
                 .bind(app)
@@ -349,6 +372,7 @@ impl Storage {
                 .bind(src)
                 .bind(ts(created))
                 .bind(ts(available))
+                .bind(principal_id)
                 .execute(&mut *conn)
                 .await?;
                 let rows = r.rows_affected();
@@ -2339,6 +2363,139 @@ impl Storage {
         .await?)
     }
 
+    // ── principals & audit (N20) ─────────────────────────────
+    // Caller identities for the HTTP surface. Inert in `[auth] mode = "open"`:
+    // nothing here is consulted and the tables stay empty.
+
+    /// Creates a principal. `key_hash` is the SHA-256 hex digest of the key —
+    /// the key itself is never handed to this layer, so it cannot be stored by
+    /// accident and cannot be re-read out of the row later.
+    pub async fn create_principal(
+        &self,
+        name: &str,
+        key_hash: &str,
+        scopes: &[String],
+        budget_usd_per_day: Option<f64>,
+        rate_limit_per_min: Option<i64>,
+    ) -> Result<Principal> {
+        let id = Uuid::new_v4().to_string();
+        let scopes_json = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO principals (id, name, key_hash, scopes, budget_usd_per_day, \
+             rate_limit_per_min, enabled, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(key_hash)
+        .bind(scopes_json)
+        .bind(budget_usd_per_day)
+        .bind(rate_limit_per_min)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_principal(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_principal(&self, id: &str) -> Result<Option<Principal>> {
+        let row: Option<PrincipalRow> = sqlx::query_as(&format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals WHERE id = ?1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Principal::try_from).transpose()
+    }
+
+    /// Resolves a presented key by its digest. The lookup is on the indexed
+    /// `key_hash` column, so no plaintext key is ever compared and the query
+    /// shape does not vary with how much of a wrong key matched.
+    pub async fn principal_by_key_hash(&self, key_hash: &str) -> Result<Option<Principal>> {
+        let row: Option<PrincipalRow> = sqlx::query_as(&format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals WHERE key_hash = ?1"
+        ))
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Principal::try_from).transpose()
+    }
+
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        let rows: Vec<PrincipalRow> = sqlx::query_as(&format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals ORDER BY created_at"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Principal::try_from).collect()
+    }
+
+    pub async fn set_principal_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE principals SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Points a principal at a new key digest. The OLD digest is overwritten,
+    /// not kept alongside: a rotation that left the previous key working would
+    /// be a no-op dressed as a revocation.
+    pub async fn rotate_principal_key(&self, id: &str, key_hash: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE principals SET key_hash = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(key_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Appends one audit row. `principal_id` is NULL for a request refused
+    /// before any identity was established — never back-filled with a guess
+    /// about who it might have been.
+    pub async fn record_audit(
+        &self,
+        principal_id: Option<&str>,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO audit_log (principal_id, action, target, at, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(principal_id)
+        .bind(action)
+        .bind(target)
+        .bind(now())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One page of the audit ledger, newest first, keyset-paged on the
+    /// monotonic row id (`after_id` = the last id seen).
+    pub async fn list_audit(
+        &self,
+        principal_id: Option<&str>,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<AuditEntry>> {
+        let rows: Vec<AuditRow> = sqlx::query_as(
+            "SELECT id, principal_id, action, target, at, detail FROM audit_log \
+             WHERE (?1 IS NULL OR principal_id = ?1) AND (?2 IS NULL OR id < ?2) \
+             ORDER BY id DESC LIMIT ?3",
+        )
+        .bind(principal_id)
+        .bind(after_id)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(AuditEntry::try_from).collect()
+    }
+
     // ── ingress ──────────────────────────────────────────────────────────────
     // Inbound event ingress sources: per-caller credentials for POST /ingest/{id}.
 
@@ -3712,6 +3869,104 @@ impl TryFrom<ScheduleRow> for Schedule {
             last_skipped_at: r.last_skipped_at.as_deref().map(parse_ts).transpose()?,
             skipped_count: r.skipped_count,
             created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// The columns [`Principal`] is built from. One list, so a new column cannot be
+/// added to one query and forgotten in the other three.
+const PRINCIPAL_COLUMNS: &str =
+    "id, name, key_hash, scopes, budget_usd_per_day, rate_limit_per_min, enabled, created_at";
+
+/// A caller identity for the HTTP surface (N20): a scoped API key with an
+/// optional daily spend ceiling and an optional request throttle.
+///
+/// The key digest is `skip_serializing` for the same reason
+/// [`IngressSource::secret`] is: the plaintext key is shown exactly once, at
+/// creation or rotation, and nothing about it is ever listed again.
+#[derive(Debug, Clone, Serialize)]
+pub struct Principal {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub key_hash: String,
+    /// `"read"` | `"enqueue:<app>"` | `"enqueue:*"` | `"admin"`.
+    pub scopes: Vec<String>,
+    /// `None` = no ceiling, matching what an omitted `budget_usd` means at every
+    /// other door.
+    pub budget_usd_per_day: Option<f64>,
+    /// `None` = no per-principal throttle beyond the configured fallback.
+    pub rate_limit_per_min: Option<i64>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PrincipalRow {
+    id: String,
+    name: String,
+    key_hash: String,
+    scopes: String,
+    budget_usd_per_day: Option<f64>,
+    rate_limit_per_min: Option<i64>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<PrincipalRow> for Principal {
+    type Error = Error;
+
+    fn try_from(r: PrincipalRow) -> Result<Principal> {
+        Ok(Principal {
+            id: r.id,
+            name: r.name,
+            key_hash: r.key_hash,
+            // A row whose scopes JSON is unreadable grants NOTHING. Defaulting
+            // to a permissive set on a parse failure is how a corrupt row
+            // becomes an admin key.
+            scopes: serde_json::from_str(&r.scopes).unwrap_or_default(),
+            budget_usd_per_day: r.budget_usd_per_day,
+            rate_limit_per_min: r.rate_limit_per_min,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// One row of the durable audit ledger: which principal did what, to what, when.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    /// `None` when the request never resolved an identity.
+    pub principal_id: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub at: DateTime<Utc>,
+    /// Free-form JSON string as recorded; never parsed by this layer.
+    pub detail: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    id: i64,
+    principal_id: Option<String>,
+    action: String,
+    target: Option<String>,
+    at: String,
+    detail: Option<String>,
+}
+
+impl TryFrom<AuditRow> for AuditEntry {
+    type Error = Error;
+
+    fn try_from(r: AuditRow) -> Result<AuditEntry> {
+        Ok(AuditEntry {
+            id: r.id,
+            principal_id: r.principal_id,
+            action: r.action,
+            target: r.target,
+            at: parse_ts(&r.at)?,
+            detail: r.detail,
         })
     }
 }
