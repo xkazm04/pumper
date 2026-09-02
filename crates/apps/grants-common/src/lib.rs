@@ -17,6 +17,8 @@ use pumper_core::resilience::{write_dataset, SourceState};
 use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
 use serde_json::{json, Value};
 
+pub mod programs;
+
 /// Derivation stamp (M12) for a cross-source write. `job_id` is the one fact
 /// the runtime always knows; `source_url` is passed ONLY where the whole batch
 /// genuinely came from that one endpoint (a source app's listing URL). Derived
@@ -29,6 +31,39 @@ fn stamp(ctx: &AppContext, source_url: Option<&str>) -> Provenance {
         source_url: source_url.map(str::to_string),
         ..Provenance::default()
     }
+}
+
+/// The ONE way this crate writes `grants/unified` (or its `@q` shadow).
+///
+/// Every unified write goes through here for two reasons that must not drift
+/// apart: each row is stamped with its [`programs::program_key`] so
+/// `GET /grants?program=` can filter in SQL, and that field is declared
+/// **derived** so the stamp is excluded from change detection.
+///
+/// Both halves are load-bearing at EVERY site. A write that stamped but did not
+/// declare would mint a `changed` revision for the whole corpus (watches,
+/// triggers, webhooks, the yield ledger) the first time it ran, and one that
+/// declared but did not stamp would silently strip the stamp from every row it
+/// touched — the source apps re-list rows daily, so `program=` would go blank
+/// for that source until the next corpus pass.
+async fn write_unified(
+    ctx: &AppContext,
+    dataset: &str,
+    items: &[(String, Value)],
+    trust: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<UpsertSummary> {
+    let stamped = programs::stamp_program_keys(items);
+    ctx.datasets
+        .upsert_many_derived(
+            UNIFIED_APP,
+            dataset,
+            &stamped,
+            trust,
+            Some(&stamp(ctx, source_url)),
+            &programs::derived_paths(),
+        )
+        .await
 }
 
 /// Virtual app namespace holding the cross-source datasets.
@@ -142,6 +177,10 @@ pub struct UnifiedOutcome {
     /// Annual-cycle links written to `grants/recurrence_links`, or `None` when
     /// this run did not own the corpus pass.
     pub recurrences: Option<usize>,
+    /// The `grants/programs` rollup this run produced, or `None` when it did not
+    /// own the corpus pass — the same "we did not look" vs "there were none"
+    /// distinction the two link counts draw.
+    pub programs: Option<programs::ProgramRollup>,
     /// Whether this run owned (and therefore ran) this cycle's corpus-wide pass.
     pub corpus_pass: bool,
     /// The sync cycle this run belongs to (see [`corpus_cycle`]).
@@ -199,6 +238,10 @@ impl UnifiedOutcome {
                 "cycle": self.cycle,
                 "batchSwept": self.batch_swept,
                 "corpusSwept": self.corpus_swept,
+                // The program registry the pass materialized — `null` (not a
+                // zeroed block) on a run that did not own the pass, for the same
+                // reason `corpusSwept` is.
+                "programs": self.programs.as_ref().map(|p| p.block()),
             }),
         );
         // Per-opportunity search docs come from the unified dataset (compact
@@ -206,10 +249,15 @@ impl UnifiedOutcome {
         // Withheld entirely when the source's health says so: the worker's own
         // gate on ("grants","unified") can never fire (see `indexable`).
         if indexable(self.state) {
-            map.insert(
-                "index_datasets".into(),
-                json!([{ "app": UNIFIED_APP, "dataset": self.dataset }]),
-            );
+            let mut specs = vec![json!({ "app": UNIFIED_APP, "dataset": self.dataset })];
+            // The program registry is indexed by the run that WROTE it and only
+            // then: `dataset_search_docs` reads the revisions this job produced,
+            // so naming `grants/programs` on a run that did not own the corpus
+            // pass would index an empty window and claim coverage it has not got.
+            if self.programs.is_some() {
+                specs.push(json!({ "app": UNIFIED_APP, "dataset": programs::PROGRAMS_DATASET }));
+            }
+            map.insert("index_datasets".into(), Value::Array(specs));
         }
     }
 }
@@ -320,14 +368,22 @@ pub async fn finalize_unified(
     // corrections into a shadow dataset it did not read from.
     let cycle = corpus_cycle(now);
     let corpus_pass = claim_corpus_pass(ctx, &cycle).await?;
-    let (corpus_swept, cross_source_dups, recurrences) = if corpus_pass {
+    let (corpus_swept, cross_source_dups, recurrences, program_rollup) = if corpus_pass {
         let swept = sweep_closed(ctx).await?;
         let (dups, recurrences) = link_relations(ctx, DUP_DISTANCE).await?;
-        (Some(swept), Some(dups), Some(recurrences))
+        // The program registry is folded LAST, from what the two passes above
+        // have just settled: `sweep_closed` decides which postings are still
+        // live, and `link_relations` is the corroboration the rollup reports
+        // beside its own projection.
+        let rollup = programs::roll_up_programs(ctx).await?;
+        (Some(swept), Some(dups), Some(recurrences), Some(rollup))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
-    let warnings = drift_warnings(unified_items);
+    let mut warnings = drift_warnings(unified_items);
+    if let Some(rollup) = &program_rollup {
+        warnings.extend(rollup.warnings.iter().cloned());
+    }
     Ok(UnifiedOutcome {
         unified,
         swept: batch_swept + corpus_swept.unwrap_or(0),
@@ -335,6 +391,7 @@ pub async fn finalize_unified(
         corpus_swept,
         cross_source_dups,
         recurrences,
+        programs: program_rollup,
         corpus_pass,
         cycle,
         warnings,
@@ -631,15 +688,7 @@ pub async fn sync_unified(
             "grants/unified contribution gated on source health"
         );
     }
-    ctx.datasets
-        .upsert_many_stamped(
-            UNIFIED_APP,
-            &dataset,
-            items,
-            trust,
-            Some(&stamp(ctx, source_url)),
-        )
-        .await
+    write_unified(ctx, &dataset, items, trust, source_url).await
 }
 
 /// The award amounts a stored `grants/opportunity_details` record carries, as
@@ -1055,15 +1104,7 @@ async fn sweep_batch(
     }
     // An inferred closure, not a source publish: no source_url is honest here.
     // The trust stamp is the contribution's, because these ARE this run's rows.
-    ctx.datasets
-        .upsert_many_stamped(
-            UNIFIED_APP,
-            dataset,
-            &updates,
-            trust,
-            Some(&stamp(ctx, None)),
-        )
-        .await?;
+    write_unified(ctx, dataset, &updates, trust, None).await?;
     Ok(updates.len())
 }
 
@@ -1114,15 +1155,7 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     }
     if !updates.is_empty() {
         // An inferred closure, not a source publish: no source_url is honest here.
-        ctx.datasets
-            .upsert_many_stamped(
-                UNIFIED_APP,
-                UNIFIED_DATASET,
-                &updates,
-                None,
-                Some(&stamp(ctx, None)),
-            )
-            .await?;
+        write_unified(ctx, UNIFIED_DATASET, &updates, None, None).await?;
     }
     Ok(updates.len())
 }
@@ -2945,6 +2978,7 @@ mod tests {
                 corpus_swept: Some(0),
                 cross_source_dups: Some(0),
                 recurrences: Some(0),
+                programs: Some(programs::ProgramRollup::default()),
                 corpus_pass: true,
                 cycle: "2026-08-04".to_string(),
                 warnings: vec![],
@@ -2958,9 +2992,25 @@ mod tests {
         outcome(SourceState::Healthy).merge_into(&mut healthy);
         assert_eq!(
             healthy["index_datasets"],
-            json!([{ "app": "grants", "dataset": "unified" }])
+            json!([
+                { "app": "grants", "dataset": "unified" },
+                { "app": "grants", "dataset": "programs" }
+            ])
         );
         assert_eq!(healthy["unified"]["trust"], "stable");
+
+        // A run that did not own the corpus pass wrote no program rows, so it
+        // must not name the dataset: `dataset_search_docs` indexes THIS job's
+        // revision window, and naming it would report coverage of an empty one.
+        let mut passenger = json!({});
+        let mut solo = outcome(SourceState::Healthy);
+        solo.programs = None;
+        solo.merge_into(&mut passenger);
+        assert_eq!(
+            passenger["index_datasets"],
+            json!([{ "app": "grants", "dataset": "unified" }])
+        );
+        assert_eq!(passenger["corpusPass"]["programs"], Value::Null);
 
         let mut quarantined = json!({});
         outcome(SourceState::Quarantined).merge_into(&mut quarantined);

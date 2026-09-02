@@ -121,7 +121,8 @@ impl ScrapeApp for EuSedia {
                  changed, unchanged, historyJoined, sweep, truncated, \
                  unifiedDropped, unified: {new, changed, events}, \
                  swept, crossSourceDups, recurrenceLinks, \
-                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept, \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, \
                  warnings[], index_datasets[]} — `sweep` names how the walk ended \
                  (complete|capped|short_page|unknown_total: swept the corpus, hit maxPages, \
                  the source served a short page, or it published no usable `totalResults` to \
@@ -130,7 +131,9 @@ impl ScrapeApp for EuSedia {
                  corpus-wide relation pass (sweep + \
                  duplicate/recurrence links) runs once per UTC-day cycle on whichever grant \
                  source gets there first, so a run that did not own it reports \
-                 `crossSourceDups`/`recurrenceLinks` as null (not 0) — normalized topics in \
+                 `crossSourceDups`/`recurrenceLinks` and `corpusPass.programs` as null (not 0), \
+                 the last being the `grants/programs` registry that pass materialized (one row \
+                 per funding PROGRAM, N29) — normalized topics in \
                  the `opportunities` dataset (keyed by topic identifier), Horizon topics \
                  carrying a `history` block joined from cordis/topic_stats \
                  (`{family, source, as_of, stats}`, where `stats.coverage` says how much of \

@@ -847,3 +847,49 @@ status = "live"
 confidence = 3
 dataset = "sources"
 notes = "N25. One record per cited URL, keyed by the URL. Revisions always stamp source_url; artifact_sha ONLY when snapshot_sources actually archived the body as source-N.md, so an unarchived citation never claims to be re-derivable. Capped per run by [research] max_watched_sources (default 20) — the same cap bounds the record write, the snapshot fetch and the proposed watch, and a run that cites more reports sources_truncated. watch_sources emits POST /schedules bodies; the app creates no schedules itself. See docs/features/apps.md #research-a-living-knowledge-base."
+
+# `grants/programs` (N29) — the funding PROGRAM as an entity, not the posting.
+#
+# `app` is the VIRTUAL NAMESPACE, for the same reason `grants-opportunity-details`
+# above is: the rollup writes ("grants", "programs"), and both consumers key on
+# that pair — `enforce_contracts` (worker.rs) reads it off each revision, and
+# /catalog/health reads `datasets.list(s.app, s.dataset)`. Filing it under any
+# one of the three source apps would compile and be a lie.
+#
+# `cron` MUST stay empty: `Catalog::reconcile` derives desired schedules from
+# `Source::is_scheduled()`, and there is no app called `grants` to schedule. The
+# rollup rides the once-per-cycle corpus pass, claimed by whichever grant source
+# reaches `finalize_unified` first that UTC day, so `max_staleness_hours` is what
+# actually holds it to a daily cadence.
+#
+# `max_row_delta_pct` IS declared here (unlike the two upsert-only grants rows,
+# and like `cordis-topic-stats`): the rollup writes with removal detection when
+# the corpus read is complete, so a mass tombstone is reachable and the tripwire
+# can genuinely fire.
+[[source]]
+id = "grants-programs"
+app = "grants"
+market = "us"
+name = "Cross-source funding-program registry (rollup of grants/unified)"
+url = "derived from grants/unified + grants/recurrence_links + grants/events + cordis/topic_stats"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "programs"
+notes = "N29. One record per funding program, keyed `aln:<listing set>` | `family:<Horizon topic lineage>` | `<agency>|<program title>` — precision over recall, so two programs with the same stripped title and different ALNs stay distinct and a row that names neither is left out rather than bucketed. Recomputed over the WHOLE live unified corpus by whichever grant source owns that UTC day's corpus pass, after link_relations. Carries the recurrence projection (period_days, next_expected_open/close, prediction_basis — null unless the program's own dated cycles support one), amendment behaviour from grants/events (deadline_extended_count, closed_early_count, extension_rate — null when the events read was windowed), last_award_ceiling, and Horizon win_history joined from cordis/topic_stats. Removal detection runs only when the corpus read did not come back at its cap; a windowed read upserts and warns instead of tombstoning programs it never looked at. `program_key` is also stamped onto every unified row as a DerivedPath, so GET /grants?program= filters in SQL without a program change reading as a source publication. Queryable at GET /grants/programs."
+
+# `cycles_observed` is required alongside the key because a program row without
+# it is a claim about a program with no evidence attached — the count of postings
+# is what every other number on the row rests on.
+[source.contract]
+required_fields = ["program_key", "cycles_observed"]
+max_row_delta_pct = 10.0
+max_staleness_hours = 48
+
+[source.contract.types]
+program_key = "string"
+cycles_observed = "number"

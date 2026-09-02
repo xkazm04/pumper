@@ -312,6 +312,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(search_status))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
+        .routes(routes!(list_programs))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
         .routes(routes!(catalog_reconcile, catalog_reconcile_apply))
@@ -712,6 +713,7 @@ mod api_spec_tests {
         "POST /extract/preview",
         "GET /grants",
         "GET /grants/closing-soon",
+        "GET /grants/programs",
         "GET /catalog/sources",
         "GET /catalog/health",
         "GET /catalog/reconcile",
