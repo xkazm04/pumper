@@ -254,6 +254,15 @@ Full usage in [`clients/cli/README.md`](../../clients/cli/README.md).
   `EventSource` of its own.
 - **No push half.** `POST /subscriptions` (the server pushing at a sink) has no
   SDK wrapper; `subscribe` is the pull side only.
+- **There is no `GET /datasets/{app}/{ds}/stream`, and there is not going to
+  be.** The consumer-plane design originally paired the typed spec with a
+  resumable SSE feed of dataset revisions. N05 shipped the durable event log
+  first, and it answers the same question better: `dataset.changed` is a kind on
+  `GET /events/log`, the cursor is a row number that survives a restart rather
+  than a ring position that does not, and both SDKs already walk it with
+  `subscribe(cursor)`. A second resumable feed over the same revisions would be
+  a second cursor to keep honest for no new capability. Sub-second latency is
+  what `GET /events` (SSE) is for.
 - **No Rust client crate.** TypeScript, Python and the CLI generate off the
   document; a Rust twin would too, but the server's own types are already in the
   workspace, so it would serve an external consumer only.
