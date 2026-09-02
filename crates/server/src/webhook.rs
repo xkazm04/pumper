@@ -149,71 +149,66 @@ pub async fn dispatch(state: &AppState, job: Job) {
     dispatch_event(state, "job", &id, &url, "job.terminal", &job, secret).await;
 }
 
-/// Queues a best-effort, logged delivery of a `dataset.changed` event through
-/// the watch's configured sink. Body shaping happens here (once, so the logged
-/// body is exactly what the DLQ drain re-sends); transport branching happens
-/// in [`deliver`].
-pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json::Value) {
-    match watch.sink.as_str() {
-        "file" => {
-            // The pseudo-URL names the file from the watch id ONLY — never
-            // user input — and the transport re-validates it before writing.
-            let url = file_sink_url(&watch.id);
-            dispatch_event(
-                state,
-                "change",
-                &watch.id,
-                &url,
-                "dataset.changed",
-                &payload,
-                None,
-            )
-            .await;
-        }
+/// Where one delivery goes and what it carries, for a given sink.
+///
+/// Returns `(url, secret, body)`. The **one** transport-shaping switch: watches
+/// and cursor subscriptions (N05) both go through it, so a sink's pseudo-URL,
+/// its signing posture and its body shape cannot drift between the two.
+///
+/// - `file`/`plugin:` build a pseudo-URL from the *subscriber id* (never user
+///   input) that [`deliver`] re-validates, and are unsigned — the transport is
+///   local, so there is nothing to authenticate to;
+/// - `slack` sends the compact summary Slack accepts, signed like a webhook;
+/// - `webhook` (and anything unrecognized) sends the payload verbatim at the
+///   configured URL, so an unknown sink fails toward the most informative
+///   behaviour rather than dropping the event.
+pub(crate) fn sink_route(
+    sink: &str,
+    url: &str,
+    ref_id: &str,
+    secret: Option<String>,
+    payload: &serde_json::Value,
+) -> (String, Option<String>, serde_json::Value) {
+    match sink {
+        "file" => (file_sink_url(ref_id), None, payload.clone()),
         // N10: `plugin:<name>`. The body is the payload UNSHAPED — the same
         // bytes a webhook sink would receive — so one connector module works
         // against every event kind rather than against a sink-specific shape.
-        sink if sink.starts_with(PLUGIN_SINK_PREFIX) => {
-            let url = plugin_sink_url(&sink[PLUGIN_SINK_PREFIX.len()..], &watch.url);
-            dispatch_event(
-                state,
-                "change",
-                &watch.id,
-                &url,
-                "dataset.changed",
-                &payload,
-                None,
-            )
-            .await;
-        }
-        "slack" => {
-            let body = slack_summary(&payload);
-            dispatch_event(
-                state,
-                "change",
-                &watch.id,
-                &watch.url,
-                "dataset.changed",
-                &body,
-                watch.secret.clone(),
-            )
-            .await;
-        }
-        // "webhook" and anything unrecognized (fail toward the original,
-        // most-informative behavior rather than dropping the event).
-        _ => {
-            dispatch_event(
-                state,
-                "change",
-                &watch.id,
-                &watch.url,
-                "dataset.changed",
-                &payload,
-                watch.secret.clone(),
-            )
-            .await;
-        }
+        s if s.starts_with(PLUGIN_SINK_PREFIX) => (
+            plugin_sink_url(&s[PLUGIN_SINK_PREFIX.len()..], url),
+            None,
+            payload.clone(),
+        ),
+        "slack" => (url.to_string(), secret, slack_summary(payload)),
+        _ => (url.to_string(), secret, payload.clone()),
     }
+}
+
+/// Queues a best-effort, logged delivery of a `dataset.changed` event through
+/// the watch's configured sink.
+///
+/// The **legacy** path, kept for `[events] log_enabled = false`: with the
+/// durable log on, `worker::notify_watches` emits a `dataset.changed` event and
+/// [`crate::subscriptions::drain`] delivers it through [`dispatch_logged`]
+/// instead.
+pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json::Value) {
+    let (url, secret, body) = sink_route(
+        &watch.sink,
+        &watch.url,
+        &watch.id,
+        watch.secret.clone(),
+        &payload,
+    );
+    dispatch_event(
+        state,
+        "change",
+        &watch.id,
+        &url,
+        "dataset.changed",
+        &body,
+        secret,
+    )
+    .await;
 }
 
 // ---- Sink helpers ---------------------------------------------------------
@@ -342,6 +337,64 @@ pub async fn dispatch_event(
         secret,
     )
     .await;
+}
+
+/// Dispatches one event to one sink, creating the delivery log row **before**
+/// returning — the outbox drain's entry point (N05).
+///
+/// The difference from [`dispatch_event`] is that difference alone, and it is
+/// the whole reason this exists: the drain advances a subscription's cursor only
+/// past events that are durably owed to somebody. `dispatch_event` creates the
+/// row inside the delivery pool, so it can only report "queued", and a cursor
+/// advanced on "queued" would skip an event whose log write then failed. Here
+/// the row is written first and its id is what the send runs against; a write
+/// error propagates to the caller, which leaves the cursor where it was.
+///
+/// Everything after the row is identical to every other delivery: the same
+/// [`deliver`] transport (`plugin:` sinks included), the same in-process ladder,
+/// the same [`log_outcome`] → DLQ → manual-replay path.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_logged(
+    state: &AppState,
+    kind: &str,
+    ref_id: &str,
+    sink: &str,
+    sink_url: &str,
+    event: &str,
+    payload: &serde_json::Value,
+    secret: Option<String>,
+) -> Result<(), pumper_core::Error> {
+    let (url, secret, body) = sink_route(sink, sink_url, ref_id, secret, payload);
+    let body = serde_json::to_vec(&body).map_err(|e| {
+        pumper_core::Error::App(format!("subscription delivery serialize failed: {e}"))
+    })?;
+    let delivery_id = state
+        .storage
+        .create_delivery(kind, ref_id, &url, event, &String::from_utf8_lossy(&body))
+        .await?;
+    let storage = state.storage.clone();
+    let client = state.webhook_client.clone();
+    let plugins = state.plugins.clone();
+    let event = event.to_string();
+    let tag = delivery_id.clone();
+    state
+        .deliveries
+        .run_tagged("subscription", tag, async move {
+            let outcome = deliver(
+                &storage,
+                &client,
+                plugins.as_ref(),
+                &url,
+                &event,
+                &delivery_id,
+                &body,
+                secret.as_deref(),
+            )
+            .await;
+            log_outcome(&storage, &delivery_id, &url, outcome).await;
+        })
+        .await;
+    Ok(())
 }
 
 /// Queues a best-effort, logged `job.failed` delivery to the global failure
@@ -553,6 +606,7 @@ async fn log_outcome(
 /// | `change`  | watch id        | the watch's `secret` (DB)           |
 /// | `search`  | saved-search id | the saved search's `secret` (DB)    |
 /// | `failure` | job id          | `[webhooks] failure_secret` (config)|
+/// | `subscription` | subscription id | the subscription's `secret` (DB) |
 ///
 /// `failure` is the reason this takes a config handle: its secret is the only
 /// one that is NOT a row, so it has to be threaded in explicitly rather than
@@ -589,6 +643,16 @@ pub async fn resolve_secret(
             .and_then(|w| w.secret),
         "search" => storage
             .get_saved_search(&delivery.ref_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.secret),
+        // N05: a cursor subscription's secret lives on its row, exactly like a
+        // watch's. Missing this arm is the failure mode the table above exists
+        // to prevent: every drain retry and every manual replay would go out
+        // UNSIGNED and a verifying receiver would 401 them all the way to `dead`.
+        "subscription" => storage
+            .get_subscription(&delivery.ref_id)
             .await
             .ok()
             .flatten()
@@ -1082,7 +1146,14 @@ mod tests {
 
         let watch = store
             .storage
-            .create_watch("fake", "*", "https://x/hook", Some("s3-watch"), "webhook")
+            .create_watch(
+                "fake",
+                "*",
+                "https://x/hook",
+                Some("s3-watch"),
+                "webhook",
+                0,
+            )
             .await
             .expect("create watch");
         assert_eq!(
@@ -1115,7 +1186,14 @@ mod tests {
         // An unknown kind gets nothing — not the failure secret, not a watch's.
         let watch = store
             .storage
-            .create_watch("fake", "*", "https://x/hook", Some("s3-watch"), "webhook")
+            .create_watch(
+                "fake",
+                "*",
+                "https://x/hook",
+                Some("s3-watch"),
+                "webhook",
+                0,
+            )
             .await
             .expect("create watch");
         assert_eq!(

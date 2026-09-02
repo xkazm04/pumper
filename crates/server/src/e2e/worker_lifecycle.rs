@@ -436,7 +436,7 @@ async fn the_health_gate_runs_before_the_watch_and_trigger_hooks() {
     let rx = TestReceiver::spawn(vec![]).await;
     state
         .storage
-        .create_watch("fake", "d", &rx.url(), None, "webhook")
+        .create_watch("fake", "d", &rx.url(), None, "webhook", 0)
         .await
         .unwrap();
     state

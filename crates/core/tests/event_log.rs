@@ -208,7 +208,7 @@ async fn a_watch_carries_a_cursor_like_any_other_subscription() {
     let store = pumper_core::testing::TempStore::new("event-log-watch").await;
     let storage = &store.storage;
     let watch = storage
-        .create_watch("fake", "*", "https://example.test/w", None, "webhook")
+        .create_watch("fake", "*", "https://example.test/w", None, "webhook", 0)
         .await
         .expect("create watch");
     assert_eq!(watch.cursor_seq, 0, "a new watch starts at the beginning");

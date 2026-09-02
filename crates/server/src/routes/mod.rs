@@ -25,6 +25,11 @@ pub(crate) use datasets::parse_filters;
 // (`crate::mcp::live`): both SSE surfaces have to end on the shutdown token, and
 // one implementation means neither can silently regain the unbounded `recv()`.
 pub(crate) use events::next_or_shutdown;
+// The ring-then-log replay, re-exported for the MCP live stream: N05 made a
+// resume able to fall back to the durable event log, and both SSE surfaces must
+// fall back the same way or an agent and a browser reconnecting at the same
+// sequence get different answers.
+pub(crate) use events::replay_or_log;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;
@@ -85,9 +90,10 @@ mod retention;
 mod runtime;
 mod schedules;
 mod search;
+mod subscriptions;
 pub(crate) mod transactions;
 mod triggers;
-mod watches;
+pub(crate) mod watches;
 mod workflows;
 
 // Bring every handler (and its utoipa-generated `__path_*` companion) into this
@@ -115,6 +121,7 @@ use retention::*;
 use runtime::*;
 use schedules::*;
 use search::*;
+use subscriptions::*;
 use transactions::*;
 use triggers::*;
 use watches::*;
@@ -250,6 +257,12 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_watch))
         .routes(routes!(set_watch_enabled))
         .routes(routes!(watch_deliveries))
+        // N05: the durable event log's pull page, and the cursor subscriptions
+        // that generalize watches.
+        .routes(routes!(event_log))
+        .routes(routes!(list_subscriptions, create_subscription))
+        .routes(routes!(delete_subscription))
+        .routes(routes!(subscription_deliveries))
         .routes(routes!(list_triggers, create_trigger))
         .routes(routes!(delete_trigger))
         .routes(routes!(set_trigger_enabled))
@@ -641,6 +654,12 @@ mod api_spec_tests {
         "DELETE /watches/{id}",
         "POST /watches/{id}/enabled",
         "GET /watches/{id}/deliveries",
+        // N05 durable event log + cursor subscriptions.
+        "GET /events/log",
+        "GET /subscriptions",
+        "POST /subscriptions",
+        "DELETE /subscriptions/{id}",
+        "GET /subscriptions/{id}/deliveries",
         "GET /triggers",
         "POST /triggers",
         "DELETE /triggers/{id}",

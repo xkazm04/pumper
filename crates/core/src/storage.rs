@@ -1387,8 +1387,17 @@ impl Storage {
 
     // ---- Dataset watches ---------------------------------------------------
 
-    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"`);
-    /// callers validate the value — storage stores it verbatim.
+    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"` |
+    /// `"plugin:<name>"`); callers validate the value — storage stores it
+    /// verbatim.
+    ///
+    /// `from_seq` is where the watch's cursor starts (N05), and it is a REQUIRED
+    /// argument rather than a default because getting it wrong is silent and
+    /// wrong in an expensive direction. A watch created on a live server must
+    /// start at the log's head: with `0` it would replay every retained
+    /// `dataset.changed` event — including changes from before it existed — as
+    /// real deliveries at a real receiver, which is precisely what a watch has
+    /// never done. `0` is the deliberate "replay what you still have".
     pub async fn create_watch(
         &self,
         app: &str,
@@ -1396,11 +1405,12 @@ impl Storage {
         url: &str,
         secret: Option<&str>,
         sink: &str,
+        from_seq: i64,
     ) -> Result<Watch> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, cursor_seq, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
         )
         .bind(&id)
         .bind(app)
@@ -1408,6 +1418,7 @@ impl Storage {
         .bind(url)
         .bind(secret)
         .bind(sink)
+        .bind(from_seq.max(0))
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -3493,7 +3504,8 @@ pub struct RevisionCount {
 /// `total_ms` spans claim → end of fan-out and is **not** the sum of the named
 /// stages: the queue's own bookkeeping (completion write, checkpoint clear,
 /// yield record) sits between them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, sqlx::FromRow)]
+#[serde(default)]
 pub struct JobStages {
     /// The attempt these numbers describe.
     pub attempt: i64,
@@ -3853,6 +3865,15 @@ pub struct TriggerRun {
 /// `GET /watches/{id}/deliveries` to answer anything at all — an e2e drives a
 /// real dispatch through both ends rather than trusting the string twice.
 pub const DELIVERY_KIND_WATCH: &str = "change";
+
+/// `webhook_deliveries.kind` for a delivery a **cursor subscription** produced
+/// (N05); the row's `ref_id` is then the subscription id.
+///
+/// Deliberately NOT `change`: a watch's deliveries and a subscription's are
+/// queried by different routes and resolve their signing secret from different
+/// tables, so one value could not serve both without
+/// `webhook::resolve_secret` guessing which.
+pub const DELIVERY_KIND_SUBSCRIPTION: &str = "subscription";
 
 /// The `trigger_id` a decision carries when it is about the evaluation SET, not
 /// about one trigger — the only such case is the set failing to load, which

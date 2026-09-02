@@ -1032,8 +1032,14 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     // event so a watcher learns WHAT is being asked without a
                     // follow-up read.
                     let mut event = JobEvent::new(job.id, job.app.clone(), "waiting");
-                    event.result = Some(request);
+                    event.result = Some(request.clone());
                     publish(&state, event);
+                    // N05 carry-forward: a park that stages a transaction is
+                    // `transaction.pending` — an approval waiting for a human is
+                    // exactly the kind of thing a subscriber wants pushed.
+                    for event in park_domain_events(&job.app, &request) {
+                        publish(&state, event);
+                    }
                 }
                 // Stale (job reset/reaped mid-run): the live attempt owns it.
                 Ok(false) => {}
@@ -1310,6 +1316,11 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
                 &by_dataset,
             )
             .await;
+            // N05 carry-forward: the domain events this run DECLARED in its
+            // result become real events here, beside the dataset changes above.
+            for event in result_domain_events(&job.app, &result) {
+                publish(&state, event);
+            }
         })
         .await;
 
@@ -1340,6 +1351,19 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
         warn!(job = %job.id, "stage-timing record failed: {e}");
     }
     finalize_with_stages(&state, job.id, Some(stages)).await;
+    // N05: push this run's events to their subscribers HERE, *after* the
+    // terminal event — which is deliberate and was a bug the first time it
+    // wasn't. `job.succeeded` is the single most subscribed kind there is, and
+    // it is published by `finalize_with_stages`; draining before that left it
+    // sitting in the queue until the next scheduler tick.
+    //
+    // The outbox is what makes delivery durable; this call is what keeps it
+    // prompt. A watch used to be delivered inside this same fan-out unit, so
+    // `worker::run_one` returning meant "every delivery this job produced has
+    // finished" — a guarantee the sink tests are built on and a latency an
+    // operator can feel. The scheduler tick's drain is the safety net for
+    // whatever this pass could not hand off.
+    crate::subscriptions::drain(&state).await;
 }
 
 /// Parses the VCR enqueue params out of a job's params object:
@@ -1719,63 +1743,150 @@ fn enforce_contracts(
     }
 }
 
-/// Fires `dataset.changed` webhooks at every enabled watch whose `(app, dataset)`
-/// pair saw new/changed/removed revisions during this job run. Best-effort:
-/// delivery failures never affect the job outcome.
+/// Emits one `dataset.changed` event per `(app, dataset)` pair that saw
+/// new/changed/removed revisions during this job run.
 ///
-/// Watches are loaded per APP of the batch, not once for `job.app`, because a run
-/// can write under several namespaces (see [`load_run_changes`]). Each watch is
-/// then offered only the entries of its own app — that scoping is what makes one
-/// dispatch per (watch, app, dataset) and no more. Without it, a watch on the
-/// virtual app with `dataset = "*"` would also match the job app's own datasets
-/// and fire twice for one run.
+/// **N05 changed what this function is.** It used to load the watch table and
+/// dispatch a webhook per matching watch — the fan-out and the delivery decision
+/// in one place, reachable only by watches. It now emits the *fact* onto the
+/// durable event bus; [`crate::subscriptions::drain`] (called at the end of this
+/// job's fan-out, and again on every scheduler tick) is what turns that fact
+/// into deliveries, for watches and for cursor subscriptions alike. So a
+/// `dataset.changed` now survives a restart, is replayable from a cursor, and is
+/// visible on `GET /events/log` whether or not anything was subscribed to it.
+///
+/// One event per `(app, dataset)` — not per watch — because a run can write
+/// under several namespaces (see [`load_run_changes`]) and the *event* is about
+/// the data, not about who asked for it. The per-watch scoping that used to live
+/// here (a watch belongs to exactly one app, so a `dataset = "*"` watch must not
+/// fire twice for a two-namespace run) is now the selector's job, and is tested
+/// there as `a_watch_is_a_dataset_changed_selector`.
+///
+/// With `[events] log_enabled = false` there is no log to drain, so this falls
+/// back to the pre-N05 in-line dispatch — the config key means what it says.
 async fn notify_watches(
     state: &AppState,
     job: &Job,
     by_dataset: &HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
-    let mut apps: Vec<&str> = by_dataset.keys().map(|(app, _)| *app).collect();
-    apps.sort_unstable();
-    apps.dedup();
-    for app in apps {
-        let watches = match state.storage.enabled_watches(app).await {
-            Ok(w) if !w.is_empty() => w,
-            Ok(_) => continue,
-            Err(e) => {
-                warn!(job = %job.id, %app, "failed to load watches: {e}");
+    // Sorted so a multi-dataset run emits in a stable sequence rather than in
+    // `HashMap` (RandomState) order — matching `fire_dataset_triggers`, and now
+    // also fixing the LOG's order, which is a cursor's order.
+    let mut pairs: Vec<(&str, &str)> = by_dataset.keys().copied().collect();
+    pairs.sort_unstable();
+    let legacy = !state.events.logs();
+    for pair in pairs {
+        let (app, dataset) = pair;
+        let revs = &by_dataset[&pair];
+        let payload = serde_json::json!({
+            "event": "dataset.changed",
+            "job_id": job.id,
+            // The app the records actually live under — which for a virtual-app
+            // write is NOT the job's app, and is the only namespace the consumer
+            // can read them back from.
+            "app": app,
+            "dataset": dataset,
+            "count": revs.len(),
+            "changes": revs,
+        });
+        if legacy {
+            legacy_notify_watches(state, job, app, dataset, &payload).await;
+            continue;
+        }
+        publish(
+            state,
+            JobEvent::domain(crate::subscriptions::DATASET_CHANGED, app, dataset, payload),
+        );
+    }
+}
+
+/// The pre-N05 dispatch: load the app's watches, offer each only the entries of
+/// its own app, POST. Reached only with `[events] log_enabled = false`.
+async fn legacy_notify_watches(
+    state: &AppState,
+    job: &Job,
+    app: &str,
+    dataset: &str,
+    payload: &Value,
+) {
+    let watches = match state.storage.enabled_watches(app).await {
+        Ok(w) if !w.is_empty() => w,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, %app, "failed to load watches: {e}");
+            return;
+        }
+    };
+    for watch in watches
+        .iter()
+        .filter(|w| watch_covers_entry(w, app, dataset))
+    {
+        let mut body = payload.clone();
+        if let Value::Object(map) = &mut body {
+            map.insert("watch_id".into(), serde_json::json!(watch.id));
+        }
+        webhook::dispatch_change(state, watch.clone(), body).await;
+    }
+}
+
+/// Domain events a finished run DECLARES in its result (N05 carry-forward).
+///
+/// Two wave-2 seams closed here, both the same shape: an app knows something
+/// happened, names it in its result, and cannot dispatch it — `dispatch_event`
+/// lives in the server, above the app boundary. The worker's post-run fan-out is
+/// where a named event becomes a real one.
+///
+/// - `result.events: ["source.repair_promoted", …]` — the `repair` app (N12)
+///   already writes this array; its subject is the source it repaired.
+/// - `result.submitted == true` with a `transaction_id` — the `transact` app
+///   (N01) commits inside `Browser::commit`, so `transaction.submitted` could
+///   not be dispatched from there.
+///
+/// Pure so the vocabulary is testable without a worker: a kind that drifts from
+/// what a selector can name is a subscription that silently never fires.
+pub(crate) fn result_domain_events(app: &str, result: &Value) -> Vec<JobEvent> {
+    let mut out = Vec::new();
+    let subject = |result: &Value| {
+        result
+            .get("source")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("transaction_id").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(kinds) = result.get("events").and_then(Value::as_array) {
+        for kind in kinds.iter().filter_map(Value::as_str) {
+            if kind.is_empty() {
                 continue;
             }
-        };
-        // Sorted so a multi-dataset run dispatches in a stable sequence rather
-        // than in `HashMap` (RandomState) order — matching `fire_dataset_triggers`.
-        let mut datasets: Vec<(&str, &str)> = by_dataset
-            .keys()
-            .copied()
-            .filter(|(entry_app, _)| *entry_app == app)
-            .collect();
-        datasets.sort_unstable();
-        for pair in datasets {
-            let (_, dataset) = pair;
-            let revs = &by_dataset[&pair];
-            for watch in watches
-                .iter()
-                .filter(|w| watch_covers_entry(w, app, dataset))
-            {
-                let payload = serde_json::json!({
-                    "event": "dataset.changed",
-                    "watch_id": watch.id,
-                    "job_id": job.id,
-                    // The app the records actually live under — which for a
-                    // virtual-app write is NOT the job's app, and is the only
-                    // namespace the consumer can read them back from.
-                    "app": app,
-                    "dataset": dataset,
-                    "count": revs.len(),
-                    "changes": revs,
-                });
-                webhook::dispatch_change(state, watch.clone(), payload).await;
-            }
+            out.push(JobEvent::domain(kind, app, subject(result), result.clone()));
         }
+    }
+    if result.get("submitted").and_then(Value::as_bool) == Some(true) {
+        if let Some(tx) = result.get("transaction_id").and_then(Value::as_str) {
+            out.push(JobEvent::domain(
+                "transaction.submitted",
+                app,
+                tx,
+                result.clone(),
+            ));
+        }
+    }
+    out
+}
+
+/// `transaction.pending` for a job that PARKED on an approval (N05
+/// carry-forward). The staging happens inside the app, so the park is the only
+/// server-side moment that knows a transaction is waiting for a human.
+pub(crate) fn park_domain_events(app: &str, request: &Value) -> Vec<JobEvent> {
+    match request.get("transaction_id").and_then(Value::as_str) {
+        Some(tx) => vec![JobEvent::domain(
+            "transaction.pending",
+            app,
+            tx,
+            request.clone(),
+        )],
+        None => Vec::new(),
     }
 }
 
@@ -2939,6 +3050,7 @@ mod hook_scope_tests {
             secret: None,
             sink: "webhook".into(),
             enabled: true,
+            cursor_seq: 0,
             created_at: chrono::Utc::now(),
         }
     }

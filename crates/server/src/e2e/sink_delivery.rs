@@ -47,7 +47,7 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
     let (state, store) = test_state(vec![Arc::new(FakeApp)]).await;
     let watch = state
         .storage
-        .create_watch("fake", "d", "", None, "file")
+        .create_watch("fake", "d", "", None, "file", 0)
         .await
         .expect("create file-sink watch");
 
@@ -99,7 +99,7 @@ async fn slack_sink_posts_a_compact_summary_message() {
     let rx = TestReceiver::spawn(vec![]).await;
     state
         .storage
-        .create_watch("fake", "d", &rx.url(), None, "slack")
+        .create_watch("fake", "d", &rx.url(), None, "slack", 0)
         .await
         .expect("create slack-sink watch");
 
@@ -182,6 +182,7 @@ async fn a_permanent_plugin_sink_refusal_dead_letters_like_any_other_sink() {
             "http://localhost:3000/deliveries",
             None,
             "plugin:sink-stub",
+            0,
         )
         .await
         .expect("create plugin-sink watch");
@@ -244,7 +245,7 @@ async fn a_delivering_plugin_sink_logs_a_delivered_row() {
         super::harness::test_state_with_plugins(vec![Arc::new(FakeApp)], connector).await;
     state
         .storage
-        .create_watch("fake", "d", "", None, "plugin:sink-stub")
+        .create_watch("fake", "d", "", None, "plugin:sink-stub", 0)
         .await
         .expect("create plugin-sink watch");
 

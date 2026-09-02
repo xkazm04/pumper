@@ -569,7 +569,7 @@ async fn a_watch_on_the_mirror_namespace_fires_on_a_pull() {
 
     mirror
         .storage
-        .create_watch(NAMESPACE, DATASET, &rx.url(), Some("s3cr3t"), "webhook")
+        .create_watch(NAMESPACE, DATASET, &rx.url(), Some("s3cr3t"), "webhook", 0)
         .await
         .expect("watch the mirror namespace");
 
