@@ -195,10 +195,10 @@ impl ScrapeApp for CensusDensity {
                  employees_cells, payroll_cells}, top} | {naics, label, note}], \
                  top_places_overall, top_places_by_saturation, normalization: \
                  {places_matched, places_excluded_no_denominator_row, \
-                 places_excluded_base_not_positive, ...}, market_blend (carrying \n                 market_profile: the state x trade product this run republishes, and 
+                 places_excluded_base_not_positive, ...}, market_blend (the census/market_blend product; carrying \n                 market_profile: the state x trade product this run republishes, and 
                  atlas: {states, state_rank_basis, counties_ranked, metro_pricing: 
                  {enabled, plan, requested, unmapped_counties}} - the county/metro 
-                 launch atlas), \
+                 launch atlas, written to census/atlas), \
                  suppression, empty_answers, index_datasets, records, new, changed, \
                  unchanged} — suppressed cells are absent (Null), never zeroed, and \
                  are counted; a trade the API publishes nothing for (HTTP 204) yields \

@@ -9,6 +9,21 @@
 //! Upserted into the `pricing` dataset; the run's cost / duration / turns are reported
 //! back in the result so a consumer (e.g. the Ledgerline admin console) can meter it.
 //!
+//! **Who chooses the locality (N35).** Until the sub-state atlas existed, this
+//! app priced whatever a human passed — in practice `DEFAULT_LOCALITY`, i.e.
+//! the country. `census/atlas` now plans one locality per metro it ranks (a
+//! CBSA title from the `census-common` county→CBSA crosswalk, e.g.
+//! `"Phoenix-Mesa-Chandler, AZ"`) and, when `[census] metro_pricing` is on,
+//! asks the runtime for one `homewyse-pricing` schedule per planned metro with
+//! a `budget_usd` ceiling. Nothing here changes to serve that: the record key
+//! is already `{locality}:{trade}:{job}` and the freshness gate is already
+//! per-locality, so a metro run neither satisfies nor is satisfied by the
+//! national one. **Known gap, and it is a scope boundary:** the unified join
+//! looks a state row's pricing up by `locality == <state code>`
+//! (`trades-common`), so a metro-priced row lands in `pricing` and is queryable
+//! but does not yet reach `trades/operator_economics`. Teaching that lookup
+//! about metros is a `trades-common` change owned elsewhere.
+//!
 //! Data type: PEER PRICING BENCHMARKS. Access: the local Claude Code CLI (no API key;
 //! uses the local subscription). This is a metered engine — every run costs real money,
 //! unlike the http Census apps. Params: {"locality": "United States", "year": "2025",
@@ -58,7 +73,7 @@ impl ScrapeApp for HomewysePricing {
                     "locality": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Market the prices are researched for (a country, state or metro). Scopes both the record keys and the freshness gate — a Texas refresh never satisfies a national one."
+                        "description": "Market the prices are researched for (a country, state or metro). Scopes both the record keys and the freshness gate — a Texas refresh never satisfies a national one. The census/atlas metro_pricing driver passes a CBSA title here (e.g. \"Phoenix-Mesa-Chandler, AZ\")."
                     },
                     "year": { "type": "string", "description": "Pricing year stamped on every record." },
                     "role": { "type": "string", "enum": ["research", "compose"] },

@@ -159,12 +159,14 @@ pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[
         // `routes::mod`'s `live_catalog_entries_map_to_registered_apps_with_
         // matching_cron`).
         name: "census",
-        publishers: &[
-            "census-density",
-            "census-nonemp",
-            "census-nesd",
-            "census-bfs",
-        ],
+        // `census-nesd` and `census-bfs` ALSO re-derive these products (all four
+        // apps call `sync_market_blend`), and are deliberately absent: the guard
+        // below asks a publisher's own manifest to name the namespace it writes
+        // into, and those two `output_shape`s do not — a manifest change in
+        // crates this work does not own. The seed is a bootstrap, not the
+        // authority (the store is), so listing fewer publishers is honest and
+        // listing them without evidence would not be.
+        publishers: &["census-density", "census-nonemp"],
         note: "the census product namespace holding market_blend, saturation and the county \
            atlas, which all four census apps publish into",
     },

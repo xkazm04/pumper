@@ -167,7 +167,7 @@ impl ScrapeApp for CensusNonemp {
                  total_receipts_thousands, national_avg_receipts_per_operator, \
                  states_with_receipts, suppressed: {places_dropped, receipts_cells}, \
                  top_states_by_density, top_states_by_avg_receipts} | {naics, label, note}], \
-                 market_blend, suppression, empty_answers, index_datasets, records, new, \
+                 market_blend (the census/market_blend + census/atlas products this run \n                 re-derives), suppression, empty_answers, index_datasets, records, new, \
                  changed, unchanged} — a fully suppressed NAICS yields a `note` entry, not a \
                  failure; a suppressed NRCPTOT cell yields Null receipts (never $0), so the \
                  receipts totals cover `states_with_receipts` only",

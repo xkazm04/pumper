@@ -950,3 +950,65 @@ total_market_per_10k_basis = "string"
 
 [source.contract.ranges]
 total_market_per_10k = { min = 0.0 }
+
+
+# ── The sub-state launch atlas (N35) ─────────────────────────────────────────
+# `census/atlas` is the county/metro grain of the launch ranking: the top-N
+# counties per trade by county SATURATION and by the blend cell's own
+# `total_market_per_10k`, scoped to the top-K states (`[census] atlas_states_k`,
+# default 10) and carrying the metro each county sits in.
+#
+# `app = "census"` is the VIRTUAL NAMESPACE the rows land under — the pair
+# `enforce_contracts` and /catalog/health both key on — which is now a
+# registered `VirtualNamespace` (registry.rs, publishers: the four census apps).
+# That is what the header comment further up this file said did not exist yet;
+# it does now, for this row. The other two census products (`market_blend`,
+# `saturation`) are deliberately still uncataloged: adding them is a follow-up
+# that has to think about their own contracts, not a side effect of this row.
+#
+# `cron` MUST stay empty: the write rides a publisher's job (the atlas is
+# rebuilt at the end of every `sync_market_blend`), and a cron here would ask
+# the scheduler to create a schedule for an app that does not exist.
+#
+# No `max_row_delta_pct`: the atlas is a RANKING, and a ranking legitimately
+# swaps most of its membership when the scope (`atlas_states_k`) or the top-N
+# changes. A mass-delta tripwire here would fire on a re-parameterisation.
+[[source]]
+id = "census-atlas"
+app = "census"
+market = "us"
+name = "Sub-state launch atlas (top counties per trade, with their metro)"
+url = ""
+category = "market-stats"
+engine = ""
+access = ""
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "atlas"
+notes = "One row per (naics4, county) that entered EITHER ranking, keyed {naics4}:{county_fips5}. Ranked by county saturation (census/saturation per_10k) and by the blend cell's total_market_per_10k; a county that made only one ranking carries Null for the other, never a position it did not reach. SCOPE: the top-K states by state_total_market ([census] atlas_states_k, default 10) - NOT by formation velocity, because BFS is NATIONAL-grain only and cannot rank states; the basis is on every row as atlas_state_rank_basis. GRAINS ARE LABELLED PER BLOCK (`grains`): employers at county, solos at county OR `state_carried` (NES county availability is ASSUMED unavailable - see the census-nonemp doc header for the probe and its unverified verdict), saturation at county, succession at 2-digit sector x state, formation at national sector. A state_carried row has solo_operators = null and a total_market that counts employers only; the state's solo total rides along as solo_state_operators, labelled, never apportioned. `metro` is the county's CBSA from the PARTIAL hand-curated crosswalk in census-common (crosswalk_vintage = omb_2020); an unknown county has metro = null and is counted as unmapped, never given a substitute market. Derived only: revisions carry job_id + a derived:// source_url naming census/market_blend + census/saturation, never an artifact_sha. See the 'census/atlas' section of docs/features/apps.md."
+
+# Declared data contract (M20): the five top-level keys a consumer keys on or
+# branches on. `rank_by_saturation` / `rank_by_total_market_per_10k` are
+# deliberately NOT required — each is Null on a row that entered only the other
+# ranking, and requiring them would push the builder toward fabricating a rank.
+# `total_market_per_10k` is likewise optional: it is Null when no ACS base is
+# known for the county, and a required numeric would invite a zero.
+[source.contract]
+required_fields = ["naics4", "geo", "geo_fips", "state_fips", "grains"]
+
+[source.contract.types]
+naics4 = "string"
+geo = "string"
+geo_fips = "string"
+state_fips = "string"
+grains = "object"
+saturation_per_10k = "number"
+total_market_per_10k = "number"
+employer_establishments = "number"
+
+[source.contract.ranges]
+saturation_per_10k = { min = 0.0 }
+total_market_per_10k = { min = 0.0 }
+employer_establishments = { min = 0.0 }
