@@ -763,6 +763,32 @@ impl HealthStore {
         Ok(())
     }
 
+    /// Consecutive clean shadow runs for one diagnosis, newest first.
+    ///
+    /// Counted from the attempt ledger rather than kept as a streak counter,
+    /// for the same reason `promotions_30d` is: a counter has to be reset by
+    /// somebody, and the run that fails to reset it is the run that promotes on
+    /// a streak that never happened. The count stops at the first attempt for
+    /// this diagnosis whose outcome was not `shadow_clean`, so one bad run
+    /// zeroes the streak without anything having to write a zero.
+    pub async fn consecutive_clean_shadow_runs(
+        &self,
+        source_id: &str,
+        diagnosis_hash: &str,
+    ) -> Result<u32> {
+        let outcomes: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT outcome FROM repair_attempts              WHERE source_id = ?1 AND diagnosis_hash = ?2              ORDER BY created_at DESC LIMIT 100",
+        )
+        .bind(source_id)
+        .bind(diagnosis_hash)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(outcomes
+            .iter()
+            .take_while(|o| o.as_deref() == Some("shadow_clean"))
+            .count() as u32)
+    }
+
     /// Closes an attempt with its outcome.
     pub async fn finish_repair_attempt(
         &self,

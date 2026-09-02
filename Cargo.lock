@@ -477,6 +477,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-repair"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pumper-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "app-research"
 version = "0.1.0"
 dependencies = [
@@ -3814,6 +3827,7 @@ dependencies = [
  "app-plugin",
  "app-provisioner",
  "app-readable",
+ "app-repair",
  "app-research",
  "app-smlouvy-dump-watch",
  "app-state-licensing",

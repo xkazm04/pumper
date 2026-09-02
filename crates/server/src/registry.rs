@@ -37,6 +37,7 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_provisioner::Provisioner),
         Arc::new(app_transact::Transact),
         Arc::new(app_peer::Peer),
+        Arc::new(app_repair::Repair),
     ]
 }
 

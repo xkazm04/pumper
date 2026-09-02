@@ -47,6 +47,7 @@ app-mpsv-ispv.workspace = true
 app-extractor.workspace = true
 app-plugin.workspace = true
 app-crawl.workspace = true
+app-repair.workspace = true
 app-smlouvy-dump-watch.workspace = true
 app-provisioner.workspace = true
 app-transact.workspace = true

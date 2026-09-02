@@ -847,6 +847,29 @@ All of these must hold:
 5. `now > repair_blocked_until`, `promotions_30d < max_promotions_30d`, and the
    daily repair budget has headroom.
 
+**The `repair` app as built (N12 step 5).** `POST /apps/repair/jobs
+{"source": "<app>/<dataset>", "profile": "<name>"}`.
+
+- Refuses inertly (`{"repaired": false, "skipped": "<reason>"}`, job succeeds)
+  when repair is disabled, health detection is off, the source is unknown or is
+  not `degraded`/`quarantined`, a cooldown or the 30-day promotion budget is
+  live, the source is not profile-backed (`repairable: false`), fewer than
+  `holdout_min_docs` retained bodies carry known-good values, or the live rules
+  already reproduce those values.
+- Corpus: up to 200 records; the body from `read_source_artifact`, the expected
+  values from the newest revision **before `state_since`** — reading the current
+  record would hand the inverter the breakage and ask it to reproduce it.
+- Train/holdout is split structurally (first 6 documents invert, the rest
+  score); the candidate is never scored on a document it was derived from.
+- Cost class `free`, structurally: the app never calls `ctx.research`.
+- Result carries `candidates[]` with each verdict, `decision`, `clean_runs`,
+  `shadow_version`, `promoted_version` and `events` — the webhook kinds the run
+  WOULD emit. Dispatch is not wired: `webhook::dispatch_event` lives in the
+  server, above the app boundary.
+- **Nothing promotes today.** Gate 4 needs golden documents, `data/golden/` has
+  no store, and a gate that cannot run REFUSES rather than skipping. Every run
+  therefore ends `rejected:golden_missing` until the golden store lands.
+
 Repair runs as a dedicated app, `repair`, so **every dollar it spends is
 attributable by construction** through the existing `cost_events` ledger
 (`AppContext::research` is the metered seam; nothing here touches

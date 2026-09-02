@@ -121,7 +121,9 @@
     {
       "doc": "docs/features/resilient-extraction.md",
       "sourceGlobs": [
-        "crates/core/src/resilience/**"
+        "crates/core/src/resilience/**",
+        "crates/apps/repair/**",
+        "crates/server/src/bin/resilience-eval.rs"
       ]
     },
     {

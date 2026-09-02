@@ -1187,7 +1187,9 @@ mod tests {
 
     // ── Tier-0 inversion ────────────────────────────────────────────────────
 
-    use super::{invert, lint_selector, lint_selector_breadth, InvertOptions, MAX_SELECTOR_BREADTH};
+    use super::{
+        invert, lint_selector, lint_selector_breadth, InvertOptions, MAX_SELECTOR_BREADTH,
+    };
     use std::collections::BTreeMap;
 
     /// A detail page: the old markup binds `.price`/`.sku`; the new markup is
@@ -1268,8 +1270,7 @@ mod tests {
         let olds: Vec<_> = (0..6).map(known).collect();
         let docs: Vec<String> = (0..6)
             .map(|i| {
-                detail(i, true)
-                    .replace(&format!("<span class=\"cost-v2\">${i}9.00</span>"), "")
+                detail(i, true).replace(&format!("<span class=\"cost-v2\">${i}9.00</span>"), "")
             })
             .collect();
         let out = invert(&olds, &docs, &InvertOptions::default());
