@@ -156,8 +156,10 @@ pub use plugin::{NoPlugins, Plugins};
 pub use recipes::RecipeStore;
 pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
 pub use search::{
+    merge_entities, parse_enricher_spec, EnrichInput, Enricher, EnricherSpec, EnricherStat, Entity,
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
-    SearchRequest, SearchResponse, SearchSort,
+    SearchRequest, SearchResponse, SearchSort, ENRICHER_BUILTIN, ENRICHER_PLUGIN_PREFIX,
+    ENTITY_AMOUNT, ENTITY_EVENT_DATE,
 };
 pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
 #[cfg(feature = "storage")]

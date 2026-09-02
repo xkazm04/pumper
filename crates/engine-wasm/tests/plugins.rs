@@ -67,6 +67,12 @@ fn plugins_src() -> PathBuf {
 const EXPECTED_PLUGIN_ABI: &[(&str, &[&str])] = &[
     ("busyloop", &["alloc", "extract"]),
     ("delta-slim", &["alloc", "describe", "extract_v2"]),
+    // N11's reference index-time ENRICHER: the same core-module ABI, entered
+    // through `enrich` instead of `extract_v2` because an enricher is not an
+    // extractor. It belongs here for the same reason as the connector — a
+    // module that lost its entry point loads, answers `has() == false`, and
+    // silently strips the entities it exists to add.
+    ("enrich-money-date", &["alloc", "describe", "enrich"]),
     // N10's reference SINK CONNECTOR: the same core-module ABI, plus a
     // `capabilities` block in its manifest and one declared host import. It
     // belongs on this list precisely because a connector that lost `extract_v2`
@@ -169,6 +175,53 @@ fn every_shipped_plugin_still_exports_the_host_abi() {
              and silently fails its hop open"
         );
     }
+}
+
+/// N11's reference enricher, against the BUILT artifact: it must load, be
+/// executable, describe itself as an enricher, and answer the `{doc, params}`
+/// envelope with the entity contract the search host parses.
+///
+/// The source-level ABI test above cannot see any of that: a plugin that
+/// exports the right names and returns the wrong SHAPE still compiles, and the
+/// host then fails open per document — an index quietly missing entities, with
+/// no red build anywhere.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/enrich-money-date.wasm — `just plugins-verify` (CI runs this step)"]
+async fn the_reference_enricher_answers_the_entity_contract() {
+    let host = host();
+    assert!(
+        host.has("enrich-money-date"),
+        "data/plugins/enrich-money-date.wasm missing — {NEEDS_INSTALL}"
+    );
+    let manifest = host
+        .manifests()
+        .into_iter()
+        .find(|m| m["name"] == "enrich-money-date")
+        .expect("the enricher self-describes");
+    assert_eq!(manifest["kind"], json!("enricher"));
+
+    // 2026-01-01T00:00:00Z as the document's own clock.
+    let out = host
+        .run(
+            "enrich-money-date",
+            "Award up to $250,000; applications close 2026-03-01.",
+            &json!({ "now": 1_767_225_600i64 }),
+        )
+        .await
+        .expect("the enricher runs");
+    assert_eq!(out["entities"]["amount"], json!(250_000));
+    assert_eq!(out["entities"]["event_date"], json!(1_772_323_200i64));
+
+    // No match = no key: the contract the index stores verbatim.
+    let out = host
+        .run(
+            "enrich-money-date",
+            "a page about nothing in particular",
+            &json!({ "now": 1_767_225_600i64 }),
+        )
+        .await
+        .expect("the enricher runs");
+    assert_eq!(out["entities"], json!({}));
 }
 
 #[tokio::test]

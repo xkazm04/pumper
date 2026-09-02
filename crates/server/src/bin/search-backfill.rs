@@ -28,11 +28,23 @@
 //!   cargo run -p pumper-server --bin search-backfill -- --app grants --dataset unified
 //!   cargo run -p pumper-server --bin search-backfill -- --app grants   # all of an app's datasets
 //!   cargo run -p pumper-server --bin search-backfill -- --all          # every dataset
+//!
+//! `--re-enrich` (N11) is the same walk run for a different reason: after
+//! installing or reordering `[search] enrichers`, the stored entity maps of
+//! documents already in the index are stale. Re-indexing upserts them with the
+//! CURRENT enrichers and no schema rebuild — the `entities` field is one JSON
+//! object, so a new entity kind never moves the schema and never wipes the
+//! corpus. It refuses to run against an EMPTY index, because re-enriching
+//! nothing is a plain backfill the operator did not ask for.
+
+use std::sync::Arc;
 
 use pumper_core::{
-    backfill_cursor, parse_backfill_cursor, Config, Datasets, Search, SearchDoc, Storage,
+    backfill_cursor, parse_backfill_cursor, Config, Datasets, NoPlugins, Plugins, Search,
+    SearchDoc, Storage,
 };
 use pumper_engine_search::TantivyIndex;
+use pumper_engine_wasm::WasmPluginHost;
 
 /// Records indexed per commit — matches the batch shape of the live path, and
 /// doubles as the keyset page size so nothing is read that isn't about to be
@@ -54,11 +66,32 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = Storage::connect(&config.storage).await?;
     let datasets = Datasets::new(storage.pool());
-    let search = TantivyIndex::new(&config.search)?;
+    // The same plugin host the server runs enrichers on, so an offline
+    // re-enrichment produces the same entities a live index() would. Without it
+    // a `plugin:` enricher would fail open on every document here and quietly
+    // strip the very fields the run exists to refresh.
+    let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
+        Arc::new(WasmPluginHost::new(&config.plugins)?)
+    } else {
+        Arc::new(NoPlugins)
+    };
+    let search = TantivyIndex::with_plugins(&config.search, Some(plugins))?;
 
-    let scope = parse_scope(&std::env::args().collect::<Vec<_>>())?;
+    let invocation = parse_invocation(&std::env::args().collect::<Vec<_>>())?;
+    let scope = invocation.scope;
+    if invocation.re_enrich {
+        // Checked BEFORE the walk: an empty index means the operator asked to
+        // refresh entities on a corpus that is not there, and silently doing a
+        // full first-time build under that flag would report a re-enrichment
+        // that never happened.
+        re_enrich_precondition(search.doc_count().await?).map_err(anyhow::Error::msg)?;
+    }
     let targets = resolve_targets(&datasets, &scope).await?;
-    tracing::info!(datasets = targets.len(), "backfilling search index");
+    tracing::info!(
+        datasets = targets.len(),
+        re_enrich = invocation.re_enrich,
+        "backfilling search index"
+    );
 
     let mut total = DatasetReport::default();
     for (app, dataset) in targets {
@@ -78,11 +111,25 @@ async fn main() -> anyhow::Result<()> {
     // right after — flush so the tail is durable and doc_count is accurate.
     search.flush().await?;
     let doc_count = search.doc_count().await?;
+    let what = if invocation.re_enrich {
+        "search re-enrichment complete"
+    } else {
+        "search backfill complete"
+    };
     println!(
-        "search backfill complete: {} record(s) indexed, {} tombstoned \
+        "{what}: {} record(s) indexed, {} tombstoned \
          record(s) purged; index now holds {doc_count} document(s)",
         total.indexed, total.purged
     );
+    // Per-enricher counters, so a run that produced no entities says WHY: a
+    // pass with failures > 0 could not run (a trapping plugin, a module nobody
+    // installed), which otherwise looks exactly like one that found nothing.
+    for stat in search.enricher_stats() {
+        println!(
+            "  enricher {}: {} doc(s), {} entities, {} failure(s)",
+            stat.name, stat.docs, stat.entities, stat.failures
+        );
+    }
     Ok(())
 }
 
@@ -200,6 +247,47 @@ impl std::fmt::Display for Scope {
     }
 }
 
+/// One run of the tool: what to walk, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Invocation {
+    scope: Scope,
+    /// `--re-enrich` (N11): the walk exists to refresh entity maps with the
+    /// current `[search] enrichers`, not to repopulate a lost index.
+    re_enrich: bool,
+}
+
+/// Parses argv into a run. Pure — no store access — so the flag grammar is
+/// testable without a database.
+///
+/// `--re-enrich` is a MODIFIER, not a scope: it never implies one, because
+/// "refresh the entities" and "refresh WHICH dataset's entities" are different
+/// questions and defaulting the second to everything is exactly the accidental
+/// full rebuild `parse_scope` exists to prevent.
+fn parse_invocation(args: &[String]) -> anyhow::Result<Invocation> {
+    Ok(Invocation {
+        scope: parse_scope(args)?,
+        re_enrich: args.iter().any(|a| a == "--re-enrich"),
+    })
+}
+
+/// Whether a `--re-enrich` run has anything to re-enrich.
+///
+/// The anti-pattern: treating `--re-enrich` on an empty index as a plain
+/// backfill. It succeeds, prints a completion line, and leaves the operator
+/// believing a re-enrichment ran over documents that were in fact indexed for
+/// the first time — so a broken enricher list reads as a working one.
+fn re_enrich_precondition(doc_count: u64) -> std::result::Result<(), String> {
+    if doc_count == 0 {
+        return Err(
+            "--re-enrich needs an index with documents in it, and this one holds 0. \
+             Run the same scope WITHOUT --re-enrich to build it first (a first-time \
+             build already enriches with the configured [search] enrichers)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Parses the scope out of argv. Pure — no store access — so the flag grammar is
 /// testable without a database.
 fn parse_scope(args: &[String]) -> anyhow::Result<Scope> {
@@ -273,9 +361,11 @@ async fn resolve_targets(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        backfill_action, backfill_dataset, parse_scope, resolve_targets, BackfillAction,
-        DatasetReport, Scope, INDEX_CHUNK,
+        backfill_action, backfill_dataset, parse_invocation, parse_scope, re_enrich_precondition,
+        resolve_targets, BackfillAction, DatasetReport, Invocation, Scope, INDEX_CHUNK,
     };
     use chrono::{TimeZone, Utc};
     use pumper_core::config::SearchConfig;
@@ -355,6 +445,43 @@ mod tests {
         assert_eq!(parse_scope(&argv(&["--all"])).unwrap(), Scope::All);
         assert!(parse_scope(&argv(&["--dataset", "unified"])).is_err());
         assert!(parse_scope(&argv(&[])).is_err());
+    }
+
+    /// `--re-enrich` modifies a scope; it never SUPPLIES one. The anti-pattern:
+    /// letting the flag stand in for `--all`, which turns "refresh the entities
+    /// I just reconfigured" into an unrequested rebuild of every dataset in the
+    /// store.
+    #[test]
+    fn re_enrich_is_a_modifier_and_never_supplies_a_scope() {
+        assert_eq!(
+            parse_invocation(&argv(&["--all", "--re-enrich"])).unwrap(),
+            Invocation {
+                scope: Scope::All,
+                re_enrich: true
+            }
+        );
+        assert_eq!(
+            parse_invocation(&argv(&["--app", "grants"])).unwrap(),
+            Invocation {
+                scope: Scope::App("grants".into()),
+                re_enrich: false
+            }
+        );
+        assert!(
+            parse_invocation(&argv(&["--re-enrich"])).is_err(),
+            "the flag alone names no scope"
+        );
+    }
+
+    /// Re-enriching an empty index is not a re-enrichment. Reporting it as one
+    /// tells an operator their new enricher ran over the corpus when in fact
+    /// the corpus was built for the first time by that very command.
+    #[test]
+    fn re_enrich_refuses_an_empty_index_instead_of_reporting_a_first_build_as_one() {
+        let err = re_enrich_precondition(0).expect_err("nothing to re-enrich");
+        assert!(err.contains("holds 0"), "{err}");
+        assert!(err.contains("WITHOUT --re-enrich"), "{err}");
+        assert_eq!(re_enrich_precondition(1), Ok(()));
     }
 
     // ── target resolution (the function both honesty defects lived in) ──────
@@ -610,6 +737,142 @@ mod tests {
             remaining, 0,
             "helper must leave the dataset fully tombstoned"
         );
+    }
+
+    /// An enricher standing in for an installed `.wasm`, so the re-enrichment
+    /// path is provable on a machine with no wasm toolchain.
+    struct StubEnricher;
+
+    #[async_trait::async_trait]
+    impl pumper_core::Enricher for StubEnricher {
+        fn name(&self) -> &str {
+            "plugin:stub"
+        }
+        async fn enrich(&self, _input: &pumper_core::EnrichInput) -> Vec<pumper_core::Entity> {
+            vec![pumper_core::Entity::new("currency", "usd")]
+        }
+    }
+
+    /// Reopens the index dir once the previous handle's background committer has
+    /// released Tantivy's writer lock. Bounded and clock-free: the committer only
+    /// needs the runtime to poll it, so yielding is enough — no sleep, no
+    /// timing assumption.
+    async fn reopen(
+        dir: &std::path::Path,
+        enrichers: Vec<Arc<dyn pumper_core::Enricher>>,
+    ) -> TantivyIndex {
+        let cfg = SearchConfig {
+            enabled: true,
+            dir: dir.to_path_buf(),
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            match TantivyIndex::with_enrichers(&cfg, enrichers.clone()) {
+                Ok(index) => return index,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        panic!("the previous index handle never released its writer lock");
+    }
+
+    /// `--re-enrich` over a fixture index: a second walk with a NEW enricher
+    /// installed refreshes the stored entity maps in place — same documents,
+    /// same doc ids, no schema rebuild and no wipe.
+    ///
+    /// The anti-pattern this pins: needing a destructive rebuild to pick up a new
+    /// entity kind. Before N11 every entity field was a schema field, so "add an
+    /// enricher" meant wiping the corpus and rebuilding it from the store, with
+    /// the index answering queries as an empty-but-healthy index in between.
+    #[tokio::test]
+    async fn re_enrich_refreshes_entities_in_place_without_wiping_the_index() {
+        let store = TempStore::new("backfill-re-enrich").await;
+        let datasets = Datasets::new(store.storage.pool());
+        datasets
+            .upsert_many(
+                "grants",
+                "unified",
+                &[(
+                    "a".to_string(),
+                    serde_json::json!({
+                        "title": "Award notice",
+                        "body": "award up to $250,000",
+                        "url": "https://example.test/a"
+                    }),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // A scratch dir this test owns across TWO index handles, so the
+        // re-enrichment runs against the SAME on-disk index the first walk built.
+        let dir = std::env::temp_dir().join(format!(
+            "pumper-backfill-re-enrich-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First build: the shipped rules only.
+        let first = reopen(
+            &dir,
+            vec![Arc::new(pumper_engine_search::enrichers::BuiltinEnricher)],
+        )
+        .await;
+        let report = backfill_dataset(&datasets, &first, "grants", "unified")
+            .await
+            .unwrap();
+        assert_eq!(report.indexed, 1);
+        first.flush().await.unwrap();
+        let before = first
+            .stored_entities("grants:unified:a")
+            .await
+            .unwrap()
+            .expect("indexed");
+        assert_eq!(before["amount"], serde_json::json!(250_000));
+        assert!(before.get("currency").is_none(), "{before}");
+        drop(first);
+
+        // Second walk with an enricher "installed": the re-enrichment.
+        let index = reopen(
+            &dir,
+            vec![
+                Arc::new(pumper_engine_search::enrichers::BuiltinEnricher),
+                Arc::new(StubEnricher),
+            ],
+        )
+        .await;
+        assert_eq!(
+            index.doc_count().await.unwrap(),
+            1,
+            "reopening with a new enricher must not wipe the index"
+        );
+        let report = backfill_dataset(&datasets, &index, "grants", "unified")
+            .await
+            .unwrap();
+        assert_eq!(report.indexed, 1);
+        index.flush().await.unwrap();
+
+        let after = index
+            .stored_entities("grants:unified:a")
+            .await
+            .unwrap()
+            .expect("still indexed");
+        assert_eq!(after["amount"], serde_json::json!(250_000), "kept");
+        assert_eq!(after["currency"], serde_json::json!("usd"), "added");
+        assert_eq!(
+            index.doc_count().await.unwrap(),
+            1,
+            "an upsert, not a duplicate"
+        );
+        let stats = index.enricher_stats();
+        assert_eq!(stats.len(), 2);
+        assert!(stats.iter().all(|s| s.failures == 0), "{stats:?}");
+
+        drop(index);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RAII scratch Tantivy index — the dir is removed when the test ends.

@@ -249,7 +249,7 @@ pub(crate) async fn search(
     get,
     path = "/search/status",
     tag = "search",
-    responses((status = 200, description = "`{enabled, doc_count, disk_bytes, segment_count}` — index telemetry. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin. `disk_bytes` is the index directory's on-disk size and `segment_count` the searchable segments the reader sees — `doc_count` flat while those climb is the growth signal upserts hide. Both are 0 when search is disabled (`NoSearch` measures nothing rather than guessing)."))
+    responses((status = 200, description = "`{enabled, doc_count, disk_bytes, segment_count, enrichers}` — index telemetry. `enrichers` is one row per configured `[search] enrichers` entry (`{name, docs, entities, failures}`, N11): `failures > 0` is a pass that could NOT run (a trapping plugin, a module nobody installed) — those documents were indexed without its entities, so an enricher that fails on everything is otherwise indistinguishable from one that honestly finds nothing. Empty when nothing enriches. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin. `disk_bytes` is the index directory's on-disk size and `segment_count` the searchable segments the reader sees — `doc_count` flat while those climb is the growth signal upserts hide. Both are 0 when search is disabled (`NoSearch` measures nothing rather than guessing)."))
 )]
 pub(crate) async fn search_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let doc_count = state.search.doc_count().await?;
@@ -262,6 +262,9 @@ pub(crate) async fn search_status(State(state): State<AppState>) -> Result<Json<
         "doc_count": doc_count,
         "disk_bytes": stats.disk_bytes,
         "segment_count": stats.segment_count,
+        // N11: what each configured enricher has done since boot. `failures`
+        // is the fail-open path made visible.
+        "enrichers": state.search.enricher_stats(),
     })))
 }
 

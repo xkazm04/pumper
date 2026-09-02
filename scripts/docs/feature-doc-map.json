@@ -46,6 +46,7 @@
         "crates/core/src/governor.rs",
         "crates/core/src/cache.rs",
         "crates/core/src/tiers.rs",
+        "crates/core/src/recipes.rs",
         "crates/engine-http/**",
         "crates/engine-browser/**",
         "crates/engine-claude/**",
