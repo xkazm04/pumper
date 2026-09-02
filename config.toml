@@ -261,6 +261,14 @@ dir = "data/search-index"
 # Per-run cap on hits a materialized saved search (POST /searches with
 # `materialize: {app, dataset}`) snapshots into its view dataset.
 max_materialize_results = 500
+# Index-time entity enrichment passes, IN ORDER (N11). "builtin" is the shipped
+# regex pass (amount + event_date); "plugin:<name>" runs an installed core-module
+# plugin's `enrich` export under the usual fuel/memory caps, fail-open per
+# document. An earlier entry wins a colliding entity kind, so appending only ADDS
+# kinds. Entities land in one stored JSON field, so a new KIND never changes the
+# schema (and never wipes the index); after changing this list, refresh existing
+# documents with: search-backfill --app <app> --dataset <ds> --re-enrich
+enrichers = ["builtin"]
 
 # Result delivery via webhooks (job callbacks + dataset-watch events).
 [webhooks]
