@@ -4,7 +4,13 @@
 // changes); use `createPumperSync` for continuous mirroring.
 
 import { getJson, streamNdjson, type HttpOptions } from "./http.js";
-import type { DatasetRef, PumperRecord, RevisionPage } from "./types.js";
+import type {
+  DatasetRef,
+  PumperEvent,
+  PumperEventPage,
+  PumperRecord,
+  RevisionPage,
+} from "./types.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8088";
 
@@ -76,5 +82,53 @@ export class PumperClient {
     q.set("trust", trust);
     const url = `${this.dataset(ds)}/changes?${q.toString()}`;
     return getJson<RevisionPage<T>>(url, this.http);
+  }
+
+  /** One page of the durable event log past `after` (N05).
+   *
+   *  This is the cursor half of the API, and it is a different thing from
+   *  `changesPage`: the change feed answers "what records changed in this
+   *  dataset", the event log answers "what happened on this server", including
+   *  kinds a dataset has no opinion about (`job.failed`, `external`,
+   *  `transaction.submitted`). Ascending by `seq`, so a consumer walks forward
+   *  from whatever it last stored.
+   *
+   *  Deliberately NOT an SSE subscription: `@pumper/sync` is a batch mirror with
+   *  no long-lived connection anywhere in it, and a durable cursor gives the
+   *  same at-least-once guarantee without one. See `subscribe` below. */
+  eventsPage<T = unknown>(
+    after = 0,
+    opts: { kind?: string; app?: string; limit?: number } = {},
+  ): Promise<PumperEventPage<T>> {
+    const q = new URLSearchParams({ after: String(after) });
+    if (opts.kind) q.set("kind", opts.kind);
+    if (opts.app) q.set("app", opts.app);
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return getJson<PumperEventPage<T>>(`${this.baseUrl}/events/log?${q.toString()}`, this.http);
+  }
+
+  /** Walk the event log forward from `cursor`, yielding every event until the
+   *  server says you are caught up (`next_after === null`).
+   *
+   *  A generator rather than a callback loop so the consumer owns the cursor:
+   *  persist `event.seq` after you have durably handled the event, and pass it
+   *  back as `cursor` on the next call. Nothing here retries or remembers —
+   *  at-least-once is the server's cursor plus your commit, not client state.
+   *
+   *  This terminates; it does not tail. Poll it on your own interval (the
+   *  `next_after: null` page is the signal to back off). */
+  async *subscribe<T = unknown>(
+    opts: { cursor?: number; kind?: string; app?: string; limit?: number } = {},
+  ): AsyncGenerator<PumperEvent<T>> {
+    let after = opts.cursor ?? 0;
+    for (;;) {
+      const page = await this.eventsPage<T>(after, opts);
+      for (const event of page.events) {
+        after = event.seq;
+        yield event;
+      }
+      if (page.next_after === null) return;
+      after = page.next_after;
+    }
   }
 }

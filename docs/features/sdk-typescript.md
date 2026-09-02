@@ -76,8 +76,25 @@ re-processes idempotently (upsert by key) rather than skipping.
   `baseUrl?` (default `$PUMPER_URL` → `http://127.0.0.1:8088`), `timeoutMs?`,
   `maxBytes?`, `onProgress?`, `signal?`.
 - `PumperClient` — stateless low-level reads: `exportRecords(ds, filter?, signal?)`
-  (async generator, requests `trust=all&removed=include`) and
-  `changesPage(ds, since, cursor, limit?, trust?)` (defaults `trust="stable"`).
+  (async generator, requests `trust=all&removed=include`),
+  `changesPage(ds, since, cursor, limit?, trust?)` (defaults `trust="stable"`),
+  and the event-log cursor pair below.
+- `client.eventsPage(after?, {kind?, app?, limit?})` / `client.subscribe({cursor?,
+  kind?, app?, limit?})` — the durable event log (N05). `subscribe` is an async
+  generator that walks `GET /events/log` forward from `cursor` and **returns**
+  when the server says you are caught up (`next_after: null`); it does not tail,
+  so poll it on your own interval. The consumer owns the cursor: persist
+  `event.seq` after you have durably handled the event and pass it back as
+  `cursor`. At-least-once is the server's log plus your commit — the SDK keeps
+  no state and retries nothing.
+
+  This is a different question from `changesPage`, not a faster version of it.
+  The change feed answers *what records changed in this dataset*; the event log
+  answers *what happened on this server*, including kinds a dataset has no
+  opinion about (`job.failed`, `external`, `transaction.submitted`,
+  `source.repair_promoted`). Mirroring stays on the watermark; reacting goes on
+  the cursor. See [events-webhooks.md § The durable event
+  log](events-webhooks.md#the-durable-event-log-n05).
 - `memoryWatermark()`, `kvWatermark(kv)` — `WatermarkStore` implementations.
 - `PumperHttpError` — carries Pumper's `{error, code}` envelope; branch on `.code`.
 
@@ -100,5 +117,12 @@ watermark row.
 - **No built-in retry/backoff:** a failed page aborts the run with the watermark
   unadvanced; the next run resumes from the same point. Wrap `.run()` in the
   caller's scheduler retry.
+- **No SSE in the SDK.** `subscribe` polls `GET /events/log`; it does not open
+  the `GET /events` stream. A batch mirror has no long-lived connection anywhere
+  in it, and a durable cursor gives the same at-least-once guarantee without
+  one — but a consumer that wants sub-second latency needs the SSE stream and an
+  `EventSource` of its own.
+- **No push half.** `POST /subscriptions` (the server pushing at a sink) has no
+  SDK wrapper; `subscribe` is the pull side only.
 - **TypeScript only** so far — a Rust/Python twin would generate off the same
   OpenAPI spec.

@@ -87,7 +87,10 @@
       "sourceGlobs": [
         "crates/server/src/webhook.rs",
         "crates/server/src/events.rs",
-        "crates/server/src/routes/watches.rs"
+        "crates/server/src/routes/watches.rs",
+        "crates/server/src/subscriptions.rs",
+        "crates/server/src/routes/subscriptions.rs",
+        "crates/server/src/routes/events.rs"
       ]
     },
     {

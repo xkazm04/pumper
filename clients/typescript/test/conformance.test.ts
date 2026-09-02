@@ -189,3 +189,57 @@ test("incremental sync applies a 'changed' revision as upsert and a 'removed' on
   assert.equal(tombstones[0], "ca-grants|GR-0002");
   assert.equal(await watermark.get(dataset), result.watermark, "watermark persisted only after the sink commits");
 });
+
+test("subscribe walks the log forward from a cursor and stops when the server says caught up", async () => {
+  // Two pages: the first FILLS (next_after set), the second does not (null).
+  // The anti-pattern this pins: a poller that treats "no events" as "keep
+  // asking immediately" and spins, or one that stops at the first page and
+  // silently never sees the rest of its backlog.
+  const pages = [
+    {
+      count: 2,
+      next_after: 2,
+      latest_seq: 3,
+      retained: 3,
+      retention_days: 7,
+      events: [
+        { seq: 1, kind: "job.succeeded", app: "fake", subject_id: "j1", payload: {}, created_at: "2026-09-02T00:00:00Z" },
+        { seq: 2, kind: "dataset.changed", app: "grants", subject_id: "unified", payload: {}, created_at: "2026-09-02T00:00:01Z" },
+      ],
+    },
+    {
+      count: 1,
+      next_after: null,
+      latest_seq: 3,
+      retained: 3,
+      retention_days: 7,
+      events: [
+        { seq: 3, kind: "external", app: "src", subject_id: "e1", payload: {}, created_at: "2026-09-02T00:00:02Z" },
+      ],
+    },
+  ];
+  const requested: string[] = [];
+  let call = 0;
+  const fetchSpy: typeof fetch = (async (url: string | URL) => {
+    requested.push(String(url));
+    const body = JSON.stringify(pages[Math.min(call++, pages.length - 1)]);
+    return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const client = new PumperClient({ baseUrl: "http://example.invalid:1", fetch: fetchSpy });
+  const seen: number[] = [];
+  for await (const ev of client.subscribe({ cursor: 0, kind: "job.succeeded" })) seen.push(ev.seq);
+
+  assert.deepEqual(seen, [1, 2, 3], "every page is walked, ascending, exactly once");
+  assert.equal(requested.length, 2, "a non-full page ends the walk — no spin");
+
+  const first = new URL(requested[0]!);
+  assert.equal(first.pathname, "/events/log", "the cursor surface, not the SSE stream");
+  assert.equal(first.searchParams.get("after"), "0");
+  assert.equal(first.searchParams.get("kind"), "job.succeeded", "filters are pushed to the server");
+  assert.equal(
+    new URL(requested[1]!).searchParams.get("after"),
+    "2",
+    "the second call resumes from the page's next_after, not from 0",
+  );
+});

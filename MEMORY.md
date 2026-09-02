@@ -28,7 +28,7 @@ Other durable references live outside `.perfect/`:
 
 ## Invariants and gotchas
 
-Nine things this repo does that are **not** derivable from a skim, and that prose
+Eleven things this repo does that are **not** derivable from a skim, and that prose
 elsewhere gets wrong.
 
 1. **CORS is OFF by default — README.md and ONBOARDING.md §2 say the opposite.**
@@ -118,6 +118,25 @@ elsewhere gets wrong.
    process and a shared keypair makes the forgery test pass for the wrong
    reason); a corrupt `node.key` is a hard error, never a silent re-key; and
    `[[peer]]` is reconciled into schedules at **boot only**, unlike the catalog.
+
+10. **An empty replay ring reports "nothing missed", not "reset".** `EventBus::replay`
+   answers `Events([])` when the ring is empty ("no buffered events, so no loss possible"),
+   which is right for a fresh process that has emitted nothing and catastrophically wrong for
+   a process that has just *restarted*: a client resuming with `Last-Event-ID` got an empty
+   answer, no events and no `reset`. Any code reading the ring for a resume must check that
+   the first buffered event is exactly `after + 1` before trusting it — that is what
+   `routes::events::replay_or_log` does before falling through to the `events` table. Found
+   2026-09-02 (N05 build), by the restart e2e.
+
+   Two more N05 traps in the same area: the durable log is written **asynchronously** —
+   `emit` queues, and the transaction happens at the next outbox pass (`subscriptions::drain`,
+   on the scheduler tick and at the end of a job's fan-out), so a test that reads the table
+   right after an emit must `persist_pending` first. And the drain must run **after**
+   `finalize_with_stages`, which is what publishes `job.succeeded` — the most-subscribed kind
+   there is; draining before it left that event in the queue until the next tick.
+
+11. **The nine invariants above were numbered 1–9 before wave 3.** Renumbering on merge is
+   normal here; cite invariants by their text, not their number.
 
 ## How to extend this file
 
