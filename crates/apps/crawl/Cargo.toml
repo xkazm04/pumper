@@ -15,8 +15,11 @@ chrono.workspace = true
 # around the crawl future).
 tokio = { workspace = true, features = ["fs", "time"] }
 # Provenance (M12): sha256 of the archived page body stamped on each
-# `page_versions` revision.
+# `page_versions` revision. Also the out-edge-set digest a `mode: graph` run
+# stores so the NEXT run can see structural drift (N27).
 sha2.workspace = true
+# `derive`: the `mode: graph` PageRank checkpoint blob (`graph::GraphState`).
+serde.workspace = true
 
 [dev-dependencies]
 # `test-util`: `#[tokio::test(start_paused = true)]` drives a crawl past the
