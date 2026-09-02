@@ -911,6 +911,10 @@ const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
     ("triggers.rs", "validate_app_params"),
     // The MCP `enqueue_job` tool and its research sugar.
     ("mcp/mod.rs", "validate_app_params"),
+    // N03 workflow steps — each step's RENDERED params are validated before the
+    // step is claimed, so a template that resolves to something the app refuses
+    // fails that step at its own door instead of minutes later.
+    ("workflow.rs", "validate_app_params"),
 ];
 
 /// Work-creating call sites that deliberately do NOT run the check, each with
@@ -1047,7 +1051,18 @@ mod tests {
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
             {
-                for marker in [".enqueue(", ".enqueue_dedup(", ".create_schedule("] {
+                // `.enqueue_dedup_as(` earns its own marker rather than being
+                // caught by a prefix of `.enqueue_dedup(`: it is a DIFFERENT
+                // symbol, and the day `routes/jobs.rs` switched to it (N20
+                // principal stamping) this scan stopped seeing the platform's
+                // primary enqueue door entirely. An inventory that silently
+                // loses its most important row is worse than no inventory.
+                for marker in [
+                    ".enqueue(",
+                    ".enqueue_dedup(",
+                    ".enqueue_dedup_as(",
+                    ".create_schedule(",
+                ] {
                     if line.contains(marker) {
                         found.entry(rel.clone()).or_default().insert(marker.into());
                     }

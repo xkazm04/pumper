@@ -167,11 +167,17 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    // wait_job is read-only (awaits status, spends nothing) so it is always
-    // offered; the actuating tools are not.
+    // The read-only tools are always offered — `wait_job` and `wait_workflow`
+    // await a status and spend nothing. The actuating ones are not.
     assert_eq!(
         names,
-        vec!["list_apps", "query_dataset", "search", "wait_job"]
+        vec![
+            "list_apps",
+            "query_dataset",
+            "search",
+            "wait_job",
+            "wait_workflow"
+        ]
     );
 
     // Calling the withheld tool is a readable tool error naming the switch.
@@ -191,7 +197,12 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     .await
     .unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
+    for gated in ["enqueue_job", "run_workflow"] {
+        assert!(
+            tools.iter().any(|t| t["name"] == gated),
+            "{gated} must appear once enqueue is opted in"
+        );
+    }
 }
 
 #[tokio::test]
