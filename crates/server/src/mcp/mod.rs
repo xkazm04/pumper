@@ -358,7 +358,54 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "additionalProperties": false
             }
         }));
+        // N03 workflow runs. Appended at the END of the tool table (three wave-2
+        // items add tools here); no existing entry is reordered.
+        tools.push(json!({
+            "name": "run_workflow",
+            "description": "Start a run of a DECLARED multi-step workflow (see GET /workflows) \
+                and return its run id. A workflow is a DAG of ordinary jobs with fan-in join \
+                barriers, so a crawl -> extract -> research pipeline is ONE call and ONE \
+                receipt instead of N enqueue_job/wait_job round-trips. budget_usd is the \
+                envelope for the WHOLE run: each step's ceiling is clamped to what is left of \
+                it, and it is clamped to the operator's [mcp] max_job_budget_usd rail. Then \
+                wait_workflow for the outcome. Same operator gate as enqueue_job.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workflow"],
+                "properties": {
+                    "workflow": { "type": "string", "description": "Workflow id or name." },
+                    "budget_usd": { "type": "number", "minimum": 0 },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Replaying a start with the same key returns the ORIGINAL \
+                            run instead of executing the plan twice."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
     }
+    tools.push(json!({
+        "name": "wait_workflow",
+        "description": format!(
+            "Wait for a workflow run to settle (succeeded | failed | cancelled) and return its \
+             step matrix plus the rolled-up receipt: cost summed over the run's job set, yield \
+             from job_yield. timeout_secs is clamped to the operator's [mcp] wait_job_max_secs \
+             cap ({}s; omitted = that cap). Hitting the deadline returns timed_out: true with \
+             the run's current step matrix - call again to keep waiting. A step that never \
+             became a job reports cost_usd: null, not $0.",
+            state.config.mcp.wait_job_max_secs
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id"],
+            "properties": {
+                "run_id": { "type": "string" },
+                "timeout_secs": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+        }
+    }));
     // N15 (appended last, per the wave-2 shared-surface rule). Advertised
     // unconditionally: the token, not a config switch, is what makes it usable,
     // and hiding it would leave the self-hosted subprocess unable to discover
@@ -432,7 +479,10 @@ async fn tools_call(
             tool_fetch_readable(state, &args).await
         }
         "deep_research" if state.config.mcp.allow_enqueue => tool_deep_research(state, &args).await,
-        "enqueue_job" | "fetch_readable" | "deep_research" | "resume_job" => Err(
+        // N03: appended at the END of the dispatch, no arm reordered.
+        "wait_workflow" => tool_wait_workflow(state, &args).await,
+        "run_workflow" if state.config.mcp.allow_enqueue => tool_run_workflow(state, &args).await,
+        "enqueue_job" | "fetch_readable" | "deep_research" | "resume_job" | "run_workflow" => Err(
             "enqueue is disabled on this MCP surface — the operator must set \
              [mcp] allow_enqueue = true"
                 .to_string(),
@@ -665,6 +715,9 @@ async fn enqueue_app(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
     let (job, created) = state
         .storage
@@ -684,6 +737,101 @@ async fn enqueue_app(
         "budget_usd": budget,
         "note": note,
     }))
+}
+
+/// The `run_workflow` tool (N03): opens a run of a declared plan.
+///
+/// Goes through `workflow::start_run`, the same door `POST /workflows/{id}/runs`
+/// uses, so an agent and an operator cannot get different validation, different
+/// idempotence or a different envelope.
+async fn tool_run_workflow(state: &AppState, args: &Value) -> Result<Value, String> {
+    let name = require_str(args, "workflow")?;
+    let Some(def) = state
+        .storage
+        .get_workflow(name)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Err(format!(
+            "unknown workflow '{name}' — GET /workflows lists the declared plans"
+        ));
+    };
+    let budget = clamp_budget(
+        args.get("budget_usd").and_then(Value::as_f64),
+        state.config.mcp.max_job_budget_usd,
+    );
+    let key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (run, created) = crate::workflow::start_run(
+        state,
+        &def,
+        // 0 is a real ceiling on this surface (free tiers only), exactly as on
+        // `enqueue_app` — so it is passed through rather than dropped to "no
+        // envelope", which is what `None` would mean.
+        Some(budget),
+        key.as_deref(),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "run": run,
+        "created": created,
+        "budget_usd": budget,
+        "note": format!(
+            "wait_workflow {{\"run_id\": \"{}\"}} for the outcome and the rolled-up receipt",
+            run.id
+        ),
+    }))
+}
+
+/// The `wait_workflow` tool: settle on a run, or report the deadline honestly.
+///
+/// Polls rather than riding the event bus: a run's lifecycle events are emitted
+/// on the same bus, but a run can also be advanced by a step that finished
+/// before this call started, and a poll cannot miss that. The deadline is the
+/// operator's `wait_job_max_secs` rail — the same one `wait_job` honours, so an
+/// agent cannot buy a longer hold by waiting on a workflow instead of a job.
+async fn tool_wait_workflow(state: &AppState, args: &Value) -> Result<Value, String> {
+    let run_id = require_str(args, "run_id")?.to_string();
+    let cap = state.config.mcp.wait_job_max_secs.max(1);
+    let secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(cap)
+        .clamp(1, cap);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let Some(run) = state
+            .storage
+            .get_workflow_run(&run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!("unknown workflow run '{run_id}'"));
+        };
+        let settled = run.status != "running";
+        if settled || tokio::time::Instant::now() >= deadline {
+            let report = crate::workflow::run_report(state, &run_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| json!({ "run": run }));
+            let mut out = report;
+            if let Value::Object(obj) = &mut out {
+                obj.insert("timed_out".into(), json!(!settled));
+            }
+            return Ok(out);
+        }
+        tokio::select! {
+            _ = state.shutdown.cancelled() => {
+                return Err("server is shutting down; the run is durable — call wait_workflow \
+                            again after the restart".into());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
+    }
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -830,6 +978,10 @@ const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
     ("triggers.rs", "validate_app_params"),
     // The MCP `enqueue_job` tool and its research sugar.
     ("mcp/mod.rs", "validate_app_params"),
+    // N03 workflow steps — each step's RENDERED params are validated before the
+    // step is claimed, so a template that resolves to something the app refuses
+    // fails that step at its own door instead of minutes later.
+    ("workflow.rs", "validate_app_params"),
 ];
 
 /// Work-creating call sites that deliberately do NOT run the check, each with
@@ -1100,7 +1252,18 @@ mod tests {
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
             {
-                for marker in [".enqueue(", ".enqueue_dedup(", ".create_schedule("] {
+                // `.enqueue_dedup_as(` earns its own marker rather than being
+                // caught by a prefix of `.enqueue_dedup(`: it is a DIFFERENT
+                // symbol, and the day `routes/jobs.rs` switched to it (N20
+                // principal stamping) this scan stopped seeing the platform's
+                // primary enqueue door entirely. An inventory that silently
+                // loses its most important row is worse than no inventory.
+                for marker in [
+                    ".enqueue(",
+                    ".enqueue_dedup(",
+                    ".enqueue_dedup_as(",
+                    ".create_schedule(",
+                ] {
                     if line.contains(marker) {
                         found.entry(rel.clone()).or_default().insert(marker.into());
                     }

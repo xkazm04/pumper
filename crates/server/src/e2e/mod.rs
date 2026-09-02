@@ -59,3 +59,4 @@ mod watch_honesty;
 mod webhook_contract;
 mod worker_fanout;
 mod worker_lifecycle;
+mod workflow_runs;

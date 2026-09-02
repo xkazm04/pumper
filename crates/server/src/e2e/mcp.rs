@@ -167,15 +167,21 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    // wait_job is read-only (awaits status, spends nothing) so it is always
-    // offered; the actuating tools are not. `fetch` (N15) is always offered too
-    // and is NOT gated by `allow_enqueue`: it creates no job, and its gate is
-    // the per-run job token pumper mints for its own Claude subprocess — an
-    // ordinary client that calls it gets an `[unauthorized]` tool error rather
-    // than a fetch (see `e2e::mcp_fetch`).
+    // The read-only tools are always offered —  and     // await a status and spend nothing. The actuating ones are not.  (N15)
+    // is always offered too and is NOT gated by : it creates no job,
+    // and its gate is the per-run job token pumper mints for its own Claude
+    // subprocess — an ordinary client that calls it gets an  tool
+    // error rather than a fetch (see ). It stays LAST.
     assert_eq!(
         names,
-        vec!["list_apps", "query_dataset", "search", "wait_job", "fetch"]
+        vec![
+            "list_apps",
+            "query_dataset",
+            "search",
+            "wait_job",
+            "wait_workflow",
+            "fetch"
+        ]
     );
 
     // Calling the withheld tool is a readable tool error naming the switch.
@@ -195,7 +201,12 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     .await
     .unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
+    for gated in ["enqueue_job", "run_workflow"] {
+        assert!(
+            tools.iter().any(|t| t["name"] == gated),
+            "{gated} must appear once enqueue is opted in"
+        );
+    }
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::auth::CallerPrincipal;
 use crate::events::JobEvent;
 use crate::routes::error::{
     default_limit, keyset_cursor, parse_cursor, parse_since, ApiError, MAX_ATTEMPTS_CAP,
@@ -103,6 +104,7 @@ pub(crate) async fn enqueue_job(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: axum::http::HeaderMap,
+    caller: Option<axum::Extension<CallerPrincipal>>,
     body: Option<Json<EnqueueBody>>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Some(app) = state.registry.get(&name) else {
@@ -163,8 +165,24 @@ pub(crate) async fn enqueue_job(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
-    let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
+    // N20 attribution: the principal the identity layer resolved is stamped onto
+    // the job row, which is what makes `cost_events.principal_id` (copied from
+    // the job at metering time) anything other than NULL. `stored_id()` is
+    // `None` for the synthetic `open`-mode operator — an identity this server
+    // invented rather than authenticated — so an `open` node keeps reporting its
+    // spend as `(unattributed)`, which is the truth about it.
+    let principal_id = caller
+        .as_ref()
+        .and_then(|axum::Extension(c)| c.stored_id())
+        .map(str::to_string);
+    let (job, created) = state
+        .storage
+        .enqueue_dedup_as(&name, opts, principal_id.as_deref())
+        .await?;
     if created {
         state.notify.notify_one();
         Ok((StatusCode::ACCEPTED, Json(job)))
@@ -573,6 +591,11 @@ pub(crate) struct CostSummaryQuery {
     app: Option<String>,
     /// RFC 3339 lower bound for the window.
     since: Option<String>,
+    /// Restrict the ledger to one caller (N20). Pass the literal
+    /// `(unattributed)` for the rows that carry no caller — every legacy row,
+    /// and every row an `open`-mode node or an internal producer (scheduler,
+    /// trigger hop, workflow step of an unauthenticated run) creates.
+    principal: Option<String>,
 }
 
 /// Spend grouped by (app, engine) — the ROI overview.
@@ -581,18 +604,56 @@ pub(crate) struct CostSummaryQuery {
     path = "/costs",
     tag = "costs",
     params(CostSummaryQuery),
-    responses((status = 200, description = "`{total_usd, by_app_engine: [{app, engine, cost_usd}]}`"))
+    responses((status = 200, description = "`{total_usd, by_app_engine: [{app, engine, cost_usd}], principal}`. With `?principal=` the ledger is restricted to that caller (`(unattributed)` selects the rows with no caller)"))
 )]
 pub(crate) async fn cost_summary(
     State(state): State<AppState>,
     Query(query): Query<CostSummaryQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let since = parse_since(query.since.as_deref())?;
-    let summary = state.costs.summary(query.app.as_deref(), since).await?;
+    let principal = query.principal.as_deref().map(principal_filter);
+    // `Option<Option<&str>>`: absent = no filter, `Some(None)` = the rows with
+    // no caller, `Some(Some(id))` = that caller. See `summary_scoped`.
+    let summary = state
+        .costs
+        .summary_scoped(query.app.as_deref(), since, principal)
+        .await?;
     let total: f64 = summary.iter().map(|s| s.cost_usd).sum();
-    Ok(Json(
-        json!({ "total_usd": total, "by_app_engine": summary }),
-    ))
+    Ok(Json(json!({
+        "total_usd": total,
+        // Echoed so a caller can see the filter was applied — an empty ledger
+        // under a mistyped principal must not read as "this caller spent $0".
+        "principal": query.principal,
+        "by_app_engine": summary,
+    })))
+}
+
+/// Maps the caller-facing `principal=` value onto the ledger's own encoding.
+///
+/// The by-principal report renders NULL rows as `(unattributed)`
+/// ([`pumper_core::costs::UNATTRIBUTED_PRINCIPAL`]), so that label has to be
+/// accepted back as a filter — otherwise the one row an operator is most likely
+/// to click on is the one row that cannot be drilled into. Anything else is a
+/// literal principal id.
+pub(crate) fn principal_filter(requested: &str) -> Option<&str> {
+    (requested != pumper_core::costs::UNATTRIBUTED_PRINCIPAL).then_some(requested)
+}
+
+#[cfg(test)]
+mod principal_filter_tests {
+    use super::principal_filter;
+
+    /// The anti-pattern: `(unattributed)` — the label the by-principal report
+    /// prints for rows with no caller — read as an ordinary principal id. The
+    /// filter would then match no row, and the one line an operator is most
+    /// likely to click on would answer "$0 spent" about the largest bucket on
+    /// most deployments.
+    #[test]
+    fn the_unattributed_label_selects_null_rows_not_a_principal_named_that() {
+        assert_eq!(principal_filter("(unattributed)"), None);
+        assert_eq!(principal_filter("p_abc"), Some("p_abc"));
+        assert_eq!(principal_filter(""), Some(""));
+    }
 }
 
 #[cfg(test)]

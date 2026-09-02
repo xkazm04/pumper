@@ -118,6 +118,13 @@
       ]
     },
     {
+      "doc": "docs/features/workflows.md",
+      "sourceGlobs": [
+        "crates/server/src/workflow.rs",
+        "crates/server/src/routes/workflows.rs"
+      ]
+    },
+    {
       "doc": "docs/features/auth.md",
       "sourceGlobs": [
         "crates/server/src/auth.rs",

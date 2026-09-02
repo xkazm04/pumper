@@ -156,6 +156,11 @@ async fn tick_once(
     // interval-gated and spawned — deprecations/tags/assertions in DataHub
     // become schedule disables, Claude-tier pauses, and immediate syncs.
     crate::datahub::govern_tick(state);
+    // And scheduled workflows (N03): a plan with a cron fires a run per firing,
+    // held while its newest run is still open. Rides this tick rather than
+    // owning a timer, and reads `last_pass` for the same reason the schedule
+    // reconcile does — a boot must not fire every plan at once.
+    crate::workflow::reconcile_scheduled(state, last_pass, now).await;
     completed
 }
 

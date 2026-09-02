@@ -180,6 +180,48 @@ impl CostLedger {
             .collect())
     }
 
+    /// [`Self::summary`] with an optional **principal** filter (N20) — the
+    /// query behind `GET /costs?principal=`.
+    ///
+    /// `principal` is deliberately a nested option, because this filter has
+    /// THREE states and collapsing them to two is the bug: `None` = no filter
+    /// (every row), `Some(None)` = the rows with **no** caller (what the
+    /// by-principal report labels [`UNATTRIBUTED_PRINCIPAL`], and the one row an
+    /// operator is most likely to want to drill into), `Some(Some(id))` = that
+    /// caller. A flat `Option<&str>` would make "unattributed" indistinguishable
+    /// from "unfiltered" and silently answer the whole ledger.
+    ///
+    /// The NULL-safe `IS` comparison is what lets one statement serve all
+    /// three; `= NULL` would match nothing.
+    pub async fn summary_scoped(
+        &self,
+        app: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        principal: Option<Option<&str>>,
+    ) -> Result<Vec<CostSummary>> {
+        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(
+            "SELECT app, engine, COUNT(*), COALESCE(SUM(cost_usd), 0) FROM cost_events \
+             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR created_at > ?2) \
+             AND (?3 = 0 OR principal_id IS ?4) \
+             GROUP BY app, engine ORDER BY app, engine",
+        )
+        .bind(app)
+        .bind(since.map(ts))
+        .bind(i64::from(principal.is_some()))
+        .bind(principal.flatten())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(app, engine, calls, cost_usd)| CostSummary {
+                app,
+                engine,
+                calls,
+                cost_usd,
+            })
+            .collect())
+    }
+
     /// Spend grouped by the **calling principal** (N20), optionally windowed.
     ///
     /// Rows with no principal are reported under

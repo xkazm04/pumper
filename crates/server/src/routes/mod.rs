@@ -28,6 +28,13 @@ pub(crate) use events::next_or_shutdown;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;
+// The job cancel door, re-exported for the workflow engine (`crate::workflow`),
+// which sits outside `routes`. Cancelling a workflow run must stop its open
+// steps EXACTLY the way `DELETE /jobs/{id}` stops any other job — queued rows
+// through the guarded write, running ones through their cancellation token —
+// so the engine calls that handler rather than growing a second, subtly
+// different cancel path.
+pub(crate) use jobs::cancel_job;
 // The poison-recovering lock helper, re-exported for the BACKGROUND loops
 // (`crate::worker`, `crate::datahub`) — they hold the same class of advisory
 // in-memory caches the request path does, but sit outside `routes` and so
@@ -79,6 +86,7 @@ mod schedules;
 mod search;
 mod triggers;
 mod watches;
+mod workflows;
 
 // Bring every handler (and its utoipa-generated `__path_*` companion) into this
 // module so the `routes!(...)` registrations below resolve. Each submodule
@@ -106,6 +114,7 @@ use schedules::*;
 use search::*;
 use triggers::*;
 use watches::*;
+use workflows::*;
 
 /// Top-level metadata for the generated OpenAPI document. Route operations are
 /// collected from each `#[utoipa::path]` handler by `OpenApiRouter` (see
@@ -146,6 +155,7 @@ use watches::*;
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
+        (name = "workflows", description = "Declared multi-step DAGs: fan-in join barriers, param templating, one budget envelope and one rolled-up receipt per run"),
     )
 )]
 struct ApiDoc;
@@ -285,6 +295,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(disable_principal))
         .routes(routes!(rotate_principal))
         .routes(routes!(list_audit))
+        .routes(routes!(list_workflows, create_workflow))
+        .routes(routes!(get_workflow, delete_workflow))
+        .routes(routes!(list_workflow_runs, start_workflow_run))
+        .routes(routes!(get_workflow_run, cancel_workflow_run))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -668,6 +682,14 @@ mod api_spec_tests {
         "POST /principals/{id}/disable",
         "POST /principals/{id}/rotate",
         "GET /audit",
+        "GET /workflows",
+        "POST /workflows",
+        "GET /workflows/{id}",
+        "DELETE /workflows/{id}",
+        "GET /workflows/{id}/runs",
+        "POST /workflows/{id}/runs",
+        "GET /workflow-runs/{run_id}",
+        "DELETE /workflow-runs/{run_id}",
         "GET /openapi.json",
     ];
 
