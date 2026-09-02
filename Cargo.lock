@@ -336,6 +336,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "pumper-core",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",

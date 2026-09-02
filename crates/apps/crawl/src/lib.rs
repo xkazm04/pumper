@@ -3,6 +3,13 @@
 //! governor, dropping near-duplicate pages, and streaming page bodies to the
 //! job's artifact directory.
 
+// The result builder is one `json!` literal of ~45 keys, and `json_internal!`
+// recurses once per key: adding the two importance counters (N27) crossed the
+// default 128-step limit. Raising it keeps the result a single literal in emit
+// order — the property `output_shape` is diffed against — instead of splitting
+// it into `map.insert` calls that would drift.
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +25,7 @@ use pumper_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub mod graph;
 pub mod link_graph;
 pub mod reliability;
 
@@ -246,6 +254,61 @@ fn edge_tracking_warning(untracked: usize) -> Option<String> {
     ))
 }
 
+/// Prior interval a revisit seed's [`due_score`] is measured against when the
+/// URL has never been seen to change. Mirrors core's own cold-start prior
+/// (`DEFAULT_CADENCE_PRIOR_SECS`, private to `core::crawl`) so the app-side
+/// importance ranking scores a seed the same way core's own ranking would.
+const CADENCE_PRIOR_SECS: f64 = 7.0 * 86_400.0;
+
+/// The multiplier the opt-in importance term applies to a revisit seed's
+/// due-score: `1 + weight × (rank / max_rank)`.
+///
+/// **`weight = 0` is exactly 1.0, for every input** — that is the pin that
+/// makes `importance_weight` default-off in the byte-for-byte sense: an
+/// unweighted run must rank by learned change cadence alone, exactly as it did
+/// before this term existed.
+///
+/// A URL with no `page_rank` record contributes `0`, not an invented average:
+/// honest absence, so a corpus that has never had a `graph` run behaves as if
+/// the term were off rather than quietly ranking every page as mid-importance.
+pub fn importance_multiplier(rank: Option<f64>, max_rank: f64, weight: f64) -> f64 {
+    if weight <= 0.0 || max_rank <= 0.0 {
+        return 1.0;
+    }
+    let normalized = (rank.unwrap_or(0.0).max(0.0) / max_rank).min(1.0);
+    1.0 + weight * normalized
+}
+
+/// Importance-weighted revisit order: `(url, due_score, rank)` triples ranked by
+/// `due × importance_multiplier`, ties broken by URL for determinism, truncated
+/// to `budget`. Returns the selected URLs, most-worth-fetching first.
+///
+/// This is the ranking a crawl runs *instead of* core's cadence-only one when
+/// `importance_weight > 0`: the app can only choose which seeds it hands over,
+/// so the budget is spent here and core then sees a set it will not truncate
+/// again. At `weight = 0` the caller must not call this at all — see
+/// [`DatasetPageSource::seeds`].
+pub fn importance_order(
+    scored: Vec<(String, f64, Option<f64>)>,
+    max_rank: f64,
+    weight: f64,
+    budget: Option<usize>,
+) -> Vec<String> {
+    let mut ranked: Vec<(f64, String)> = scored
+        .into_iter()
+        .map(|(url, due, rank)| (due * importance_multiplier(rank, max_rank, weight), url))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    if let Some(n) = budget {
+        ranked.truncate(n);
+    }
+    ranked.into_iter().map(|(_, url)| url).collect()
+}
+
 /// The manifest's `output_shape`: the leading `{...}` block lists **every key
 /// `run()` always returns**, and nothing else. [`output_shape_keys`] parses that
 /// block so an inventory test can diff it against a real run in both directions.
@@ -259,7 +322,8 @@ const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, 
      sitemap_seeded, failed, failed_by_host, skipped_botwall, robots_fetch_failures, \
      checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining, pages_dataset, \
      pages_new, pages_changed, pages_unchanged, revisit, revisited, unchanged_304, \
-     skipped_not_due, cadence_updates, changed, new, gone, versions_archived, \
+     skipped_not_due, cadence_updates, importance_weight, importance_skipped, \
+     changed, new, gone, versions_archived, \
      reliability_hosts, edges_dataset, edges_written, edges_unchanged, \
      edges_dropped_out_degree, edges_deduped, edges_untracked, top_linked, \
      top_linked_complete} — crawl tallies plus the `pages` \
@@ -267,23 +331,49 @@ const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, 
      `top_linked_complete: false` — additionally \
      carries a `warnings` array naming what was cut. Bodies land in the job's artifact dir, \
      changed revisions also as revision-suffixed copies recorded in `page_versions`, and the \
-     link graph streams into the `edges` dataset (key `{from_url}|{to_url}`).";
+     link graph streams into the `edges` dataset (key `{from_url}|{to_url}`). \
+     `mode: \"graph\"` fetches nothing and returns a DIFFERENT shape entirely — see \
+     `graph_output_shape_keys()`.";
+
+/// The always-present result keys of a `mode: "graph"` run — a whole different
+/// shape from [`OUTPUT_SHAPE`], because a graph run makes no fetches, keeps no
+/// frontier and writes no pages. Pinned by the same two-way inventory test, for
+/// the same reason: a consumer codes against it.
+const GRAPH_OUTPUT_SHAPE: &str = "{mode, graph_dataset, structure_changes_dataset, \
+     edges_scanned, edges_superseded, edges_unattributed, edge_pages, nodes, nodes_dropped, \
+     edges_dropped, graph_complete, \
+     damping, iterations, resumed, page_rank_new, page_rank_changed, page_rank_unchanged, \
+     structure_drop_threshold, structure_changes_written, structure_baseline} — whole-corpus \
+     PageRank over the `edges` dataset into `page_rank` (key = URL), plus structural-drift \
+     records in `structure_changes`. A run whose graph hit a cap additionally carries a \
+     `warnings` array.";
+
+/// The always-present result keys of a `mode: "graph"` run, parsed out of
+/// [`GRAPH_OUTPUT_SHAPE`] exactly as [`output_shape_keys`] parses its own.
+pub fn graph_output_shape_keys() -> Vec<&'static str> {
+    shape_keys(GRAPH_OUTPUT_SHAPE)
+}
+
+/// The keys inside a shape string's leading `{...}` block.
+fn shape_keys(shape: &'static str) -> Vec<&'static str> {
+    let Some(open) = shape.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = shape[open..].find('}').map(|i| open + i) else {
+        return Vec::new();
+    };
+    shape[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .collect()
+}
 
 /// The always-present result keys named by [`OUTPUT_SHAPE`] — everything inside
 /// its leading brace block. Lives beside the string it parses so the inventory
 /// test cannot drift from the format.
 pub fn output_shape_keys() -> Vec<&'static str> {
-    let Some(open) = OUTPUT_SHAPE.find('{') else {
-        return Vec::new();
-    };
-    let Some(close) = OUTPUT_SHAPE[open..].find('}').map(|i| open + i) else {
-        return Vec::new();
-    };
-    OUTPUT_SHAPE[open + 1..close]
-        .split(',')
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .collect()
+    shape_keys(OUTPUT_SHAPE)
 }
 
 /// How often a running crawl commits what it has learned about the hosts it is
@@ -872,6 +962,90 @@ struct DatasetPageSource {
     /// Populated during `seeds()` with each seeded URL's full record data — the
     /// sink's merge base for 304 cadence markers (no second dataset read).
     seed_data: SeedData,
+    /// Opt-in importance term (N27). `0.0` = OFF and the seed list is handed to
+    /// core **untouched**, so the frontier orders exactly as it did before this
+    /// existed. Above 0, the run's budget is spent here instead — see
+    /// [`importance_order`].
+    importance_weight: f64,
+    /// The `revisit_budget` this run was given, so an importance-weighted
+    /// selection can spend it. `None` = every due seed.
+    revisit_budget: Option<usize>,
+    /// Seeds dropped by the importance-weighted selection because they ranked
+    /// past the budget — counted, never silent, and reported beside core's own
+    /// `skipped_not_due`.
+    importance_skipped: Arc<AtomicUsize>,
+}
+
+impl DatasetPageSource {
+    /// Importance-weighted revisit frontier (N27), applied to the seed list
+    /// before core sees it.
+    ///
+    /// **The `weight = 0` path returns `seeds` by identity** — no dataset read,
+    /// no scoring, no reordering — so a run that has not opted in is the run
+    /// this app has always made. Above 0 the app scores each seed with core's
+    /// own [`due_score`], multiplies by the URL's whole-corpus PageRank (from
+    /// the `page_rank` dataset a `mode: "graph"` run writes), and spends the
+    /// `revisit_budget` on the winners; core then re-ranks a set it will not
+    /// truncate again.
+    ///
+    /// A missing/empty `page_rank` dataset means no page has an importance, so
+    /// every multiplier is 1.0 and the order collapses back to due-score —
+    /// honest absence rather than a fabricated ranking.
+    async fn weight_by_importance(&self, seeds: Vec<RevisitSeed>) -> Vec<RevisitSeed> {
+        if self.importance_weight <= 0.0 || seeds.is_empty() {
+            return seeds;
+        }
+        let ranks: HashMap<String, f64> = match self
+            .datasets
+            .list(&self.app, graph::PAGE_RANK_DATASET, i64::from(u32::MAX))
+            .await
+        {
+            Ok(records) => records
+                .into_iter()
+                .filter(|r| r.removed_at.is_none())
+                .filter_map(|r| {
+                    r.data
+                        .get("rank")
+                        .and_then(Value::as_f64)
+                        .map(|rank| (r.key, rank))
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(app = %self.app, "crawl page_rank read failed: {e}");
+                HashMap::new()
+            }
+        };
+        let max_rank = ranks.values().copied().fold(0.0_f64, f64::max);
+        let now = chrono::Utc::now().timestamp();
+        let scored: Vec<(String, f64, Option<f64>)> = seeds
+            .iter()
+            .map(|s| {
+                let prior = s.cadence.interval_secs.unwrap_or(CADENCE_PRIOR_SECS);
+                (
+                    s.url.clone(),
+                    pumper_core::due_score(&s.cadence, now, prior),
+                    ranks.get(&s.url).copied(),
+                )
+            })
+            .collect();
+        let offered = seeds.len();
+        let keep = importance_order(
+            scored,
+            max_rank,
+            self.importance_weight,
+            self.revisit_budget,
+        );
+        let order: HashMap<String, usize> =
+            keep.into_iter().enumerate().map(|(i, u)| (u, i)).collect();
+        let mut chosen: Vec<(usize, RevisitSeed)> = seeds
+            .into_iter()
+            .filter_map(|s| order.get(&s.url).map(|&i| (i, s)))
+            .collect();
+        chosen.sort_by_key(|(i, _)| *i);
+        self.importance_skipped
+            .fetch_add(offered.saturating_sub(chosen.len()), Ordering::Relaxed);
+        chosen.into_iter().map(|(_, s)| s).collect()
+    }
 }
 
 #[async_trait]
@@ -910,7 +1084,7 @@ impl PageSource for DatasetPageSource {
                     });
                 }
                 *self.seed_data.lock().unwrap_or_else(|e| e.into_inner()) = data_map;
-                seeds
+                self.weight_by_importance(seeds).await
             }
             Err(e) => {
                 tracing::warn!(app = %self.app, "crawl revisit seed load failed: {e}");
@@ -937,7 +1111,11 @@ impl ScrapeApp for Crawl {
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
          conditional GETs; \"discover\": true opts into link-following; \
          \"revisit_budget\" + \"min_due_score\" spend the budget on the URLs \
-         most likely changed, per learned per-URL change cadence)}. \
+         most likely changed, per learned per-URL change cadence; \
+         \"importance_weight\" > 0 additionally weights that spend by whole-corpus \
+         PageRank), \"mode\": \"graph\" (fetch nothing; rank the whole corpus from \
+         the persisted `edges` dataset into `page_rank` and record structural \
+         drift into `structure_changes`)}. \
          Frontier state is checkpointed durably per job: an interrupted, reaped, \
          or shutdown-suspended crawl resumes where it left off on its next attempt. \
          Changed pages are archived into the `page_versions` dataset (key \
@@ -981,8 +1159,8 @@ impl ScrapeApp for Crawl {
                     "sitemap_seeds": { "type": "boolean" },
                     "mode": {
                         "type": "string",
-                        "enum": ["revisit"],
-                        "description": "Incremental recrawl of the existing `pages` dataset via conditional GETs."
+                        "enum": ["revisit", "graph"],
+                        "description": "`revisit` = incremental recrawl of the existing `pages` dataset via conditional GETs. `graph` = fetch nothing; rank the whole corpus from the persisted `edges` dataset into `page_rank` and record structural drift."
                     },
                     "discover": { "type": "boolean" },
                     "revisit_budget": {
@@ -995,6 +1173,30 @@ impl ScrapeApp for Crawl {
                         "minimum": 0,
                         "maximum": 1,
                         "description": "Revisit mode: skip seeds whose probability-changed-since-last-check falls below this (0 = fetch all; skipped seeds are counted in skipped_not_due)."
+                    },
+                    "importance_weight": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                        "description": "Revisit mode, opt-in (0 = OFF = today's cadence-only ordering, byte for byte): multiply each seed's due-score by 1 + weight x (PageRank / max PageRank) read from the `page_rank` dataset, and spend `revisit_budget` on the winners. Seeds ranked out are counted in importance_skipped."
+                    },
+                    "damping": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 0.99,
+                        "description": "Graph mode: PageRank damping factor (default 0.85)."
+                    },
+                    "iterations": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Graph mode: power iterations, checkpointed one per pass (default 20)."
+                    },
+                    "structure_drop_threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Graph mode: fraction of a hub's out-links that must vanish since the previous graph run before a `structure_changes` record is written (default 0.25)."
                     }
                 },
                 "additionalProperties": true
@@ -1012,6 +1214,20 @@ impl ScrapeApp for Crawl {
                 ManifestExample {
                     description: "Incremental revisit of already-crawled pages (conditional GETs)",
                     params: json!({ "mode": "revisit", "max_pages": 200 }),
+                },
+                ManifestExample {
+                    description:
+                        "Whole-corpus PageRank over the persisted `edges` dataset (no fetches)",
+                    params: json!({ "mode": "graph" }),
+                },
+                ManifestExample {
+                    description:
+                        "Revisit weighted toward important pages (needs a prior `mode: graph` run)",
+                    params: json!({
+                        "mode": "revisit",
+                        "revisit_budget": 200,
+                        "importance_weight": 1.0
+                    }),
                 },
             ],
             // Every key `run()` always returns, in emit order. An inventory test
@@ -1035,9 +1251,17 @@ impl ScrapeApp for Crawl {
                 })
                 .unwrap_or_default()
         };
+        let mode = ctx.params.get("mode").and_then(Value::as_str);
+        // Graph mode fetches nothing at all: it reads the `edges` dataset the
+        // crawls already wrote and ranks the whole corpus. Dispatched before
+        // any crawl plumbing is built, and it returns its own result shape
+        // (`graph::GRAPH_OUTPUT_SHAPE`).
+        if mode == Some("graph") {
+            return graph::run_graph(&ctx).await;
+        }
         // Revisit mode seeds the frontier from the `pages` dataset, so `seeds` is
         // optional there (it stays required for a normal fresh crawl).
-        let revisit = ctx.params.get("mode").and_then(Value::as_str) == Some("revisit");
+        let revisit = mode == Some("revisit");
         let seeds = str_array("seeds");
         if seeds.is_empty() && !revisit {
             return Err(Error::App(
@@ -1109,6 +1333,16 @@ impl ScrapeApp for Crawl {
                 .map(|s| s.clamp(0.0, 1.0))
                 .unwrap_or(0.0),
         };
+        // Importance-weighted revisits (N27), opt-in and OFF by default: at 0
+        // the seed list reaches core untouched and the frontier orders by
+        // learned change cadence exactly as it always has.
+        let importance_weight = ctx
+            .params
+            .get("importance_weight")
+            .and_then(Value::as_f64)
+            .map(|w| w.clamp(0.0, 10.0))
+            .unwrap_or(0.0);
+        let importance_skipped = Arc::new(AtomicUsize::new(0));
 
         // Per-page fingerprints stream into the `pages` dataset as the crawl
         // runs (key = canonical URL), so crawled pages become queryable/diffable
@@ -1137,6 +1371,9 @@ impl ScrapeApp for Crawl {
                 app: ctx.app.clone(),
                 limit: REVISIT_SEED_LIMIT,
                 seed_data: seed_data.clone(),
+                importance_weight,
+                revisit_budget: cfg.revisit_budget,
+                importance_skipped: importance_skipped.clone(),
             }) as Box<dyn PageSource>
         });
 
@@ -1251,6 +1488,12 @@ impl ScrapeApp for Crawl {
             // not-due / over-budget, and 304 cadence-counter merges written.
             "skipped_not_due": stats.skipped_not_due,
             "cadence_updates": counts.cadence_updates.load(Ordering::Relaxed),
+            // Importance-weighted frontier (N27). `0` is the default and means
+            // the seed order reaching core was untouched; `importance_skipped`
+            // counts seeds the weighted selection spent the budget away from,
+            // beside core's cadence-only `skipped_not_due`.
+            "importance_weight": importance_weight,
+            "importance_skipped": importance_skipped.load(Ordering::Relaxed),
             // `changed`/`new` = live pages re-fingerprinted / first-seen this run.
             "changed": pages_changed,
             "new": pages_new,
@@ -1488,6 +1731,73 @@ mod tests {
             w.contains("`edges` dataset is complete"),
             "the dataset is NOT what was truncated, and saying so is the point: {w}"
         );
+    }
+
+    // ── importance-weighted revisits (N27) ──────────────────────────────────
+
+    #[test]
+    fn a_zero_weight_multiplier_is_exactly_one_for_every_input() {
+        // The pin. `importance_weight` is opt-in and OFF by default, and "off"
+        // has to mean this: whatever the rank, whatever the corpus, the
+        // due-score is untouched.
+        for rank in [None, Some(0.0), Some(0.5), Some(1.0), Some(-3.0)] {
+            for max in [0.0, 0.001, 1.0, 1_000.0] {
+                let m = importance_multiplier(rank, max, 0.0);
+                assert_eq!(m, 1.0, "weight 0 with rank {rank:?}, max {max} gave {m}");
+            }
+        }
+        // A corpus with no ranking at all is the same "off": honest absence, not
+        // an invented mid-importance for everyone.
+        assert_eq!(importance_multiplier(Some(0.9), 0.0, 5.0), 1.0);
+        assert_eq!(importance_multiplier(None, 1.0, 5.0), 1.0);
+    }
+
+    #[test]
+    fn the_multiplier_scales_with_rank_and_is_bounded_by_the_weight() {
+        // Top of the corpus gets the full weight; the bottom gets none.
+        assert_eq!(importance_multiplier(Some(1.0), 1.0, 2.0), 3.0);
+        assert_eq!(importance_multiplier(Some(0.5), 1.0, 2.0), 2.0);
+        assert_eq!(importance_multiplier(Some(0.0), 1.0, 2.0), 1.0);
+        // A rank above the observed maximum (a stale `page_rank` row) is
+        // clamped rather than allowed to run the weight away, and a negative
+        // one floors at 0 instead of INVERTING the term.
+        assert_eq!(importance_multiplier(Some(9.0), 1.0, 2.0), 3.0);
+        assert_eq!(importance_multiplier(Some(-9.0), 1.0, 2.0), 1.0);
+    }
+
+    #[test]
+    fn an_important_page_outranks_an_equally_due_leaf_but_not_a_far_more_due_one() {
+        let seeds = || {
+            vec![
+                ("https://x/hub".to_string(), 0.4, Some(1.0)),
+                ("https://x/a".to_string(), 0.4, Some(0.05)),
+                ("https://x/hot".to_string(), 0.95, Some(0.05)),
+            ]
+        };
+        // Unweighted: pure cadence — most-due first, ties by URL.
+        let plain = importance_order(seeds(), 1.0, 0.0, None);
+        assert_eq!(plain[0], "https://x/hot");
+        assert_eq!(plain[1], "https://x/a", "the tie breaks by URL: {plain:?}");
+
+        // Weighted: the hub jumps its equally-due leaf...
+        let weighted = importance_order(seeds(), 1.0, 2.0, None);
+        assert_eq!(weighted[0], "https://x/hub", "{weighted:?}");
+        // ...but importance is a MULTIPLIER on due-score, not a replacement for
+        // it — a leaf that is about to change still beats a stale hub once the
+        // weight is small.
+        let gentle = importance_order(seeds(), 1.0, 0.2, None);
+        assert_eq!(gentle[0], "https://x/hot", "{gentle:?}");
+    }
+
+    #[test]
+    fn the_budget_is_spent_on_the_winners_not_on_the_first_seeds_read() {
+        let scored = vec![
+            ("https://x/a".to_string(), 0.4, Some(0.01)),
+            ("https://x/hub".to_string(), 0.4, Some(1.0)),
+            ("https://x/b".to_string(), 0.4, Some(0.01)),
+        ];
+        let keep = importance_order(scored, 1.0, 3.0, Some(1));
+        assert_eq!(keep, vec!["https://x/hub".to_string()]);
     }
 
     /// Approximate heap footprint of one stored record: the text plus the

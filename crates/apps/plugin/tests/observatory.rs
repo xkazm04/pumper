@@ -244,3 +244,97 @@ async fn an_empty_stored_body_is_reported_as_a_corpus_fact_not_as_a_plugin_miss(
     );
     assert_eq!(row.data["rates"]["ok"], 1.0, "{}", row.data);
 }
+
+/// `sample_by: "rank"` (N27) — the sample follows the corpus's own importance
+/// instead of the crawl clock.
+///
+/// The refuted behaviour: the sampler always takes the head of a NEWEST-FIRST
+/// list, so on a large site the pages audited every run are whatever was
+/// crawled last — while the nav hub every extraction rule depends on may never
+/// be sampled at all, and its rot is invisible until every leaf rule breaks.
+#[tokio::test]
+async fn rank_sampling_audits_the_hub_the_corpus_points_at_not_the_newest_leaf() {
+    let store = TempStore::new("observatory-sample-by-rank").await;
+    // The hub is crawled FIRST (so it is the OLDER page) and is the one the
+    // stub plugin traps on — that trap is only visible if the hub is sampled.
+    seed_page(&store, "http://site.test/hub", "hub.html", "HUB-MARK body").await;
+    seed_page(&store, "http://site.test/leaf", "leaf.html", "leaf body").await;
+    store
+        .datasets()
+        .upsert_many(
+            "crawl",
+            "page_rank",
+            &[
+                (
+                    "http://site.test/hub".to_string(),
+                    json!({"url": "http://site.test/hub", "rank": 0.9}),
+                ),
+                (
+                    "http://site.test/leaf".to_string(),
+                    json!({"url": "http://site.test/leaf", "rank": 0.01}),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let trapping = || {
+        StubPlugins::new(
+            &["title"],
+            Answer::FailIf("HUB-MARK", pumper_core::error::PluginFailure::Trap),
+        )
+    };
+
+    // Recency (today's behaviour): the budget of one goes to the newest page,
+    // and the hub's trap is invisible.
+    let by_recency = Plugin
+        .run(ctx_with(
+            &store,
+            json!({ "observatory": { "sample_per_site": 1 } }),
+            trapping(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(by_recency["sample_by"], "recency", "{by_recency}");
+    let row = store
+        .datasets()
+        .get("plugin", "observatory", "title|site.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.data["sampled"], 1, "{}", row.data);
+    assert_eq!(
+        row.data["outcomes"]["trap"], 0,
+        "the newest page is a leaf, and it does not trap: {}",
+        row.data
+    );
+
+    // Rank: same corpus, same budget, and the page the site is built around is
+    // the one that gets audited.
+    let by_rank = Plugin
+        .run(ctx_with(
+            &store,
+            json!({ "observatory": { "sample_per_site": 1, "sample_by": "rank" } }),
+            trapping(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(by_rank["sample_by"], "rank", "{by_rank}");
+    let row = store
+        .datasets()
+        .get("plugin", "observatory", "title|site.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.data["sampled"], 1, "{}", row.data);
+    assert_eq!(
+        row.data["outcomes"]["trap"], 1,
+        "the hub was audited and its trap surfaced: {}",
+        row.data
+    );
+    assert_eq!(
+        row.data["total_pages"], 2,
+        "rank REORDERS the population, it does not filter it: {}",
+        row.data
+    );
+}

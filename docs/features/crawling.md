@@ -4,7 +4,9 @@ High-concurrency frontier crawler (`crawl()` in core; exposed as the `crawl` app
 
 ## CrawlConfig (app params)
 
-`seeds` (required unless `mode:"revisit"`), `max_pages` (50), `max_depth` (2), `concurrency` (16, max 64), `max_pages_per_host` (null = unlimited; per-host page cap for host-fair multi-seed crawls), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `mode` (`"revisit"` → incremental recrawl, see below), `discover` (false; revisit-only link-following opt-in), `revisit_budget` (null = every seed; revisit-only cap on how many known pages are fetched this run, spent on the highest due-score URLs), `min_due_score` (0; revisit-only, skips seeds whose probability-changed-since-last-check falls below it — skipped seeds are counted in `skipped_not_due`).
+`seeds` (required unless `mode:"revisit"` / `mode:"graph"`), `max_pages` (50), `max_depth` (2), `concurrency` (16, max 64), `max_pages_per_host` (null = unlimited; per-host page cap for host-fair multi-seed crawls), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `mode` (`"revisit"` → incremental recrawl, `"graph"` → whole-corpus ranking, both below), `discover` (false; revisit-only link-following opt-in), `revisit_budget` (null = every seed; revisit-only cap on how many known pages are fetched this run, spent on the highest due-score URLs), `min_due_score` (0; revisit-only, skips seeds whose probability-changed-since-last-check falls below it — skipped seeds are counted in `skipped_not_due`), `importance_weight` (0 = OFF; revisit-only importance term, see *Importance-weighted revisits*).
+
+Graph mode adds `damping` (0.85), `iterations` (20) and `structure_drop_threshold` (0.25).
 
 There is **no `checkpoint` param**. Resume is automatic and per job — see *Durable resume* below.
 
@@ -49,6 +51,54 @@ Revisit does **not** follow links (no frontier expansion) unless `discover: true
 
 **Sentinel recipe:** schedule a revisit crawl (`POST /schedules {app:"crawl", cron, params:{mode:"revisit"}}`) after an initial full crawl has populated `pages`; add a dataset **watch** or **trigger** on the crawl app's `pages` dataset (`on_change: "changed"`) to get a webhook / chained job whenever a monitored page's content changes or goes gone. The `changed`/`gone` counts in the result summarize each sweep.
 
+## Corpus graph intelligence (`mode: "graph"`)
+
+A `graph` run **fetches nothing**. It reads the `edges` dataset every crawl has been streaming to disk and turns it into a whole-corpus ranking plus a structural-drift signal — the consumers `edges` never had.
+
+`POST /jobs {"app":"crawl","params":{"mode":"graph"}}`
+
+**What it computes.** Damped PageRank (`damping`, default 0.85) over the current link graph, `iterations` power passes (default 20), **checkpointed one per pass** through the platform's job checkpoint seam (runtime-throttled like every other checkpoint, so a run whose passes are faster than the throttle persists fewer of them — the throttle costs at most one pass of redone work) — a reaped or suspended graph run resumes at the pass it reached instead of re-iterating from the top. (The edge scan itself is not checkpointed: it is a keyset read that costs one scan, while the passes cost `iterations × edges`.) A restored checkpoint whose node set no longer matches the loaded graph **restarts** rather than publishing ranks that were never computed over this corpus.
+
+**`page_rank` dataset** — one record per URL, **key = the URL**:
+
+`url, rank` (the PageRank probability; the vector sums to 1), `in_degree`, `out_degree`, `out_edges_digest` (a 64-bit digest of the node's sorted out-edge set — the structural fingerprint the next run diffs against), `run_at`.
+
+`run_at` is declared a **derived path**, so a re-run over an unchanged graph rewrites the stamp *without* appending a revision: the run reports `page_rank_unchanged`, and watches/triggers/webhooks on `page_rank` stay quiet on a corpus that did not move. (Without that declaration a nightly graph job would mark every record `changed` every night.)
+
+**Which edges count.** `edges` is upsert-only — "an edge absent this run is NOT removed" — so a hub that dropped two of its five out-links still has five rows in the dataset forever, and reading out-degree straight off it would report that hub as unchanged. The join that fixes it needs no new column: both datasets carry the producing `job_id`, and a `pages` record's is rewritten by whichever crawl last fingerprinted the page. An edge whose `job_id` matches its source page's is **current**; one that does not is **superseded** (history — excluded and counted in `edges_superseded`); an edge whose source page has no live `pages` record is **unattributed** (admitted, counted in `edges_unattributed`, and never silently called either of the other two).
+
+**`structure_changes` dataset** — written when a hub's *current* out-edge set has shrunk by at least `structure_drop_threshold` (default 0.25) since the previous graph run. Key `{url}|{previous_digest}|{digest}`, so one transition writes one record however often the job runs. Fields: `url, previous_out_degree, out_degree, links_removed, dropped_fraction, previous_digest, digest, detected_at, job_id`. **Only shrinkage counts**: a hub that re-pointed the same number of links, or gained links, is not a structural loss and gets no record (the digest change is still recorded on its `page_rank` row). The first graph run over a corpus has no baseline and writes none — `structure_baseline: false` says so.
+
+This is a signal nothing else in the platform carries: simhash sees one different page, and the extraction health detector sees nothing at all, until every leaf rule breaks.
+
+**Bounded, like the rest of the crawler.** The in-memory graph is capped at 50,000 nodes (`MAX_GRAPH_NODES`, ~8 MB including the checkpointed rank map) and 500,000 edges (`MAX_GRAPH_EDGES`); refusals are counted in `nodes_dropped` / `edges_dropped`, with `graph_complete` as the verdict and a `warnings` entry when it is false. The `edges` scan pages in 500-row keyset batches — never one `list()` of the corpus.
+
+**Result stats** (`mode: "graph"` returns a *different* shape from a crawl, pinned by the same two-way inventory test): `mode, graph_dataset, structure_changes_dataset, edges_scanned, edges_superseded, edges_unattributed, edge_pages, nodes, nodes_dropped, edges_dropped, graph_complete, damping, iterations, resumed, page_rank_new, page_rank_changed, page_rank_unchanged, structure_drop_threshold, structure_changes_written, structure_baseline`, plus `warnings` when the graph was capped.
+
+### Whole-corpus in-degree without a job (`just graph-indegree`)
+
+In-degree alone needs no code at all — [derived datasets](datasets.md#derived-datasets-derived) already do `group_by` + `count`:
+
+```bash
+curl -sX POST http://127.0.0.1:8088/derived -H 'content-type: application/json' -d '{
+  "source_app": "crawl", "source_dataset": "edges", "target_dataset": "in_degree",
+  "group_by": ["$.to_url"], "aggregates": {"links_in": "count"}
+}'
+```
+
+`just graph-indegree` creates exactly that spec (server RUNNING) and prints it. From then on every crawl's edge writes recompute `crawl/in_degree` incrementally through the normal upsert flow; `POST /derived/{id}/backfill` folds the edges already stored. Use it when in-degree is all you need — it is live and free. Use `mode: "graph"` when you need rank (in-degree cannot tell a link from the front page from a link from a link farm), out-degree, or structural drift.
+
+### Importance-weighted revisits
+
+`importance_weight` (revisit mode, **default 0 = off**) multiplies each seed's due-score by `1 + weight × (rank / max rank)`, read from `page_rank`, and spends `revisit_budget` on the winners.
+
+- **At 0 the seed list reaches core untouched** — no `page_rank` read, no reordering, no app-side truncation — so an unweighted run is the cadence-only frontier this app has always had, byte for byte. That is pinned by a test.
+- Importance is a **multiplier on due-score, not a replacement for it**: a leaf that is about to change still beats a stale hub at a small weight. Nothing due means nothing to spend (a corpus crawled a moment ago has a due-score of 0 everywhere, and no weighting reorders zeros).
+- A URL with no `page_rank` record contributes 0 — honest absence, so a corpus that has never had a `graph` run behaves as if the term were off rather than ranking every page as mid-importance.
+- Seeds the weighted selection ranked out are counted in `importance_skipped`, beside core's cadence-only `skipped_not_due`.
+
+Run `mode: "graph"` on a schedule (nightly is plenty — the ranking moves at the speed of the site map, not the content) and the revisit sweep follows it.
+
 ## Crawl → extract pipeline (source mode)
 
 The crawl writes every kept page's body to disk and records `artifact_path` + `job_id` in `pages`. The [`extractor`](extraction.md) app can read those stored bodies directly instead of re-fetching — a **crawl → dataset trigger → extractor** pipeline with no double-fetch:
@@ -78,13 +128,14 @@ Crawl tallies: `crawled, kept, skipped_duplicates, skipped_robots, skipped_filte
 
 Link graph: `edges_dataset, edges_written` (rows the store actually wrote — new + changed, **not** the row count offered), `edges_unchanged` (no-op upserts), `edges_dropped_out_degree` (links past the per-page out-degree cap), `edges_deduped` (within-run duplicates), `edges_untracked` (edges written after the 200k in-memory tracking budget was spent — see *Bounded memory*), `top_linked`, and `top_linked_complete` (`false` once `edges_untracked > 0`, i.e. the ranking covers only the run's first 200,000 distinct edges).
 
-Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`), plus the learned-cadence frontier's `skipped_not_due` (seeds not fetched because they scored below `min_due_score` or ranked past `revisit_budget`) and `cadence_updates` (304 cadence-counter merges written).
+Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`), plus the learned-cadence frontier's `skipped_not_due` (seeds not fetched because they scored below `min_due_score` or ranked past `revisit_budget`) and `cadence_updates` (304 cadence-counter merges written). `importance_weight` and `importance_skipped` are always present and `0` unless the importance term was opted into (see *Importance-weighted revisits*).
 
 Per-page detail is queried from the `pages` dataset, not returned inline (memory-bounded). The app's `output_shape` on `GET /apps` lists every always-present key, and an inventory test (`crates/apps/crawl/tests/result_contract.rs`) fails if the two ever drift apart.
 
 ## Known gaps
 
 - Crawl-delay gates dispatch; same-host in-flight fetches dispatched earlier can still cluster (the engine-level governor softens this). Frontier capped at 100k seen URLs. No JS rendering in the crawl loop (http engine only).
-- `top_linked` is a **within-run** ranking held in memory, and past 200,000 distinct edges it stops growing (see *Bounded memory*). A whole-corpus in-degree ranking would have to be computed from the `edges` dataset; the crawl does not persist in-degree.
+- `top_linked` is a **within-run** ranking held in memory, and past 200,000 distinct edges it stops growing (see *Bounded memory*). The whole-corpus ranking is a separate run — `mode: "graph"` (or the `in_degree` derived spec) — not something a crawl result carries.
+- Graph mode ships PageRank only: **no HITS hub/authority scores**, and no cross-run tombstoning of superseded rows inside `edges` itself (they are excluded from each ranking by the `job_id` join and counted in `edges_superseded`, but they stay in the dataset). Structural drift compares against the previous **graph run**, not the previous crawl, so a corpus whose first graph run happens after the restructure sees no change.
 - Revisit seeds are capped at 10k live `pages` records per run and `max_pages` still caps re-fingerprinted (changed/new) pages, so a very large monitored set is swept across multiple runs, not all at once. Conditional-GET support depends on the origin sending `ETag`/`Last-Modified`; origins that send neither are always re-fetched in full (still diffed by simhash, just not cheaply).
 - The `pages` dataset is not fed to the full-text search index: the crawl app doesn't emit `index_datasets`, and the result-key indexer explodes result arrays, not dataset rows.

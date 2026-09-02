@@ -332,6 +332,20 @@ enforcement-preview app='':
 datahub-preview port='8088':
     curl -s "http://127.0.0.1:{{port}}/datahub/governance/preview"
 
+# Whole-corpus in-degree over the crawl's persisted link graph, with NO new code
+# and no job: one derived spec (`group_by $.to_url` + `count`) that recomputes
+# `crawl/in_degree` incrementally on every crawl's edge writes. Needs the server
+# RUNNING. Creating it twice is not harmful — the second POST just answers with
+# the conflict.
+#
+# In-degree only. `POST /jobs {"app":"crawl","params":{"mode":"graph"}}` is the
+# run that computes PageRank, out-degree and structural drift — see
+# docs/features/crawling.md "Corpus graph intelligence".
+graph-indegree port='8088':
+    curl -s -X POST "http://127.0.0.1:{{port}}/derived" \
+      -H 'content-type: application/json' \
+      -d '{"source_app":"crawl","source_dataset":"edges","target_dataset":"in_degree","group_by":["$.to_url"],"aggregates":{"links_in":"count"}}'
+
 # A scope is required, e.g.
 #   just search-backfill "--app grants --dataset unified"
 #   just search-backfill --all
