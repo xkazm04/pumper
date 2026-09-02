@@ -634,7 +634,8 @@ pub(crate) struct RunsQuery {
 /// `runs` is the job lineage (`jobs.trigger_id`) — the jobs the trigger
 /// actually enqueued. `decisions` is the ledger (`trigger_runs`): one row per
 /// evaluation of this trigger against one source event, INCLUDING the negatives
-/// (`no_change_match`, `status_mismatch`, `filter_miss`, `dedup`, `cycle`,
+/// (`no_change_match`, `status_mismatch`, `filter_miss`, `bind_miss`,
+/// `fan_out_empty`, `dedup`, `cycle`,
 /// `depth`, `target_unregistered`, `bad_params`, `predicate_veto`,
 /// `plugin_missing`, `hook_trap`, `hook_malformed`, `hook_not_executable`,
 /// `hook_host_error`, `bad_filters`, `eval_set_error`, `enqueue_failed`), which
