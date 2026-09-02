@@ -101,7 +101,7 @@ server test guarantees every manifest example (and every scheduled app's
   replays the missed gap from the ring; when the gap has been evicted, a
   single `notifications/pumper/reset` (`params: {latest_seq, reason}`) tells
   the client to resync. Per-connection filters: `?app=<name>` and
-  `?kind=queued,running,succeeded,failed,cancelled,external`
+  `?kind=queued,running,waiting,succeeded,failed,cancelled,external`
   (comma-separated). Buffering is bounded (broadcast capacity + replay
   ring) — a consumer too slow to keep up drops events with a server-side
   warning and is recovered from the ring (or reset), never blocking the bus.
