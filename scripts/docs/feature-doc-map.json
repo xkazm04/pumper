@@ -165,7 +165,8 @@
     {
       "doc": "docs/features/datahub.md",
       "sourceGlobs": [
-        "crates/server/src/datahub.rs"
+        "crates/server/src/datahub.rs",
+        "crates/server/src/lineage.rs"
       ]
     },
     {

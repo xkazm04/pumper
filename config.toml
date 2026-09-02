@@ -357,6 +357,17 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # govern_interval_secs = 300                  # governance poll cadence (min 30)
 # govern_pause_max_stale_secs = 900           # cost:pause expires (loudly) after this long with no SUCCESSFUL poll; 0 = freeze until DataHub is readable again
 
+# Vendor-neutral lineage (N24) — the SECOND catalog writer, plus the two classes
+# of fact Pumper already knows and never pushed. Every key here is off by
+# default and the defaults are load-bearing: with this section absent the
+# DataHub emitter produces byte-for-byte the entity set it produced before N24.
+[lineage]
+# openlineage_url = "http://localhost:5000"   # Marquez / any OpenLineage HTTP receiver; unset = writer off. /api/v1/lineage is appended.
+# namespace = "pumper"                        # OpenLineage job/dataset namespace for this node
+# api_key = "..."                             # or put OPENLINEAGE_API_KEY in .env
+# emit_sources = false                        # catalog [[source]] rows as `web`-platform upstream entities; column lineage names them instead of upstreamType NONE
+# emit_quality = false                        # contract verdicts -> dataQualityAssertions / DataHub assertionRunEvent; health + trust -> globalTags
+
 # Information economics (M04) — GET /economics joins the cost ledger with
 # per-job yield (job_yield) into $/new-record and $/changed-record per app over
 # trailing 7d/30d windows, plus an ADVISORY budget/cadence recommendation per
