@@ -44,14 +44,14 @@ Two lookups decide whether a declaration does anything at all, and **both key on
 - `Catalog::contract_for(app, dataset)` finds the contract, so a row filed under an app that never writes that pair is never evaluated.
 - `/catalog/health` reads `datasets.list(source.app, source.dataset)`, so the same mismatch reports the source **permanently stale** rather than reporting nothing.
 
-**A row may name a virtual namespace** (`grants`, `census`) rather than a registered app, because that is the pair those datasets land under. `live_catalog_entries_map_to_registered_apps_with_matching_cron` accepts a namespace declared in `registry::VIRTUAL_NAMESPACES` provided **every one of its publishers is a registered app**, so this widens what may be named, not whether it is checked. Filing such a dataset under a producing app instead is the failure mode above, not a workaround.
+**A row may name a virtual namespace** (`grants`, `trades`, `market`, `census`) rather than a registered app, because that is the pair those datasets land under. `live_catalog_entries_map_to_registered_apps_with_matching_cron` accepts a namespace declared in `registry::VIRTUAL_NAMESPACES` provided **every one of its publishers is a registered app**, so this widens what may be named, not whether it is checked. Filing such a dataset under a producing app instead is the failure mode above, not a workaround.
 
 Two rules come with it:
 
 - **`cron` must be empty.** A virtual namespace has no `schedule()` of its own — the write rides a publisher's job — and `Catalog::reconcile` derives desired schedules from `Source::is_scheduled()`, so a cron here would ask the scheduler to create a schedule for an app that does not exist. The guard asserts this rather than trusting it. Hold the cadence with `max_staleness_hours` instead.
 - **The cron-equality check is skipped** for these rows, and only for them; every app-named row still has to match its app's `schedule()` exactly in both directions.
 
-`grants/opportunity_details` is live under this shape as of 2026-08-13. `census/market_blend` is the remaining candidate and is documented in place in the TOML.
+`grants/opportunity_details` is live under this shape as of 2026-08-13, and `market/profile` joined it on 2026-09-02 (N33) — a row under the `market` namespace, `cron` empty, `cadence = "annual"`, contract on the five fields a consumer keys, branches on or reads the economics half through, plus the headline density metric. `census/market_blend` is the remaining candidate and is documented in place in the TOML; the header comment there predates the namespace seam and is stale on the point that no honest row shape exists.
 
 **`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`, and since 2026-09-02 `grants-programs`, whose rollup runs removal detection whenever its corpus read was complete), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants`, `eu-sedia` and `state-licensing` still declare one on upsert-only writes (`state-licensing` writes via `upsert_many_with_provenance` + `upsert_many_stamped`; found in the round-21 sweep, which is also why this list is now three names and not two — an audit found the list itself had drifted).
 
@@ -85,6 +85,17 @@ and `enforce_contracts` see their revisions at all — the worker's fan-out is s
 `run_indexed_apps`, so an undeclared cross-source dataset is invisible to every one of those
 mechanisms no matter how often it is rewritten. `cms-fee-schedule` is deliberately not a publisher:
 it is in the same product group but writes only its own datasets and never rebuilds the join.
+
+`market` (N33) is the third, and the only one fed by **two families**: `market/profile` (one row per
+state x trade) is re-derived at the end of both `unified::sync_operator_economics` and
+`app_census_density::sync_market_blend`, so its nine publishers are the five trades apps AND the
+four census apps, and whichever refreshed last publishes it. Only `census-density` declares `market/profile`
+through `index_datasets` today; the other eight publish it without declaring it, because both
+shared declaration lists are pinned by tests in crates outside that change's scope (noted in
+apps.md as a known gap, with the four tests named). The seed's publisher-evidence test accepts
+either spelling a manifest uses for a shared write — a `unified` block (grants, trades) or the
+namespace's own name (`market_blend` / `market_profile`) — because a publisher owes evidence that
+its declared result NAMES the shared layer, not that it uses one family's word for it.
 
 ## Sources as lineage entities
 

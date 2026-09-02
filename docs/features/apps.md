@@ -39,6 +39,53 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 - **Unknown labels** are never dropped: the raw string is kept and surfaced in the job result's `unknown_trades` array.
 - **Unified dataset `trades/operator_economics`** (virtual `trades` app namespace): a national roll-up row `US:<trade>` **and** a per-state row `<ST>:<trade>` for every state tax record. Each joins wage band (trade-wages), pricing summary (homewyse low/median/high envelope + jobs priced, **filtered to the row's locality** so two localities no longer average into one envelope), tax context, and valuation multiples. The **per-state rows carry that state's REAL top-marginal rate** (a Texan 0% and a Californian 13.3% no longer get the same median middle number); wage and valuation stay the national roll-up on state rows (`wage_grain: "national"`) until per-state OEWS wages land (deferred — needs new research). Rebuilt by `unified::sync_operator_economics`, which each of the four apps calls at the end of its run (mirrors `grants-common`'s `sync_unified`); it is an `upsert_many` join, never a full-snapshot sync. Job results carry `unified: {new, changed}` counts.
 
+## `market/profile`: state × trade market profile (N33)
+
+**One row per US state × trade**, keyed `<ST>:<trade>` (`TX:Plumbing`), carrying both halves of *"should I launch as a plumber in Texas, and what will it cost/earn?"*. It is a **join, not a new source**: the join lives in `trades_common::market` (`crates/apps/trades-common/src/lib.rs`) and reads two products this repo already publishes.
+
+**The hazard it removes.** `trades/operator_economics` is keyed `<ST>:<trade>` and `census/market_blend` is keyed `{naics4}:{state_fips}` — `TX:Plumbing` vs `2382:48`. Joining them by hand needs the trade→NAICS map (`taxonomy::TradeEntry.naics`), the USPS→FIPS map (`census_common::state_fips_for_abbr`) *and* the knowledge that the census cell is 4-digit. That is the same class of grain/key hazard the labour trio is warned about at the top of this file, and it now has one answer instead of a warning.
+
+### The row
+
+| Block | From | Notes |
+|---|---|---|
+| `state`, `state_fips`, `trade`, `soc_code`, `naics4` | both | `state_fips` is the resolved FIPS; `naics4` is the trade's census group, `null` for a registry trade that declares no NAICS. |
+| `coverage` | the join | `both` \| `economics_only`. |
+| `density_grain`, `density_key` | the join | Always `naics4`, on every row; `density_key` is the blend cell that was looked up (`2382:48`) or `null`. |
+| `total_market_per_10k`, `total_market_per_10k_basis` | `census/market_blend` | The headline density number, hoisted to the top level (catalog contracts check top-level keys only) with the basis that says what it counted. |
+| `economics` | `trades/operator_economics` | `{wage_band, wage_grain, pricing, pricing_locality, tax, compliance, valuation}` — the per-state row, so `tax` carries that state's real top-marginal rate and `compliance` its licensing/bonding facts. |
+| `density` | `census/market_blend` | `{employer_establishments, employer_naics, employer_naics_covered, solo_operators, total_market, solo_share, base, denominator_kind, coverage}` — the cell's **own** coverage marker rides along. |
+| `succession` | `census/market_blend` | `{pct_owners_55plus, succession_grain, owner_age_year, succession_receipts}` — NES-D is 2-digit **sector** grain, which `succession_grain` states. `null` when NES-D published nothing for the cell. |
+| `formation` | `census/market_blend` | The BFS block, `grain: naics_sector_national`, `scope: national` — the API serves no state geography. |
+| `vintages` | both | `{employer_cbp_year, solo_nes_year, owner_age_nesd_year, formation_bfs_as_of, base_acs_year}` — the year each input came from, which `updated_at` does not tell you (the row is re-derived weekly over 2021/2022 stock). Every key is present and `null` on a row with no cell, never a fabricated year. |
+
+### Two rules the row states about itself
+
+- **`density_grain` is always `naics4`, and it is not a formality.** The nonemployer series publishes no finer grain, so a trade's density is its 4-digit **group's** density. With today's seed taxonomy that means **Plumbing, Electrical and HVAC (all NAICS 238220) share one density block**, and Landscaping and Pool service share another (5617). Their economics differ, so the profiles are distinct — but the density half is a group figure and says so.
+- **Coverage is honest, never zeros.** A trade whose group has no blend cell — the census publishes nothing for it, or the census apps have not run — yields `coverage: "economics_only"` with `density`, `succession`, `formation` and `total_market_per_10k` all `null`. A zeroed density block would read as *"nobody operates in this state"* when the fact is *"we did not measure"*.
+
+The `US:<trade>` national roll-up that `trades/operator_economics` also writes is **not** a profile row: it has no state FIPS and therefore can never carry density.
+
+### Who writes it, and when
+
+`sync_market_profile(ctx)` runs at the end of **both** `unified::sync_operator_economics` (the five trades apps) and `app_census_density::sync_market_blend` (the four census apps) — **last writer publishes**, so the product is never a cycle behind either family. **Only `census-density` declares `market/profile` in its result's `index_datasets` today**, which is what lets a watch, trigger, saved search or contract evaluation see its revisions at all. **Known gap, and it is a scope boundary rather than a judgment:** the other eight publishers republish the profile without declaring it, because both shared declaration lists — `census_common::product_index_datasets` and `trades_common::unified::product_index_datasets` — have their exact contents pinned by tests in crates the change that added this product could not touch (`census-nonemp`, `census-nesd`, `census-bfs`, and `app-state-tax`'s `join_is_derived_and_visible` integration test). Closing it is two one-line additions plus four test updates. Until then a refresh driven by one of those eight writes the rows but does not index them, and the next `census-density` run does. `market` is a virtual namespace in `registry::VIRTUAL_NAMESPACES` (publishers: those nine), so it is watchable before its first record and a `[[source]]` row may name it — see [catalog.md](catalog.md).
+
+Writes go through `upsert_many_derived` with **`DerivedPaths` on the replicated national blocks** (`economics.wage_band`, `economics.valuation`, `economics.tax.federal`, `formation`, `vintages.formation_bfs_as_of`): those are the same values on every row, and `formation` moves *weekly*, so without the exclusion one national BFS refresh would mark ~255 profile rows `changed` every Friday. The blocks are still stored and still readable — `DerivedPaths` narrows the change-detection hash and nothing else — and each is announced in its own right by the dataset that owns it. Revisions carry `job_id` and a `derived://market/profile?inputs=…&as_of=…` source URL, never an `artifact_sha`: a joined row has no archived body and must not claim to be replayable. A failed profile publish is **reported on the run's `market_profile` block, never raised** — the rows the run had already written stay written.
+
+### Reading it
+
+- `GET /market/profile/{state}/{trade}` — one row; state code and trade label both matched case-insensitively; `404` names the key it looked for and what publishes the dataset.
+- MCP `market_profile {state, trade}` — the same lookup function, read-only and ungated.
+- The generic surfaces work too: `GET /datasets/market/profile`, `query_dataset` with `$.coverage:eq:both`-style filters.
+
+### Known gaps (v1)
+
+- **State grain only.** County-grain density is deferred (N35): `census/market_blend` cells are state rows, because the solo side has no county grain.
+- **No currency/inflation adjustment.** Wage, pricing and receipts figures are as published, in their own vintages' dollars; `vintages` is what a consumer deflates by.
+- **`density_only` is not a coverage value.** Rows are driven by the economics side, so a blend cell for a state × trade with no economics row produces nothing rather than a density-only profile.
+- **Reads the canonical datasets.** If the trades namespace is quarantined its rows divert to `operator_economics@q`, and the profile then joins the last healthy canonical rows rather than the shadow ones.
+
+
 ## `transact`: evidence, approval, submit
 
 `transact` runs a declarative browser flow (`steps`: `type`/`click`/`wait_for_selector`/`wait_ms`/`scroll`/`repeat`, reusing `PageAction` verbatim) up to the final confirmation state and **stops before the irreversible action**. `submit_action` lives in its own field, and the staging path has no code path that hands it to the executor — stop-before-submit is structural, not a flag check.

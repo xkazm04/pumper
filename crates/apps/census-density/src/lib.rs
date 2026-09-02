@@ -151,7 +151,7 @@ impl ScrapeApp for CensusDensity {
                  employees_cells, payroll_cells}, top} | {naics, label, note}], \
                  top_places_overall, top_places_by_saturation, normalization: \
                  {places_matched, places_excluded_no_denominator_row, \
-                 places_excluded_base_not_positive, ...}, market_blend, \
+                 places_excluded_base_not_positive, ...}, market_blend (carrying \n                 market_profile: the state x trade product this run republishes), \
                  suppression, empty_answers, index_datasets, records, new, changed, \
                  unchanged} — suppressed cells are absent (Null), never zeroed, and \
                  are counted; a trade the API publishes nothing for (HTTP 204) yields \
@@ -488,25 +488,27 @@ impl ScrapeApp for CensusDensity {
         // `with_product_index` is what puts the two `census/*` products in the
         // worker's index + hook scope — without it no watch, trigger or saved
         // search on app `census` can fire, and neither product is searchable.
-        Ok(census_common::with_product_index(json!({
-            "source": format!("census/cbp/{year}"),
-            "geo": geo,
-            "year": year,
-            "vintage": vintage,
-            "trades": trade_summaries,
-            "top_places_overall": top_overall,
-            "top_places_by_saturation": saturation,
-            "normalization": normalization,
-            // What the API declined to tell us this run, so a shrinking corpus
-            // reads as suppression rather than as a market that vanished.
-            "suppression": suppression.as_json(),
-            "empty_answers": empty_answers,
-            "market_blend": market_blend,
-            "records": record_count,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-        })))
+        Ok(with_market_index(census_common::with_product_index(
+            json!({
+                "source": format!("census/cbp/{year}"),
+                "geo": geo,
+                "year": year,
+                "vintage": vintage,
+                "trades": trade_summaries,
+                "top_places_overall": top_overall,
+                "top_places_by_saturation": saturation,
+                "normalization": normalization,
+                // What the API declined to tell us this run, so a shrinking corpus
+                // reads as suppression rather than as a market that vanished.
+                "suppression": suppression.as_json(),
+                "empty_answers": empty_answers,
+                "market_blend": market_blend,
+                "records": record_count,
+                "new": summary.new.len(),
+                "changed": summary.changed.len(),
+                "unchanged": summary.unchanged,
+            }),
+        )))
     }
 }
 
@@ -949,6 +951,29 @@ pub async fn sync_saturation(
         .await
 }
 
+/// Adds the cross-FAMILY `market/profile` spec (N33) to a result that
+/// `census_common::with_product_index` has already stamped, so the `market`
+/// namespace enters this run's `indexed_apps` too — without it a watch, trigger,
+/// saved search or contract evaluation on the product cannot fire for a
+/// census-driven refresh, however often the run rewrites it.
+///
+/// **Why here and not in `census_common::product_index_datasets`,** which is
+/// where it belongs: that helper is shared by all four census apps, and three of
+/// them (`census-nonemp`, `census-nesd`, `census-bfs`) pin its exact two-element
+/// output in their own tests. Adding the spec there is a one-line change plus
+/// three test updates in crates this change may not touch — reported as a seam,
+/// not made. Until then the declaration rides the app that OWNS the blend, and
+/// the other three publish the profile without indexing it.
+fn with_market_index(mut result: Value) -> Value {
+    if let Some(specs) = result
+        .get_mut("index_datasets")
+        .and_then(Value::as_array_mut)
+    {
+        specs.push(trades_common::market::product_index_spec());
+    }
+    result
+}
+
 /// What a saturation row is derived from: this run's own CBP establishment
 /// counts divided by an ACS base fetched in the same run.
 const SATURATION_INPUTS: [&str; 2] = ["census-density/establishments", "census-acs/denominator"];
@@ -1097,6 +1122,23 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
                 truncated.join(", ")
             )]),
         );
+    }
+    // LAST WRITER PUBLISHES (N33): the cross-family `market/profile` (state x
+    // trade) is rebuilt at the end of this blend AND at the end of the trades
+    // join, so whichever family refreshed last republishes the product and it
+    // is never a cycle behind either half. The join itself lives in
+    // `trades_common::market` — this crate already depends on that library for
+    // the trade taxonomy, and the direction stays one-way.
+    //
+    // Reported, never fatal: the blend rows above are already written, and a
+    // downstream join's failure must not turn a successful refresh into a
+    // failed run.
+    let profile = match trades_common::market::sync_market_profile(ctx).await {
+        Ok(v) => v,
+        Err(e) => json!({ "profiled": 0, "error": e.to_string() }),
+    };
+    if let Value::Object(map) = &mut out {
+        map.insert("market_profile".into(), profile);
     }
     Ok(out)
 }
@@ -1626,6 +1668,33 @@ mod tests {
                 { "app": "census", "dataset": "saturation" },
             ])
         );
+        // N33: this app's run also republishes the cross-FAMILY product, and a
+        // namespace the result does not name is a namespace no watch, trigger,
+        // saved search or contract evaluation can fire for. The spec is added by
+        // `with_market_index`, which run() wraps around the shared stamp.
+        let needle = concat!("with_market_index", "(census_common::with_product_index");
+        assert_eq!(
+            include_str!("lib.rs").matches(needle).count(),
+            1,
+            "census-density's run() must add the market spec exactly once"
+        );
+        // Bound in two steps on purpose: written as one nested call this line
+        // would match the needle above and the count would check itself.
+        let stamped = census_common::with_product_index(json!({}));
+        assert_eq!(
+            with_market_index(stamped)["index_datasets"],
+            json!([
+                { "app": "census", "dataset": "market_blend" },
+                { "app": "census", "dataset": "saturation" },
+                { "app": "market", "dataset": "profile" },
+            ])
+        );
+        // A result with no index_datasets at all is passed through untouched —
+        // there is nowhere honest to append to.
+        assert_eq!(
+            with_market_index(json!({ "records": 1 })),
+            json!({ "records": 1 })
+        );
     }
 
     /// A read that comes back AT the cap is a window, not the dataset — the
@@ -2065,6 +2134,118 @@ mod tests {
             .await
             .expect("seed solos");
         (store, ctx)
+    }
+
+    /// N33, end to end through a real store: a census run is the LAST WRITER,
+    /// so it republishes the cross-family `market/profile` — and the profile is
+    /// honest about the half it does not have.
+    ///
+    /// The anti-pattern this closes is the zeroed half-profile: before the
+    /// coverage marker, a trade whose 4-digit group the census publishes
+    /// nothing for would have been indistinguishable from a state where nobody
+    /// operates.
+    #[tokio::test]
+    async fn a_census_run_republishes_the_state_x_trade_profile_with_honest_coverage() {
+        let (_store, ctx) = seeded_ctx("census-blend-profile").await;
+        // The trades half. Plumbing and HVAC share NAICS 238220 → one cell;
+        // Landscaping (5617) has no cell in this fixture.
+        let econ = |trade: &str| {
+            json!({
+                "trade": trade, "state": "CA", "soc_code": "47-2152",
+                "wage_band": { "median_hourly": 30.0 }, "wage_grain": "national",
+                "pricing": Value::Null, "pricing_locality": "CA",
+                "tax": { "federal": { "qbi_deduction_pct": 20.0 } },
+                "compliance": Value::Null, "valuation": Value::Null,
+            })
+        };
+        ctx.datasets
+            .upsert_many(
+                "trades",
+                "operator_economics",
+                &[
+                    ("CA:Plumbing".to_string(), econ("Plumbing")),
+                    ("CA:HVAC".to_string(), econ("HVAC")),
+                    ("CA:Landscaping".to_string(), econ("Landscaping")),
+                    // The national roll-up the trades layer also writes — it
+                    // has no state FIPS and must not become a profile row.
+                    (
+                        "US:Plumbing".to_string(),
+                        json!({ "trade": "Plumbing", "state": "US" }),
+                    ),
+                ],
+            )
+            .await
+            .expect("seed economics");
+
+        let out = sync_market_blend(&ctx).await.expect("blend");
+        let profile = &out["market_profile"];
+        assert_eq!(
+            profile["profiled"], 3,
+            "3 state rows, the US roll-up skipped"
+        );
+        assert_eq!(profile["with_density"], 2, "only 2382 has a cell");
+        assert_eq!(profile["economics_only"], 1);
+        assert_eq!(profile["density_grain"], "naics4");
+        assert_eq!(profile["dataset"], "market/profile");
+
+        async fn profile_row(ctx: &AppContext, key: &str) -> Value {
+            ctx.datasets
+                .get("market", "profile", key)
+                .await
+                .expect("read")
+                .expect("record")
+                .data
+        }
+        let plumbing = profile_row(&ctx, "CA:Plumbing").await;
+        let hvac = profile_row(&ctx, "CA:HVAC").await;
+        // Two distinct profiles, ONE density block, labeled.
+        assert_eq!(plumbing["trade"], "Plumbing");
+        assert_eq!(hvac["trade"], "HVAC");
+        assert_eq!(plumbing["density_key"], "2382:06");
+        assert_eq!(plumbing["density"], hvac["density"]);
+        assert_eq!(plumbing["density_grain"], "naics4");
+        assert_eq!(plumbing["density"]["total_market"], 400);
+        assert_eq!(plumbing["coverage"], "both");
+        assert_eq!(plumbing["state_fips"], "06");
+
+        // The half profile: absent, never zeroed.
+        let landscaping = profile_row(&ctx, "CA:Landscaping").await;
+        assert_eq!(landscaping["coverage"], "economics_only");
+        assert!(landscaping["density"].is_null());
+        assert!(landscaping["total_market_per_10k"].is_null());
+        assert_eq!(
+            landscaping["economics"]["wage_band"]["median_hourly"], 30.0,
+            "the half it HAS is whole"
+        );
+        assert!(
+            ctx.datasets
+                .get("market", "profile", "US:Plumbing")
+                .await
+                .expect("read")
+                .is_none(),
+            "the national roll-up is not a state profile"
+        );
+
+        // Provenance: a row in a namespace no app owns still names its job, its
+        // inputs and when it was derived.
+        let revs = ctx
+            .datasets
+            .history("market", "profile", "CA:Plumbing", 10)
+            .await
+            .expect("history");
+        let prov = &revs.first().expect("one revision").provenance;
+        assert_eq!(prov.job_id.as_deref(), Some(&*ctx.job_id.to_string()));
+        let url = prov.source_url.as_deref().expect("derived source_url");
+        assert!(url.starts_with("derived://market/profile?"), "{url}");
+        assert!(url.contains("trades/operator_economics"), "{url}");
+        assert!(url.contains("census/market_blend"), "{url}");
+        assert!(!prov.replayable(), "a joined row has no body to replay");
+
+        // Idempotent: a second run with nothing changed announces nothing.
+        let again = sync_market_blend(&ctx).await.expect("blend");
+        assert_eq!(again["market_profile"]["new"], 0);
+        assert_eq!(again["market_profile"]["changed"], 0);
+        assert_eq!(again["market_profile"]["unchanged"], 3);
     }
 
     /// The anti-pattern: a derived product whose every revision reads

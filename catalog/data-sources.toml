@@ -893,3 +893,60 @@ max_staleness_hours = 48
 [source.contract.types]
 program_key = "string"
 cycles_observed = "number"
+
+
+# ── The cross-FAMILY market product (N33) ────────────────────────────────────
+# `market/profile` joins the two Ledgerline-facing products that answer halves
+# of one question under keys a consumer cannot join: `trades/operator_economics`
+# (`<ST>:<trade>`) and `census/market_blend` (`{naics4}:{state_fips}`). The join
+# is `trades_common::market::sync_market_profile`, called at the end of BOTH
+# `sync_operator_economics` and `sync_market_blend` — so whichever of the nine
+# publishing apps refreshed last republishes the product.
+#
+# `app = "market"` is the VIRTUAL NAMESPACE the rows actually land under (the
+# pair `enforce_contracts` and /catalog/health both key on), which the coverage
+# test explicitly allows — the seam the census header comment above says does
+# not exist was built for `grants` and now serves this row too. `cron` MUST stay
+# empty: the write rides a publisher's job, and a cron here would ask the
+# scheduler to create a schedule for an app that does not exist.
+#
+# No `max_row_delta_pct`: the product is written with `upsert_many_derived`,
+# which never tombstones, so the mass-delete tripwire could not fire.
+[[source]]
+id = "market-profile"
+app = "market"
+market = "us"
+name = "State x trade market profile (trades economics joined to census density)"
+url = ""
+category = "market-stats"
+engine = ""
+access = ""
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "profile"
+notes = "One row per state x trade, keyed <ST>:<trade> (51 jurisdictions x the enabled taxonomy). Economics (wage_band, pricing, tax, compliance, valuation) from trades/operator_economics; density (employer/solo/total, per_10k + basis), succession and formation from census/market_blend; a `vintages` block naming the year of every input. DENSITY IS 4-DIGIT NAICS and every row says so (density_grain=naics4): the nonemployer series publishes no finer grain, so Plumbing, Electrical and HVAC (all 238220) share one density block and Landscaping/Pool service share 5617. Coverage is honest and never zeroed — a trade with no NES cell is coverage=economics_only with density=null, which is NOT a market of zero. National facts replicated onto every row (wage band, valuation, federal tax, the national BFS formation block) are declared derived, so a weekly national refresh does not mark ~255 rows changed. Derived only: revisions carry job_id + a derived:// source_url naming both inputs, never an artifact_sha. Read one row via GET /market/profile/{state}/{trade} or the MCP market_profile tool. See docs/features/apps.md #market-profile."
+
+# Declared data contract (M20): the five fields a consumer keys, branches on or
+# reads the economics half through,
+# plus the headline density number. `total_market_per_10k` is deliberately NOT
+# required — it is Null on an `economics_only` row, and requiring it would push
+# the join toward fabricating a zero, which is the exact failure this product's
+# coverage marker exists to prevent. Contract fields are top-level keys (no
+# nested paths in v1), which is why the headline metric and its basis are
+# hoisted out of the density block.
+[source.contract]
+required_fields = ["state", "trade", "coverage", "density_grain", "economics"]
+
+[source.contract.types]
+state = "string"
+trade = "string"
+coverage = "string"
+density_grain = "string"
+economics = "object"
+total_market_per_10k = "number"
+total_market_per_10k_basis = "string"
+
+[source.contract.ranges]
+total_market_per_10k = { min = 0.0 }

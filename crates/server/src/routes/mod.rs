@@ -94,7 +94,10 @@ mod meta;
 mod principals;
 mod provenance;
 mod provisioner;
-mod query;
+// `pub(crate)` (N33): the MCP `market_profile` tool answers through this
+// module's `find_market_profile`, the same function the HTTP door uses, so the
+// two surfaces cannot disagree about which row exists or what a miss means.
+pub(crate) mod query;
 pub(crate) mod receipt;
 mod recipes;
 mod remote;
@@ -158,6 +161,7 @@ use workflows::*;
         (name = "schedules", description = "Cron schedules"),
         (name = "datasets", description = "Change-detected dataset records, export, history"),
         (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
+        (name = "market", description = "State x trade market profile: trades economics joined to census density"),
         (name = "derived", description = "Derived datasets: filter/project/lookup specs recomputed on upstream deltas"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
@@ -327,6 +331,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(datahub_governance_preview))
+        // N33: the cross-family market product, one keyed row per state x trade.
+        .routes(routes!(market_profile))
         .routes(routes!(list_principals, create_principal))
         .routes(routes!(principal_costs))
         .routes(routes!(disable_principal))
@@ -747,6 +753,7 @@ mod api_spec_tests {
         "GET /transactions/{id}",
         "POST /transactions/{id}/approve",
         "POST /transactions/{id}/reject",
+        "GET /market/profile/{state}/{trade}",
         "GET /openapi.json",
     ];
 

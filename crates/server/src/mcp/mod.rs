@@ -626,6 +626,28 @@ fn server_tools(state: &AppState) -> Vec<Value> {
             }
         }));
     }
+    // N33: read-only and ungated, like `query_dataset` — it answers from the
+    // store, enqueues nothing and spends nothing. Appended BEFORE `fetch`,
+    // which stays LAST (the e2e inventory pins it).
+    tools.push(json!({
+        "name": "market_profile",
+        "description": "One US state x trade market profile in ONE call: the economics half (wage band, local pricing envelope, state + federal tax, licensing/bonding compliance, business valuation multiples) and the density half (employer firms, solo operators, total market, operators per 10k with its basis, succession pressure, business-formation velocity), plus a `vintages` block naming the year each input came from. This is the tool for 'best state to start an HVAC business' and 'what does a plumber in Texas face' — the two underlying datasets are keyed differently (`TX:Plumbing` vs `2382:48`) and joining them by hand needs a NAICS + FIPS crosswalk you should not have to reproduce. Read `coverage`: `economics_only` means the census publishes no density cell for that trade and `density` is null — it is NOT a market of zero. Read `density_grain` too: it is always `naics4`, so Plumbing, Electrical and HVAC (all NAICS 238220) share one density block, which is the finest grain the source publishes.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["state", "trade"],
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "description": "USPS state code, any case (TX, tx). 'US' has no profile: the national roll-up lives in trades/operator_economics."
+                },
+                "trade": {
+                    "type": "string",
+                    "description": "Canonical trade label, matched case-insensitively (Plumbing, Electrical, HVAC, Landscaping, Pool service)."
+                }
+            },
+            "additionalProperties": false
+        }
+    }));
     // N15 (appended last, per the wave-2 shared-surface rule). Advertised
     // unconditionally: the token, not a config switch, is what makes it usable,
     // and hiding it would leave the self-hosted subprocess unable to discover
@@ -742,6 +764,8 @@ async fn tools_call(
              work, so it rides the same switch as a single enqueue"
                 .to_string(),
         ),
+        // N33: read-only, ungated, appended before `fetch`.
+        "market_profile" => tool_market_profile(state, &args).await,
         // N15, appended last per the wave-2 shared-surface rule.
         "fetch" => tool_fetch(state, &args, caller).await,
         other => return rpc_error(id, -32602, &format!("unknown tool '{other}'")),
@@ -758,6 +782,26 @@ async fn tools_call(
         }),
     };
     rpc_result(id, result)
+}
+
+/// The `market_profile` tool (N33): one state × trade row from `market/profile`.
+///
+/// Answers through `routes::query::find_market_profile`, the same function the
+/// HTTP door uses, so the two surfaces cannot disagree about which row exists
+/// or what a miss means. A miss is a readable tool error naming the key that
+/// was looked for and what publishes the dataset — an agent that gets silence
+/// concludes the server is broken.
+async fn tool_market_profile(state: &AppState, args: &Value) -> Result<Value, String> {
+    let st = require_str(args, "state")?;
+    let trade = require_str(args, "trade")?;
+    match crate::routes::query::find_market_profile(state, st, trade).await {
+        Ok(Some(profile)) => Ok(profile),
+        Ok(None) => Err(format!(
+            "no market/profile row for '{}' — the product is derived from trades/operator_economics and census/market_blend, so it covers only states a trades app has data for and trades in the live taxonomy. query_dataset on market/profile lists what exists.",
+            crate::routes::query::market_profile_key(st, trade)
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The `resume_job` tool: answers a parked job (N02).

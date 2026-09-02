@@ -183,6 +183,9 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
             "wait_job",
             "wait_workflow",
             "list_pending_transactions",
+            // N33: read-only, ungated — it answers from the store, enqueues
+            // nothing and spends nothing, so it sits with the other reads.
+            "market_profile",
             "fetch"
         ]
     );
@@ -257,6 +260,71 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         Some(&"fetch"),
         "`fetch` stays LAST however many tools are appended: {names:?}"
     );
+}
+
+/// N33: the `market_profile` tool answers one state × trade row through the
+/// SAME lookup the HTTP door uses, and a miss is a readable refusal naming the
+/// key it looked for — an agent that gets silence concludes the server is
+/// broken and stops asking.
+#[tokio::test]
+async fn market_profile_answers_one_row_case_insensitively_and_names_a_miss() {
+    let (state, _store) = mcp_state(false).await;
+    state
+        .datasets
+        .upsert_many(
+            "market",
+            "profile",
+            &[(
+                "TX:HVAC".to_string(),
+                json!({
+                    "state": "TX", "state_fips": "48", "trade": "HVAC",
+                    "naics4": "2382", "density_grain": "naics4",
+                    "density_key": "2382:48", "coverage": "both",
+                    "total_market_per_10k": 3.33,
+                    "economics": { "wage_grain": "national" },
+                    "density": { "total_market": 10_000 },
+                }),
+            )],
+        )
+        .await
+        .expect("seed profile");
+
+    // Exact key.
+    let resp = handle_rpc(
+        &state,
+        &call("market_profile", json!({ "state": "TX", "trade": "HVAC" })),
+    )
+    .await
+    .unwrap();
+    let row = structured(&resp);
+    assert_eq!(row["trade"], "HVAC");
+    assert_eq!(row["density_grain"], "naics4");
+    assert_eq!(row["coverage"], "both");
+
+    // Lower-cased on both segments — the fallback finds the stored label
+    // instead of 404-ing on a key an agent could not have guessed.
+    let resp = handle_rpc(
+        &state,
+        &call("market_profile", json!({ "state": "tx", "trade": "hvac" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&resp)["trade"], "HVAC");
+
+    // A miss is a readable tool error that names the key and what publishes it.
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "market_profile",
+            json!({ "state": "CA", "trade": "Plumbing" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("CA:Plumbing"), "{text}");
+    assert!(text.contains("market/profile"), "{text}");
 }
 
 /// The anti-pattern: an agent handed a tool that authors a STANDING commitment
