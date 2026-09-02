@@ -27,6 +27,10 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
 | `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just openapi` | regenerates `clients/openapi.json` from the **router** (needs cargo). A `cargo test` asserts the committed copy matches, so skipping this fails the Rust suite rather than shipping stale clients |
+| `just clients` | regenerates every client's wire types from that document — TypeScript, the CLI's copy, and the Python TypedDicts. Node only, seconds |
+| `just clients-check` | the same generation, diffed against what is committed: exit 1 on drift. Part of `sdk`, so `just ci` blocks on it |
+| `just sdk` | `clients-check`, then typecheck + test `@pumper/sync`, `@pumper/cli`, and `pumper-sync` (Python) — what the `Consumer clients` CI job runs |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |
@@ -79,7 +83,8 @@ crates/
                    webhooks + triggers + SSE + datahub
 plugins-src/       example WASM plugins (Rust -> wasm32), built separately
 catalog/           data-sources.toml — the machine-readable pipeline registry
-clients/typescript @pumper/sync consumer SDK
+clients/          generated consumer plane: openapi.json (the contract) +
+                  typescript (@pumper/sync), python (pumper-sync), cli (@pumper/cli)
 ```
 
 **Dependency rule (README.md §Architecture):** apps depend only on `core` (plus

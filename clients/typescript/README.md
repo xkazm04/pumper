@@ -105,8 +105,13 @@ Zero runtime dependencies (global `fetch` + WebStreams; Node ≥ 20).
   resolution; a new revision landing at the *exact* micro-second of the stored
   watermark could be skipped. Negligible at Pumper's job cadence, but real —
   re-run a snapshot (clear the watermark) if you ever suspect a gap.
-- **Wire types are hand-written**, mirroring `crates/core/src/datasets.rs`. If
-  the record/revision shapes change, regenerate against `GET /openapi.json`.
+- **Wire types are generated**, not hand-written: `src/generated.ts` is
+  `openapi-typescript` output over `clients/openapi.json`, the document the
+  server's router produces, and `src/types.ts` aliases into it. Regenerate with
+  `just clients` (or `just openapi && just clients` if the server changed); CI
+  fails on drift. The two places the aliases deliberately differ from the
+  generator are `data`/`payload` (which stay your `T`) and `Required<>`, which
+  re-imposes the presence utoipa drops when it renders a Rust `Option<T>`.
 - **No built-in retry/backoff** on a failed page — a throw aborts the run and
   leaves the watermark unadvanced, so the next run resumes from the same point.
   Wrap `.run()` in your scheduler's retry if you want automatic recovery.
