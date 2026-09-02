@@ -310,12 +310,16 @@ pub fn missing_hook_plugins(plugins: &dyn pumper_core::Plugins, trigger: &Trigge
     let Some(hooks) = &trigger.plugin_hooks else {
         return Vec::new();
     };
-    [hooks.predicate.as_ref(), hooks.transform.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter(|h| !plugins.has(&h.plugin))
-        .map(|h| h.plugin.clone())
-        .collect()
+    [
+        hooks.predicate.as_ref(),
+        hooks.transform.as_ref(),
+        hooks.post_enqueue.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|h| !plugins.has(&h.plugin))
+    .map(|h| h.plugin.clone())
+    .collect()
 }
 
 /// Which hook slot something happened in.
@@ -323,6 +327,9 @@ pub fn missing_hook_plugins(plugins: &dyn pumper_core::Plugins, trigger: &Trigge
 pub enum HookSlot {
     Predicate,
     Transform,
+    /// N10: after the hop's job exists. Gates nothing by construction — the
+    /// enqueue already happened — so its incidents are pure ledger.
+    PostEnqueue,
 }
 
 impl HookSlot {
@@ -330,6 +337,7 @@ impl HookSlot {
         match self {
             HookSlot::Predicate => "predicate",
             HookSlot::Transform => "transform",
+            HookSlot::PostEnqueue => "post_enqueue",
         }
     }
 }
@@ -543,6 +551,82 @@ pub async fn apply_plugin_hooks(
         obj: Some(obj),
         incidents,
     }
+}
+
+/// Runs a trigger's `post_enqueue` hook over the hop that was just created
+/// (N10), returning the rows the caller must record.
+///
+/// **This slot cannot gate anything, and that is its definition.** It fires
+/// after `enqueue_dedup` has already returned a job, so there is no decision
+/// left for a verdict to influence: the output is ignored, and a trap, a missing
+/// module or a malformed answer produces a ledger row and nothing else. That is
+/// a stronger guarantee than the predicate's fail-open, which still has an
+/// `on_error: skip` escape hatch — here there is no hatch to have.
+///
+/// The envelope is the `_trigger` object with `job_id` added, which is the one
+/// fact this slot exists to carry: it is the only hook that can know it.
+///
+/// Pure like [`apply_plugin_hooks`] — no storage handle, no `AppState` — so the
+/// "never gates" property is testable against a stub host rather than asserted
+/// in a comment.
+pub async fn run_post_enqueue_hook(
+    plugins: &dyn pumper_core::Plugins,
+    trigger: &Trigger,
+    obj: Option<&Value>,
+    job_id: &str,
+) -> Vec<HookIncident> {
+    let Some(hook) = trigger
+        .plugin_hooks
+        .as_ref()
+        .and_then(|h| h.post_enqueue.as_ref())
+    else {
+        return Vec::new();
+    };
+    let envelope = post_enqueue_envelope(obj.unwrap_or(&Value::Null), job_id);
+    match plugins
+        .run(&hook.plugin, &envelope.to_string(), &hook.params)
+        .await
+    {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            let outcome = hook_failure_outcome(&e);
+            warn!(trigger = %trigger.id, plugin = %hook.plugin, job = %job_id, %outcome,
+                  "post_enqueue hook failed; the hop is already enqueued and is unaffected: {e}");
+            vec![HookIncident {
+                slot: HookSlot::PostEnqueue,
+                plugin: hook.plugin.clone(),
+                outcome,
+                detail: format!("{e} — post_enqueue gates nothing, hop {job_id} unaffected"),
+            }]
+        }
+    }
+}
+
+/// The `_trigger` object a `post_enqueue` hook will need, or `None` when the
+/// trigger has no such hook — so the enqueue path's clone is paid for only by
+/// the triggers that use the slot.
+fn post_enqueue_input(trigger: &Trigger, obj: &Value) -> Option<Value> {
+    trigger
+        .plugin_hooks
+        .as_ref()
+        .and_then(|h| h.post_enqueue.as_ref())
+        .map(|_| obj.clone())
+}
+
+/// The `_trigger` object plus the hop's `job_id`.
+///
+/// Extracted and tested because the job id is the ONLY reason this slot exists,
+/// and an envelope that dropped it (or that let the object's own `job_id` win)
+/// would leave the hook indistinguishable from a transform running one step
+/// later. The host's value is authoritative: a transform plugin cannot forge a
+/// job id into the object and have it survive here.
+pub fn post_enqueue_envelope(obj: &Value, job_id: &str) -> Value {
+    let mut map = match obj {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    map.insert("job_id".into(), Value::String(job_id.to_string()));
+    Value::Object(map)
 }
 
 /// At-most-once-per-source-run dedup key (existing partial unique index).
@@ -1242,6 +1326,10 @@ pub async fn fire_external_triggers(
             .await;
             continue;
         }
+        // The pre-merge `_trigger` object is what a `post_enqueue` hook sees;
+        // cloned only when that slot is configured, so a hop without one pays
+        // nothing for it.
+        let params_obj = post_enqueue_input(trigger, &obj);
         let params = merged_params(&trigger.params, obj);
         if !hop_params_pass_target_schema(state, trigger, &params, &ctx).await {
             continue;
@@ -1261,6 +1349,16 @@ pub async fn fire_external_triggers(
                 info!(trigger = %trigger.id, event = %event_id, target = %hop.id,
                       app = %trigger.target_app, "external trigger fired");
                 let hop_id = hop.id.to_string();
+                // N10 `post_enqueue`: side effects that must not gate the hop,
+                // run once the hop HAS a job id. Ledgered, never acted on.
+                let incidents = run_post_enqueue_hook(
+                    state.plugins.as_ref(),
+                    trigger,
+                    params_obj.as_ref(),
+                    &hop_id,
+                )
+                .await;
+                record_hook_incidents(state, trigger, &ctx, &incidents).await;
                 record(
                     state,
                     NewTriggerRun {
@@ -1375,6 +1473,8 @@ async fn enqueue_hop(
         .await;
         return 0;
     }
+    // See the sibling call site: cloned only when the slot is configured.
+    let params_obj = post_enqueue_input(trigger, &obj);
     let params = merged_params(&trigger.params, obj);
     if !hop_params_pass_target_schema(state, trigger, &params, ctx).await {
         return 0;
@@ -1397,6 +1497,16 @@ async fn enqueue_hop(
             info!(trigger = %trigger.id, source = %source.id, target = %hop.id,
                   app = %trigger.target_app, "trigger fired");
             let hop_id = hop.id.to_string();
+            // N10 `post_enqueue`: side effects that must not gate the hop, run
+            // once the hop HAS a job id. Ledgered, never acted on.
+            let incidents = run_post_enqueue_hook(
+                state.plugins.as_ref(),
+                trigger,
+                params_obj.as_ref(),
+                &hop_id,
+            )
+            .await;
+            record_hook_incidents(state, trigger, ctx, &incidents).await;
             record(
                 state,
                 NewTriggerRun {
@@ -1570,6 +1680,7 @@ mod tests {
         let mut t = trigger_with_hooks(TriggerPluginHooks {
             predicate: None,
             transform: None,
+            post_enqueue: None,
         });
         t.id = id.into();
         t.plugin_hooks = None;
@@ -2042,12 +2153,103 @@ mod tests {
         apply_plugin_hooks(plugins, trigger, obj).await.obj
     }
 
+    /// The slot's whole point: the hook is the only one that can know the hop's
+    /// job id, and it must be the HOST's id — a transform plugin that forged a
+    /// `job_id` into the envelope one step earlier must not win here.
+    #[test]
+    fn the_post_enqueue_envelope_carries_the_hosts_job_id_not_the_objects() {
+        let obj = json!({"trigger_id": "T1", "job_id": "forged-by-a-transform"});
+        let envelope = post_enqueue_envelope(&obj, "real-hop-id");
+        assert_eq!(envelope["job_id"], "real-hop-id");
+        assert_eq!(envelope["trigger_id"], "T1", "the delta survives");
+        // A non-object delta still produces a usable envelope rather than
+        // dropping the one fact the hook exists for.
+        assert_eq!(
+            post_enqueue_envelope(&Value::Null, "hop")["job_id"],
+            "real-hop-id".replace("real-hop-id", "hop")
+        );
+    }
+
+    /// **The property that distinguishes this slot from the other two.** A
+    /// predicate that traps can still stop the hop under `on_error: skip`; a
+    /// `post_enqueue` hook that traps can stop nothing, because by the time it
+    /// runs the job exists. It leaves a ledger row and that is all it does.
+    #[tokio::test]
+    async fn a_failing_post_enqueue_hook_ledgers_and_gates_nothing() {
+        let plugins = StubPlugins::new(vec![("notifier", Err(PluginFailure::Trap))]);
+        let mut trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: None,
+            post_enqueue: Some(hook("notifier", json!({}), Some("skip"))),
+        });
+        trigger.id = "T1".into();
+        let incidents = run_post_enqueue_hook(&plugins, &trigger, Some(&delta()), "hop-1").await;
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].slot, HookSlot::PostEnqueue);
+        assert_eq!(
+            incidents[0].outcome, "hook_trap",
+            "the sandbox stopped it, and the ledger says which class"
+        );
+        assert!(
+            incidents[0].detail.contains("hop-1"),
+            "the row names the hop that was NOT affected: {}",
+            incidents[0].detail
+        );
+        // `on_error: "skip"` is meaningless in this slot and must not resurrect
+        // a gate: the function's only output is ledger rows.
+        assert!(
+            incidents.iter().all(|i| i.slot == HookSlot::PostEnqueue),
+            "nothing here decides anything about the hop"
+        );
+    }
+
+    /// A hook that ran is silent — and the envelope it received is the delta
+    /// plus the job id, which is what a connector is actually given.
+    #[tokio::test]
+    async fn a_successful_post_enqueue_hook_is_silent_and_sees_the_job_id() {
+        let plugins = StubPlugins::new(vec![("notifier", Ok(json!({"ok": true})))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: None,
+            post_enqueue: Some(hook("notifier", json!({"channel": "C1"}), None)),
+        });
+        let incidents = run_post_enqueue_hook(&plugins, &trigger, Some(&delta()), "hop-9").await;
+        assert!(
+            incidents.is_empty(),
+            "a hook that worked has nothing to say"
+        );
+        let calls = plugins.calls.lock().expect("calls");
+        let (name, input, params) = calls.first().expect("the hook ran").clone();
+        assert_eq!(name, "notifier");
+        assert_eq!(params["channel"], "C1");
+        let envelope: Value = serde_json::from_str(&input).expect("json envelope");
+        assert_eq!(envelope["job_id"], "hop-9");
+    }
+
+    /// The slot is opt-in: a trigger without it must not pay a clone, and must
+    /// not call anything.
+    #[tokio::test]
+    async fn a_trigger_without_the_slot_runs_no_post_enqueue_hook() {
+        let plugins = StubPlugins::new(vec![]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: None,
+            post_enqueue: None,
+        });
+        assert!(post_enqueue_input(&trigger, &delta()).is_none());
+        assert!(run_post_enqueue_hook(&plugins, &trigger, None, "hop")
+            .await
+            .is_empty());
+        assert!(plugins.calls.lock().expect("calls").is_empty());
+    }
+
     #[tokio::test]
     async fn hooks_absent_is_a_passthrough() {
         let plugins = StubPlugins::new(vec![]);
         let mut trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: None,
             transform: None,
+            post_enqueue: None,
         });
         trigger.plugin_hooks = None;
         let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
@@ -2065,6 +2267,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({ "min_count": 5 }), None)),
             transform: None,
+            post_enqueue: None,
         });
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
         // The plugin saw the delta envelope as input and its own params.
@@ -2091,6 +2294,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), None)),
             transform: None,
+            post_enqueue: None,
         });
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
         // Unknown plugin (not loaded) is the same failure class.
@@ -2104,6 +2308,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), Some("skip"))),
             transform: None,
+            post_enqueue: None,
         });
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
     }
@@ -2117,6 +2322,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: None,
             transform: Some(hook("slim", json!({}), None)),
+            post_enqueue: None,
         });
         let out = hook_obj(&plugins, &trigger, delta())
             .await
@@ -2141,6 +2347,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), None)),
             transform: Some(hook("slim", json!({}), None)),
+            post_enqueue: None,
         });
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
         let calls = plugins.calls.lock().unwrap();
@@ -2160,6 +2367,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), Some("skip"))),
             transform: None,
+            post_enqueue: None,
         });
         let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
         assert_eq!(verdict.obj, None, "on_error=skip still stops the hop");
@@ -2209,6 +2417,7 @@ mod tests {
             let trigger = trigger_with_hooks(TriggerPluginHooks {
                 predicate: Some(hook("gate", json!({}), None)),
                 transform: None,
+                post_enqueue: None,
             });
             let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
             assert_eq!(
@@ -2235,6 +2444,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), None)),
             transform: None,
+            post_enqueue: None,
         });
         let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
         assert_eq!(verdict.obj, Some(delta()));
@@ -2245,6 +2455,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: None,
             transform: Some(hook("slim", json!({}), None)),
+            post_enqueue: None,
         });
         let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
         assert_eq!(verdict.obj, Some(delta()), "the original envelope survives");
@@ -2265,6 +2476,7 @@ mod tests {
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), None)),
             transform: Some(hook("slim", json!({}), None)),
+            post_enqueue: None,
         });
         let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
         assert!(verdict.obj.is_some());

@@ -35,6 +35,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "http_cache",
     "ingress_sources",
     "jobs",
+    // N10: the per-plugin kv namespace behind `pumper_kv_get`/`pumper_kv_put`.
+    "plugin_kv",
     "principals",
     "record_revisions",
     "profile_versions",

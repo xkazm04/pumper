@@ -227,6 +227,14 @@ dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /
 fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
 max_memory_mb = 64          # hard linear-memory cap per call (per instance)
 max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU core); bounds aggregate wasm memory + blocking-pool use
+# allow_http_hosts = []     # N10: the OPERATOR half of the plugin capability gate. A plugin's
+#                           # pumper_http_request import reaches a host only if BOTH this list and
+#                           # the plugin's own describe().capabilities.http.hosts allow it. Empty
+#                           # (the default) means NO plugin reaches the network. ".example.com"
+#                           # covers a domain and its subdomains; "*" delegates the whole decision
+#                           # to the plugins' manifests and is honored only from here. A host you
+#                           # list is a host EVERY capability-declaring plugin in `dir` may reach,
+#                           # loopback included — see docs/features/trigger-plugins.md §Capabilities.
 # app_dir = "data/apps"     # OPTIONAL: dir scanned at boot for dynamic-app .wasm modules.
 #                           # A describe-only CORE module is LISTED read-only in GET /apps (dynamic: true,
 #                           # runnable: false) — it exports a manifest and no run, so there is nothing to

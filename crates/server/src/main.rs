@@ -9,6 +9,8 @@ mod maintenance;
 mod mcp;
 // N16: node identity (the ed25519 keypair mesh bundles are signed with).
 mod node;
+// N10: the host side of a plugin's declared capabilities.
+mod plugin_caps;
 mod progress;
 mod refresher;
 mod registry;

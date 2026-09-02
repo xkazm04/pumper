@@ -191,7 +191,7 @@ The field-level `is_blank` (which decides `FieldStatus::Empty` and `CoercionStat
 | | plugin sandbox (this section) | dynamic-app host ([apps.md](apps.md#dynamic-wasm-apps)) |
 | --- | --- | --- |
 | guest shape | core module, `alloc` + `extract`/`extract_v2` + optional `describe` | **component** (component-model binary) exporting the `pumper:app@0.1.0` world |
-| imports | **none** — an empty linker, no ambient authority | exactly the metered `AppContext` seams the WIT world declares |
+| imports | **none by default** — an empty linker, no ambient authority. Since N10 a module may declare `capabilities` in its `describe()` manifest and be granted exactly those imports (`pumper_http_request`, `pumper_kv_get/put`); one it did not declare fails to link. See [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10). | exactly the metered `AppContext` seams the WIT world declares |
 | what it is | a pure document transformer called per document | a whole `ScrapeApp`: it drives its own job |
 | bounds | per **call** fuel + memory, blocking-pool admission | per **job** fuel, wall clock, host-call ceiling, live-instance admission |
 | switch | `[plugins] enabled` (on by default) | `[wasm_apps] enabled` (**off** by default) |

@@ -235,7 +235,9 @@ pub(crate) async fn create_trigger(
     // evaluated; an all-empty hooks object stores as no hooks.
     let plugin_hooks = match &body.plugins {
         None => None,
-        Some(h) if h.predicate.is_none() && h.transform.is_none() => None,
+        Some(h) if h.predicate.is_none() && h.transform.is_none() && h.post_enqueue.is_none() => {
+            None
+        }
         Some(h) => {
             if let Some(p) = &h.predicate {
                 validate_hook(p, "predicate", true).map_err(bad)?;

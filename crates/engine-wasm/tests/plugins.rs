@@ -67,6 +67,11 @@ fn plugins_src() -> PathBuf {
 const EXPECTED_PLUGIN_ABI: &[(&str, &[&str])] = &[
     ("busyloop", &["alloc", "extract"]),
     ("delta-slim", &["alloc", "describe", "extract_v2"]),
+    // N10's reference SINK CONNECTOR: the same core-module ABI, plus a
+    // `capabilities` block in its manifest and one declared host import. It
+    // belongs on this list precisely because a connector that lost `extract_v2`
+    // would load, answer `has() == false`, and dead-letter every delivery.
+    ("sink-postgrest", &["alloc", "describe", "extract_v2"]),
     (
         "title-extractor",
         &["alloc", "describe", "extract", "extract_v2"],
@@ -262,4 +267,52 @@ fn every_shipped_app_crate_carries_the_world_and_no_plugin_abi() {
             "plugins-src/{name} is built against a different {package} than the host links — the module would fail to link, and the drift would only show up at load time on a deployed machine"
         );
     }
+}
+
+/// The N10 capability path against a **real rustc-built module**, not a `wat`
+/// fixture: `sink-postgrest` imports `pumper_http_request`, its manifest
+/// declares `capabilities.http`, and it must therefore load EXECUTABLE with the
+/// loader's parsed capabilities on its `GET /plugins` entry.
+///
+/// This is the half the unit tests cannot reach. They prove the linker refuses
+/// an undeclared import; only a real artifact proves the declared one actually
+/// resolves through a wasm32 codegen that puts the import where the host looks
+/// for it (module `env`, that exact symbol name). A mismatch there would leave
+/// every connector silently `executable: false`.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/sink-postgrest.wasm — `just plugins-verify` (CI runs this step)"]
+async fn the_reference_connector_loads_with_its_declared_capabilities() {
+    let host = host();
+    let manifest = host
+        .manifests()
+        .into_iter()
+        .find(|m| m["name"] == "sink-postgrest")
+        .unwrap_or_else(|| panic!("data/plugins/sink-postgrest.wasm missing — {NEEDS_INSTALL}"));
+
+    assert!(
+        manifest["capability_error"].is_null(),
+        "a declared import must resolve: {}",
+        manifest["capability_error"]
+    );
+    assert_eq!(
+        manifest["executable"],
+        json!(true),
+        "a connector that imports what it declared is runnable: {manifest}"
+    );
+    assert!(
+        host.has("sink-postgrest"),
+        "…and a `plugin:` sink pointed at it must resolve"
+    );
+    // The loader's own parse, not the manifest text — what a plugin asked for
+    // and what it was granted are the same answer or the surface is lying.
+    assert_eq!(
+        manifest["capabilities"]["http"]["methods"],
+        json!(["POST"]),
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["capabilities"]["kv"],
+        json!(false),
+        "this connector stores nothing and must be granted nothing"
+    );
 }

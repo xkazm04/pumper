@@ -67,13 +67,25 @@ A watch's `sink` (a first-class `POST /watches` param, default `webhook`) select
 | `webhook` (default) | the watch's `url` | the full `{event, watch_id, job_id, app, dataset, count, changes[]}` payload | yes, when `secret` is set |
 | `slack` | the watch's `url` (a Slack incoming-webhook URL) | a compact `{"text": "pumper: \`app/dataset\` changed — N revisions (job J)"}` summary — **never** the raw revision batch | yes, when `secret` is set; Slack ignores the `x-pumper-*` headers |
 | `file` | `data/sinks/<watch_id>.ndjson` (appended) | one NDJSON line `{delivery_id, event, delivered_at, payload}` | no — see below |
+| `plugin:<name>` | a WASM connector in `[plugins] dir` | the module receives `{delivery_id, event, body}`, where `body` is the **unshaped** `webhook` payload | no — see below |
 
 Two `file`-sink quirks worth knowing before you create one:
 
 - **`url` is ignored.** `POST /watches` with `sink: "file"` accepts a missing or arbitrary `url` and stores the empty string; the destination is derived from the watch id alone. The delivery row's `url` is the pseudo-URL `file://<watch_id>.ndjson`, which the transport re-validates on every send (bare filename characters only, no `..`, no separators) so nothing in the delivery log — including a tampered row — can write outside `data/sinks/`. On the `webhook`/`slack` sinks `url` is required and must be `http(s)`, or the create is a 400.
 - **`secret` is stored but never used.** A file append has no HTTP request to sign, so no signature is computed and the envelope carries none. The stable `delivery_id` in each line is the dedup key instead — a line re-appended by a drain retry or a manual replay repeats it.
 
-WASM (`plugin:<name>`) sinks are deliberately out of scope; the seam for them is the transport branch in `webhook.rs::deliver`.
+### `plugin:<name>` sinks (N10)
+
+A destination stops being a Rust change to `webhook.rs`: drop a `.wasm` into `data/plugins/`, `POST /plugins/reload`, and create a watch with `sink: "plugin:sink-postgrest"`. The module is handed `{delivery_id, event, body}` and answers `{delivered: bool, permanent?: bool, error?: string}`, which is mapped onto the same `(delivered, attempts, last_error, permanent)` tuple every built-in sink returns — so the delivery log, the retry ladder, the DLQ and manual replay are unchanged.
+
+- **`url` is the connector's target, and it is optional.** It reaches the module as `params.target`; a connector with its destination compiled in ignores it. When set it must be `http(s)`. The delivery row's `url` is the pseudo-URL `plugin://<name>` (plus `?target=<url>`), re-validated on every send — plugin-name characters only, no `..`, no separators — so nothing in the delivery log, including a tampered row, can resolve to a different module. Carrying the target on the URL rather than in the body is what keeps the body identical to a `webhook` sink's, so one connector module works against every event kind, and what makes a replayed row reach the destination the first attempt did.
+- **`secret` is stored but never used**, as with the `file` sink: there is no outbound HTTP request *the server* makes to sign. A connector that signs its own requests does so with what it was built with. The stable `delivery_id` is the idempotency key; `sink-postgrest` sends it as the row's primary key with `Prefer: resolution=merge-duplicates`.
+- **`permanent: true` dead-letters immediately**, exactly as a non-429 4xx does on the `webhook` sink, instead of burning the whole five-rung ladder to reach the same state.
+- **A trap, a missing module or malformed output is NOT a delivery**, and IS retryable. Trigger hooks fail *open* because a broken gate must not wedge a pipeline; a sink that failed open would silently drop the event it exists to deliver. Install the module and `POST /plugins/reload`, and the backed-off drain is what then succeeds.
+- **One in-process attempt**, like the `file` sink: a sandboxed module called three times with the same bytes and a fresh store answers the same three times. The DLQ ladder is where a *reloaded* module gets its second chance.
+- `POST /watches` refuses `plugin:<name>` when no executable module of that name is loaded — a watch pointed at a plugin that was never installed would look configured and dead-letter every event.
+
+What the connector may *do* — outbound HTTP through the metered chokepoint, a per-plugin key/value namespace — is its declared capability manifest, plus the operator's `[plugins] allow_http_hosts`. Both are in [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10), including the threat model.
 
 ## Delivery lifecycle, log & dead-letter queue
 
@@ -141,3 +153,5 @@ Two opt-in knobs under `[storage]`, both `0` (off) by default:
 - No per-endpoint success-rate breakdown: the metrics are whole-log aggregates, so "which receiver is failing" still means reading `GET /webhooks/deliveries?status=dead` and looking at `url`.
 - The delivery log is unauthenticated like the rest of the API, and `GET /webhooks/deliveries/{id}` returns the full body — which for `dataset.changed` is the revision batch. See [../deployment.md](../deployment.md) for the auth posture.
 - Delivery-pool sizing (16 concurrent / 1024 queued) is a constant, not a config key.
+- A `plugin:` sink's only per-watch configuration is `params.target` (the watch's `url`). There is no per-watch params object, and no secret injection into a connector — a connector needing a token has it compiled in or stores it through the `kv` capability.
+- A `plugin:` sink holds a `[plugins] max_concurrent` admission slot for the whole call, network included. A slow connector therefore competes with trigger hooks and extraction plugins for the same gate; the two ceilings that bound it are documented in [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10), and no latency benchmark has been run.

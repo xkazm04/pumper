@@ -357,6 +357,11 @@ async fn trigger_plugin_hooks_roundtrip() {
             params: json!({ "keep": ["dataset", "count"] }),
             on_error: None,
         }),
+        post_enqueue: Some(PluginHook {
+            plugin: "sink-postgrest".into(),
+            params: json!({ "target": "http://localhost:3000/hops" }),
+            on_error: None,
+        }),
     };
     let trigger = storage
         .create_trigger(&NewTrigger {
@@ -389,11 +394,17 @@ async fn trigger_plugin_hooks_roundtrip() {
     let t = h.transform.expect("transform hook");
     assert_eq!(t.plugin, "delta-slim");
     assert!(t.on_error.is_none());
+    // N10's third slot round-trips through the same JSON column. A hooks object
+    // holding ONLY a post_enqueue must not read back as "no hooks".
+    let pe = h.post_enqueue.expect("post_enqueue hook persisted");
+    assert_eq!(pe.plugin, "sink-postgrest");
+    assert_eq!(pe.params["target"], "http://localhost:3000/hops");
 
     // All-empty hooks object → stored as NULL, read back as None.
     let empty = TriggerPluginHooks {
         predicate: None,
         transform: None,
+        post_enqueue: None,
     };
     let bare = storage
         .create_trigger(&NewTrigger {

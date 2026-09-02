@@ -1836,6 +1836,21 @@ pub struct PluginConfig {
     /// only; executing dynamic apps needs the component-model host (next
     /// slice). `None` (the default) disables discovery entirely.
     pub app_dir: Option<PathBuf>,
+    /// **The operator half of the N10 capability gate.** Hosts a plugin's
+    /// `pumper_http_request` import may reach, on top of what the plugin's own
+    /// `describe().capabilities.http.hosts` declares — BOTH lists must pass.
+    ///
+    /// Default: empty, which means **no plugin reaches the network**, so a
+    /// deployment behaves byte-for-byte as it did before N10 until an operator
+    /// opts in. An entry starting with `.` covers a domain and its subdomains
+    /// (`.notion.com`); `"*"` delegates the whole decision to the plugins'
+    /// manifests and is honored only from here — a manifest may not write it.
+    ///
+    /// This is the sandbox's first outbound authority, so treat it like the
+    /// `[ingress]` allow-lists: name the hosts, and remember that a host you
+    /// allow is a host every capability-declaring plugin in `dir` may reach
+    /// (loopback and link-local addresses included, if you list them).
+    pub allow_http_hosts: Vec<String>,
 }
 
 impl Default for PluginConfig {
@@ -1847,6 +1862,9 @@ impl Default for PluginConfig {
             max_memory_mb: 64,
             max_concurrent: 0,
             app_dir: None,
+            // Empty = no plugin has network. The capability model is opt-in on
+            // both sides, and this is the side the operator owns.
+            allow_http_hosts: Vec::new(),
         }
     }
 }

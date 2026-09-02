@@ -1,16 +1,20 @@
 # Trigger plugins (sandboxed WASM hooks)
 
 A trigger edge can run **untrusted WebAssembly** at the moment it decides to
-fire. Two hook slots, both optional, both attachable to any `source_kind`:
+fire. Three hook slots, all optional, all attachable to any `source_kind`:
 
 | Hook | Question it answers | Output contract |
 |---|---|---|
 | `predicate` | Should this hop fire at all? | `{"pass": bool}` (a bare `true`/`false` is accepted) |
 | `transform` | What should the `_trigger` envelope look like? | a JSON **object**, which becomes the new envelope |
+| `post_enqueue` | (nothing — side effects only) | ignored entirely |
 
 The predicate runs first; a veto short-circuits the transform entirely.
+`post_enqueue` runs **after** the hop's job exists and receives its `job_id`.
 
-Two example plugins ship in-tree: `plugins-src/trigger-gate` (predicate — fire
+Three example plugins ship in-tree: `plugins-src/sink-postgrest` (a **sink
+connector** — see [Capabilities](#capabilities-n10) and
+[events-webhooks.md](events-webhooks.md)), `plugins-src/trigger-gate` (predicate — fire
 only on batches of at least `min_count`, optionally only for one dataset; both
 rules read fields only **dataset** hops carry, so on job and external hops they
 sit out and the hop passes, with `reason` saying so) and
@@ -28,8 +32,8 @@ declared ABI from source in the ordinary suite, and the artifact tests ask the
 host whether each installed module is actually executable.
 
 Implementation: `crates/server/src/triggers.rs` (`apply_plugin_hooks`,
-`restamp_host_owned`, `missing_hook_plugins`) over the host in
-`crates/engine-wasm/`. The ABI and the sandbox itself are shared with
+`run_post_enqueue_hook`, `restamp_host_owned`, `missing_hook_plugins`) over the
+host in `crates/engine-wasm/`. The ABI and the sandbox itself are shared with
 extraction plugins — see [extraction.md](extraction.md).
 
 ## Build and install
@@ -74,10 +78,27 @@ POST /triggers
     "transform": {
       "plugin": "delta-slim",
       "params": { "keep": ["dataset", "count"] }
+    },
+    "post_enqueue": {
+      "plugin": "sink-postgrest",   // side effects only; output ignored
+      "params": { "target": "http://localhost:3000/hops" }
     }
   }
 }
 ```
+
+### `post_enqueue`
+
+Runs after `enqueue_dedup` has returned a job, and receives the `_trigger`
+object **plus the hop's `job_id`** — the one fact no other slot can know. Its
+output is ignored and its failures are ledgered but never acted on: by the time
+it runs there is no decision left to influence, so unlike the predicate it has
+no `on_error` escape hatch (a configured one is accepted and means nothing).
+The `job_id` is re-stamped by the host, so a transform plugin cannot forge it.
+
+It fires only on a hop that was actually **created**: a hop suppressed by the
+idempotency key, or refused by the target's params schema, never reaches it.
+That makes it "a job now exists", not "the trigger fired".
 
 `keep` shapes the **payload**, never the target's work scope: `keys` and
 `keys_truncated` are re-added by the host afterwards. (This example used to be a
@@ -178,7 +199,107 @@ one per core) capping how many plugin executions run at once **across the whole
 host** — trigger hooks and extraction plugins share that admission gate. Each
 call gets its own wasmtime `Store`, so no state survives between invocations;
 only the module's linking is shared (pre-instantiated once at load). Plugins
-declare no imports, so they have no filesystem or network access.
+declare no imports unless they declare a **capability**, so by default they have
+no filesystem and no network. What they may declare is below.
+
+## Capabilities (N10)
+
+A plugin may ask, in its own `describe()` manifest, for a bounded slice of the
+outside world. Two independent locks have to open:
+
+1. **The manifest** — written by whoever wrote the plugin — names the hosts and
+   methods. The host builds that module's linker *from this block*, so a module
+   importing a host function it did not declare **fails to link at load**: it is
+   listed with `executable: false` and a `capability_error`, `has()` answers
+   false, and every call refuses with `hook_not_executable`. There is no path
+   where an undeclared import resolves to a stub.
+2. **`[plugins] allow_http_hosts`** — written by whoever runs the box — names
+   the hosts this deployment permits. It defaults to **empty, which means no
+   plugin reaches the network**, so a deployment behaves exactly as it did
+   before N10 until an operator opts in.
+
+```json
+{
+  "kind": "sink",
+  "capabilities": {
+    "http": { "hosts": ["api.example.com", ".notion.com"], "methods": ["POST"] },
+    "kv": true
+  }
+}
+```
+
+`hosts` is a closed list: an entry starting with `.` covers a domain and its
+subdomains, everything else is an exact hostname, and `*` is **refused** in a
+manifest (a plugin may not grant itself the internet). `methods` defaults to
+`["GET"]`. A malformed `capabilities` block is refused by name in the log and
+the plugin is granted nothing.
+
+```toml
+[plugins]
+# Both lists must pass. "*" is honored ONLY here, and delegates the whole
+# decision to the plugins' manifests.
+allow_http_hosts = [".notion.com", "localhost"]
+```
+
+`GET /plugins` shows each module's `capabilities` as the **loader parsed them**
+(and a `capability_error` when there is one), so what a plugin asked for and
+what it was granted are never two different answers.
+
+### The imports
+
+Under the wasm import module `env` — what a bare `extern "C"` block compiles to
+on `wasm32-unknown-unknown` — returning through the same packed
+`(ptr << 32) | len` convention `extract_v2` uses:
+
+| Import | Requires | Contract |
+|---|---|---|
+| `pumper_http_request(ptr, len) -> u64` | `capabilities.http` | JSON `{method, url, headers, body}` in; `{status, body}` or `{error}` out |
+| `pumper_kv_get(ptr, len) -> u64` | `capabilities.kv` | key in; value out, packed `0` when absent |
+| `pumper_kv_put(kptr, klen, vptr, vlen) -> u32` | `capabilities.kv` | `1` stored, `0` refused |
+
+HTTP goes through the same engine every raw-HTTP caller in the process uses, so
+a plugin's traffic is spaced by the **per-host politeness governor**, sees the
+response cache, obeys the body cap and shows up on `GET /hosts` like any other
+request. Per call: a 20s timeout and a 2 MiB body cap. `kv` is a per-plugin
+namespace in the `plugin_kv` table (migration 0048) whose primary key starts
+with the plugin name — supplied by the host, never by the guest — so there is no
+call shape that reads another plugin's keys. Ceilings: 64 KiB per value, 1,000
+keys per plugin.
+
+**A denied destination is DATA, not a trap** (`{error: "..."}`), so a connector
+can report a permanent delivery failure instead of looking like a crashed
+sandbox. A *bound* being reached — the 32-host-call-per-invocation ceiling, the
+4 MiB payload cap — is a trap, because that is the host stopping the plugin.
+
+`plugins-src/sink-postgrest` is the worked example: one declared import, one
+declared host list, and the three decisions it makes (`build_request`,
+`classify`, `manifest`) unit-tested on the host target by `just plugins-test`.
+
+### Threat model
+
+The sandbox's first outbound authority, so the risks are named rather than
+implied — the same posture as `[ingress]`:
+
+- **SSRF.** A host you list is a host every capability-declaring plugin in
+  `dir` may reach. Loopback and link-local addresses are not special-cased: if
+  you list `localhost`, plugins get `localhost`. Only `http`/`https` schemes are
+  permitted; `file:`, `data:` and everything else are refused before a socket
+  exists.
+- **Secret leakage.** A plugin sees exactly the envelope it is handed. Nothing
+  injects credentials into plugin memory, and there is no route that would.
+- **Admission starvation.** A plugin call holds a `max_concurrent` slot for its
+  whole run, network included. The worst case per invocation is 32 host calls at
+  20s each; a connector doing more than one round trip per delivery should be an
+  app, not a hook.
+- **Fuel does not bound host time.** A host call burns the host's seconds, not
+  the guest's instructions, which is exactly why the call ceiling exists
+  separately from `fuel`.
+
+### Benchmark note (not measured)
+
+No fuel/latency benchmark of an HTTP-calling plugin under the admission gate has
+been run. The bounds above are declared and enforced, not observed. Measuring
+one is owed before this capability is recommended for anything latency-sensitive.
 
 The admission permit belongs to the running work, not to the caller waiting on
 it. Wasm executes on an uncancellable blocking thread, so abandoning the call (a
@@ -206,4 +327,20 @@ the type and a reworded message cannot silently reclassify stored rows. See
   exporting an `alloc` of the wrong type still lists as executable and fails per
   call with `hook_not_executable` instead.
 - The concurrency gate is shared with extraction plugins and cannot be split.
-- Only `predicate` and `transform` slots exist; there is no post-enqueue hook.
+- `post_enqueue` runs only on a hop that was actually created. A hop suppressed
+  by the idempotency key (`dedup`) or refused by the target's params schema
+  never reaches it — correct, since there is no job to report, but it means the
+  slot is not a "the trigger fired" notification.
+- The `capabilities` vocabulary is `http` and `kv` and nothing else: no
+  filesystem, no timers, no outbound sockets other than HTTP.
+- A capability manifest is **static**. A connector's hosts are fixed at build
+  time; changing them is an edit plus a rebuild, which is the audit trail, not
+  an oversight. There is no route that widens a loaded module's capabilities.
+- Secrets are not injected into plugins. A connector that needs a token today
+  has it compiled in or stores it through `kv`; OAuth/secret injection is
+  deliberately out of this slice.
+- The HTTP capability sends **GET and POST only** — the engine behind it speaks
+  those two. A manifest may declare `PUT`/`DELETE`; the call is then refused by
+  name at the bridge rather than downgraded.
+- `pumper_kv_get` returns a packed `0` both for "absent" and for a stored empty
+  value. A plugin that must tell them apart stores a JSON wrapper.

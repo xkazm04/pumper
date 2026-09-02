@@ -123,3 +123,147 @@ async fn slack_sink_posts_a_compact_summary_message() {
         "slack gets the summary only, never the raw revision batch"
     );
 }
+
+// ── plugin sinks (N10) ───────────────────────────────────────────────────────
+
+/// A canned connector: whatever verdict the test hands it, plus a record of the
+/// envelope it was given.
+///
+/// A stub rather than a real `.wasm` because what this file proves is the
+/// SERVER's half — that a connector's verdict reaches the same delivery ladder
+/// every other sink rides. The sandbox half (an undeclared import cannot link)
+/// is proved where it lives, in `engine-wasm`.
+struct StubConnector {
+    verdict: serde_json::Value,
+    seen: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+#[async_trait::async_trait]
+impl pumper_core::Plugins for StubConnector {
+    async fn run(
+        &self,
+        name: &str,
+        input: &str,
+        params: &serde_json::Value,
+    ) -> pumper_core::Result<serde_json::Value> {
+        let envelope: serde_json::Value =
+            serde_json::from_str(input).expect("the host hands the module JSON");
+        self.seen.lock().expect("seen").push((
+            name.to_string(),
+            json!({ "doc": envelope, "params": params }),
+        ));
+        Ok(self.verdict.clone())
+    }
+    fn list(&self) -> Vec<String> {
+        vec!["sink-stub".into()]
+    }
+    async fn reload(&self) -> pumper_core::Result<usize> {
+        Ok(1)
+    }
+}
+
+/// **The gate the item promises**: a `plugin:` sink that reports a PERMANENT
+/// refusal lands in the DLQ exactly like any other sink's permanent failure —
+/// `dead` immediately, not after five backed-off retries — and the delivery row
+/// is a replayable `plugin://` row like the `file://` ones above.
+#[tokio::test]
+async fn a_permanent_plugin_sink_refusal_dead_letters_like_any_other_sink() {
+    let connector = Arc::new(StubConnector {
+        verdict: json!({"delivered": false, "permanent": true, "error": "422 schema"}),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let (state, _store) =
+        super::harness::test_state_with_plugins(vec![Arc::new(FakeApp)], connector.clone()).await;
+    state
+        .storage
+        .create_watch(
+            "fake",
+            "d",
+            "http://localhost:3000/deliveries",
+            None,
+            "plugin:sink-stub",
+        )
+        .await
+        .expect("create plugin-sink watch");
+
+    run_sync_job(&state).await;
+
+    // The module got the delivery envelope AND the operator's target — the
+    // whole configuration path, which is what makes one module reusable.
+    let seen = connector.seen.lock().expect("seen").clone();
+    assert_eq!(seen.len(), 1, "one change batch → one connector call");
+    let (name, call) = &seen[0];
+    assert_eq!(name, "sink-stub");
+    assert_eq!(call["params"]["target"], "http://localhost:3000/deliveries");
+    assert_eq!(call["doc"]["event"], "dataset.changed");
+    assert_eq!(
+        call["doc"]["body"]["count"], 2,
+        "the body is the UNSHAPED payload, exactly what a webhook sink receives"
+    );
+    assert!(
+        call["doc"]["delivery_id"].is_string(),
+        "the stable idempotency key a connector dedups on"
+    );
+
+    // …and the outcome rode the ordinary ladder into the ordinary DLQ.
+    let dead = state
+        .storage
+        .list_deliveries(Some("dead"), 10)
+        .await
+        .expect("list dead deliveries");
+    assert_eq!(
+        dead.len(),
+        1,
+        "a permanent refusal is `dead` NOW — not after the 5-rung ladder"
+    );
+    assert_eq!(
+        dead[0].url,
+        "plugin://sink-stub?target=http://localhost:3000/deliveries"
+    );
+    assert_eq!(dead[0].kind, "change");
+    assert!(
+        dead[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("422 schema"),
+        "the connector's own reason survives into the log: {:?}",
+        dead[0].last_error
+    );
+}
+
+/// The negative that keeps the test above from passing for the wrong reason: a
+/// connector that says `delivered` produces a `delivered` row, not a dead one.
+#[tokio::test]
+async fn a_delivering_plugin_sink_logs_a_delivered_row() {
+    let connector = Arc::new(StubConnector {
+        verdict: json!({"delivered": true}),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let (state, _store) =
+        super::harness::test_state_with_plugins(vec![Arc::new(FakeApp)], connector).await;
+    state
+        .storage
+        .create_watch("fake", "d", "", None, "plugin:sink-stub")
+        .await
+        .expect("create plugin-sink watch");
+
+    run_sync_job(&state).await;
+
+    let dead = state
+        .storage
+        .list_deliveries(Some("dead"), 10)
+        .await
+        .expect("list");
+    assert!(dead.is_empty(), "nothing dead-letters on a good delivery");
+    let delivered = state
+        .storage
+        .list_deliveries(Some("delivered"), 10)
+        .await
+        .expect("list");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered[0].url, "plugin://sink-stub",
+        "a watch with no target logs the bare pseudo-URL"
+    );
+}

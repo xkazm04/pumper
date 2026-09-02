@@ -338,10 +338,41 @@ pub(crate) async fn create_watch(
             }
             url
         }
+        // N10: `plugin:<name>` delivers through the WASM plugin host. The
+        // module must already be loaded — a watch pointed at a plugin that was
+        // never installed would look configured and dead-letter every event.
+        // `url` is OPTIONAL here and is the connector's target: it reaches the
+        // module as `params.target`, and a connector that has its destination
+        // compiled in ignores it (see docs/features/events-webhooks.md).
+        other if other.starts_with(crate::webhook::PLUGIN_SINK_PREFIX) => {
+            let name = &other[crate::webhook::PLUGIN_SINK_PREFIX.len()..];
+            if !state.plugins.has(name) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "no executable plugin named '{name}' is loaded — build and install it \
+                         (`just plugins-install`), then POST /plugins/reload"
+                    ),
+                ));
+            }
+            let url = body.url.as_deref().unwrap_or("");
+            // The target rides on the delivery row's pseudo-URL as
+            // `?target=…`, so a `?` in the stored value would be re-parsed as
+            // the separator. Refuse at the door rather than truncate later.
+            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "a plugin sink's url is the connector's target and must be http(s) \
+                     (or omitted, for a connector with its destination built in)"
+                        .into(),
+                ));
+            }
+            url
+        }
         other => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
-                format!("unknown sink '{other}' (expected webhook, file, or slack)"),
+                format!("unknown sink '{other}' (expected webhook, file, slack, or plugin:<name>)"),
             ));
         }
     };
