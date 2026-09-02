@@ -99,6 +99,10 @@ pub struct AppContext {
     /// `None` on a fresh first attempt or after the poisoned-checkpoint escape.
     /// Advisory: apps must tolerate any stored shape and start fresh on doubt.
     pub restored: Option<Value>,
+    /// The input `POST /jobs/{id}/resume` supplied to a previously parked run,
+    /// handed back through [`restore_input`](Self::restore_input). `None` on
+    /// every attempt that was not resumed from a wait.
+    pub resumed_input: Option<Value>,
     /// VCR mode (M24): `Off` (default), `Record` (persist every fetch/research
     /// through this context into the job's cassette artifact), or `Replay`
     /// (serve every fetch/research from a prior job's cassette — a MISS is a
@@ -127,6 +131,46 @@ impl AppContext {
     /// Advisory: treat unexpected shapes as "start fresh", never as an error.
     pub fn restore(&self) -> Option<&Value> {
         self.restored.as_ref()
+    }
+
+    /// Parks this job until somebody supplies the input it is asking for
+    /// (N02): forces a checkpoint of `resume_state`, then returns the typed
+    /// [`Error::AwaitingInput`] the app must propagate — `return Err(ctx
+    /// .await_input(state, request).await)`.
+    ///
+    /// The worker's outcome arm recognises that error and moves the job to
+    /// [`crate::JobStatus::Waiting`] instead of failing it: the permit is
+    /// released (a parked job costs no worker slot), the checkpoint stays live,
+    /// no attempt is burned, and `request` rides `GET /jobs/{id}`, the
+    /// non-terminal `waiting` SSE event and MCP `wait_job`. The answer arrives
+    /// on the next attempt through [`restore_input`](Self::restore_input).
+    ///
+    /// **The checkpoint is forced, not optional, and that is the whole
+    /// contract.** A park is a promise to resume from *here*; without a landed
+    /// snapshot the resumed attempt restarts from the top and re-asks the
+    /// question the human already answered. It uses
+    /// [`checkpoint_now`](Self::checkpoint_now) rather than
+    /// [`checkpoint`](Self::checkpoint) for exactly the reason that method
+    /// exists — a snapshot whose loss costs real work must not be eaten by the
+    /// 5s throttle. Pass [`Value::Null`] only if the app genuinely has nothing
+    /// to resume from.
+    ///
+    /// A save that does not land (stale lineage, storage error) is reported by
+    /// the sink and counted there; the park still happens, because refusing to
+    /// park would fail a job whose external question is already outstanding.
+    pub async fn await_input(&self, resume_state: Value, request: Value) -> Error {
+        self.checkpoint_now(resume_state).await;
+        Error::AwaitingInput(request)
+    }
+
+    /// The input a `POST /jobs/{id}/resume` supplied for this job, when this
+    /// attempt is the resume of an [`await_input`](Self::await_input) park.
+    ///
+    /// Advisory in the same way as [`restore`](Self::restore): the value is
+    /// whatever the resumer sent, so treat an unexpected shape as a refusal to
+    /// proceed, never as a panic.
+    pub fn restore_input(&self) -> Option<&Value> {
+        self.resumed_input.as_ref()
     }
 
     /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.

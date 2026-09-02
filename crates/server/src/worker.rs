@@ -807,6 +807,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             .reporter(job.id, job.app.clone(), state.events.clone()),
         checkpoints: checkpointer.clone(),
         restored,
+        // N02: the answer `POST /jobs/{id}/resume` stored for a job that had
+        // parked on `await_input`. Read straight off the claimed row, so it
+        // travels with the same lineage the checkpoint does.
+        resumed_input: job.resumed_input.clone(),
         vcr,
         artifacts_dir,
     };
@@ -998,6 +1002,45 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     finalize_fanout(st, jb, stages).await;
                 })
                 .await;
+            return;
+        }
+        // N02: NOT a failure. The app called `ctx.await_input(..)`, which forced
+        // a checkpoint and handed back this typed signal; the job parks on the
+        // outside world instead of failing. This arm is deliberately ABOVE the
+        // terminal-failure arm — `is_terminal_for_job` answers "skip the retry
+        // ladder for this failure", a question that must never be asked about a
+        // park.
+        Outcome::Finished(Err(ref e)) if e.awaited_request().is_some() => {
+            let request = e
+                .awaited_request()
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let expires = waiting_deadline(chrono::Utc::now(), state.config.waiting.expiry_secs);
+            match state
+                .storage
+                .await_input(job.id, job.attempts, &request, expires)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        job = %job.id,
+                        expires = ?expires,
+                        "job parked awaiting external input; permit released"
+                    );
+                    // Non-terminal, like `progress` — `GET /jobs/{id}/stream`
+                    // and MCP's live feed stay open, and the request rides the
+                    // event so a watcher learns WHAT is being asked without a
+                    // follow-up read.
+                    let mut event = JobEvent::new(job.id, job.app.clone(), "waiting");
+                    event.result = Some(request);
+                    publish(&state, event);
+                }
+                // Stale (job reset/reaped mid-run): the live attempt owns it.
+                Ok(false) => {}
+                Err(e) => error!(job = %job.id, "failed to persist waiting state: {e}"),
+            }
+            // The permit is released by the caller as this task ends — which is
+            // the whole economic claim of N02: a parked job costs no slot.
             return;
         }
         Outcome::Finished(Err(e)) if e.is_terminal_for_job() => {
@@ -1350,6 +1393,13 @@ pub async fn reap_once(state: &AppState) {
     // — before the `stale_after_secs == 0` early return, because a deployment
     // with the reaper disabled still writes decisions.
     prune_trigger_ledger(state).await;
+    // So does the waiting-expiry sweep (N02), for the same reason and one more:
+    // the reaper and the sweep are *different policies over different states*.
+    // The reaper selects `status='running'` on a stale heartbeat — a parked job
+    // has no executor and no heartbeat, so it is naturally outside that scan and
+    // must never be dragged into it. Turning the reaper off is a statement about
+    // leases, not about approvals.
+    expire_waiting_once(state).await;
     let stale = state.config.worker.stale_after_secs;
     if stale == 0 {
         return;
@@ -1373,6 +1423,55 @@ pub async fn reap_once(state: &AppState) {
                 finalize(state, id).await;
             }
         }
+    }
+}
+
+/// The error a parked job is failed with when its deadline passes. Distinct
+/// prose (not "job failed", not the reaper's "lease expired") because the
+/// remedy is different: nobody answered, so the fix is a person, not a restart.
+pub(crate) const WAITING_EXPIRED_REASON: &str =
+    "awaited input not provided before waiting_expires_at";
+
+/// Pure: the instant a park expires, given when it started and the configured
+/// window.
+///
+/// The anti-pattern this exists to make untestable-by-construction: reading
+/// `expiry_secs = 0` as "expires now". Zero is the DEFAULT, and it means *wait
+/// forever* — a fresh install must behave exactly as it did before N02 existed,
+/// and a park that expires the instant it is made would fail every approval the
+/// feature was built to enable.
+pub(crate) fn waiting_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    expiry_secs: u64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    (expiry_secs > 0).then(|| now + chrono::Duration::seconds(expiry_secs as i64))
+}
+
+/// One expiry-sweep pass: permanently fails every `waiting` job whose deadline
+/// has passed, routing each through [`finalize`] so its callback and terminal
+/// triggers fire exactly like any other permanent failure. Bounded per pass by
+/// `[waiting] expire_batch`; with `[waiting] expiry_secs = 0` (the default) no
+/// row ever carries a deadline, so this is one indexed query that matches
+/// nothing.
+pub(crate) async fn expire_waiting_once(state: &AppState) {
+    let cap = state.config.waiting.expire_batch;
+    if cap <= 0 {
+        return;
+    }
+    let expired = match state
+        .storage
+        .expire_waiting(WAITING_EXPIRED_REASON, cap)
+        .await
+    {
+        Ok(expired) => expired,
+        Err(e) => {
+            error!("waiting-expiry sweep failed: {e}");
+            return;
+        }
+    };
+    for (id, app) in expired {
+        warn!(job = %id, %app, "waiting job expired: {WAITING_EXPIRED_REASON}");
+        finalize(state, id).await;
     }
 }
 
@@ -2730,6 +2829,10 @@ mod fanout_fence_tests {
             trigger_id: None,
             result: None,
             error: None,
+            input_request: None,
+            waiting_since: None,
+            waiting_expires_at: None,
+            resumed_input: None,
             created_at: chrono::Utc::now(),
             available_at: chrono::Utc::now(),
             started_at: None,
@@ -2957,6 +3060,28 @@ mod saved_search_scope_tests {
             vec!["grants".to_string()],
             "job app equal to the virtual app collapses to one entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod waiting_deadline_tests {
+    use super::waiting_deadline;
+    use chrono::{Duration, Utc};
+
+    /// The anti-pattern: `expiry_secs = 0` read as "expires now". Zero is the
+    /// DEFAULT, and a park that expired the instant it was made would fail
+    /// every approval the feature exists to enable, on a fresh install, with
+    /// nobody having configured anything.
+    #[test]
+    fn zero_expiry_waits_forever_it_does_not_expire_immediately() {
+        let now = Utc::now();
+        assert_eq!(waiting_deadline(now, 0), None);
+        // Any positive window is a real deadline, in the future.
+        let deadline = waiting_deadline(now, 3600).expect("a configured window stamps a deadline");
+        assert_eq!(deadline, now + Duration::seconds(3600));
+        assert!(deadline > now, "a deadline must be ahead of the park");
+        // And the smallest configurable window is still a future instant.
+        assert!(waiting_deadline(now, 1).expect("1s window") > now);
     }
 }
 

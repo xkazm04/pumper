@@ -128,7 +128,9 @@ fn initialize_result(params: &Value) -> Value {
             query_dataset (`$.path:op:value` filters) and search (full text). enqueue_job, \
             fetch_readable, and deep_research are only offered when the operator has enabled \
             [mcp] allow_enqueue; every budget_usd is clamped to [mcp] max_job_budget_usd. Await \
-            a job with wait_job (timeout capped by [mcp] wait_job_max_secs), or open GET /mcp \
+            a job with wait_job (timeout capped by [mcp] wait_job_max_secs) - it settles on \
+            a terminal status OR on 'waiting', a job asking YOU for input, which you answer \
+            with resume_job - or open GET /mcp \
             (SSE, optional ?app=/?kind= filters, Last-Event-ID resume) for live \
             notifications/pumper/* events. Catalog + app manifests are resources.",
     })
@@ -241,11 +243,13 @@ fn server_tools(state: &AppState) -> Vec<Value> {
         json!({
             "name": "wait_job",
             "description": format!(
-                "Wait for a job to reach a terminal status (succeeded | failed | cancelled), \
-                 watching the live event stream. timeout_secs is clamped to the operator's \
-                 [mcp] wait_job_max_secs cap ({}s; omitted = that cap). Hitting the deadline \
-                 returns timed_out: true with the job's current snapshot — call again to keep \
-                 waiting.",
+                "Wait for a job to SETTLE, watching the live event stream. It settles on a \
+                 terminal status (succeeded | failed | cancelled) OR on 'waiting' - a job that \
+                 parked to ask YOU for something, in which case the result carries input_request: \
+                 answer it with resume_job, then call wait_job again. timeout_secs is clamped to \
+                 the operator's [mcp] wait_job_max_secs cap ({}s; omitted = that cap). Hitting \
+                 the deadline returns timed_out: true with the job's current snapshot - call \
+                 again to keep waiting.",
                 state.config.mcp.wait_job_max_secs
             ),
             "inputSchema": {
@@ -295,6 +299,28 @@ fn server_tools(state: &AppState) -> Vec<Value> {
             }
         }));
         tools.push(json!({
+            "name": "resume_job",
+            "description": "Answer a job that is 'waiting' (its request is in wait_job's input_request) \
+                and let it continue: it resumes from the checkpoint it parked at, reads `input` \
+                back through ctx.restore_input(), and burns no retry attempt. 409-equivalent \
+                refusal if the job is not waiting - including a second resume of one you have \
+                already answered. Same operator gate as enqueue_job, because resuming lets a job \
+                spend the rest of its budget.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["job_id"],
+                "properties": {
+                    "job_id": { "type": "string", "format": "uuid" },
+                    "input": {
+                        "description": "The answer, in whatever shape the job's input_request \
+                            asked for. Omitted = null, which is a fine answer to a pure \
+                            'proceed?' gate."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
             "name": "enqueue_job",
             "description": format!(
                 "Enqueue one job for a registered app (see list_apps for each app's params \
@@ -336,11 +362,12 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         "search" => tool_search(state, &args).await,
         "wait_job" => live::wait_job(state, &args).await,
         "enqueue_job" if state.config.mcp.allow_enqueue => tool_enqueue(state, &args).await,
+        "resume_job" if state.config.mcp.allow_enqueue => tool_resume_job(state, &args).await,
         "fetch_readable" if state.config.mcp.allow_enqueue => {
             tool_fetch_readable(state, &args).await
         }
         "deep_research" if state.config.mcp.allow_enqueue => tool_deep_research(state, &args).await,
-        "enqueue_job" | "fetch_readable" | "deep_research" => Err(
+        "enqueue_job" | "fetch_readable" | "deep_research" | "resume_job" => Err(
             "enqueue is disabled on this MCP surface — the operator must set \
              [mcp] allow_enqueue = true"
                 .to_string(),
@@ -359,6 +386,38 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         }),
     };
     rpc_result(id, result)
+}
+
+/// The `resume_job` tool: answers a parked job (N02).
+///
+/// One store call, through the same `status = 'waiting'` guard the HTTP door
+/// uses - so the two surfaces cannot disagree about what a stale resume does,
+/// and an agent that retries a `resume_job` it already sent gets a refusal
+/// instead of restarting a lineage that has moved on.
+async fn tool_resume_job(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id: uuid::Uuid = require_str(args, "job_id")?
+        .parse()
+        .map_err(|e| format!("invalid job_id: {e}"))?;
+    let input = args.get("input").cloned().unwrap_or(Value::Null);
+    match state.storage.resume(id, &input).await {
+        Ok(Some(job)) => {
+            state.events.emit(crate::events::JobEvent::new(
+                job.id,
+                job.app.clone(),
+                "queued",
+            ));
+            state.notify.notify_one();
+            Ok(json!({ "resumed": true, "job": job }))
+        }
+        // Deliberately not split into `unknown job` vs `wrong state`: the store
+        // cannot tell them apart in one guarded statement, and inventing the
+        // distinction with a second read would be a race, not a fact.
+        Ok(None) => Err(format!(
+            "job '{id}' is not waiting for input (unknown, still running, already \
+            resumed, or terminal) - read its status with wait_job before resuming"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn tool_list_apps(state: &AppState) -> Value {

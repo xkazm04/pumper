@@ -5,7 +5,7 @@ Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/serv
 ## Jobs
 
 - Enqueue: `POST /apps/{name}/jobs` with optional `{params, max_attempts, delay_secs, priority, callback_url, callback_secret, budget_usd, idempotency_key}`. An `Idempotency-Key` header (or body field) makes retries safe: a duplicate key returns the original job with `200` instead of a new `202`.
-- Lifecycle: `queued → running → succeeded | failed | cancelled`. Failures retry with exponential backoff up to `max_attempts`; the boot recovery sweep (`recover_stuck`) issues the *same* verdict to jobs orphaned by a crash — see **Recovery verdicts** below. `POST /jobs/{id}/retry` resurrects a failed/cancelled job with one extra attempt.
+- Lifecycle: `queued → running → succeeded | failed | cancelled`, with one non-terminal detour: `running → waiting → queued` when a job parks on external input (see **Jobs that wait** below). Failures retry with exponential backoff up to `max_attempts`; the boot recovery sweep (`recover_stuck`) issues the *same* verdict to jobs orphaned by a crash — see **Recovery verdicts** below. `POST /jobs/{id}/retry` resurrects a failed/cancelled job with one extra attempt.
 - **Job control surface:**
   - `POST /jobs/retry` — bulk resurrect: re-queues every job in a terminal state (`failed` default, or `cancelled`), optionally scoped to one `app`, up to `limit` (≤500), each with one extra attempt. Returns `{retried, ids}`.
   - `POST /jobs/{id}/reset` — re-queues a **running** job (e.g. one stuck on a hung task) with a fresh attempt budget (409 if not running).
@@ -61,6 +61,41 @@ sweep being idempotent and the reaper continuing the work. It reports per class
 — `requeued` / `failed` / `skipped` — where `skipped` counts rows a live worker
 resolved between the scan and the verdict (the `(status, attempts)` fence), so a
 sweep that verdicted fewer rows than it scanned is legible rather than silent.
+
+## Jobs that wait (`waiting`)
+
+A running app can say *"I need something from outside before I can continue"* — a human approval, a 2FA code, an agent's answer to a clarifying question — and park itself **without holding a worker permit**.
+
+```rust
+// inside ScrapeApp::run
+let Some(answer) = ctx.restore_input().cloned() else {
+    // No answer yet: checkpoint the reversible work, then park.
+    return Err(ctx
+        .await_input(
+            json!({ "stage": "prepared", "amount": 42 }),   // the resume snapshot
+            json!({ "kind": "approval", "prompt": "submit $42?" }), // what you're asking for
+        )
+        .await);
+};
+// A later attempt lands here with `answer` in hand and the checkpoint restored.
+```
+
+- **`ctx.await_input(resume_state, request)`** forces a checkpoint of `resume_state` (`checkpoint_now`, so the 5s throttle cannot eat it) and returns `Error::AwaitingInput(request)`, which the app propagates. The forced checkpoint is the contract: a park is a promise to resume *from here*, and without a landed snapshot the resumed attempt would restart from the top and re-ask a question somebody already answered. Pass `Value::Null` if there is genuinely nothing to resume from.
+- **The worker's outcome arm** (above the terminal-failure arm — a park is not a failure, so `is_terminal_for_job` is never consulted) writes `status = 'waiting'` fenced on `(status='running', attempts)`, keeps the checkpoint, leaves `finished_at` NULL, **burns no attempt**, releases the permit, and publishes a **non-terminal `waiting` job event** carrying the request — so `GET /jobs/{id}/stream`, `/events` and the MCP live feed stay open.
+- **Columns** (migration `0043`): `input_request` (what the job is asking for), `waiting_since`, `waiting_expires_at`, `resumed_input`. The first three ride `GET /jobs/{id}`; `resumed_input` is **never serialized**, for the same reason as `callback_secret` — the payloads it exists to carry are approvals, one-time codes and credentials, and the read API is unauthenticated on a default install.
+- **`POST /jobs/{id}/resume {input}`** stores the answer and re-queues the job with `reset`'s attempt headroom (`max_attempts = MAX(max_attempts, attempts + 1)`), so a job that waited an hour for a human still has every retry it started with. `input` is optional (omitted = `null`, a fine answer to a pure "proceed?" gate). The write is guarded on `status = 'waiting'`, which makes the door **idempotent by refusal**: a second resume — a stale browser tab, an agent retry, a second approver — is `409`, never a second live lineage for one job. `404` if the job does not exist. The resumed attempt reads the answer through **`ctx.restore_input()`** and its checkpoint through `ctx.restore()`.
+- **`DELETE /jobs/{id}` reaches a parked job.** A `waiting` job has no in-flight future to interrupt, so it is cancelled synchronously through the same guarded write as a `queued` one (the guard is `status IN ('queued','waiting')`). Without that it would be uncancellable: the door finds no registered token, falls through, and tells the operator the job is *already terminal*. `POST /jobs/{id}/retry` deliberately does **not** reach it — resume is the door, and retry would drop the answer on the floor.
+- **The schedule slot is held.** `run_holds_slot` (the single predicate behind the cron overlap guard *and* `GET /schedules` health) counts `waiting` as active: a parked run is mid-work, so stacking the next firing on top of it would do the same work twice.
+- **The reaper does not touch it.** The lease reaper selects `status = 'running'` on a stale heartbeat; a parked job has no executor and no heartbeat, so it is naturally outside that scan. Its policy is a *deadline* instead: with `[waiting] expiry_secs > 0` a park stamps `waiting_expires_at`, and a sweep on the scheduler tick fails an unanswered wait permanently with `error: "awaited input not provided before waiting_expires_at"` — through `finalize`, so the result callback, the failure firehose and terminal triggers all fire like any other permanent failure.
+- **Metrics:** `pumper_jobs{status="waiting"}` — always emitted, `0` when nothing is parked (an absent series is indistinguishable from a scrape failure, and "how many jobs are blocked on a human right now" is the number this feature exists to make answerable).
+- **MCP:** `wait_job` settles on a terminal status **or** on `waiting`, returning `{status: "waiting", input_request, note}`; `resume_job` answers it (gated by `[mcp] allow_enqueue`, like every other tool that lets a job spend). `list_jobs`/`GET /jobs?status=waiting` is the inbox. See [mcp.md](mcp.md).
+
+| `[waiting]` key | default | meaning |
+| --- | --- | --- |
+| `expiry_secs` | `0` | How long a parked job may wait before the sweep fails it. **`0` = wait forever**, which is byte-for-byte the behaviour of a build without this feature. A deadline is opt-in on purpose: the alternative default is a timer that fails approvals nobody got to over a weekend. |
+| `expire_batch` | `100` | Rows one sweep pass will fail before stopping (the sweep piggybacks the scheduler tick). |
+
+**Not in this slice:** no app ships a `waiting` flow yet — `apps/transact` still refuses `submit: true` at the door, and porting it (plus `research`'s clarification loop) is the declared next step. The only consumer today is the `approval` test app in `crates/server/src/e2e/waiting_resume.rs`. A deadline is per-server, not per-park: an app cannot ask for its own expiry window.
 
 ## Live progress
 
@@ -202,13 +237,13 @@ Every join is an index seek on the job id — a receipt is a per-job audit view,
 
 ## AppContext (what a running app gets)
 
-`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `require_str`, `remaining_budget_usd`.
+`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `resumed_input` (the answer a `POST /jobs/{id}/resume` supplied — see [Jobs that wait](#jobs-that-wait-waiting)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `await_input`/`restore_input`, `require_str`, `remaining_budget_usd`.
 
 **Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives **in the store**: `Datasets::detect_removed` demands a `RemovalGuard`, and the only public way to mint one is `RemovalGuard::for_source_state(state)`, which yields `None` for a degrading source. So an app that hand-rolls `upsert_many` + removal detection cannot skip it either (it previously could, and one did). A caller that already knows which specific records disappeared uses `Datasets::tombstone_keys` instead — removal by name, nothing inferred. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert while `[resilience] enforce = false` (the shipping default — verdicts are computed and stored, nothing is gated). Full surface: [resilient-extraction.md](resilient-extraction.md).
 
 ## Config
 
-`config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
+`config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner, waiting`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
 
 ## Process startup & error reporting
 
@@ -218,7 +253,7 @@ Every join is an index seek on the job id — a receipt is a per-job audit view,
 
 ## Metrics
 
-`GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges, `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
+`GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges (including `status="waiting"` — jobs parked on external input, holding no permit), `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
 
 Webhook delivery health, all four read in one aggregate pass so they describe the same instant, and all DB-derived like `pumper_job_failures_total` (the retention sweep can lower the `_total` series): `pumper_webhook_deliveries{status="pending|delivered|failed|dead"}`, `pumper_webhook_oldest_undelivered_seconds` (oldest `pending`+`failed` row; `0` when none, `dead` excluded so the gauge can clear — **the series to alert on**), `pumper_webhook_delivery_attempts_total`, `pumper_webhook_deliveries_succeeded_total`. See [events-webhooks.md § Metrics](events-webhooks.md#metrics).
 

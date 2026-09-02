@@ -66,7 +66,18 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     let schedules = state.storage.list_schedules().await?;
     let mut out = String::new();
     out.push_str("# HELP pumper_jobs Jobs by status\n# TYPE pumper_jobs gauge\n");
-    for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
+    // `waiting` (N02) is listed so the gauge reads 0 rather than being ABSENT on
+    // a fleet where nothing is parked — an absent series is indistinguishable
+    // from a scrape failure, and "how many jobs are blocked on a human right
+    // now" is the number this feature exists to make answerable.
+    for status in [
+        "queued",
+        "running",
+        "waiting",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ] {
         let n = counts
             .iter()
             .find(|(s, _)| s == status)

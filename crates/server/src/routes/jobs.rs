@@ -384,6 +384,63 @@ pub(crate) async fn reset_job(
     }
 }
 
+#[derive(Deserialize, ToSchema, Default)]
+pub(crate) struct ResumeBody {
+    /// The answer the parked job asked for (`input_request` on `GET
+    /// /jobs/{id}`). Any JSON; the app is what interprets it. Omitted = `null`,
+    /// which is a legitimate answer for a pure "proceed" gate.
+    #[serde(default)]
+    input: Value,
+}
+
+/// Answers a `waiting` job and re-queues it (N02).
+///
+/// The job resumes from the checkpoint `ctx.await_input(..)` forced before it
+/// parked, and reads `input` back through `ctx.restore_input()`. **No attempt is
+/// burned**: the re-queue uses `reset`'s `max_attempts = MAX(max_attempts,
+/// attempts + 1)` headroom, so a job that waited an hour for a human still has
+/// every retry it started with.
+///
+/// 409 on anything that is not `waiting` — including a second resume of a job
+/// the first one already re-queued. That guard IS the `(status, attempts)` fence
+/// applied at the door: a stale resume (the operator's tab was open across the
+/// answer, the expiry sweep already fired) matches no row, so it cannot restart
+/// a lineage that has moved on.
+#[utoipa::path(
+    post,
+    path = "/jobs/{id}/resume",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    request_body = ResumeBody,
+    responses(
+        (status = 202, description = "Re-queued job", body = Object),
+        (status = 404, description = "Job not found", body = Object),
+        (status = 409, description = "Job not in `waiting` state", body = Object),
+    )
+)]
+pub(crate) async fn resume_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<ResumeBody>>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    let input = body.map(|Json(b)| b.input).unwrap_or(Value::Null);
+    match state.storage.resume(id, &input).await? {
+        Some(job) => {
+            state
+                .events
+                .emit(JobEvent::new(job.id, job.app.clone(), "queued"));
+            state.notify.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(job)))
+        }
+        None => Err(job_state_error(
+            &state,
+            id,
+            "job is not in 'waiting' state (nothing is awaiting input on it)",
+        )
+        .await),
+    }
+}
+
 /// Distinguishes a missing job (404) from a job in the wrong state (409) after a
 /// state-guarded mutation reported no rows changed — one extra lookup to give the
 /// caller an actionable status instead of a blanket conflict.
@@ -395,7 +452,9 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     }
 }
 
-/// Cancels a job. A `queued` job is cancelled synchronously; a `running` job
+/// Cancels a job. A `queued` job — or a `waiting` one, parked on external
+/// input with no executor to interrupt — is cancelled synchronously; a
+/// `running` job
 /// has its cancellation token fired so the worker aborts the app future and
 /// marks it `cancelled` (the response reports `running: true`). A terminal job
 /// is `409`, an unknown one `404`.

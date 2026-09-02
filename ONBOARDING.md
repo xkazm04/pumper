@@ -175,7 +175,7 @@ Naming the binary is required — see [§8](#8-verification-loop--do-this-before
   job JSON here; if a secret is set, the body is HMAC-SHA256 signed and sent as
   `X-Pumper-Signature: sha256=<hex>`. So you can push results instead of polling.
 
-**Job lifecycle:** `queued → running → succeeded | failed | cancelled`. Poll
+**Job lifecycle:** `queued → running → succeeded | failed | cancelled`, plus the non-terminal `running → waiting → queued` detour when an app parks on external input (`ctx.await_input`; answered by `POST /jobs/{id}/resume`). Poll
 `GET /jobs/{id}` until `status` is terminal, then read `result` (or `error`).
 Structured output for each app is under `result`; raw dumps are on disk at
 `data/artifacts/<app>/<job_id>/`.

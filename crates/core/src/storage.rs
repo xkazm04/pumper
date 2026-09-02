@@ -18,7 +18,8 @@ use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
-                           result, error, created_at, available_at, started_at, finished_at";
+                           result, error, input_request, waiting_since, waiting_expires_at, \
+                           resumed_input, created_at, available_at, started_at, finished_at";
 
 /// Rows one recovery sweep will verdict before stopping. The sweep runs inside
 /// boot, so it is bounded rather than proportional to how bad the last crash
@@ -559,8 +560,17 @@ impl Storage {
         Ok(rows > 0)
     }
 
-    /// Cancels a job that has not started yet, returning the cancelled job's
-    /// **app** (`None` = there was nothing queued to cancel).
+    /// Cancels a job that no worker task is currently executing — `queued`
+    /// (not started yet) or `waiting` (N02: parked on external input, its
+    /// executor long gone) — returning the cancelled job's **app**
+    /// (`None` = there was nothing cancellable).
+    ///
+    /// `waiting` belongs here rather than on the token path for the same
+    /// reason `queued` does: there is no in-flight future to interrupt, so
+    /// the cancel is a plain guarded write. Without it a parked job would be
+    /// uncancellable — the door would find no registered token, fall through
+    /// to the 409 branch, and tell the operator the job was *already
+    /// terminal*, which is the opposite of true.
     ///
     /// The app rides back with the outcome because the caller has to *announce*
     /// this transition, and a `JobEvent` with a blank app is invisible to every
@@ -570,7 +580,7 @@ impl Storage {
     pub async fn cancel(&self, id: Uuid) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?2 \
-             WHERE id = ?1 AND status = 'queued' RETURNING app",
+             WHERE id = ?1 AND status IN ('queued', 'waiting') RETURNING app",
         )
         .bind(id.to_string())
         .bind(now())
@@ -615,6 +625,110 @@ impl Storage {
             return Ok(None);
         }
         self.get(id).await
+    }
+
+    /// Parks a `running` job in [`JobStatus::Waiting`] with the request the app
+    /// wants answered (N02). Guarded on `(status, attempts)` exactly like
+    /// [`Storage::complete`]: a task whose job was reset or reaped mid-run must
+    /// not park the live attempt. Returns whether the write landed
+    /// (`false` = stale, discarded).
+    ///
+    /// **Nothing terminal is written**: `finished_at` stays NULL, `attempts` is
+    /// untouched (a park burns no attempt), and the checkpoint is deliberately
+    /// NOT cleared — it is the whole point of the park.
+    pub async fn await_input(
+        &self,
+        id: Uuid,
+        attempt: i64,
+        request: &Value,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let payload = request.to_string();
+        let expires = expires_at.map(ts);
+        let rows = self
+            .metered(StoreOp::JobVerdict, |mut conn| async move {
+                let r = sqlx::query(
+                    "UPDATE jobs SET status = 'waiting', input_request = ?2, waiting_since = ?3, \
+                     waiting_expires_at = ?4, resumed_input = NULL, error = NULL \
+                     WHERE id = ?1 AND status = 'running' AND attempts = ?5",
+                )
+                .bind(id.to_string())
+                .bind(payload)
+                .bind(now())
+                .bind(expires)
+                .bind(attempt)
+                .execute(&mut *conn)
+                .await?;
+                let rows = r.rows_affected();
+                Ok((rows, rows))
+            })
+            .await?;
+        Ok(rows > 0)
+    }
+
+    /// Answers a `waiting` job and re-queues it (`POST /jobs/{id}/resume`).
+    ///
+    /// Uses [`Storage::reset`]'s attempt semantics — `max_attempts = MAX(
+    /// max_attempts, attempts + 1)` — so a park costs no attempt: a job that
+    /// waited an hour for a human still has every retry it started with. The
+    /// guard is `status = 'waiting'`, which makes the door idempotent against a
+    /// double-submit: the second resume matches no row and answers 409 rather
+    /// than re-queueing a run that is already going.
+    ///
+    /// `waiting_since` is deliberately kept (how long the wait actually took is
+    /// the measurement this feature exists to produce); the deadline is cleared,
+    /// because the sweep must not expire a job that has already been answered.
+    /// Returns the refreshed job, or `None` when it was not waiting.
+    pub async fn resume(&self, id: Uuid, input: &Value) -> Result<Option<Job>> {
+        let payload = input.to_string();
+        let r = sqlx::query(
+            "UPDATE jobs SET status = 'queued', resumed_input = ?2, waiting_expires_at = NULL, \
+             error = NULL, finished_at = NULL, available_at = ?3, \
+             max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id = ?1 AND status = 'waiting'",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
+    /// Fails every `waiting` job whose `waiting_expires_at` has passed, up to
+    /// `cap`, returning the `(id, app)` pairs so the caller can route each
+    /// through `finalize` (callback + terminal triggers, like any other
+    /// permanent failure).
+    ///
+    /// The app travels with the id for the same reason it does on
+    /// [`Storage::cancel`] and [`Storage::retry_bulk`]: an announce with a blank
+    /// app never reaches an app-scoped watcher.
+    ///
+    /// A job with no deadline (`waiting_expires_at IS NULL`) is never swept —
+    /// "wait forever" is the default and it means what it says.
+    pub async fn expire_waiting(&self, reason: &str, cap: i64) -> Result<Vec<(Uuid, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE jobs SET status = 'failed', error = ?1, finished_at = ?2 \
+             WHERE id IN (SELECT id FROM jobs WHERE status = 'waiting' \
+                          AND waiting_expires_at IS NOT NULL AND waiting_expires_at <= ?2 \
+                          ORDER BY waiting_expires_at LIMIT ?3) \
+             RETURNING id, app",
+        )
+        .bind(reason)
+        .bind(now())
+        .bind(cap.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, app)| {
+                Uuid::parse_str(&id)
+                    .map(|id| (id, app))
+                    .map_err(|e| Error::Parse(format!("job id: {e}")))
+            })
+            .collect()
     }
 
     /// Bulk re-queue: re-queues up to `cap` jobs in the given terminal state
@@ -3211,6 +3325,10 @@ struct JobRow {
     trigger_id: Option<String>,
     result: Option<String>,
     error: Option<String>,
+    input_request: Option<String>,
+    waiting_since: Option<String>,
+    waiting_expires_at: Option<String>,
+    resumed_input: Option<String>,
     created_at: String,
     available_at: String,
     started_at: Option<String>,
@@ -3240,6 +3358,10 @@ impl TryFrom<JobRow> for Job {
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
             error: r.error,
+            input_request: parse_json_column(r.input_request.as_deref()),
+            waiting_since: r.waiting_since.as_deref().map(parse_ts).transpose()?,
+            waiting_expires_at: r.waiting_expires_at.as_deref().map(parse_ts).transpose()?,
+            resumed_input: parse_json_column(r.resumed_input.as_deref()),
             created_at: parse_ts(&r.created_at)?,
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
@@ -4092,10 +4214,122 @@ fn cutoff(days: u64) -> DateTime<Utc> {
     Utc::now() - chrono::Duration::days(days as i64)
 }
 
+/// A nullable JSON column read back onto a [`Job`] (`input_request`,
+/// `resumed_input`).
+///
+/// Absent column → `None`. Present-but-unparsable → `Some(Value::String(raw))`,
+/// **not** `None`: these two columns are the evidence that a job parked and that
+/// somebody answered it, and the anti-pattern is a corrupt blob silently
+/// reading back as "this job never waited for anything" — a `waiting` row whose
+/// `input_request` decoded to `None` would show an operator a job parked on
+/// nothing at all. Keeping the raw text says what is actually there.
+fn parse_json_column(raw: Option<&str>) -> Option<Value> {
+    let raw = raw?;
+    Some(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())))
+}
+
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+}
+
+#[cfg(test)]
+mod cancel_reaches_parked_jobs_tests {
+    use crate::testing::TempStore;
+    use crate::{EnqueueOptions, JobStatus};
+    use serde_json::json;
+
+    /// A parked job has no executor and no registered cancel token, so the
+    /// cancel door's only route to it is this guarded write. When the guard
+    /// was `status = 'queued'` alone, `DELETE /jobs/{id}` on a job waiting on
+    /// a human found no token, fell through to the terminal branch, and
+    /// answered *already terminal* — leaving the only exit an expiry sweep
+    /// that is off by default.
+    #[tokio::test]
+    async fn cancel_reaches_a_parked_job_not_only_a_queued_one() {
+        let store = TempStore::new("cancel-parked").await;
+        let job = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        // Claim it, then park it exactly as the worker's outcome arm does.
+        let claimed = store
+            .storage
+            .claim_next(&[], 0.0)
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        assert!(store
+            .storage
+            .await_input(
+                claimed.id,
+                claimed.attempts,
+                &json!({"kind": "approval"}),
+                None
+            )
+            .await
+            .unwrap());
+
+        let app = store
+            .storage
+            .cancel(job.id)
+            .await
+            .unwrap()
+            .expect("a parked job is cancellable");
+        assert_eq!(app, "waiter", "the event needs the job's real app");
+        let row = store.storage.get(job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+        assert!(row.finished_at.is_some());
+
+        // And the guard still refuses what it always refused: a running job
+        // belongs to the token path, a terminal one to the 409.
+        let other = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        store.storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+        assert!(
+            store.storage.cancel(other.id).await.unwrap().is_none(),
+            "a running job is cancelled through its token, not this write"
+        );
+        assert!(
+            store.storage.cancel(job.id).await.unwrap().is_none(),
+            "an already-cancelled job is not cancelled twice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod json_column_tests {
+    use super::parse_json_column;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn absent_column_is_none() {
+        assert_eq!(parse_json_column(None), None);
+    }
+
+    #[test]
+    fn stored_request_round_trips() {
+        assert_eq!(
+            parse_json_column(Some(r#"{"kind":"approval","amount":12}"#)),
+            Some(json!({"kind": "approval", "amount": 12}))
+        );
+        // A JSON `null` really is a stored value; it is not an absent column.
+        assert_eq!(parse_json_column(Some("null")), Some(Value::Null));
+    }
+
+    /// The anti-pattern: a corrupt blob decoding to `None`, which reads exactly
+    /// like "this job never parked" on a row whose status says it did.
+    #[test]
+    fn unparsable_blob_survives_as_text_not_as_never_parked() {
+        let got = parse_json_column(Some("{not json"));
+        assert_eq!(got, Some(Value::String("{not json".to_string())));
+        assert!(got.is_some(), "a corrupt request must not read as absent");
+    }
 }
 
 #[cfg(test)]
