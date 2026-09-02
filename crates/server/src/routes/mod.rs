@@ -62,6 +62,18 @@ pub(crate) use retention::artifact_retention_plan;
 // on a wiped index while the other tells the truth.
 pub(crate) use search::{build_search_request, run_search, SearchInput, SEARCH_MAX_OFFSET};
 
+// N04: the MCP trigger/watch/ingress AUTHORING tools call these HTTP handlers
+// (and their request bodies) directly rather than re-implementing the door, so
+// an agent and an operator cannot get different answers about the same body —
+// the same reason `approve_transaction` shares the HTTP door's decision
+// function. Handlers only; nothing here is a second validation path.
+pub(crate) use error::ApiError;
+pub(crate) use ingress::{create_ingress_source, CreateIngressSourceBody};
+pub(crate) use triggers::{
+    create_trigger, test_trigger, trigger_runs, CreateTriggerBody, RunsQuery, TestTriggerQuery,
+};
+pub(crate) use watches::{create_watch, CreateWatchBody};
+
 mod datasets;
 mod derived;
 mod doctor;

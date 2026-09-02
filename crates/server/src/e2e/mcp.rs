@@ -235,6 +235,66 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         !tools.iter().any(|t| t["name"] == "approve_transaction"),
         "allow_enqueue must not imply the authority to release an irreversible action"
     );
+
+    // N04: the five pipeline-AUTHORING tools ride the same switch — a trigger
+    // is a standing commitment to enqueue, not a lesser authority than one
+    // enqueue — and they are appended BEFORE `fetch`, which stays last.
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for authoring in [
+        "create_trigger",
+        "test_trigger",
+        "trigger_decisions",
+        "create_watch",
+        "create_ingress_source",
+    ] {
+        assert!(
+            names.contains(&authoring),
+            "{authoring} must appear once enqueue is opted in: {names:?}"
+        );
+    }
+    assert_eq!(
+        names.last(),
+        Some(&"fetch"),
+        "`fetch` stays LAST however many tools are appended: {names:?}"
+    );
+}
+
+/// The anti-pattern: an agent handed a tool that authors a STANDING commitment
+/// to enqueue work on a node whose operator only opted into reads. The refusal
+/// has to name the switch, like every other withheld tool on this surface —
+/// silence would read to an agent as a broken server.
+#[tokio::test]
+async fn authoring_tools_are_withheld_until_enqueue_is_opted_in() {
+    let (state, _store) = mcp_state(false).await;
+    for (tool, args) in [
+        (
+            "create_trigger",
+            json!({ "source_kind": "job", "source_app": "a", "target_app": "b" }),
+        ),
+        ("test_trigger", json!({ "trigger_id": "T1" })),
+        ("trigger_decisions", json!({ "trigger_id": "T1" })),
+        ("create_watch", json!({ "app": "a" })),
+        ("create_ingress_source", json!({ "name": "x" })),
+    ] {
+        let resp = handle_rpc(&state, &call(tool, args)).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{tool} must be refused");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("allow_enqueue"), "{tool}: {text}");
+    }
+    // And they are not even listed.
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"create_trigger"), "{names:?}");
 }
 
 #[tokio::test]
