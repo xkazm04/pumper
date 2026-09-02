@@ -569,6 +569,12 @@ notes = "No public read API; JS SPA; LMC ToS is the binding constraint (robots a
 #     `enforce_contracts` (worker.rs) reads the pair off each revision, i.e.
 #     ("census", …), and /catalog/health reads `datasets.list(s.app, s.dataset)`.
 # So the only row shape that would function is exactly the one the test refuses.
+# UPDATE (N35, 2026-09-02): the missing seam now exists — `census` is a declared
+# VirtualNamespace (registry.rs) and the coverage test already accepted a row
+# naming one, so `census-atlas` at the bottom of this file IS cataloged under
+# app = "census". Giving `market_blend` and `saturation` their own rows is now
+# unblocked and is a deliberate follow-up: each needs its own contract written,
+# which is not a side effect of adding the atlas.
 # Filing them under a producing app instead (app = "census-density", dataset =
 # "market_blend") would compile and pass, and would be a lie: that pair is never
 # written, so the contract would never evaluate and /catalog/health would report
