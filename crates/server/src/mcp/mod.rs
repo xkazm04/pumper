@@ -309,7 +309,11 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "Agentic web research (search, read, synthesize) via the Claude engine: \
                  enqueues a 'research' job and returns its job id (then wait_job for the \
                  result). budget_usd is the run's spend ceiling, clamped to the operator's \
-                 [mcp] max_job_budget_usd rail (${:.2}); omitted = that rail.",
+                 [mcp] max_job_budget_usd rail (${:.2}); omitted = that rail. The awaited \
+                 result carries session_id (pass it back as the research app's session_id \
+                 param to drill down on the context it built) and datasets.findings / \
+                 datasets.sources - the record keys this run wrote to research/findings and \
+                 research/sources, readable with query_dataset as the agent's memory.",
                 state.config.mcp.max_job_budget_usd
             ),
             "inputSchema": {
