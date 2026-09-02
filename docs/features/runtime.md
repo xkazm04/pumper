@@ -275,6 +275,87 @@ It is a **partial census by design** and says so in its own `# HELP` text: seven
 instrumented statement families, with schedules, watches, triggers, deliveries,
 saved searches, the caches and the search index explicitly unmeasured.
 
+## Elastic executor plane (`[executors]`)
+
+**Default OFF.** With no `[executors]` section a node behaves exactly as it always has: one process owns the SQLite file and runs every job. Turning the plane on lets *additional* pumper processes — started as `pumper --executor --coordinator <url>` — dial in, claim whole jobs, run them with their own engines, and report the results back. Concurrency and geography then scale by starting a process, not by the coordinator's core count.
+
+**Only `execute` moves.** The queue, the attempt ladder, the heartbeat lease, the health/contract gates and the whole post-run fan-out stay on the coordinator. An executor's job ends with one call — *here is the result for `(job, attempt)`* — and the coordinator then indexes, gates, fires watches/triggers/saved searches, emits the terminal event and delivers the callback, through the identical `finalize_fanout` a local run uses.
+
+### What an executor may run: result-only apps
+
+An app is executor-eligible when it declares `ScrapeApp::executor() -> true` **and** is result-only: everything it produces comes back in the job result and the artifact tree. Today that is exactly one shipped app, `readable`.
+
+The reason is honest rather than temporary: an executor's `AppContext` carries a **refusing** `datasets` handle (an empty in-memory database with no schema), because there is no RPC dataset client in this slice. The alternative that "works" — pointing `datasets` at the executor's own scratch store — is the one that must never ship, since the app would report success while its records existed only on a machine nobody collects from. A server-side inventory test (`crate::executors::executor_eligible_apps_are_result_only`) reads each eligible app's own source and fails if it reaches `ctx.upsert*` / `ctx.sync_many` / `ctx.datasets` / `ctx.register_rules` / `ctx.observe_extraction`, so the declaration is a checked claim, not a comment.
+
+Everything else in the executor's context is real and local: engines (HTTP/browser/Claude/plugins), the cost ledger, the HTTP cache, learned host weather, the recipe store and the research cache all live in the executor's own `[storage] database_path`. They are process-local **derived** state — losing them costs a cache miss, never a record.
+
+### The doors (coordinator side)
+
+All six answer `404` unless `[executors] enabled` **and** a non-blank `secret`; there is no "configured but open" state. The secret arrives in `x-pumper-executor-secret` and is compared as SHA-256 digests, exactly like the remote fetch fabric's — a wrong secret is `401`. Under `[auth] mode = "keys"` they additionally require the `admin` scope, for free: `auth::required_scope` classifies any unknown mutating path as `Admin` and `GET /executors` as `Read`. Two credentials in two headers, so "wrong secret" and "wrong key" stay two distinguishable `401`s.
+
+| route | body | answer |
+| --- | --- | --- |
+| `POST /executors/claim` | `{executor_id, capabilities?}` | `200 {job_id, app, params, attempt, budget_usd, restored, resumed_input}` or `204` |
+| `POST /jobs/{id}/heartbeat` | `{executor_id, attempt}` | `{owned: true}` / `409` |
+| `POST /jobs/{id}/checkpoint` | `{executor_id, attempt, state}` | `{saved}` / `409` |
+| `POST /jobs/{id}/progress` | `{executor_id, attempt, state}` | `{reported}` / `409` |
+| `POST /jobs/{id}/finish` | `{executor_id, attempt, result \| error, run_ms?}` | `{outcome: "succeeded"\|"queued"\|"failed"\|"stale"}` / `409` |
+| `GET /executors` | — | `{executors: [...], eligible_apps: [...]}` |
+
+- **The claim is a long poll**, held up to `[executors] claim_wait_secs` (default 30) against an empty queue and woken instantly by an enqueue (the same `Notify` the local worker waits on). The poll is the clock *and* the backpressure boundary: an executor asks only when it has a free slot, so the coordinator never models remote capacity.
+- **`capabilities` can only narrow.** The coordinator intersects it with its own eligible set, so naming an app there never widens what an executor may claim. An empty list means "whatever you'll give me".
+- **Per-app caps go cluster-wide** for this path: the blocked set is computed from `SELECT app, COUNT(*) FROM jobs WHERE status='running' AND executor_id IS NOT NULL`, not from the worker's in-process `HashMap` — that map counts one process's jobs, so with N executors a cap of 2 admitted 2×N. The **local** claim path is unchanged and still uses the in-memory map.
+- **`GET /executors`** reports one of three states per executor — `busy` (polled recently, running something), `idle` (polled recently, running nothing: healthy on an empty queue), `offline` (no poll within `[executors] offline_after_secs`, default 120). It is a *report*: an executor going offline does nothing to any job by itself.
+
+### The fence, and why executor loss is cheap
+
+Every executor-driven write is refused unless the row still says `status='running' AND attempts = ? AND executor_id = ?`. The attempt half is the fence the local worker has always run under; the executor half makes a *reaped* process's late write refusable rather than merely unlucky.
+
+So the failure story needs no new machinery:
+
+1. an executor dies mid-run — its job stops being heartbeated;
+2. the coordinator's existing reaper re-queues the lease past `[worker] stale_after_secs`, with failure semantics (attempts, backoff, permanent failure when exhausted);
+3. the next claim advances `attempts` and hands the new attempt the checkpoint the dead executor pushed, through the same poisoned-checkpoint escape a local resume gets;
+4. if the corpse comes back and reports anyway, the fence answers `409` and the report is discarded.
+
+The heartbeat's answer is also the executor's **stop signal**: a `409` means "you no longer own this job", and the executor abandons the run rather than spending on a result that will be refused. A transport *failure* is deliberately not treated as loss of ownership — the lease is still live for `stale_after_secs`, and throwing away an almost-finished run over one dropped packet is worse than waiting.
+
+### Executor mode
+
+```bash
+pumper --executor --coordinator http://coordinator:8088
+```
+
+`--coordinator` overrides `[executors] coordinator_url`; with neither set the process refuses to start rather than polling nothing forever while looking healthy. `[executors] secret` is required in this mode — it is the credential the executor presents. `[executors] executor_id` names the process (unset = `<host>-<pid>`, which is honest but changes across restarts; set it for a fleet whose history you want to read). `[executors] capabilities` narrows what it offers to run; `poll_interval_secs` (default 2) is the pause after a `204` or a transport failure.
+
+An executor binds no port, serves no API, runs no scheduler, no janitors and no maintenance pass; `[search]`, `[mcp]` and the durable event log are forced off in this mode so a second index or MCP endpoint cannot appear beside the coordinator's. Progress is throttled executor-side (≥2s) and checkpoints (≥5s, `force` bypasses) exactly as the in-process seams are, so a chatty app cannot turn a tight loop into a DoS against the coordinator's event bus. A finish is retried three times with backoff, because the run is already paid for and losing its result to one dropped connection is the most expensive failure this process has; after that the lease simply goes stale and the reaper re-queues the job.
+
+### Where a job ran
+
+`jobs.executor_id` (migration 0051) is `NULL` for every locally-claimed job — the honest value, and every job on a single-process install. It rides `GET /jobs/{id}` and `receipt.job.executor_id`, and `/metrics` carries `pumper_executors{state="busy|idle|offline"}` whenever the plane is enabled (absent when it is not: a series that is always zero on the installs that never run an executor is noise).
+
+### Config
+
+| key | default | side | meaning |
+| --- | --- | --- | --- |
+| `enabled` | `false` | coordinator | serve the executor doors at all (paired with `secret` by `Config::validate`) |
+| `secret` | `""` | both | the shared plane secret, compared as digests |
+| `claim_wait_secs` | `30` | coordinator | long-poll ceiling; must be > 0 when enabled |
+| `offline_after_secs` | `120` | coordinator | when `GET /executors` calls an executor offline (report only) |
+| `coordinator_url` | `""` | executor | who to dial (`--coordinator` wins) |
+| `executor_id` | `""` | executor | stable identity (unset ⇒ `<host>-<pid>`) |
+| `capabilities` | `[]` | executor | apps offered; always intersected with the coordinator's eligible set |
+| `poll_interval_secs` | `2` | executor | pause after an empty claim or a failure |
+
+### Known gaps (deliberately out of the v1 slice)
+
+- **No RPC `Datasets` client**, so only result-only apps run remotely. This is the one change that unlocks every app.
+- **VCR is coordinator-side state** (cassettes live beside the recorded job's artifacts), so a remote run neither records nor replays; `record: true` on an executor-claimed job is silently a no-op run.
+- **`DELETE /jobs/{id}` cannot stop a running remote job.** The cancel-token registry is in-process, so a running executor job has no token and the door answers 409. The executor *does* stop on a lost fence (reset the job and it abandons), but a direct cancel arm on the heartbeat is not built.
+- **No TLS/mTLS of its own** — put the coordinator behind a reverse proxy if the plane crosses a network you do not control. The secret is a bearer credential in a header, exactly like the remote fabric's.
+- **No autoscaling and no executor-side VCR.** Capacity is "how many processes you started".
+- **Spend is metered on the executor's own ledger**, not folded back into the coordinator's `cost_events` — so `GET /jobs/{id}/costs` for a remotely-executed job is empty and its receipt says so through the existing "no ledger rows" note.
+
 ## Known gaps
 
 - No auth on the HTTP API (deliberate local power mode; API-key auth is a parked product decision).
