@@ -52,6 +52,7 @@ mod trigger_hops;
 mod trigger_ledger;
 mod trigger_plugins;
 mod vcr_attempts;
+mod waiting_resume;
 mod watch_honesty;
 mod webhook_contract;
 mod worker_fanout;
