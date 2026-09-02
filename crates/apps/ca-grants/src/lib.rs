@@ -85,7 +85,8 @@ impl ScrapeApp for CaGrants {
                  truncated, unifiedDropped, unified: {new, changed, events, dataset, trust, \
                  sourceState}, \
                  swept, crossSourceDups, recurrenceLinks, \
-                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept, \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, warnings[], \
                  index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
                  (keyed by PortalID) plus the shared grants/unified cross-source layer. \
                  `sweep` names how the walk ended — complete|capped|short_page|\
@@ -94,8 +95,10 @@ impl ScrapeApp for CaGrants {
                  non-complete arm also lands in `warnings[]`. \
                  The corpus-wide relation pass (sweep + duplicate/recurrence links) runs \
                  once per UTC-day cycle, on whichever grant source gets there first; a run \
-                 that did not own it reports `crossSourceDups`/`recurrenceLinks` as null \
-                 (not 0) and `corpusPass.ran: false`",
+                 that did not own it reports `crossSourceDups`/`recurrenceLinks` and \
+                 `corpusPass.programs` as null (not 0) and `corpusPass.ran: false`. \
+                 `corpusPass.programs` is the `grants/programs` registry that pass \
+                 materialized — one row per funding PROGRAM (N29)",
             ),
             cost_class: CostClass::Free,
         }

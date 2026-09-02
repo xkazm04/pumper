@@ -221,7 +221,8 @@ impl ScrapeApp for GrantsGov {
                  unifiedDropped, unified: {new, changed, events, dataset, trust, sourceState}, \
                  swept, \
                  crossSourceDups, recurrenceLinks, \
-                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept, \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, warnings[], \
                  index_datasets[]} — Search2 sync tallies over the `opportunities` dataset \
                  (keyed by opportunity id). `sweep` names how the walk ended \
                  (`complete` | `capped` | `short_page` | `unknown_total`) and `truncated` is \
@@ -240,7 +241,11 @@ impl ScrapeApp for GrantsGov {
                  `recurrenceLinks` and `corpusPass`: the corpus-wide relation pass (sweep + \
                  duplicate/recurrence links) runs once per UTC-day cycle on whichever grant \
                  source gets there first, so a run that did not own it reports both link counts \
-                 as null. `index_datasets[]` is **withheld entirely** when this source's \
+                 AND `corpusPass.programs` as null. `corpusPass.programs` is the \
+                 `grants/programs` registry that pass materialized — one row per funding \
+                 PROGRAM (N29), with its recurrence projection, amendment behaviour and \
+                 Horizon win history — and the run that writes it also names that dataset in \
+                 `index_datasets[]`. `index_datasets[]` is **withheld entirely** when this source's \
                  extraction health says its rows must not reach the search index",
             ),
             cost_class: CostClass::Free,
