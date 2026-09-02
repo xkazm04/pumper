@@ -3407,6 +3407,15 @@ pub struct TriggerPluginHooks {
     /// Must return a JSON object; provenance keys are re-stamped by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<PluginHook>,
+    /// N10: runs AFTER the hop's job exists, with the job id in its envelope.
+    ///
+    /// The slot for side effects that must not gate the hop — notifying a
+    /// tracker, stamping an external system with the job id. Its output is
+    /// ignored entirely and its failures are ledgered, never acted on: by the
+    /// time it runs the job is already enqueued, so there is nothing left for a
+    /// verdict to decide. `on_error` is therefore meaningless here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_enqueue: Option<PluginHook>,
 }
 
 /// A reactive-pipeline edge: (source event) → (enqueue target app). The set of

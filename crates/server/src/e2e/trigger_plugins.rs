@@ -151,6 +151,7 @@ fn predicate_only(plugin: &str, params: Value) -> TriggerPluginHooks {
     TriggerPluginHooks {
         predicate: Some(hook(plugin, params)),
         transform: None,
+        post_enqueue: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn transform_only(plugin: &str, params: Value) -> TriggerPluginHooks {
     TriggerPluginHooks {
         predicate: None,
         transform: Some(hook(plugin, params)),
+        post_enqueue: None,
     }
 }
 
@@ -402,6 +404,7 @@ fn missing_hook_plugins_names_only_configured_absent_ones() {
     let t = trigger(Some(TriggerPluginHooks {
         predicate: Some(hook("gone-a", json!({}))),
         transform: Some(hook("gone-b", json!({}))),
+        post_enqueue: None,
     }));
     assert_eq!(
         missing_hook_plugins(plugins.as_ref(), &t),
@@ -435,6 +438,7 @@ async fn a_configured_hook_with_no_loaded_plugin_is_recorded_not_only_silently_p
             plugin_hooks: Some(&TriggerPluginHooks {
                 predicate: Some(hook("never-built", json!({}))),
                 transform: None,
+                post_enqueue: None,
             }),
         })
         .await
@@ -736,6 +740,7 @@ async fn a_loaded_hook_plugin_records_no_plugin_missing_row() {
             plugin_hooks: Some(&TriggerPluginHooks {
                 predicate: Some(hook("allow", json!({}))),
                 transform: None,
+                post_enqueue: None,
             }),
         })
         .await
