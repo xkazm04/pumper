@@ -18,6 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule as CronSchedule;
+use pumper_core::config::{peer_cron, PeerConfig, PullStream};
 use pumper_core::{Catalog, EnqueueOptions, ReconcilePlan, Schedule, CATALOG_MANAGED_BY};
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -48,6 +49,9 @@ pub async fn run(state: AppState) {
     // when [catalog] auto_reconcile = true (default OFF). Failures are non-fatal
     // — a broken catalog must not stop the scheduler from serving existing rows.
     boot_reconcile(&state).await;
+    // N16: [[peer]] rows become ordinary schedules. Boot-only — see
+    // `peer_boot_reconcile`.
+    peer_boot_reconcile(&state).await;
     // So a contained panic's `file:line:col` survives into the log line below.
     crate::worker::install_panic_location_hook();
     // Parsed crons cached across ticks, keyed by expression string, so we don't
@@ -902,6 +906,244 @@ pub(crate) fn validate_schedule_params(
     let effective = schedule_params(registry, app, params);
     crate::mcp::validate_app_params(registry, app, &effective)?;
     Ok(effective)
+}
+
+
+// ── [[peer]] reconcile (N16) ────────────────────────────────────────────────
+//
+// `[[peer]]` is desired state exactly the way `catalog/data-sources.toml` is,
+// and it is reconciled the same way: plan (pure), then apply through writes
+// fenced on `managed_by = 'peer'` so a hand-made schedule can never be
+// rewritten by a peer row. The difference is WHEN: the catalog is a file the
+// operator may edit while the server runs, `[[peer]]` is process config that
+// cannot change without a restart, so this pass runs once at boot and not on
+// every tick.
+
+/// One schedule a `[[peer]]` row wants to exist.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PeerSchedule {
+    pub id: String,
+    pub cron: String,
+    pub params: serde_json::Value,
+    pub enabled: bool,
+}
+
+/// Turns `[[peer]]` rows into the schedules they ask for. Pure — no clock, no
+/// database — so the fan-out (one schedule per peer x stream), the parameter
+/// shape and the disabled case are all testable without a server.
+///
+/// A row whose interval or streams do not parse contributes NOTHING rather than
+/// a partial set: `Config::validate` already refuses such a row at load, so
+/// reaching here means the config was built in code, and half a peer is worse
+/// than none.
+pub(crate) fn peer_reconcile_plan(peers: &[PeerConfig]) -> Vec<PeerSchedule> {
+    let mut out = Vec::new();
+    for (i, peer) in peers.iter().enumerate() {
+        let label = peer.label(i);
+        let (Ok(streams), Some(secs)) = (peer.streams(), peer.every_secs()) else {
+            continue;
+        };
+        let Some(cron) = peer_cron(secs) else {
+            continue;
+        };
+        for stream in streams {
+            let mut params = serde_json::json!({
+                "url": peer.url.trim(),
+                "peer_name": label,
+                "stream": stream.param(),
+                // Trust travels with the job so the app never needs config
+                // access: the key it must verify against, and whether this peer
+                // is allowed to be unverifiable at all.
+                "public_key": peer.public_key.trim(),
+                "allow_unsigned": peer.allow_unsigned,
+                "max_penalty_secs": peer.max_penalty_secs,
+            });
+            if let PullStream::Dataset { app, dataset } = &stream {
+                params["datasets"] = serde_json::json!([format!("{app}/{dataset}")]);
+            }
+            if let Some(ns) = peer.namespace.as_deref().filter(|n| !n.trim().is_empty()) {
+                params["namespace"] = serde_json::json!(ns.trim());
+            }
+            if let Some(key) = peer.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+                // Stored verbatim. `env:VAR` is the recommended form precisely
+                // because THIS row is readable on `GET /schedules` and on every
+                // job it enqueues — see the [[peer]] docs in config.rs.
+                params["api_key"] = serde_json::json!(key.trim());
+            }
+            out.push(PeerSchedule {
+                id: crate::routes::mesh::peer_schedule_id(&label, &stream.slug()),
+                cron: cron.clone(),
+                params,
+                enabled: peer.enabled,
+            });
+        }
+    }
+    out
+}
+
+/// Applies the plan: upsert each row, fenced on `managed_by = 'peer'`, and
+/// disable any peer-managed row the current config no longer asks for.
+///
+/// The disable-rather-than-delete rule is the catalog reconcile's, for the same
+/// reason: a schedule row carries `last_run`, `skipped_count` and the job
+/// history keyed on its id, and deleting it to re-create it later would erase
+/// the record of a peer that used to sync and stopped.
+async fn apply_peer_schedules(state: &AppState, plan: &[PeerSchedule]) -> anyhow::Result<usize> {
+    let pool = state.storage.pool();
+    let wanted: std::collections::HashSet<&str> = plan.iter().map(|p| p.id.as_str()).collect();
+    let mut applied = 0usize;
+    for row in plan {
+        sqlx::query(
+            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, created_at) \
+             VALUES (?1, 'peer', ?2, ?3, ?4, 0, ?5, ?6) \
+             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, params = excluded.params, \
+               enabled = excluded.enabled \
+             WHERE schedules.managed_by = excluded.managed_by",
+        )
+        .bind(&row.id)
+        .bind(&row.cron)
+        .bind(row.params.to_string())
+        .bind(row.enabled as i64)
+        .bind(crate::routes::mesh::PEER_MANAGED_BY)
+        .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .execute(&pool)
+        .await?;
+        applied += 1;
+    }
+    for existing in state.storage.list_schedules().await? {
+        if existing.managed_by.as_deref() != Some(crate::routes::mesh::PEER_MANAGED_BY) {
+            continue;
+        }
+        if wanted.contains(existing.id.as_str()) || !existing.enabled {
+            continue;
+        }
+        warn!(
+            id = %existing.id,
+            "peer reconcile: schedule DISABLED (no [[peer]] row asks for it any more)"
+        );
+        state
+            .storage
+            .set_managed_schedule_enabled(
+                &existing.id,
+                false,
+                crate::routes::mesh::PEER_MANAGED_BY,
+            )
+            .await?;
+    }
+    Ok(applied)
+}
+
+/// Boot pass for `[[peer]]`. Non-fatal by construction: a mesh that cannot be
+/// reconciled must not stop the scheduler from serving the schedules that
+/// already exist.
+async fn peer_boot_reconcile(state: &AppState) {
+    let plan = peer_reconcile_plan(&state.config.peer);
+    if plan.is_empty() {
+        // Silence is correct here: a node with no peers is the default, and a
+        // log line every boot saying "no peers" is noise, not information.
+        return;
+    }
+    match apply_peer_schedules(state, &plan).await {
+        Ok(n) => info!(
+            schedules = n,
+            peers = state.config.peer.len(),
+            "peer reconcile: [[peer]] rows reconciled into schedules"
+        ),
+        Err(e) => warn!("peer reconcile failed (existing schedules keep running): {e}"),
+    }
+}
+
+#[cfg(test)]
+mod peer_reconcile_tests {
+    use super::*;
+
+    fn peer(name: &str, pull: &[&str], every: &str) -> PeerConfig {
+        PeerConfig {
+            name: name.into(),
+            url: "https://vps.example:8088".into(),
+            public_key: "aa".repeat(32),
+            pull: pull.iter().map(|s| s.to_string()).collect(),
+            every: every.into(),
+            enabled: true,
+            max_penalty_secs: 60,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_peer_with_three_streams_becomes_three_schedules_not_one() {
+        let plan = peer_reconcile_plan(&[peer(
+            "vps",
+            &["weather", "recipes", "datasets:hn/stories"],
+            "15m",
+        )]);
+        let ids: Vec<&str> = plan.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["peer-vps-weather", "peer-vps-recipes", "peer-vps-datasets-hn-stories"]
+        );
+        assert!(plan.iter().all(|p| p.cron == "0 */15 * * * *"));
+        assert!(plan.iter().all(|p| p.enabled));
+    }
+
+    #[test]
+    fn every_schedule_runs_the_peer_app_with_its_own_stream_and_trust() {
+        let plan = peer_reconcile_plan(&[peer("vps", &["weather", "datasets:hn/stories"], "1h")]);
+        assert_eq!(plan[0].params["stream"], "weather");
+        assert!(
+            plan[0].params.get("datasets").is_none(),
+            "a weather pull must not carry a dataset list"
+        );
+        assert_eq!(plan[1].params["stream"], "datasets");
+        assert_eq!(plan[1].params["datasets"], serde_json::json!(["hn/stories"]));
+        for p in &plan {
+            assert_eq!(p.params["url"], "https://vps.example:8088");
+            assert_eq!(p.params["public_key"], "aa".repeat(32));
+            assert_eq!(p.params["allow_unsigned"], false);
+            assert_eq!(p.params["max_penalty_secs"], 60);
+            assert_eq!(p.params["peer_name"], "vps");
+        }
+    }
+
+    #[test]
+    fn a_disabled_peer_still_plans_its_rows_but_disabled_not_deleted() {
+        let mut p = peer("vps", &["weather"], "15m");
+        p.enabled = false;
+        let plan = peer_reconcile_plan(&[p]);
+        assert_eq!(plan.len(), 1, "the row survives so its history survives");
+        assert!(!plan[0].enabled);
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_scheduled_contributes_nothing_not_half_a_peer() {
+        // `Config::validate` refuses these at load; if one is built in code the
+        // plan must still not emit a schedule with a broken cron.
+        assert!(peer_reconcile_plan(&[peer("vps", &["weather"], "7m")]).is_empty());
+        assert!(peer_reconcile_plan(&[peer("vps", &["wether"], "15m")]).is_empty());
+        assert!(peer_reconcile_plan(&[peer("vps", &[], "15m")]).is_empty());
+    }
+
+    #[test]
+    fn two_peers_never_share_a_schedule_id() {
+        let plan = peer_reconcile_plan(&[
+            peer("vps", &["weather"], "15m"),
+            peer("laptop", &["weather"], "15m"),
+        ]);
+        assert_eq!(plan.len(), 2);
+        assert_ne!(plan[0].id, plan[1].id);
+    }
+
+    #[test]
+    fn an_api_key_is_carried_verbatim_so_the_env_form_keeps_the_secret_out_of_the_row() {
+        let mut p = peer("vps", &["weather"], "15m");
+        p.api_key = Some("env:PUMPER_VPS_KEY".into());
+        let plan = peer_reconcile_plan(&[p]);
+        assert_eq!(plan[0].params["api_key"], "env:PUMPER_VPS_KEY");
+        // And an absent key adds no field at all, rather than a null one the
+        // app would have to distinguish from an empty string.
+        let bare = peer_reconcile_plan(&[peer("vps", &["weather"], "15m")]);
+        assert!(bare[0].params.get("api_key").is_none());
+    }
 }
 
 #[cfg(test)]

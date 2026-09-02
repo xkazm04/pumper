@@ -65,6 +65,7 @@ mod health;
 mod host_weather;
 mod ingress;
 mod jobs;
+pub(crate) mod mesh;
 mod meta;
 mod principals;
 mod provenance;
@@ -92,6 +93,7 @@ use health::*;
 use host_weather::*;
 use ingress::*;
 use jobs::*;
+use mesh::*;
 use meta::*;
 use principals::*;
 use provenance::*;
@@ -143,6 +145,7 @@ use watches::*;
         (name = "retention", description = "Read-only retention dry run: reclaimable artifact bytes per app and ledger sizes"),
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "principals", description = "Identity and tenancy: scoped API keys, their spend, and the audit ledger"),
+        (name = "mesh", description = "Pumper mesh: signed node identity and scheduled peer sync of datasets, host weather and recipes"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
@@ -254,6 +257,11 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(import_host_weather))
         .routes(routes!(list_profiles))
         .routes(routes!(list_recipes))
+        .routes(routes!(export_recipes))
+        .routes(routes!(import_recipes))
+        .routes(routes!(dataset_manifest))
+        .routes(routes!(get_node))
+        .routes(routes!(get_mesh))
         .routes(routes!(fetch_proxy))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
@@ -596,6 +604,7 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /datasets/{app}/{dataset}/manifest",
         "GET /datasets/doctor",
         "GET /provenance/{app}/{dataset}/{key}",
         "POST /provenance/{app}/{dataset}/{key}/rederive",
@@ -633,6 +642,10 @@ mod api_spec_tests {
         "POST /host-weather/import",
         "GET /profiles",
         "GET /recipes",
+        "GET /recipes/export",
+        "POST /recipes/import",
+        "GET /node",
+        "GET /mesh",
         "POST /fetch-proxy",
         "GET /plugins",
         "POST /plugins/reload",

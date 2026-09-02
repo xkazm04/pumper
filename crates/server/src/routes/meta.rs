@@ -165,6 +165,13 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     // `fetch_chokepoint.rs`'s EXPECTED_RAW_ENGINE_CALLS rather than an exemption.
     out.push_str(&egress_metrics(state.engines.fetch.egress_counters()));
     out.push_str(&checkpoint_metrics(state.checkpoint_failures.totals()));
+    // Mesh (N16). Emitted at zero on a node with no `[[peer]]` rows, like the
+    // egress counters above. A read failure degrades to the zero totals rather
+    // than failing `/metrics` — a scrape endpoint that 500s takes every other
+    // series down with it.
+    out.push_str(&crate::routes::mesh::mesh_metrics_lines(
+        &crate::routes::mesh::MeshTotals::collect(&state).await,
+    ));
     out.push_str(&claim_failure_metrics(
         state
             .claim_failures

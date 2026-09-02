@@ -79,6 +79,10 @@ uuid.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
+# N16: the [[peer]] schedule reconcile writes its rows fenced on
+# `managed_by = 'peer'`; there is no storage-layer writer with a caller-chosen
+# id + params, and adding one is outside this change's file scope.
+sqlx.workspace = true
 
 [dev-dependencies]
 pumper-core = { workspace = true, features = ["test-support"] }

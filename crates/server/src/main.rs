@@ -7,6 +7,8 @@ mod events;
 mod fanout;
 mod maintenance;
 mod mcp;
+// N16: node identity (the ed25519 keypair mesh bundles are signed with).
+mod node;
 mod progress;
 mod refresher;
 mod registry;
