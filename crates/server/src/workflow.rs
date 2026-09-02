@@ -684,7 +684,9 @@ pub fn step_budget(
         return Ok(step_budget_usd);
     };
     let remaining = envelope - spent_usd.max(0.0);
-    if !(remaining > 0.0) {
+    // NaN-safe deliberately: a corrupted ledger total must refuse the step, not
+    // slip past a bare `<= 0.0` comparison that NaN always answers `false` to.
+    if !remaining.is_finite() || remaining <= 0.0 {
         return Err(format!(
             "workflow budget envelope of ${envelope:.4} is exhausted (spent ${spent_usd:.4}); \
              this step was not enqueued"
