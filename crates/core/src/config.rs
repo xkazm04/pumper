@@ -2872,14 +2872,14 @@ pub fn peer_cron(every_secs: u64) -> Option<String> {
     }
     if every_secs < 3600 {
         let minutes = every_secs / 60;
-        if every_secs % 60 != 0 || 60 % minutes != 0 {
+        if !every_secs.is_multiple_of(60) || !60u64.is_multiple_of(minutes) {
             return None;
         }
         return Some(format!("0 */{minutes} * * * *"));
     }
     if every_secs <= 86_400 {
         let hours = every_secs / 3600;
-        if every_secs % 3600 != 0 || 24 % hours != 0 {
+        if !every_secs.is_multiple_of(3600) || !24u64.is_multiple_of(hours) {
             return None;
         }
         return Some(format!("0 0 */{hours} * * *"));

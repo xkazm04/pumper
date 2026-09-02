@@ -460,8 +460,13 @@ mod tests {
             public_key: None,
             allow_unsigned: true,
         };
-        let opened = open_envelope(&legacy, SCHEMA_WEATHER_V2, Some(SCHEMA_WEATHER_V1), &lenient)
-            .expect("legacy opens under allow_unsigned");
+        let opened = open_envelope(
+            &legacy,
+            SCHEMA_WEATHER_V2,
+            Some(SCHEMA_WEATHER_V1),
+            &lenient,
+        )
+        .expect("legacy opens under allow_unsigned");
         assert!(!opened.verified, "an unsigned bundle is never 'verified'");
         assert_eq!(opened.payload["entries"][0]["host"], "a.com");
     }

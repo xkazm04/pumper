@@ -37,6 +37,9 @@
 use std::collections::BTreeSet;
 
 use app_peer::envelope::{open_envelope, SCHEMA_WEATHER_V1, SCHEMA_WEATHER_V2};
+// Shared with the puller that consumes this export, so export and import can
+// never drift apart on what an entry is.
+use app_peer::mesh::weather_entries;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -159,20 +162,6 @@ pub(crate) struct ImportQuery {
 struct ImportedBundle {
     node_id: Option<String>,
     entries: Vec<WeatherEntry>,
-}
-
-/// Reads the `entries` array out of an opened bundle payload.
-///
-/// Extracted and typed rather than deserialised through a body struct because
-/// the payload arrives as an opaque `Value`: the SIGNATURE is over the bytes,
-/// so the envelope must be verified before anything reinterprets its contents.
-/// A body struct would have made serde the first reader and the verifier the
-/// second, which is the wrong order.
-pub(crate) fn weather_entries(payload: &Value) -> Result<Vec<WeatherEntry>, String> {
-    let raw = payload
-        .get("entries")
-        .ok_or_else(|| "bundle payload has no `entries` array".to_string())?;
-    serde_json::from_value(raw.clone()).map_err(|e| format!("bundle `entries` is unreadable: {e}"))
 }
 
 /// Imports a host-weather bundle with a conservative, count-weighted merge.

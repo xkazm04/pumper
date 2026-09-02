@@ -88,9 +88,12 @@ impl NodeIdentity {
     /// Wraps `payload` in a signed mesh envelope.
     pub(crate) fn seal(&self, schema: &str, payload: Value) -> Value {
         let generated_at = chrono::Utc::now().to_rfc3339();
-        let sig = self
-            .keypair
-            .sign(&signing_bytes(schema, &self.node_id, &generated_at, &payload));
+        let sig = self.keypair.sign(&signing_bytes(
+            schema,
+            &self.node_id,
+            &generated_at,
+            &payload,
+        ));
         json!({
             "schema": schema,
             "node_id": self.node_id,
@@ -248,7 +251,10 @@ mod tests {
         let db = dir.join("pumper.db");
         let path = node_key_path(&db);
         std::fs::write(&path, "zzzz not hex zzzz").expect("write");
-        let err = load_or_create(&path, &db).expect_err("must refuse");
+        let err = match load_or_create(&path, &db) {
+            Err(e) => e,
+            Ok(_) => panic!("a corrupt key file must not mint a new identity"),
+        };
         assert!(
             err.to_string().contains("REFUSING"),
             "the error must say it refused rather than quietly re-keying: {err}"
@@ -264,10 +270,16 @@ mod tests {
     #[test]
     fn two_nodes_in_one_process_get_two_identities() {
         let dir = tempdir("twonodes");
-        let a = load_or_create(&node_key_path(&dir.join("a/pumper.db")), &dir.join("a/pumper.db"))
-            .expect("a");
-        let b = load_or_create(&node_key_path(&dir.join("b/pumper.db")), &dir.join("b/pumper.db"))
-            .expect("b");
+        let a = load_or_create(
+            &node_key_path(&dir.join("a/pumper.db")),
+            &dir.join("a/pumper.db"),
+        )
+        .expect("a");
+        let b = load_or_create(
+            &node_key_path(&dir.join("b/pumper.db")),
+            &dir.join("b/pumper.db"),
+        )
+        .expect("b");
         assert_ne!(
             a.node_id(),
             b.node_id(),

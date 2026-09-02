@@ -908,7 +908,6 @@ pub(crate) fn validate_schedule_params(
     Ok(effective)
 }
 
-
 // ── [[peer]] reconcile (N16) ────────────────────────────────────────────────
 //
 // `[[peer]]` is desired state exactly the way `catalog/data-sources.toml` is,
@@ -1023,11 +1022,7 @@ async fn apply_peer_schedules(state: &AppState, plan: &[PeerSchedule]) -> anyhow
         );
         state
             .storage
-            .set_managed_schedule_enabled(
-                &existing.id,
-                false,
-                crate::routes::mesh::PEER_MANAGED_BY,
-            )
+            .set_managed_schedule_enabled(&existing.id, false, crate::routes::mesh::PEER_MANAGED_BY)
             .await?;
     }
     Ok(applied)
@@ -1080,7 +1075,11 @@ mod peer_reconcile_tests {
         let ids: Vec<&str> = plan.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["peer-vps-weather", "peer-vps-recipes", "peer-vps-datasets-hn-stories"]
+            vec![
+                "peer-vps-weather",
+                "peer-vps-recipes",
+                "peer-vps-datasets-hn-stories"
+            ]
         );
         assert!(plan.iter().all(|p| p.cron == "0 */15 * * * *"));
         assert!(plan.iter().all(|p| p.enabled));
@@ -1095,7 +1094,10 @@ mod peer_reconcile_tests {
             "a weather pull must not carry a dataset list"
         );
         assert_eq!(plan[1].params["stream"], "datasets");
-        assert_eq!(plan[1].params["datasets"], serde_json::json!(["hn/stories"]));
+        assert_eq!(
+            plan[1].params["datasets"],
+            serde_json::json!(["hn/stories"])
+        );
         for p in &plan {
             assert_eq!(p.params["url"], "https://vps.example:8088");
             assert_eq!(p.params["public_key"], "aa".repeat(32));

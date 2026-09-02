@@ -1107,7 +1107,6 @@ pub(crate) async fn record_history(
     ))
 }
 
-
 // ── live-set manifest (N16, mesh reconcile) ─────────────────────────────────
 
 /// Ceiling on keys one manifest call walks. Past it the manifest is honest
@@ -1156,7 +1155,7 @@ pub(crate) async fn dataset_manifest(
     // indistinguishable from "exactly at the cap".
     let records = state
         .datasets
-        .list(&app, &dataset, (MANIFEST_KEYS_CAP + 1).min(i64::MAX))
+        .list(&app, &dataset, MANIFEST_KEYS_CAP + 1)
         .await?;
     let complete = (records.len() as i64) <= MANIFEST_KEYS_CAP;
     let live: Vec<String> = records

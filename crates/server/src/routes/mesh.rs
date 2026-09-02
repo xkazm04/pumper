@@ -69,7 +69,10 @@ pub(crate) fn peer_schedule_id(peer_label: &str, stream_slug: &str) -> String {
 ///    if some peer row has explicitly said `allow_unsigned = true`. An operator
 ///    who has pinned keys for a fleet has said, by doing so, that anonymous
 ///    bundles are not welcome.
-pub(crate) fn trust_for(peers: &[PeerConfig], node_id: Option<&str>) -> app_peer::envelope::PeerTrust {
+pub(crate) fn trust_for(
+    peers: &[PeerConfig],
+    node_id: Option<&str>,
+) -> app_peer::envelope::PeerTrust {
     use app_peer::envelope::{fingerprint_hex, PeerTrust};
     if peers.is_empty() {
         return PeerTrust {
@@ -255,7 +258,11 @@ impl MeshTotals {
                 totals.streams += 1;
                 let record = state
                     .datasets
-                    .get(MESH_APP, MESH_DATASET, &mesh_state_key(&label, &stream.slug()))
+                    .get(
+                        MESH_APP,
+                        MESH_DATASET,
+                        &mesh_state_key(&label, &stream.slug()),
+                    )
                     .await
                     .ok()
                     .flatten()
@@ -315,7 +322,9 @@ pub(crate) fn mesh_metrics_lines(totals: &MeshTotals) -> String {
         ),
     ];
     for (name, kind, help, value) in series {
-        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
     }
     out
 }
@@ -351,7 +360,10 @@ mod tests {
     fn a_pinned_peer_is_matched_by_its_key_fingerprint_not_by_url_or_order() {
         let key = hex::encode([9u8; 32]);
         let id = fingerprint(&[9u8; 32]);
-        let peers = vec![peer_with(Some(&hex::encode([1u8; 32])), false), peer_with(Some(&key), true)];
+        let peers = vec![
+            peer_with(Some(&hex::encode([1u8; 32])), false),
+            peer_with(Some(&key), true),
+        ];
         let trust = trust_for(&peers, Some(&id));
         assert_eq!(trust.public_key.as_deref(), Some(key.as_str()));
         assert!(trust.allow_unsigned, "the matched peer's own rule applies");

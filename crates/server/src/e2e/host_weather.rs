@@ -1,5 +1,11 @@
-//! Host-weather (M01 v1) over the real router: the export floor, the
-//! dry-run-by-default purity of import, and the conservative apply merge.
+//! Host-weather over the real router: the export floor, the signed envelope
+//! (N16), the dry-run-by-default purity of import, and the conservative apply
+//! merge.
+//!
+//! Unsigned `pumper.host-weather/1` bundles still merge here because
+//! `test_state` configures no `[[peer]]` rows — a node that is not in a mesh
+//! keeps its pre-mesh import behaviour. `crate::e2e::peer_mirror` covers the
+//! opposite case, where a pinned key makes a forged bundle a refusal.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -78,12 +84,19 @@ async fn export_applies_the_observation_floor_and_carries_the_schema() {
     seed(&state).await;
     let router = routes::router(state);
 
-    // Default floor (3): only the well-observed host travels.
+    // Default floor (3): only the well-observed host travels, inside a SIGNED
+    // envelope whose entries live under `payload`.
     let (status, body) = get_json(&router, "/host-weather/export").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["schema"], "pumper.host-weather/1");
+    assert_eq!(body["schema"], "pumper.host-weather/2");
     assert!(body["node_id"].is_string() && body["generated_at"].is_string());
-    let entries = body["entries"].as_array().unwrap();
+    assert!(
+        body["legacy_id"].is_string(),
+        "the pre-mesh id travels for one release so old pins can be mapped"
+    );
+    let sig = body["sig"].as_str().expect("a v2 bundle is signed");
+    assert_eq!(sig.len(), 128, "ed25519 signature, hex");
+    let entries = body["payload"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1, "thin host must not travel: {body}");
     assert_eq!(entries[0]["host"], "pinned.example");
     assert_eq!(entries[0]["preferred_tier"], "browser");
@@ -92,7 +105,60 @@ async fn export_applies_the_observation_floor_and_carries_the_schema() {
 
     // Floor 1 includes the thin host too.
     let (_, body) = get_json(&router, "/host-weather/export?min_observations=1").await;
-    assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(body["payload"]["entries"].as_array().unwrap().len(), 2);
+}
+
+/// A fleet is rolled forward one node at a time, so the pre-N16 flat bundle
+/// must still be servable on request — and must still be UNSIGNED and flat,
+/// not a v2 body wearing a v1 schema string.
+#[tokio::test]
+async fn the_legacy_flat_bundle_is_still_servable_for_a_fleet_mid_upgrade() {
+    let (state, _store) = test_state(vec![]).await;
+    seed(&state).await;
+    let router = routes::router(state);
+
+    let (status, body) = get_json(&router, "/host-weather/export?schema=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["schema"], "pumper.host-weather/1");
+    assert!(body["sig"].is_null(), "the legacy bundle is unsigned");
+    assert!(
+        body["payload"].is_null(),
+        "the legacy bundle is FLAT — entries at the top level"
+    );
+    assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+    // And the legacy node_id is the pre-mesh value, not the new fingerprint.
+    let (_, v2) = get_json(&router, "/host-weather/export").await;
+    assert_eq!(body["node_id"], v2["legacy_id"]);
+    assert_ne!(body["node_id"], v2["node_id"]);
+}
+
+/// This node's own export must be openable by a peer that pinned its key — the
+/// round trip nothing else in this file exercises, and the one that would break
+/// silently if the signing bytes ever disagreed with the verifier.
+#[tokio::test]
+async fn this_nodes_export_verifies_under_its_own_published_key() {
+    let (state, _store) = test_state(vec![]).await;
+    seed(&state).await;
+    let router = routes::router(state);
+
+    let (_, node) = get_json(&router, "/node").await;
+    let (_, bundle) = get_json(&router, "/host-weather/export").await;
+    let trust = app_peer::envelope::PeerTrust {
+        public_key: Some(node["public_key"].as_str().unwrap().to_string()),
+        allow_unsigned: false,
+    };
+    let opened = app_peer::envelope::open_envelope(&bundle, "pumper.host-weather/2", None, &trust)
+        .expect("a node's own export must verify under the key it publishes");
+    assert!(opened.verified);
+    assert_eq!(opened.node_id.as_deref(), node["node_id"].as_str());
+
+    // The forgery: same signature, different content.
+    let mut forged = bundle.clone();
+    forged["payload"]["entries"] = json!([{"host": "evil.example", "penalty_ms": 999999}]);
+    assert!(
+        app_peer::envelope::open_envelope(&forged, "pumper.host-weather/2", None, &trust).is_err(),
+        "a tampered payload must not open"
+    );
 }
 
 #[tokio::test]
