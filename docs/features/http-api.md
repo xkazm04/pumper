@@ -62,7 +62,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Profiles | `GET /profiles` (session vault: named login profiles; see below) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 | Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |
-| Grants | `GET /grants?status=&agency=&source=&program=&closing_before=&closing_after=&min_award=&trust=&limit=&cursor=` · `GET /grants/closing-soon?days=` · `GET /grants/programs?agency=&source=&program=&next_expected_before=&limit=&cursor=` (see below) |
+| Grants | `GET /grants?status=&agency=&source=&program=&profile=&verdict=&closing_before=&closing_after=&min_award=&trust=&limit=&cursor=` · `GET /grants/closing-soon?days=` · `GET /grants/programs?agency=&source=&program=&next_expected_before=&limit=&cursor=` · `GET /grants/fits?profile=&verdict=&source=&limit=&cursor=` · `GET /grants/profiles` · `POST /grants/profiles` (see below) |
 | Catalog | `GET /catalog/sources?market=&status=&category=` (the machine-readable data-source catalog) · `GET /catalog/health` (per-source freshness monitor; see below) |
 | Source health | `GET /sources?state=&app=&limit=` · `GET /sources/{id}` (`id` = `<app>/<dataset>`) · `GET /sources/{id}/runs?limit=` · `POST /sources/{id}/state` (`{state, reason?}` — manual override; the only way out of quarantine). All `503` when `[resilience] enabled = false`. See below. |
 | Provisioner proposals | `GET /provisioner/proposals?limit=&cursor=` (backlog of what `provisioner` compiled; see below) · `POST /provisioner/proposals/{key}/validate` (re-checks against a FRESH fetch) · `POST /provisioner/proposals/{key}/promote` (renders the paste-ready TOML fragment; writes nothing to the catalog file) |
@@ -162,6 +162,7 @@ Every filter is optional and **ANDed**; with none set it lists the whole live co
 | `status` | Exact match on the normalized status: `open` \| `forecasted` \| `closed`. |
 | `source` | Exact match on the source app: `grants-gov` \| `ca-grants`. |
 | `program` | Exact match on the record's `program_key` — every posting of one funding program, across annual cycles and across portals, in one query. The keys are the ones `GET /grants/programs` lists (`aln:93.912`, `family:HORIZON-CL4-DATA-01`, `<agency>\|<program title>`). The field is stamped onto each unified row by the corpus pass and is **declared derived**, so it is excluded from change detection: gaining or correcting an identity never reads as a source publication. A row the identity rules could not name a program for carries no `program_key` and never matches — honest absence, not an `unknown` bucket. |
+| `profile` / `verdict` | **Applicant fit (N31)**: the key of a `grants/profiles` row, optionally narrowed to one verdict. Switches the route to the fit-joined view described [below](#get-grantsprofile--the-corpus-through-one-applicants-verdicts) — it reads `grants/fits`, not the corpus, and is therefore **refused with a 400 when combined with any other filter in this table**. |
 | `agency` | **Case-insensitive substring** of the agency name (`agency=health` matches "National Institutes of Health"). `%`/`_` are literal, not wildcards. |
 | `closing_before` / `closing_after` | `close_date` on or before / on or after this date. `close_date` is canonical `YYYY-MM-DD`, so the comparison is lexicographic. **Records with no close date are excluded whenever either filter is set** — a forecasted grant with no deadline is not "closing before" anything. A non-`YYYY-MM-DD` value is `400 bad_request`. |
 | `min_award` | Keeps records whose **`award_ceiling` >= v OR `total_funding` >= v**. Sources report grant size inconsistently (a per-award ceiling vs. a program total), so matching either keeps the funder's largest published number in play. A record with both fields null never matches. Grants.gov's **Search2** API publishes no money at all (live-verified 2026-08-04: an `oppHits[]` entry carries only `id, number, title, agencyCode, agency, openDate, closeDate, oppStatus, docType, cfdaList`), so federal amounts do not come from the listing — they are joined in from the **`fetchOpportunity` detail corpus** (`grants/opportunity_details`), whose `synopsis` block does carry `awardFloor` / `awardCeiling` / `estimatedFunding`. A federal record therefore matches `min_award` **iff its detail record has been harvested and the agency actually published a figure**; the agency's literal `"none"` stays `Null` and never becomes a matching `0`. Coverage is the detail corpus, which the harvest fills incrementally (`harvestDetails`, **on by default since 2026-08-04**, see [apps.md](apps.md)) — an un-harvested or figure-less federal opportunity is honestly invisible to this filter. Because the harvest is delta-only, coverage grows **forward** from that date rather than retroactively: opportunities that never change are never re-fetched, so a corpus backfill remains a non-goal and federal `min_award` recall climbs day by day. |
@@ -207,7 +208,74 @@ Each record's `data`:
 
 **Known gaps (v1):** no `award_ceiling_trend`, no per-program document links, and no program merges across sources — a program listed federally *and* on a state portal under different identities stays two rows.
 
-**Performance stance:** all three routes filter with SQLite `json_extract` over the `data` column, i.e. a full scan of the `(app, dataset)` partition with no index on the filtered fields. That is the right trade at current scale (the unified corpus is in the low thousands) and it keeps the record store free of any coupling to an app's record shape — new filters need no migration. If the corpus grows to where the scan hurts, the escape hatch is a generated column over the hot field plus an index on it; the query builder would not have to change.
+### `GET /grants/fits` (N31, 2026-09-02)
+
+**Which grants can this applicant actually apply for, and why.** One row per applicant profile ×
+opportunity, with a scored, explained verdict. The engine (five pure gates over the corpus's
+eligibility fields) and the profile schema live in [apps.md](apps.md#grantsfits-the-applicant-fit-engine-n31);
+this is the door.
+
+| Param | Semantics |
+| --- | --- |
+| `profile` | Profile key — the slugged `name` that `POST /grants/profiles` returned. |
+| `verdict` | `eligible` \| `likely` \| `blocked` \| `unknown`. An unrecognized value is a **400**, never a confident empty page (`?verdict=eligable` must not read as "no grants fit you"). |
+| `source` | Source app of the opportunity the verdict is about. |
+
+Dual-mode per the cursor convention: `{fits: [Record]}` without `cursor=`, `{items, next_cursor}`
+with it; `limit` defaults to 50 and is capped at 500.
+
+Each record's `data` is `{profile, unified_key, source, verdict, score, method, reasons[],
+blockers[], unknowns[]}`. `verdict` is `eligible` only when **every** gate had published evidence,
+and `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`.
+`unknowns[]` names the absent field per gate, which is the list that says which source field to
+enrich next. `score` ranks within a verdict band and the bands never overlap. `method` names the arm
+that decided (`deterministic` is the only v1 arm). The row is deliberately **verdict-shaped** and
+copies nothing from the opportunity, so a `changed` revision — and the alert it fires through a
+watch or dataset trigger on `grants/fits` — means the fit moved, not that an agency fixed a typo.
+
+### `GET` / `POST /grants/profiles` (N31, 2026-09-02)
+
+`GET` returns `{profiles: [Record]}` (live rows, newest-updated first).
+
+`POST` creates **or updates** one applicant profile — the record key is the slugged `name`, so
+re-POSTing the same name overwrites it and the response says `created: false`. Body:
+
+```json
+{ "name": "Acme Health Coalition", "org_type": "nonprofit", "country": "US", "state": "CA",
+  "ein": null, "uei": null, "ntee": null, "budget_band": { "min": null, "max": 250000 },
+  "focus_tags": ["rural health"], "cost_share_capacity": null, "programs_watched": ["aln:93.912"] }
+```
+
+`org_type` is a closed vocabulary (`nonprofit` | `gov` | `tribal` | `smb` | `university` |
+`individual`); `country`/`state` are 2-letter codes, upper-cased on the way in. Response is
+`{key, created, profile}` with the canonical stored document, in which **every absent optional field
+is an explicit `null`** — absent means UNKNOWN, and an unknown never blocks a fit. `ein`/`uei`/`ntee`
+are stored, never verified.
+
+Validation reports **every** error at once and is **strict**: an unknown field is a 400, not a silent
+drop, because a typo'd `cost_share_capacty` that vanishes produces a profile that blocks nothing,
+matches everything, and never explains itself. Mutating, so it needs the `admin` scope in
+`[auth] mode = "keys"` — inherited from `required_scope`'s default for any unrecognized mutating
+path, not from a special case (see [auth.md](auth.md)).
+
+### `GET /grants?profile=` — the corpus through one applicant's verdicts
+
+Setting `profile=` switches `GET /grants` to the fit-joined view: it is driven from `grants/fits`
+(so paging is exact — one fit row in, at most one grant out, keyset cursor over the fit dataset) and
+each hit is hydrated from `grants/unified` with its `fit` block attached. Response is
+`{profile, grants, retired}`, or `{items, next_cursor, retired}` when `cursor=` is present.
+`retired` counts verdicts whose opportunity has left the corpus — the gap between "12 fits" and
+"10 grants" is a real fact about the store, not a page that quietly shrank.
+
+`verdict=` narrows it. **Any corpus filter alongside `profile=` is a 400 that names the offending
+params** (`status`, `agency`, `source`, `program`, `closing_before`, `closing_after`, `min_award`).
+The two sides live in different datasets, so ANDing them in one page could only be served by
+intersecting two capped reads — which returns *part* of the answer while looking exactly like all of
+it. Filter the corpus and read `GET /grants/fits` beside it instead. A blank param (`?status=`) is
+"unset" here as everywhere else on this route, so a UI that serializes its whole filter form is not
+refused for a form it never filled in.
+
+**Performance stance:** every route in this section filters with SQLite `json_extract` over the `data` column, i.e. a full scan of the `(app, dataset)` partition with no index on the filtered fields. That is the right trade at current scale (the unified corpus is in the low thousands) and it keeps the record store free of any coupling to an app's record shape — new filters need no migration. If the corpus grows to where the scan hurts, the escape hatch is a generated column over the hot field plus an index on it; the query builder would not have to change.
 
 ## Data-source catalog (`/catalog/sources`)
 
