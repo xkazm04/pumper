@@ -422,6 +422,12 @@ async fn execute_and_report(
         // and replays nothing. Out of the v1 slice, deliberately and stated.
         vcr: pumper_core::Vcr::Off,
         artifacts_dir,
+        // App-declared schedules (P.4) are applied by the coordinator's post-run
+        // fan-out, which a remote run never reaches; a cap of 0 makes
+        // `request_schedule` refuse honestly instead of collecting requests
+        // nobody applies (the same posture as `mcp::jobtoken`).
+        schedule_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        max_schedule_requests: 0,
     };
 
     tracing::info!(job = %job.job_id, app = %job.app, attempt = job.attempt, "executing job");
