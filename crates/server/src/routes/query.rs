@@ -50,6 +50,12 @@ pub(crate) struct GrantsQuery {
     agency: Option<String>,
     /// Source app, exact match: `grants-gov` | `ca-grants` | `eu-sedia`.
     source: Option<String>,
+    /// Funding-program key, exact match — the `program_key` of `GET
+    /// /grants/programs` (`aln:93.912`, `family:HORIZON-CL4-DATA-01`,
+    /// `<agency>|<program title>`). Every posting of one program, across cycles
+    /// and portals, in one query. Rows the identity rules could not name a
+    /// program for carry no `program_key` and never match.
+    program: Option<String>,
     /// Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.
     closing_before: Option<String>,
     /// Closes on or after this `YYYY-MM-DD`. Records with no close date are excluded.
@@ -111,6 +117,12 @@ fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonF
         filters.push(JsonFilter::Contains {
             path: "$.agency".into(),
             value: agency.into(),
+        });
+    }
+    if let Some(program) = filter_value(&query.program) {
+        filters.push(JsonFilter::Eq {
+            path: format!("$.{}", grants_common::programs::PROGRAM_KEY_FIELD),
+            value: program.into(),
         });
     }
     if let Some(before) = filter_value(&query.closing_before) {
@@ -691,4 +703,118 @@ pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<V
                 .into(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Program registry (`grants/programs`) — appended for N29. Builders append at
+// the END of this file, in wave order, so two branches touching it merge
+// without reordering anything above.
+// ---------------------------------------------------------------------------
+
+/// The cross-source program registry, in the same virtual namespace as the
+/// corpus. Mirrors `grants_common::programs::PROGRAMS_DATASET`.
+const PROGRAMS_DATASET: &str = "programs";
+
+/// Filters over `grants/programs`. All optional, all ANDed.
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ProgramsQuery {
+    /// Case-insensitive substring of the program's agency, as the latest
+    /// posting published it.
+    agency: Option<String>,
+    /// Keeps programs whose `sources[]` names this source app. Matched as a
+    /// substring of the serialized array, which is exact enough for the three
+    /// source ids in play (`grants-gov` | `ca-grants` | `eu-sedia`) and needs no
+    /// array-containment operator in the store.
+    source: Option<String>,
+    /// Programs expected to REOPEN on or before this `YYYY-MM-DD`. Only
+    /// programs that earned a projection have a `next_expected_open`, so this
+    /// filter answers "what is coming back in the next N days" and silently
+    /// excludes the programs we cannot honestly predict — which is the point.
+    next_expected_before: Option<String>,
+    /// Exact `program_key`, for fetching one program without knowing its shape.
+    program: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+/// Translates the program filters into store-level JSON predicates.
+fn program_filters(
+    query: &ProgramsQuery,
+) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
+    use pumper_core::datasets::JsonFilter;
+    let mut filters = Vec::new();
+    if let Some(program) = filter_value(&query.program) {
+        filters.push(JsonFilter::Eq {
+            path: "$.program_key".into(),
+            value: program.into(),
+        });
+    }
+    if let Some(agency) = filter_value(&query.agency) {
+        filters.push(JsonFilter::Contains {
+            path: "$.agency".into(),
+            value: agency.into(),
+        });
+    }
+    if let Some(source) = filter_value(&query.source) {
+        filters.push(JsonFilter::Contains {
+            path: "$.sources".into(),
+            value: source.into(),
+        });
+    }
+    if let Some(before) = filter_value(&query.next_expected_before) {
+        // Same rule as the closing-window filters: the stored dates are
+        // canonical `YYYY-MM-DD` and compare lexicographically, so anything
+        // else is rejected rather than silently compared as a malformed string.
+        parse_grant_date(before, "next_expected_before")?;
+        filters.push(JsonFilter::Lte {
+            path: "$.next_expected_open".into(),
+            value: before.into(),
+        });
+    }
+    Ok(filters)
+}
+
+/// One row per funding **program** — the entity the postings belong to.
+///
+/// `grants/unified` answers "which opportunities are open"; this answers the
+/// question a grant-seeker actually has: *does this program come back, when,
+/// and does this agency move its deadlines*. It is materialized by the
+/// once-per-cycle corpus pass (`grants_common::programs`), not computed on read,
+/// because it folds four datasets — the live corpus, `grants/recurrence_links`,
+/// `grants/events` and `cordis/topic_stats` — and a per-request join of those
+/// would be a full scan of each.
+#[utoipa::path(
+    get,
+    path = "/grants/programs",
+    tag = "grants",
+    params(ProgramsQuery),
+    responses(
+        (status = 200, description = "Live records from `grants/programs`. Dual-mode: `{programs: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` carries `{program_key, title, agency, sources[], cycles_observed, dated_cycles, period_days, next_expected_open, next_expected_close, prediction_basis, opportunities[], recurrence_linked, deadline_extended_count, closed_early_count, extension_rate, last_award_ceiling, win_history}`. `period_days` and the next window are `null` unless the program's own dated cycles support them, with `prediction_basis` saying why; `extension_rate` is `null` when the lifecycle-event read was windowed rather than complete; `win_history` is Horizon-only."),
+        (status = 400, description = "Malformed `next_expected_before` date", body = Object),
+    )
+)]
+pub(crate) async fn list_programs(
+    State(state): State<AppState>,
+    Query(query): Query<ProgramsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let filters = program_filters(&query)?;
+    let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let Some(cursor) = &query.cursor else {
+        let programs = state
+            .datasets
+            .list_filtered(GRANTS_APP, PROGRAMS_DATASET, &filters, None, limit)
+            .await?;
+        return Ok(Json(json!({ "programs": programs })));
+    };
+    let after = parse_cursor(cursor);
+    let items = state
+        .datasets
+        .list_filtered(GRANTS_APP, PROGRAMS_DATASET, &filters, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |r| {
+        format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }

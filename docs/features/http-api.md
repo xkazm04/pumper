@@ -62,7 +62,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Profiles | `GET /profiles` (session vault: named login profiles; see below) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 | Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |
-| Grants | `GET /grants?status=&agency=&source=&closing_before=&closing_after=&min_award=&trust=&limit=&cursor=` · `GET /grants/closing-soon?days=` (see below) |
+| Grants | `GET /grants?status=&agency=&source=&program=&closing_before=&closing_after=&min_award=&trust=&limit=&cursor=` · `GET /grants/closing-soon?days=` · `GET /grants/programs?agency=&source=&program=&next_expected_before=&limit=&cursor=` (see below) |
 | Catalog | `GET /catalog/sources?market=&status=&category=` (the machine-readable data-source catalog) · `GET /catalog/health` (per-source freshness monitor; see below) |
 | Source health | `GET /sources?state=&app=&limit=` · `GET /sources/{id}` (`id` = `<app>/<dataset>`) · `GET /sources/{id}/runs?limit=` · `POST /sources/{id}/state` (`{state, reason?}` — manual override; the only way out of quarantine). All `503` when `[resilience] enabled = false`. See below. |
 | Provisioner proposals | `GET /provisioner/proposals?limit=&cursor=` (backlog of what `provisioner` compiled; see below) · `POST /provisioner/proposals/{key}/validate` (re-checks against a FRESH fetch) · `POST /provisioner/proposals/{key}/promote` (renders the paste-ready TOML fragment; writes nothing to the catalog file) |
@@ -149,7 +149,7 @@ This route carries the larger **8 MiB** request-body ceiling (see [Request body 
 
 ## Grants query surface (`/grants`)
 
-A filtered read view over **`grants/unified`** — the cross-source corpus that `grants-gov` and `ca-grants` both normalize into (schema in [apps.md](apps.md)). Without it the corpus is reachable only through the generic dataset API, so consumers have to export everything and filter client-side. Both routes read **live records only** (a tombstoned `removed_at` row never appears).
+A filtered read view over **`grants/unified`** — the cross-source corpus that `grants-gov` and `ca-grants` both normalize into (schema in [apps.md](apps.md)). Without it the corpus is reachable only through the generic dataset API, so consumers have to export everything and filter client-side. All three routes read **live records only** (a tombstoned `removed_at` row never appears) — including `GET /grants/programs`, whose registry tombstones a program once its last posting leaves the corpus.
 
 ### `GET /grants`
 
@@ -159,6 +159,7 @@ Every filter is optional and **ANDed**; with none set it lists the whole live co
 | --- | --- |
 | `status` | Exact match on the normalized status: `open` \| `forecasted` \| `closed`. |
 | `source` | Exact match on the source app: `grants-gov` \| `ca-grants`. |
+| `program` | Exact match on the record's `program_key` — every posting of one funding program, across annual cycles and across portals, in one query. The keys are the ones `GET /grants/programs` lists (`aln:93.912`, `family:HORIZON-CL4-DATA-01`, `<agency>\|<program title>`). The field is stamped onto each unified row by the corpus pass and is **declared derived**, so it is excluded from change detection: gaining or correcting an identity never reads as a source publication. A row the identity rules could not name a program for carries no `program_key` and never matches — honest absence, not an `unknown` bucket. |
 | `agency` | **Case-insensitive substring** of the agency name (`agency=health` matches "National Institutes of Health"). `%`/`_` are literal, not wildcards. |
 | `closing_before` / `closing_after` | `close_date` on or before / on or after this date. `close_date` is canonical `YYYY-MM-DD`, so the comparison is lexicographic. **Records with no close date are excluded whenever either filter is set** — a forecasted grant with no deadline is not "closing before" anything. A non-`YYYY-MM-DD` value is `400 bad_request`. |
 | `min_award` | Keeps records whose **`award_ceiling` >= v OR `total_funding` >= v**. Sources report grant size inconsistently (a per-award ceiling vs. a program total), so matching either keeps the funder's largest published number in play. A record with both fields null never matches. Grants.gov's **Search2** API publishes no money at all (live-verified 2026-08-04: an `oppHits[]` entry carries only `id, number, title, agencyCode, agency, openDate, closeDate, oppStatus, docType, cfdaList`), so federal amounts do not come from the listing — they are joined in from the **`fetchOpportunity` detail corpus** (`grants/opportunity_details`), whose `synopsis` block does carry `awardFloor` / `awardCeiling` / `estimatedFunding`. A federal record therefore matches `min_award` **iff its detail record has been harvested and the agency actually published a figure**; the agency's literal `"none"` stays `Null` and never becomes a matching `0`. Coverage is the detail corpus, which the harvest fills incrementally (`harvestDetails`, **on by default since 2026-08-04**, see [apps.md](apps.md)) — an un-harvested or figure-less federal opportunity is honestly invisible to this filter. Because the harvest is delta-only, coverage grows **forward** from that date rather than retroactively: opportunities that never change are never re-fetched, so a corpus backfill remains a non-goal and federal `min_award` recall climbs day by day. |
@@ -172,7 +173,39 @@ Live **open** grants whose `close_date` falls within `days` of today, **soonest 
 
 This is **cross-source** — the pre-existing `closingSoon` digest in the grants-gov job artifact is federal-only and computed from raw API hits, so it never sees CA grants. It is **computed on read**, not materialized as a dataset: membership changes with the *calendar*, not with the data, so a snapshotted list would go stale between syncs even when nothing upstream changed. The corpus is small enough that a read view costs nothing to keep correct.
 
-**Performance stance:** both routes filter with SQLite `json_extract` over the `data` column, i.e. a full scan of the `(app, dataset)` partition with no index on the filtered fields. That is the right trade at current scale (the unified corpus is in the low thousands) and it keeps the record store free of any coupling to an app's record shape — new filters need no migration. If the corpus grows to where the scan hurts, the escape hatch is a generated column over the hot field plus an index on it; the query builder would not have to change.
+### `GET /grants/programs` (N29, 2026-09-02)
+
+One row per funding **program** — the entity the postings belong to. `grants/unified` answers "which opportunities are open"; this answers the question a grant-seeker actually has: *does this program come back, when, and does this agency move its deadlines*. Before it, that meant joining `grants/recurrence_links` (pairwise `a|b` rows), `grants/events` (an append-only timeline nothing rolled up) and `cordis/topic_stats` (EU-only) by hand.
+
+Unlike `/grants/closing-soon` this is **materialized, not computed on read**: it folds four datasets, and a per-request join of those would be a full scan of each. It is rebuilt by the once-per-cycle corpus pass (see [apps.md](apps.md)), so a fresh program appears within one sync cycle of its first posting.
+
+| Param | Semantics |
+| --- | --- |
+| `program` | Exact `program_key`, for fetching one program without knowing its shape. |
+| `agency` | **Case-insensitive substring** of the agency as the program's *latest* posting published it. |
+| `source` | Keeps programs whose `sources[]` names this source app — matched as a substring of the serialized array, which is exact enough for the three source ids in play and needs no array-containment operator in the store. |
+| `next_expected_before` | Programs expected to **reopen** on or before this `YYYY-MM-DD`. Only a program that earned a projection has a `next_expected_open`, so this is the forward calendar — "what is coming back in the next 60 days" — and it silently excludes the programs we cannot honestly predict, which is the point. A non-`YYYY-MM-DD` value is `400 bad_request`. |
+
+Dual-mode per the cursor convention, exactly like `/grants`: `{programs: [Record]}` without `cursor=`, `{items, next_cursor}` with it; `limit` defaults to 50 and is capped at 500.
+
+Each record's `data`:
+
+| Field | Meaning |
+| --- | --- |
+| `program_key` | The identity, and the key. `aln:<sorted, deduplicated listing set>` where the postings publish an Assistance Listing Number; else `family:<Horizon topic lineage>`; else `<normalized agency>\|<year-stripped program title>`. **Precision over recall**, the same rule the recurrence relation is built on: the listing *set* is used rather than the first entry, so a program that widened its listings reads as two programs (a miss) instead of two programs merging into one (a lie every other number on the row would inherit). |
+| `title`, `agency` | From the **latest** posting — a program's own name drifts, and the newest posting is the one a reader is about to apply to. |
+| `sources[]` | Which source portals have carried this program. |
+| `cycles_observed` / `dated_cycles` | Postings observed, and the subset carrying a parsable deadline. Only the latter can support a period, and reporting one number for both would hide why a 4-posting program has no projection. |
+| `period_days`, `next_expected_open`, `next_expected_close`, `prediction_basis` | The recurrence projection, computed from this program's own dated cycles through the same `project_recurrence` the pairwise links use — so the two surfaces cannot disagree about what evidence a prediction needs. Two cycles give one interval and therefore a period but **no** next window; three give two intervals, and they must agree within 45 days. `prediction_basis` always explains the null. |
+| `opportunities[]` | The unified keys, so `GET /grants?program=` and this row cannot drift apart. |
+| `recurrence_linked` | How many of those postings the SimHash relation pass *also* paired as annual cycles — corroboration, not evidence. |
+| `deadline_extended_count`, `closed_early_count`, `extension_rate` | The amendment behaviour `grants/events` was justified by, finally rolled up. `extension_rate` is the share of this program's postings whose deadline moved **later at least once** (a posting extended twice counts once), and it is **`null`, never `0.0`,** when the events read came back at its cap — a rate over a window has an unknown denominator. |
+| `last_award_ceiling` | The most recent published per-award ceiling, walking newest-first, so a cycle that omits the figure keeps the last one the program named. |
+| `win_history` | Horizon only: the `cordis/topic_stats` block for this family (`{family, source, as_of, stats}`), skipped when that rollup is tombstoned. `null` elsewhere — absence of evidence is never rendered as a zero-project history. |
+
+**Known gaps (v1):** no `award_ceiling_trend`, no per-program document links, and no program merges across sources — a program listed federally *and* on a state portal under different identities stays two rows.
+
+**Performance stance:** all three routes filter with SQLite `json_extract` over the `data` column, i.e. a full scan of the `(app, dataset)` partition with no index on the filtered fields. That is the right trade at current scale (the unified corpus is in the low thousands) and it keeps the record store free of any coupling to an app's record shape — new filters need no migration. If the corpus grows to where the scan hurts, the escape hatch is a generated column over the hot field plus an index on it; the query builder would not have to change.
 
 ## Data-source catalog (`/catalog/sources`)
 

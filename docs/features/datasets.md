@@ -12,7 +12,7 @@ Persistent, queryable record store (`records` table): apps upsert typed JSON rec
 
 ### Derived paths — a producer can say which fields aren't its own news
 
-Some apps write a block **joined from another dataset** into their own records before upserting: `eu-sedia` embeds `cordis/topic_stats` into every Horizon topic as `history` (see [apps.md](apps.md)). Hashing the whole value made the *joined* dataset's cadence look like a change at the source — every weekly cordis rollup marked every joined topic `changed` in the next daily eu-sedia run, and watches, triggers, webhooks, the revision trail and the `job_yield` ledger all counted it as a real SEDIA publication.
+Some apps write a block **joined from another dataset** into their own records before upserting: `eu-sedia` embeds `cordis/topic_stats` into every Horizon topic as `history`, and the grants layer stamps each unified row with the `program_key` its program registry derived (see [apps.md](apps.md)). Hashing the whole value made the *joined* dataset's cadence look like a change at the source — every weekly cordis rollup marked every joined topic `changed` in the next daily eu-sedia run, and watches, triggers, webhooks, the revision trail and the `job_yield` ledger all counted it as a real SEDIA publication.
 
 A producer may now declare those paths at the write:
 
@@ -35,6 +35,8 @@ It is **producer-facing only — no HTTP API change** — and narrows exactly on
 | removal detection, revival, trust, provenance, derived specs | untouched |
 
 **Opt-in per write, default off.** `DerivedPaths::NONE` is what every existing call site passes, and `declaring_no_derived_paths_is_byte_identical_to_the_plain_upsert` (`crates/core/tests/derived_change.rs`) pins that all four batch entry points still produce the identical stored hash — the safety argument for touching a shared write path is asserted, not assumed. The batch path (`upsert_many_*`) carries the seam; the single-record `upsert_stamped` has no derived variant, because the writers that need one are exactly the full-corpus batch producers.
+
+**Every writer of a dataset has to declare the same paths.** `grants/unified` has three write sites in `grants-common` (the source contribution, the batch sweep, the corpus sweep) and only one of them derives the `program_key` stamp — but a *non*-declaring write hashes the stamp back in, so it would mint a spurious `changed` revision for every row it touched, and a declaring write of a row that never got stamped silently strips it. The seam is per-write, so the invariant is per-dataset: route every write of a dataset with derived paths through one helper (`grants_common::write_unified`) rather than declaring at each call site.
 
 **One-time transition cost, by design.** Records whose stored hash was computed over the full value re-hash the first time their producer adopts the seam, so they report `changed` **once** — bounded by the number of records carrying the declared path (for eu-sedia: `historyJoined`, the joined Horizon topics) — and settle from then on. Budget one noisy run per adopting producer, not a corpus rewrite.
 
