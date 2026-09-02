@@ -318,6 +318,27 @@ Two honest limits:
 - `CLAUDE.md` discovery walks *upward*. If your storage root sits inside a Claude Code project (the default `data/pumper.db` does, when you run from a checkout), the parent project is still found. The escape hatch is the existing `[storage] database_path`: point it somewhere outside any such project and the context is genuinely empty. There is no new config key for this.
 - `[claude] bare` (default `false`, unchanged) remains the complete lever: it skips hooks, plugin sync, auto-memory and `CLAUDE.md` auto-discovery outright, regardless of where the process runs. Set it when you want the subprocess to carry nothing but your prompt.
 
+## Sharing what the fetcher learned: the mesh
+
+Both of the fetcher's learned assets — the per-host tier memory below and the
+API recipes further down — travel between nodes as **signed bundles** on a
+schedule. See [mesh.md](mesh.md): `GET /host-weather/export` and
+`GET /recipes/export` are the serving side, `[[peer]] pull = ["weather",
+"recipes"]` is the pulling side, and both imports refuse a bundle whose
+signature does not verify against the key that peer pinned.
+
+Two rules matter here rather than there:
+
+- **Weather is a prior, not truth.** The merge is raise-only and count-weighted
+  and never downgrades a locally-observed pin, because hosts behave differently
+  per egress IP and geo (see the import precedence below). A per-peer
+  `max_penalty_secs` bounds the worst a compromised peer can do to this node's
+  politeness. A *scheduled* import lands in tier memory and the persisted
+  penalty snapshot; the live in-process governor adopts it at the next restart.
+- **A recipe's validation never travels.** An imported recipe always lands
+  `validated: false` and is proven by this node's own replay, because a
+  validation verdict is a claim about a replay from a particular egress IP.
+
 ## Politeness governor (adaptive)
 
 Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. Learned penalties are **persisted** (see host profiles below) so they survive a restart.
@@ -358,6 +379,10 @@ With it ON, four things happen in order.
 ## Known gaps
 
 - **A pinned host is consulted; an unpinned one is not.** The `api_recipe` pin is now an input to `AppContext::fetch`'s routing decision (see "The router honours both pins" above), so a pinned host consults recipes even with `xray` and `[recipes] enabled` both off. What the pin still cannot do is *rank* the recipe tier — its position in the ladder is fixed (ahead of archive), so a pin cannot express "try http first anyway", and there is no per-host memory of how good the recipe was, only that it once served.
+- **A mesh-imported recipe still costs its own proving replay.** Importing is
+  sharing candidates, not sharing verdicts ([mesh.md](mesh.md) § Weather and
+  recipe streams), so a fleet of N nodes performs N validations of the same
+  endpoint — deliberately, since each is validating from its own egress.
 - **No per-host cap on unvalidated tries.** A freshly discovered candidate is replayed on the next fetch of its host; the only bound is the burn count (`[recipes] max_failures`), not a per-day ceiling.
 - **A validating replay is not separately metered.** It happens inside a normal `AppContext::fetch`, so it is governed, cached and traced like any HTTP request, but it does not appear as its own cost event.
 - **Recipes for `GET` endpoints only, and with the parameters as observed.** `replay_url` refuses a template with an unfilled placeholder, but not a stale *filled* one — a paginated endpoint replays with the page parameter the capture saw, which is why `payload_overlaps` (not the status alone) is the acceptance bar and the strike ladder is short. POST APIs and recipe sharing between nodes are out of scope.

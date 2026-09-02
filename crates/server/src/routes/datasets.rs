@@ -1107,6 +1107,81 @@ pub(crate) async fn record_history(
     ))
 }
 
+// ── live-set manifest (N16, mesh reconcile) ─────────────────────────────────
+
+/// Ceiling on keys one manifest call walks. Past it the manifest is honest
+/// about being partial (`complete: false`) and a mirror REFUSES to reconcile
+/// from it — tombstoning against a truncated origin view would delete live
+/// records, which is a worse bug than the ghosts reconcile exists to remove.
+const MANIFEST_KEYS_CAP: i64 = 50_000;
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub(crate) struct ManifestQuery {
+    /// Include the key list itself. Default false: the digest alone answers
+    /// "are we in sync", and the keys are only needed on the mismatch path.
+    #[serde(default)]
+    keys: bool,
+}
+
+/// Live-set manifest: the key count and a rolling hash over the live keys.
+///
+/// This is the reconcile primitive. A hard delete on an origin (`DELETE
+/// /datasets/{app}/{ds}/records/{key}`) removes the row outright, so no
+/// `removed` revision ever enters the change feed and no puller can learn of
+/// it — the mirror keeps serving a record the origin does not have. A mirror
+/// compares this digest against its own; on a mismatch it asks for the keys and
+/// tombstones the ones the origin no longer lists.
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/manifest",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ManifestQuery,
+    ),
+    responses((status = 200, description = "`{app, dataset, count, live_count, digest, \
+        complete, cap, keys?}` — `digest` is SHA-256 over the sorted live keys; `complete` is \
+        false when the dataset exceeds the walk cap, and a mirror must not reconcile against \
+        an incomplete manifest."))
+)]
+pub(crate) async fn dataset_manifest(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+    Query(query): Query<ManifestQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let count = state.datasets.record_count(&app, &dataset).await?;
+    // One row over the cap is what makes truncation detectable rather than
+    // indistinguishable from "exactly at the cap".
+    let records = state
+        .datasets
+        .list(&app, &dataset, MANIFEST_KEYS_CAP + 1)
+        .await?;
+    let complete = (records.len() as i64) <= MANIFEST_KEYS_CAP;
+    let live: Vec<String> = records
+        .into_iter()
+        .take(MANIFEST_KEYS_CAP as usize)
+        .filter(|r| r.removed_at.is_none())
+        .map(|r| r.key)
+        .collect();
+    let digest = app_peer::envelope::manifest_digest(&live);
+    let mut body = json!({
+        "app": app,
+        "dataset": dataset,
+        // Every row, tombstones included — the number `GET /datasets` shows.
+        "count": count,
+        // The set the digest is over.
+        "live_count": live.len(),
+        "digest": digest,
+        "complete": complete,
+        "cap": MANIFEST_KEYS_CAP,
+    });
+    if query.keys {
+        body["keys"] = json!(live);
+    }
+    Ok(Json(body))
+}
+
 #[cfg(test)]
 mod cursor_arg_tests {
     use super::*;

@@ -101,6 +101,9 @@
 //! server-side `[[peer]]` scheduling — runs are on-demand jobs; a `[[peer]]`
 //! config block that enqueues them on a cron is the documented next slice.
 
+pub mod envelope;
+pub mod mesh;
+
 use std::collections::HashSet;
 
 use async_trait::async_trait;
@@ -152,7 +155,11 @@ impl ScrapeApp for Peer {
             params_schema: Some(json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["url", "datasets"],
+                // `datasets` is required only for the `datasets` stream, which
+                // the schema cannot express without a conditional; it is
+                // enforced in `run` instead. Requiring it here would 422 every
+                // weather/recipes schedule at the enqueue door.
+                "required": ["url"],
                 "properties": {
                     "url": {
                         "type": "string",
@@ -177,6 +184,47 @@ impl ScrapeApp for Peer {
                         "maximum": MAX_RECORDS_CAP,
                         "description": "Per-dataset revision budget for this run (default 500). \
                                         A capped walk suspends and resumes next run."
+                    },
+                    "stream": {
+                        "type": "string",
+                        "enum": ["datasets", "weather", "recipes"],
+                        "description": "What to pull. Default \"datasets\" (the revision feed). \
+                                        \"weather\" merges the peer's host intelligence; \
+                                        \"recipes\" imports its discovered JSON APIs as local \
+                                        candidates."
+                    },
+                    "peer_name": {
+                        "type": "string",
+                        "description": "Label this pull is recorded under in `peer/mesh` and on \
+                                        GET /mesh. The scheduler passes the [[peer]] name."
+                    },
+                    "public_key": {
+                        "type": "string",
+                        "description": "The peer's ed25519 public key (64 hex). Bundles are \
+                                        verified against it; without it a bundle can only be \
+                                        accepted unverified, and only under allow_unsigned."
+                    },
+                    "allow_unsigned": {
+                        "type": "boolean",
+                        "description": "Accept an unsigned or unverifiable bundle. Default false."
+                    },
+                    "max_penalty_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Ceiling on a politeness penalty imported from this peer \
+                                        (seconds). 0 = no extra ceiling beyond core's own cap."
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "Credential presented to the peer as x-pumper-key. Use \
+                                        \"env:VAR_NAME\" to keep the secret out of the schedule \
+                                        row and out of every job's params."
+                    },
+                    "reconcile": {
+                        "type": "boolean",
+                        "description": "After a datasets walk, compare live-set digests with the \
+                                        origin and tombstone ghosts a hard delete left behind. \
+                                        Default true; requires the origin to serve /manifest."
                     }
                 },
                 "additionalProperties": true
@@ -200,13 +248,20 @@ impl ScrapeApp for Peer {
                 },
             ],
             output_shape: Some(
-                "{ peer, max_records, status: ok|partial, datasets: [{dataset, namespace, \
-                 status: ok|not_modified|drift|error, pulled, new, changed, unchanged, \
-                 skipped_older_revisions, skipped_malformed, origin_provenance_kept, \
-                 origin_artifact_sha_dropped, tombstones_applied, tombstones_deferred, capped, \
-                 walk_resumed, walk_completed, since, note?, error?}], \
-                 index_datasets: [{app, dataset}], tombstones: string }. \
-                 A run where EVERY dataset errored fails the job instead of returning this.",
+                "stream=datasets (default): { peer, max_records, status: ok|partial, datasets: \
+                 [{dataset, namespace, status: ok|not_modified|drift|error, pulled, new, \
+                 changed, unchanged, skipped_older_revisions, skipped_malformed, \
+                 origin_provenance_kept, origin_artifact_sha_dropped, tombstones_applied, \
+                 tombstones_deferred, capped, walk_resumed, walk_completed, since, \
+                 reconcile: {reconciled, in_sync, local_digest, origin_digest, ghosts_removed, \
+                 ghost_keys?, reason?}, note?, error?}], index_datasets: [{app, dataset}], \
+                 tombstones: string }. \
+                 stream=weather: { stream, status, verified, source_node_id, considered, \
+                 changed, noops, penalties_raised, max_penalty_secs, note, peer, peer_name }. \
+                 stream=recipes: { stream, status, verified, source_node_id, considered, \
+                 imported, skipped, notes, note, peer, peer_name }. \
+                 A run where EVERY dataset errored fails the job instead of returning this, and \
+                 a bundle stream whose envelope is REFUSED fails the job outright.",
             ),
             cost_class: CostClass::Free,
         }
@@ -214,6 +269,22 @@ impl ScrapeApp for Peer {
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let base = normalize_base_url(ctx.require_str("url")?)?;
+        // N16: which stream this run pulls. Absent = `datasets`, so every
+        // pre-mesh peer job and every stored schedule keeps its exact meaning.
+        let stream = ctx
+            .params
+            .get("stream")
+            .and_then(Value::as_str)
+            .unwrap_or("datasets")
+            .to_string();
+        if stream == "weather" || stream == "recipes" {
+            return run_bundle_stream(&ctx, &base, &stream).await;
+        }
+        if stream != "datasets" {
+            return Err(Error::App(format!(
+                "unknown stream {stream:?}; expected \"datasets\", \"weather\" or \"recipes\""
+            )));
+        }
         let specs: Vec<String> = ctx
             .params
             .get("datasets")
@@ -247,10 +318,24 @@ impl ScrapeApp for Peer {
             .get("namespace")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // N16 additions. `reconcile` defaults ON: the ghost gap is the whole
+        // reason the manifest exists, and an origin that does not serve
+        // `/manifest` answers 404, which the pass reports rather than fails on.
+        let reconcile = ctx
+            .params
+            .get("reconcile")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let api_key = ctx
+            .params
+            .get("api_key")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let peer_label = peer_label(&ctx.params, &base);
 
         let mut reports: Vec<Value> = Vec::new();
         for spec in &specs {
-            let report = match pull_one(
+            let mut report = match pull_one(
                 &ctx,
                 &base,
                 spec,
@@ -266,6 +351,60 @@ impl ScrapeApp for Peer {
                     "error": e.to_string(),
                 }),
             };
+            // N16 ghost reconcile. AFTER the walk, so the mirror is as caught up
+            // as this run will make it before the live sets are compared —
+            // reconciling first would diagnose "not pulled yet" as "ghost" on
+            // every single run. Never on an errored dataset: a diff against a
+            // mirror this run could not update is not evidence of anything.
+            let mut ghosts_removed = 0i64;
+            let errored = report.get("status").and_then(Value::as_str) == Some("error");
+            if reconcile && !errored {
+                let namespace = report
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (remote_app, dataset) = parse_dataset_spec(spec)?;
+                let verdict = mesh::reconcile_ghosts(
+                    &ctx,
+                    &base,
+                    api_key.as_deref(),
+                    &remote_app,
+                    &dataset,
+                    &namespace,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    // A reconcile failure never fails a pull that worked: the
+                    // revisions landed, and "the ghosts are still there" is a
+                    // degraded state, not a lost one.
+                    json!({ "reconciled": false, "reason": e.to_string(), "ghosts_removed": 0 })
+                });
+                ghosts_removed = verdict
+                    .get("ghosts_removed")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                report["reconcile"] = verdict;
+            }
+            // One mesh status record per (peer, dataset stream), matching the
+            // schedule the reconcile pass creates.
+            let slug = match parse_dataset_spec(spec) {
+                Ok((a, d)) => format!("datasets-{a}-{d}"),
+                Err(_) => format!("datasets-{spec}"),
+            };
+            let outcome = mesh::MeshOutcome {
+                ok: !errored,
+                verified: false,
+                signature_failure: false,
+                ghosts_removed,
+                node_id: None,
+                detail: report
+                    .get("error")
+                    .or_else(|| report.get("note"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            mesh::write_mesh_status(&ctx, &peer_label, &slug, &base, &outcome).await?;
             reports.push(report);
         }
 
@@ -314,6 +453,85 @@ impl ScrapeApp for Peer {
             // as real local tombstones (removed_at + a 'removed' revision).
             "tombstones": "applied from the feed's 'removed' revisions",
         }))
+    }
+}
+
+/// The label this run is recorded under in `peer/mesh` and on `GET /mesh`.
+///
+/// The scheduler always supplies `peer_name` from the `[[peer]]` row. A
+/// hand-POSTed job usually does not, and falling back to the URL's host keeps
+/// an ad-hoc pull visible on the status page instead of writing it to a shared
+/// `"manual"` bucket that two different peers would then fight over.
+pub(crate) fn peer_label(params: &Value, base: &str) -> String {
+    if let Some(name) = params
+        .get("peer_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    base.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.replace(':', "-"))
+        .unwrap_or_else(|| "peer".to_string())
+}
+
+/// Runs one of the two BUNDLE streams (`weather`, `recipes`).
+///
+/// Both share the same shape: fetch a signed envelope, refuse it or apply it,
+/// record the outcome. A refusal fails the JOB — an unverifiable bundle is not a
+/// degraded pull, it is a pull that must not have happened — but the status
+/// record is written first, so `GET /mesh` shows the signature failure that
+/// `GET /jobs/{id}` shows the error for.
+async fn run_bundle_stream(ctx: &AppContext, base: &str, stream: &str) -> Result<Value> {
+    let trust = mesh::trust_from_params(&ctx.params);
+    let api_key = ctx
+        .params
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let max_penalty_secs = ctx
+        .params
+        .get("max_penalty_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let label = peer_label(&ctx.params, base);
+
+    let pulled = match stream {
+        "weather" => {
+            mesh::pull_weather(ctx, base, api_key.as_deref(), &trust, max_penalty_secs).await
+        }
+        _ => mesh::pull_recipes(ctx, base, api_key.as_deref(), &trust).await,
+    };
+
+    match pulled {
+        Ok((report, outcome)) => {
+            mesh::write_mesh_status(ctx, &label, stream, base, &outcome).await?;
+            let mut out = report;
+            out["peer"] = json!(base);
+            out["peer_name"] = json!(label);
+            Ok(out)
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            let outcome = mesh::MeshOutcome {
+                ok: false,
+                // `REFUSED` is the marker `mesh::fetch_bundle` puts on a
+                // trust-policy rejection, which is the failure an operator
+                // needs separated from "the peer was down".
+                signature_failure: detail.contains("REFUSED"),
+                detail: Some(detail),
+                ..Default::default()
+            };
+            // Best-effort: the run is failing either way, and losing the status
+            // write would hide WHY on the one page built to show it.
+            let _ = mesh::write_mesh_status(ctx, &label, stream, base, &outcome).await;
+            Err(e)
+        }
     }
 }
 
@@ -886,7 +1104,7 @@ fn run_outcome(statuses: &[&str]) -> RunOutcome {
 /// The store used to refuse this for us as a side effect of the empty-`present`
 /// guard on `detect_removed`; naming it here keeps the behavior after the switch
 /// to `tombstone_keys`, which — being removal by name — has no such guard.
-fn tombstones_would_empty_the_mirror(live: &[String], dead: &[String]) -> bool {
+pub(crate) fn tombstones_would_empty_the_mirror(live: &[String], dead: &[String]) -> bool {
     if live.is_empty() {
         return false; // nothing live to lose
     }

@@ -77,6 +77,17 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // feed. The tiered `FetchRequest` carries no validator, so routing this
     // through `ctx.fetch` would silently drop the 304 path a mirror walks on.
     ("crates/apps/peer/src/lib.rs::ctx.engines.http", 1),
+    // Mesh pulls (N16): the two signed-bundle/manifest GETs the peer app makes
+    // against another node — `{peer}/host-weather/export`, `{peer}/recipes/export`
+    // (one shared helper) and `{peer}/datasets/{app}/{ds}/manifest`. Same class
+    // as the change-feed row above and for the same reasons, plus one of its
+    // own: these carry an `x-pumper-key` credential header for the peer's own
+    // `[auth]` layer, and `FetchRequest` has no header seam. They are also
+    // `no_cache` by construction — a bundle is live intelligence and the TTL
+    // cache must not serve yesterday's — so the tiered fetcher's cache and
+    // escalation ladder have nothing to contribute. Cost is $0 (the HTTP tier
+    // is free) and the streams are peer-to-peer control traffic, not scraping.
+    ("crates/apps/peer/src/mesh.rs::ctx.engines.http", 2),
     (
         "crates/apps/smlouvy-dump-watch/src/lib.rs::ctx.engines.http",
         1,

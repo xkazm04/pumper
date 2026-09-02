@@ -13,7 +13,13 @@
 //! boundary is not lost, a corrupt cursor fails the run loudly instead of
 //! silently walking from the top, and a watch on the mirror namespace fires.
 //!
-//! What it does NOT prove — see `docs/features/peering.md` § Known gaps:
+//! N16 adds the mesh proofs to the same two nodes: a bundle signed by the wrong
+//! key is REFUSED (and counted on the mirror's status record), an unverifiable
+//! one is refused unless explicitly allowed, and a HARD delete on the origin —
+//! which emits no revision at all, so no walk can ever find it — is reconciled
+//! away by the live-set digest pass.
+//!
+//! What it does NOT prove — see `docs/features/mesh.md` § Known gaps:
 //! two nodes in one process share a clock and a loopback interface, so clock
 //! skew between origin and mirror, network partitions mid-walk, and any
 //! authentication story are all out of reach here.
@@ -590,4 +596,311 @@ async fn a_watch_on_the_mirror_namespace_fires_on_a_pull() {
     );
     assert_eq!(payload["dataset"], DATASET);
     assert_eq!(payload["count"], 2);
+}
+
+// ── the mesh (N16) ──────────────────────────────────────────────────────────
+
+/// Runs one `peer` job with arbitrary params (no dataset defaults) and returns
+/// the finished row — the bundle streams take no `datasets` list.
+async fn run_peer(mirror: &AppState, params: Value) -> Job {
+    let job = mirror
+        .storage
+        .enqueue(
+            "peer",
+            EnqueueOptions {
+                params,
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enqueue peer job");
+    assert!(
+        worker::run_one(mirror).await,
+        "the queued peer job must be claimed and run"
+    );
+    mirror
+        .storage
+        .get(job.id)
+        .await
+        .expect("read the peer job back")
+        .expect("the peer job row exists")
+}
+
+/// The mirror's `peer/mesh` status record for one (peer label, stream).
+async fn mesh_status(mirror: &AppState, label: &str, stream: &str) -> Value {
+    mirror
+        .datasets
+        .get("peer", "mesh", &format!("{label}|{stream}"))
+        .await
+        .expect("read the mesh status record")
+        .map(|r| r.data)
+        .unwrap_or(Value::Null)
+}
+
+/// The whole point of signing, over a real socket: a bundle that did not come
+/// from the key this mirror pinned is REFUSED, the job fails, and the refusal
+/// is countable on the mirror's own status page rather than only in a log line.
+///
+/// The two nodes hold genuinely different keypairs (identity is memoised per
+/// key-file path, and each node has its own temp dir), so "the wrong key" here
+/// is a real other key, not a fixture constant.
+#[tokio::test]
+async fn a_bundle_signed_by_the_wrong_key_is_refused_and_counted() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+
+    // Teach the origin something worth exporting: 3 losses pin the host.
+    for _ in 0..3 {
+        origin
+            .tiers
+            .record("pinned.example", "browser", true)
+            .await
+            .expect("record a tier outcome");
+    }
+
+    let origin_key = crate::node::identity(&origin)
+        .expect("origin identity")
+        .public_key_hex();
+    let impostor_key = crate::node::identity(&mirror)
+        .expect("mirror identity")
+        .public_key_hex();
+    assert_ne!(
+        origin_key, impostor_key,
+        "two nodes in one process must not share a keypair, or this test proves nothing"
+    );
+
+    // Pinned to the WRONG key: the bundle is real, the key is not the one this
+    // peer row trusts, so it must not be applied.
+    let job = run_peer(
+        &mirror,
+        json!({
+            "url": base,
+            "stream": "weather",
+            "peer_name": "origin",
+            "public_key": impostor_key,
+            "allow_unsigned": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        job.status,
+        JobStatus::Failed,
+        "a refused bundle must fail the job, not degrade it: {:?}",
+        job.result
+    );
+    assert!(
+        job.error.as_deref().unwrap_or_default().contains("REFUSED"),
+        "the failure must name the refusal: {:?}",
+        job.error
+    );
+    assert!(
+        mirror
+            .tiers
+            .get("pinned.example")
+            .await
+            .expect("read tier memory")
+            .is_none(),
+        "nothing from an unverified bundle may reach tier memory"
+    );
+    let status = mesh_status(&mirror, "origin", "weather").await;
+    assert_eq!(status["ok"], false);
+    assert_eq!(
+        status["signature_failures"], 1,
+        "the refusal is countable on GET /mesh: {status}"
+    );
+    assert!(
+        status["last_success_at"].is_null(),
+        "a peer that never succeeded must not report a success time"
+    );
+
+    // The same pull with the RIGHT key verifies and applies.
+    let job = run_peer(
+        &mirror,
+        json!({
+            "url": base,
+            "stream": "weather",
+            "peer_name": "origin",
+            "public_key": origin_key,
+            "allow_unsigned": false,
+        }),
+    )
+    .await;
+    assert_eq!(job.status, JobStatus::Succeeded, "result: {:?}", job.result);
+    let result = job.result.expect("weather result");
+    assert_eq!(result["verified"], true);
+    assert_eq!(result["changed"], 1, "result: {result}");
+    let adopted = mirror
+        .tiers
+        .get("pinned.example")
+        .await
+        .expect("read tier memory")
+        .expect("the verified bundle's pin was adopted");
+    assert_eq!(adopted.preferred_tier.as_deref(), Some("browser"));
+    assert_eq!(
+        adopted.observations, 0,
+        "an import never fabricates local evidence"
+    );
+
+    let status = mesh_status(&mirror, "origin", "weather").await;
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["verified"], true);
+    assert_eq!(status["pulls"], 2, "counters accumulate across runs");
+    assert_eq!(
+        status["signature_failures"], 1,
+        "the earlier refusal is not erased by a later success"
+    );
+    assert!(status["last_success_at"].is_string());
+}
+
+/// An UNVERIFIABLE bundle is refused by default. The trap this closes: a
+/// signature nobody can check reading as "signed, therefore fine".
+#[tokio::test]
+async fn a_bundle_nobody_can_verify_is_refused_unless_explicitly_allowed() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+    for _ in 0..3 {
+        origin
+            .tiers
+            .record("pinned.example", "browser", true)
+            .await
+            .expect("record a tier outcome");
+    }
+
+    // No key pinned, allow_unsigned absent → the safe default refuses.
+    let job = run_peer(
+        &mirror,
+        json!({ "url": base, "stream": "weather", "peer_name": "origin" }),
+    )
+    .await;
+    assert_eq!(job.status, JobStatus::Failed, "result: {:?}", job.result);
+
+    // Explicit opt-in accepts it — and says `verified: false` about it.
+    let job = run_peer(
+        &mirror,
+        json!({
+            "url": base, "stream": "weather", "peer_name": "origin",
+            "allow_unsigned": true,
+        }),
+    )
+    .await;
+    assert_eq!(job.status, JobStatus::Succeeded, "result: {:?}", job.result);
+    assert_eq!(
+        job.result.expect("result")["verified"],
+        false,
+        "an unverifiable bundle must never claim to be verified"
+    );
+}
+
+/// The hard-delete gap, closed. An outright `DELETE` on the origin emits NO
+/// revision, so no walk of the change feed can ever learn of it — before the
+/// reconcile pass the mirror served that record forever, with a green run.
+#[tokio::test]
+async fn a_hard_delete_on_the_origin_is_reconciled_away_on_the_mirror() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+
+    origin_sync(
+        &origin,
+        &[("keep", json!({"v": 1})), ("vanished", json!({"v": 1}))],
+    )
+    .await;
+    pull(&mirror, &base, json!({ "peer_name": "origin" })).await;
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["keep".to_string(), "vanished".into()]
+    );
+
+    // The hard delete: the row is gone from the origin outright.
+    assert!(
+        origin
+            .datasets
+            .delete_record(ORIGIN_APP, DATASET, "vanished")
+            .await
+            .expect("hard-delete on the origin"),
+        "the record existed before it was deleted"
+    );
+    let feed_after = origin_revisions(&origin).await;
+    assert!(
+        !feed_after
+            .iter()
+            .any(|r| r.key == "vanished" && r.change == "removed"),
+        "the premise: a hard delete leaves NO removed revision for a puller to find"
+    );
+
+    // A plain walk therefore changes nothing — the ghost survives it.
+    let rep = report(
+        &pull(
+            &mirror,
+            &base,
+            json!({ "reconcile": false, "peer_name": "origin" }),
+        )
+        .await,
+    );
+    assert_eq!(rep["tombstones_applied"], 0);
+    assert!(
+        rep.get("reconcile").is_none(),
+        "reconcile: false must not run the pass at all"
+    );
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["keep".to_string(), "vanished".into()],
+        "without the reconcile the mirror keeps serving a record the origin deleted"
+    );
+
+    // With the reconcile on, the digest mismatch is found and the ghost dies.
+    let rep = report(&pull(&mirror, &base, json!({ "peer_name": "origin" })).await);
+    let rec = &rep["reconcile"];
+    assert_eq!(rec["reconciled"], true, "report: {rep}");
+    assert_eq!(rec["in_sync"], false);
+    assert_ne!(rec["local_digest"], rec["origin_digest"]);
+    assert_eq!(rec["ghosts_removed"], 1);
+    assert_eq!(rec["ghost_keys"], json!(["vanished"]));
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["keep".to_string()],
+        "the ghost is gone"
+    );
+    // A real tombstone, so the mirror's own feed carries the removal downstream.
+    let removed: Vec<String> = mirror
+        .datasets
+        .changes_since(NAMESPACE, Some(DATASET), None, 50, None)
+        .await
+        .expect("mirror feed")
+        .into_iter()
+        .filter(|r| r.change == "removed")
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(removed, vec!["vanished".to_string()]);
+
+    // And the pass is idempotent: once converged it removes nothing more.
+    let rep = report(&pull(&mirror, &base, json!({ "peer_name": "origin" })).await);
+    assert_eq!(rep["reconcile"]["in_sync"], true, "report: {rep}");
+    assert_eq!(rep["reconcile"]["ghosts_removed"], 0);
+    let status = mesh_status(&mirror, "origin", "datasets-fake-d").await;
+    assert_eq!(
+        status["ghosts_removed"], 1,
+        "the reconcile's work is countable on GET /mesh: {status}"
+    );
+}
+
+/// A converged mirror must not be told it has ghosts, and the pass must not
+/// consult the origin's key list when the digests already agree.
+#[tokio::test]
+async fn a_converged_mirror_reports_in_sync_and_removes_nothing() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+
+    origin_sync(&origin, &[("a", json!({"v": 1})), ("b", json!({"v": 1}))]).await;
+    let rep = report(&pull(&mirror, &base, json!({})).await);
+    assert_eq!(rep["reconcile"]["in_sync"], true, "report: {rep}");
+    assert_eq!(
+        rep["reconcile"]["local_digest"],
+        rep["reconcile"]["origin_digest"]
+    );
+    assert_eq!(rep["reconcile"]["ghosts_removed"], 0);
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["a".to_string(), "b".into()]
+    );
 }

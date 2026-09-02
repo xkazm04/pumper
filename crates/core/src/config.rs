@@ -38,6 +38,12 @@ pub struct Config {
     pub auth: AuthConfig,
     pub waiting: WaitingConfig,
     pub wasm_apps: WasmAppsConfig,
+    /// Mesh peers (N16). `[[peer]]` is an array of tables, so this is a Vec and
+    /// not a section struct: a node has zero or more peers, and an EMPTY list
+    /// (the default) is exactly today's behaviour — nothing is pulled, nothing
+    /// is scheduled, and unsigned bundle imports keep working as they always
+    /// have. See [`PeerConfig`].
+    pub peer: Vec<PeerConfig>,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -1159,6 +1165,13 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+
+        // Mesh peers (N16). Every rule here guards a row that parses fine and
+        // then produces a peer that is never pulled, or one that is pulled and
+        // then trusted for the wrong reason.
+        for (i, peer) in self.peer.iter().enumerate() {
+            peer.validate(i)?;
         }
 
         Ok(())
@@ -2733,5 +2746,430 @@ impl WasmAppsConfig {
     /// a zero here means "not configured", not "yield constantly".
     pub fn yield_interval_or_none(&self) -> Option<u64> {
         (self.yield_interval > 0).then_some(self.yield_interval)
+    }
+}
+
+// ── [[peer]] — the mesh (N16) ───────────────────────────────────────────────
+
+/// One mesh peer: a pumper node this node pulls from on a schedule.
+///
+/// `[[peer]]` is the whole federation surface. There is no push, no discovery
+/// and no gossip: an operator names the nodes this one trusts, the streams it
+/// wants from each, and how often. Everything below is **default OFF by
+/// omission** — a config with no `[[peer]]` block behaves exactly as it did
+/// before the mesh existed.
+///
+/// ```toml
+/// [[peer]]
+/// name = "vps"
+/// url = "https://vps.example:8088"
+/// public_key = "9f3c…"            # 64 hex chars, from the peer's GET /node
+/// pull = ["datasets:grants-gov/opportunities", "weather", "recipes"]
+/// every = "15m"
+/// allow_unsigned = false           # accept pre-N16 bundles from this peer
+/// max_penalty_secs = 60            # ceiling on imported politeness penalties
+/// api_key = "pk_…"                 # presented to the peer when IT runs [auth] keys
+/// ```
+///
+/// ## Trust
+///
+/// `public_key` is the only thing that makes a bundle believable. Without it a
+/// bundle can only be accepted as UNVERIFIED, and only when `allow_unsigned` is
+/// explicitly on — a signature nobody can check is worth exactly as much as no
+/// signature. `max_penalty_secs` bounds the blast radius of a peer whose key
+/// leaked: the worst it can do to this node's politeness is slow it down by
+/// that much (and the import merge is raise-only regardless, so it can never
+/// make this node *ruder*).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PeerConfig {
+    /// Operator-facing label. Defaults to the URL's host when blank; used as
+    /// the schedule id suffix, so changing it re-creates the schedule row.
+    pub name: String,
+    /// Base URL of the peer node (`http`/`https`, no trailing path).
+    pub url: String,
+    /// The peer's ed25519 public key, 64 hex chars, from its `GET /node`.
+    /// Empty = not pinned (see the type docs).
+    pub public_key: String,
+    /// Streams to pull: `"weather"`, `"recipes"`, `"datasets:<app>/<dataset>"`.
+    /// Empty = nothing is scheduled for this peer.
+    pub pull: Vec<String>,
+    /// Pull interval, e.g. `"15m"`, `"1h"`, `"900s"`. Must divide an hour (or a
+    /// day, at or above an hour) — see [`peer_cron`].
+    pub every: String,
+    /// Accept unsigned (`pumper.host-weather/1`) or unverifiable bundles from
+    /// this peer. Default false.
+    pub allow_unsigned: bool,
+    /// Ceiling (seconds) on a politeness penalty imported from this peer.
+    /// Applied ON TOP of the core import cap, never above it.
+    pub max_penalty_secs: u64,
+    /// API key presented to the peer (`x-pumper-key`) when the PEER runs
+    /// `[auth] mode = "keys"`. Mint it on the peer with a `read`-only scope:
+    /// a pull only ever GETs export/manifest/changes routes.
+    pub api_key: Option<String>,
+    /// Local app namespace mirrored dataset records land under. Default
+    /// `peer_{remote app}`, as the puller has always done.
+    pub namespace: Option<String>,
+    /// Set false to keep the row but stop scheduling it. The reconcile pass
+    /// disables the schedule rather than deleting it, so its history survives.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Serde default for `[[peer]] enabled`, which defaults ON.
+fn default_true() -> bool {
+    true
+}
+
+/// Default pull interval when `every` is blank: 15 minutes, the value the
+/// design card names.
+pub const PEER_DEFAULT_EVERY_SECS: u64 = 900;
+
+/// One stream a peer row asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullStream {
+    /// `datasets:<app>/<dataset>` — the revision feed, mirrored by the `peer` app.
+    Dataset { app: String, dataset: String },
+    /// `weather` — the host-weather bundle.
+    Weather,
+    /// `recipes` — the discovered API-recipe bundle.
+    Recipes,
+}
+
+impl PullStream {
+    /// The `stream` param the `peer` app is run with for this entry.
+    pub fn param(&self) -> &'static str {
+        match self {
+            PullStream::Dataset { .. } => "datasets",
+            PullStream::Weather => "weather",
+            PullStream::Recipes => "recipes",
+        }
+    }
+
+    /// Stable slug used in the schedule id, so one peer's three streams are
+    /// three schedule rows that never collide.
+    pub fn slug(&self) -> String {
+        match self {
+            PullStream::Dataset { app, dataset } => format!("datasets-{app}-{dataset}"),
+            PullStream::Weather => "weather".into(),
+            PullStream::Recipes => "recipes".into(),
+        }
+    }
+}
+
+/// Parses one `pull = [...]` entry.
+///
+/// Strict on purpose: a typo'd stream name is a peer that silently never syncs,
+/// which is the single hardest mesh failure to notice. `None` here becomes a
+/// config error, not a skipped row.
+pub fn parse_pull(entry: &str) -> Option<PullStream> {
+    let entry = entry.trim();
+    match entry {
+        "weather" => Some(PullStream::Weather),
+        "recipes" => Some(PullStream::Recipes),
+        _ => {
+            let spec = entry.strip_prefix("datasets:")?;
+            let (app, dataset) = spec.split_once('/')?;
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            };
+            (ok(app) && ok(dataset)).then(|| PullStream::Dataset {
+                app: app.to_string(),
+                dataset: dataset.to_string(),
+            })
+        }
+    }
+}
+
+/// Parses `every = "15m"` into seconds. Accepts a bare number (seconds) and the
+/// `s`/`m`/`h` suffixes. `None` on anything else — including `0`.
+pub fn parse_every(every: &str) -> Option<u64> {
+    let every = every.trim();
+    if every.is_empty() {
+        return Some(PEER_DEFAULT_EVERY_SECS);
+    }
+    let (digits, mult) = match every.chars().last()? {
+        's' => (&every[..every.len() - 1], 1),
+        'm' => (&every[..every.len() - 1], 60),
+        'h' => (&every[..every.len() - 1], 3600),
+        c if c.is_ascii_digit() => (every, 1),
+        _ => return None,
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    (n > 0).then_some(n * mult)
+}
+
+/// The 6-field cron a pull interval becomes.
+///
+/// The scheduler's unit of work is a cron row, not an interval, and an arbitrary
+/// interval does not map onto one: "every 7 minutes" has no cron expression that
+/// keeps its period across an hour boundary. So the accepted set is exactly the
+/// intervals that divide an hour (below an hour) or a day (at or above one), and
+/// anything else is a **config error** rather than a schedule that quietly drifts
+/// — a peer that pulls at 07, 14, 21, … 56, 00 is not what "every 7m" promised.
+pub fn peer_cron(every_secs: u64) -> Option<String> {
+    if every_secs < 60 {
+        return None;
+    }
+    if every_secs < 3600 {
+        let minutes = every_secs / 60;
+        if !every_secs.is_multiple_of(60) || !60u64.is_multiple_of(minutes) {
+            return None;
+        }
+        return Some(format!("0 */{minutes} * * * *"));
+    }
+    if every_secs <= 86_400 {
+        let hours = every_secs / 3600;
+        if !every_secs.is_multiple_of(3600) || !24u64.is_multiple_of(hours) {
+            return None;
+        }
+        return Some(format!("0 0 */{hours} * * *"));
+    }
+    None
+}
+
+impl PeerConfig {
+    /// Operator-facing label: `name`, else the URL's host, else the index.
+    pub fn label(&self, index: usize) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        self.url
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .filter(|h| !h.is_empty())
+            .map(|h| h.replace(':', "-"))
+            .unwrap_or_else(|| format!("peer{index}"))
+    }
+
+    /// Pull interval in seconds.
+    pub fn every_secs(&self) -> Option<u64> {
+        parse_every(&self.every)
+    }
+
+    /// The streams this row asks for, in config order. `Err` names the first
+    /// unparseable entry.
+    pub fn streams(&self) -> std::result::Result<Vec<PullStream>, String> {
+        self.pull
+            .iter()
+            .map(|e| parse_pull(e).ok_or_else(|| e.clone()))
+            .collect()
+    }
+
+    /// Rejects rows that parse but cannot work.
+    pub fn validate(&self, index: usize) -> Result<()> {
+        let label = self.label(index);
+        if self.url.trim().is_empty() {
+            return Err(Error::Config(format!("[[peer]] {label}: url is required")));
+        }
+        if !(self.url.starts_with("http://") || self.url.starts_with("https://")) {
+            return Err(Error::Config(format!(
+                "[[peer]] {label}: url {:?} must start with http:// or https://",
+                self.url
+            )));
+        }
+        if !self.public_key.trim().is_empty() {
+            // Shape-checked here rather than decoded: `core` has no hex
+            // dependency and does not need one to say "that is not a key".
+            // The actual decode happens where the key is used to verify.
+            let key = self.public_key.trim();
+            if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::Config(format!(
+                    "[[peer]] {label}: public_key is not hex"
+                )));
+            }
+            if key.len() != 64 {
+                return Err(Error::Config(format!(
+                    "[[peer]] {label}: public_key must be a 32-byte (64 hex char) ed25519 key, \
+                     got {} hex chars",
+                    key.len()
+                )));
+            }
+        } else if !self.allow_unsigned && !self.pull.is_empty() {
+            return Err(Error::Config(format!(
+                "[[peer]] {label}: no public_key pinned and allow_unsigned = false — every \
+                 bundle from this peer would be refused. Pin the key from its GET /node, or \
+                 set allow_unsigned = true to accept it unverified."
+            )));
+        }
+        if let Err(bad) = self.streams() {
+            return Err(Error::Config(format!(
+                "[[peer]] {label}: unknown pull entry {bad:?} — expected \"weather\", \
+                 \"recipes\" or \"datasets:<app>/<dataset>\""
+            )));
+        }
+        let secs = self.every_secs().ok_or_else(|| {
+            Error::Config(format!(
+                "[[peer]] {label}: every {:?} is not a duration (try \"15m\", \"1h\", \"900s\")",
+                self.every
+            ))
+        })?;
+        if peer_cron(secs).is_none() {
+            return Err(Error::Config(format!(
+                "[[peer]] {label}: every {:?} ({secs}s) has no cron expression that keeps its \
+                 period — use an interval of at least 60s that divides an hour (5m, 15m, 30m) \
+                 or, at or above an hour, divides a day (1h, 2h, 6h, 12h, 24h)",
+                self.every
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod peer_config_tests {
+    use super::*;
+
+    fn peer(url: &str, pull: &[&str], every: &str) -> PeerConfig {
+        PeerConfig {
+            url: url.into(),
+            public_key: "77".repeat(32),
+            pull: pull.iter().map(|s| s.to_string()).collect(),
+            every: every.into(),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_config_with_no_peer_block_has_no_peers() {
+        assert!(Config::default().peer.is_empty());
+    }
+
+    #[test]
+    fn peer_rows_parse_from_an_array_of_tables() {
+        let toml_src = concat!(
+            "[[peer]]\n",
+            "url = \"https://a.example\"\n",
+            "pull = [\"weather\", \"datasets:grants-gov/opportunities\"]\n",
+            "every = \"15m\"\n",
+            "allow_unsigned = true\n",
+            "\n",
+            "[[peer]]\n",
+            "name = \"b\"\n",
+            "url = \"http://b.example:8088\"\n",
+            "pull = [\"recipes\"]\n",
+            "every = \"1h\"\n",
+            "allow_unsigned = true\n",
+        );
+        let cfg: Config = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.peer.len(), 2);
+        assert_eq!(cfg.peer[0].label(0), "a.example");
+        assert_eq!(cfg.peer[1].label(1), "b");
+        assert!(
+            cfg.peer[0].enabled,
+            "a peer row is enabled unless told not to"
+        );
+        assert_eq!(
+            cfg.peer[0].streams().expect("streams"),
+            vec![
+                PullStream::Weather,
+                PullStream::Dataset {
+                    app: "grants-gov".into(),
+                    dataset: "opportunities".into()
+                }
+            ]
+        );
+        cfg.validate().expect("both rows are valid");
+    }
+
+    #[test]
+    fn pull_entries_parse_the_three_streams_and_refuse_lookalikes() {
+        assert_eq!(parse_pull("weather"), Some(PullStream::Weather));
+        assert_eq!(parse_pull(" recipes "), Some(PullStream::Recipes));
+        assert_eq!(
+            parse_pull("datasets:hn/stories"),
+            Some(PullStream::Dataset {
+                app: "hn".into(),
+                dataset: "stories".into()
+            })
+        );
+        // The lookalikes: a typo, the wrong separator, a missing dataset, a
+        // wildcard the v1 slice does not implement, and a path traversal.
+        assert_eq!(parse_pull("wether"), None);
+        assert_eq!(parse_pull("dataset:hn/stories"), None);
+        assert_eq!(parse_pull("datasets:hn"), None);
+        assert_eq!(parse_pull("datasets:grants/*"), None);
+        assert_eq!(parse_pull("datasets:../etc/passwd"), None);
+    }
+
+    #[test]
+    fn every_parses_suffixes_and_refuses_zero() {
+        assert_eq!(parse_every("15m"), Some(900));
+        assert_eq!(parse_every("1h"), Some(3600));
+        assert_eq!(parse_every("90s"), Some(90));
+        assert_eq!(parse_every("300"), Some(300));
+        assert_eq!(parse_every(""), Some(PEER_DEFAULT_EVERY_SECS));
+        assert_eq!(parse_every("0m"), None);
+        assert_eq!(parse_every("soon"), None);
+        assert_eq!(parse_every("15 minutes"), None);
+    }
+
+    #[test]
+    fn a_cron_is_only_produced_for_intervals_that_keep_their_period() {
+        assert_eq!(peer_cron(900).as_deref(), Some("0 */15 * * * *"));
+        assert_eq!(peer_cron(3600).as_deref(), Some("0 0 */1 * * *"));
+        assert_eq!(peer_cron(6 * 3600).as_deref(), Some("0 0 */6 * * *"));
+        // 7 minutes divides neither an hour nor anything else useful: refused
+        // rather than silently drifting at the hour boundary.
+        assert_eq!(peer_cron(7 * 60), None);
+        assert_eq!(peer_cron(45 * 60), None);
+        assert_eq!(peer_cron(30), None, "sub-minute pulls are not a mesh");
+        assert_eq!(peer_cron(5 * 3600), None);
+        assert_eq!(peer_cron(2 * 86_400), None);
+    }
+
+    #[test]
+    fn an_unpinned_peer_that_refuses_unsigned_bundles_is_a_config_error_not_a_dead_peer() {
+        let mut p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = String::new();
+        p.allow_unsigned = false;
+        let err = p.validate(0).expect_err("must refuse");
+        assert!(
+            err.to_string()
+                .contains("every bundle from this peer would be refused"),
+            "{err}"
+        );
+        // Explicitly opting into unverified bundles is allowed — loudly.
+        p.allow_unsigned = true;
+        p.validate(0).expect("allow_unsigned makes it coherent");
+    }
+
+    #[test]
+    fn a_bad_url_key_stream_or_interval_is_refused_at_load() {
+        let mut p = peer("ftp://a.example", &["weather"], "15m");
+        assert!(p.validate(0).is_err(), "scheme");
+        p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = "nothex".into();
+        assert!(p.validate(0).is_err(), "key hex");
+        p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = "11".repeat(16);
+        assert!(p.validate(0).is_err(), "key length");
+        p = peer("https://a.example", &["wether"], "15m");
+        assert!(p.validate(0).is_err(), "stream typo");
+        p = peer("https://a.example", &["weather"], "7m");
+        assert!(p.validate(0).is_err(), "interval");
+        p = peer("", &["weather"], "15m");
+        assert!(p.validate(0).is_err(), "url required");
+    }
+
+    #[test]
+    fn stream_slugs_are_distinct_per_stream_so_schedules_cannot_collide() {
+        let a = PullStream::Dataset {
+            app: "hn".into(),
+            dataset: "stories".into(),
+        };
+        let b = PullStream::Dataset {
+            app: "hn".into(),
+            dataset: "comments".into(),
+        };
+        assert_ne!(a.slug(), b.slug());
+        assert_ne!(PullStream::Weather.slug(), PullStream::Recipes.slug());
+        assert_eq!(a.param(), "datasets");
     }
 }
