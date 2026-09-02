@@ -92,6 +92,19 @@ elsewhere gets wrong.
    `debug = 0`: backtrace frames stop resolving to source, which is verified by a
    planted-panic probe, not assumed.
 
+7. **Door-inventory tests read a file's "production half" as everything before the
+   first `#[cfg(test)]`.** `mcp::tests::every_door_that_creates_work_runs_the_shared_params_check`
+   (and the EXPECTED-diff idiom generally) scan source text, so a `#[cfg(test)]` item placed
+   high in a door file silently hides every door below it from the test that polices them.
+   Found 2026-09-02 (N15 build): a test-gated `handle_rpc` near the top of `mcp/mod.rs` hid the
+   `enqueue` doors. Keep test-gated items at the bottom of door files.
+
+8. **Parallel worktree builders all pick the same migration number.** Four of five wave-1
+   builders took 0041; the coordinator renumbers at merge and greps docs/tests for the old
+   name. `config.rs` conflicts on every merge because every builder appends a section at the
+   end — resolve by keeping both sides, and re-check for braces lost at the hunk boundary
+   (`5bfad5d`).
+
 ## How to extend this file
 
 Add an entry only when the fact is (a) durable across sessions, (b) not obvious from
