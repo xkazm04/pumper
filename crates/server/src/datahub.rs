@@ -2426,4 +2426,156 @@ mod tests {
         assert_eq!(p["customProperties"]["record_count"], "12");
         assert_eq!(p["name"], "grants/unified");
     }
+
+    // ── N24: the emitted DataHub JSON, pinned ────────────────────────────────
+    //
+    // The lineage extraction (N24) moves the assembly of these aspects behind a
+    // vendor-neutral `LineageEvent`. These goldens exist so that move is proven
+    // to be a pure refactor: they capture the EXACT JSON every aspect builder
+    // emits, so a shape drift fails here rather than silently changing what a
+    // DataHub GMS ingests. Deliberately whole-value equality, not spot checks —
+    // a spot check is exactly what lets a renamed sibling key through.
+
+    /// Fixed clock for the goldens: nothing here may read the wall clock.
+    const GOLDEN_MS: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn golden_dataset_aspects_are_byte_identical() {
+        let custom = vec![
+            ("pumper_app", "hn".to_string()),
+            ("record_count", "3".to_string()),
+            ("last_job_id", "job-1".to_string()),
+        ];
+        assert_eq!(
+            dataset_properties("hn", "stories", &custom),
+            json!({
+                "__type": "DatasetProperties",
+                "name": "hn/stories",
+                "description": "Pumper dataset `stories` maintained by app `hn` \
+                                (change-detected upserts; per-record revision history and field \
+                                diffs live in the Pumper API).",
+                "customProperties": {
+                    "pumper_app": "hn",
+                    "record_count": "3",
+                    "last_job_id": "job-1",
+                },
+            })
+        );
+        assert_eq!(
+            operation(GOLDEN_MS),
+            json!({
+                "__type": "Operation",
+                "timestampMillis": GOLDEN_MS,
+                "lastUpdatedTimestamp": GOLDEN_MS,
+                "operationType": "UPDATE",
+            })
+        );
+        assert_eq!(
+            dataset_profile(GOLDEN_MS, 3),
+            json!({ "__type": "DatasetProfile", "timestampMillis": GOLDEN_MS, "rowCount": 3 })
+        );
+        assert_eq!(
+            schema_metadata("hn", "stories", &json!({ "title": "a", "url": "b" })),
+            json!({
+                "__type": "SchemaMetadata",
+                "schemaName": "hn.stories",
+                "platform": PLATFORM_URN,
+                "version": 0,
+                "hash": "",
+                "platformSchema": {
+                    "__type": "OtherSchema",
+                    "rawSchema": "{\"title\":\"a\",\"url\":\"b\"}",
+                },
+                "fields": [
+                    { "fieldPath": "title", "nativeDataType": "string",
+                      "type": { "type": { "__type": "StringType" } } },
+                    { "fieldPath": "url", "nativeDataType": "string",
+                      "type": { "type": { "__type": "StringType" } } },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn golden_lineage_aspects_are_byte_identical() {
+        let up = dataset_urn("PROD", "hn", "stories");
+        let down = dataset_urn("PROD", "grants", "unified");
+        assert_eq!(
+            upstream_lineage(std::slice::from_ref(&up), GOLDEN_MS),
+            json!({
+                "__type": "UpstreamLineage",
+                "upstreams": [{
+                    "auditStamp": { "time": GOLDEN_MS, "actor": ACTOR_URN },
+                    "dataset": up,
+                    "type": "TRANSFORMED",
+                }],
+            })
+        );
+        let ops = vec![("title".to_string(), "css:h1".to_string())];
+        assert_eq!(
+            upstream_lineage_with_fields(&down, std::slice::from_ref(&up), &ops, GOLDEN_MS),
+            json!({
+                "__type": "UpstreamLineage",
+                "upstreams": [{
+                    "auditStamp": { "time": GOLDEN_MS, "actor": ACTOR_URN },
+                    "dataset": up,
+                    "type": "TRANSFORMED",
+                }],
+                "fineGrainedLineages": [{
+                    "upstreamType": "NONE",
+                    "upstreams": [],
+                    "downstreamType": "FIELD",
+                    "downstreams": [format!("urn:li:schemaField:({down},title)")],
+                    "confidenceScore": 1.0,
+                    "transformOperation": "css:h1",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn golden_flow_aspects_are_byte_identical() {
+        let flow = dataflow_urn("PROD", "schedule.hn.nightly");
+        let jurn = datajob_urn(&flow, "job-1");
+        assert_eq!(
+            entity(
+                "dataFlow",
+                &flow,
+                dataflow_info(
+                    "hn (schedule nightly)",
+                    &[("pumper_app", "hn".into()), ("kind", "schedule".into())],
+                ),
+            ),
+            json!({
+                "entityType": "dataFlow",
+                "entityUrn": flow,
+                "aspect": {
+                    "__type": "DataFlowInfo",
+                    "name": "hn (schedule nightly)",
+                    "customProperties": { "pumper_app": "hn", "kind": "schedule" },
+                },
+            })
+        );
+        assert_eq!(
+            datajob_info("hn run job-1", &[("job_id", "job-1".into())]),
+            json!({
+                "__type": "DataJobInfo",
+                "name": "hn run job-1",
+                "type": { "string": "COMMAND" },
+                "customProperties": { "job_id": "job-1" },
+            })
+        );
+        assert_eq!(
+            entity("dataJob", &jurn, datajob_io(&[], std::slice::from_ref(&flow))),
+            json!({
+                "entityType": "dataJob",
+                "entityUrn": jurn,
+                "aspect": {
+                    "__type": "DataJobInputOutput",
+                    "inputDatasets": [],
+                    "outputDatasets": [flow],
+                },
+            })
+        );
+    }
 }
