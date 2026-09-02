@@ -79,6 +79,10 @@ cron.workspace = true
 
 [dev-dependencies]
 pumper-core = { workspace = true, features = ["test-support"] }
+# Compiles the shared component fixture (crates/engine-wasm/tests/fixtures) so
+# the dynamic-app e2e runs a REAL component through the worker without needing
+# an external wasm toolchain on the machine.
+wat = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 async-trait.workspace = true

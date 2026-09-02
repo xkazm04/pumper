@@ -221,10 +221,12 @@ impl AppState {
         // and only when `[plugins] app_dir` is explicitly set (default: unset →
         // zero IO, so test states stay pure): scans the dir once and freezes the
         // read-only listing for the process lifetime.
-        let dynamic_apps = Arc::new(crate::registry::dynamic_app_entries(
-            &config.plugins,
-            &registry,
-        ));
+        // (N09) `&mut registry`: a component that links against the pumper:app
+        // world is REGISTERED here as an ordinary ScrapeApp, so the queue,
+        // scheduler and enqueue door need no dynamic-app special case. Modules
+        // that are only listed still produce a read-only entry.
+        let mut registry = registry;
+        let dynamic_apps = Arc::new(crate::registry::dynamic_app_entries(&config, &mut registry));
         let fanout_concurrency = config.worker.fanout_concurrency;
         let fanout_max_queued = config.worker.fanout_max_queued;
 

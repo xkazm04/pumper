@@ -24,6 +24,13 @@
 //!   re-checked at every import; the host-call count is capped because a guest
 //!   that loops on `fetch` burns host time, not fuel.
 //!
+//! **Fuel is a ceiling, not an allowance.** The budget is set once per job and
+//! never re-armed at a host call: topping the store back up on every import
+//! would let a guest that alternates `fetch`/compute burn unbounded CPU while
+//! technically never exceeding "its" budget, which is the opposite of what a
+//! ceiling is for. What a host call does check is the wall clock and the
+//! host-call count — the two bounds a fetch-heavy guest actually presses on.
+//!
 //! Everything crossing the boundary is JSON text (see the WIT file's own note):
 //! the Rust types already have stable serde shapes, and re-declaring them as
 //! WIT records would make every field addition a breaking ABI change.
@@ -927,6 +934,59 @@ mod tests {
         assert!(!cfg.enabled);
         let host = WasmAppHost::new(Path::new("."), &cfg).expect("no error");
         assert!(host.is_none());
+    }
+
+    /// The whole ABI, end to end, on a component this repo can build without any
+    /// external toolchain: link against the world, read the manifest through the
+    /// describe() probe, instantiate, call run(), lift the result.
+    ///
+    /// The probe deliberately runs with no job context, so this also pins that a
+    /// module can be *described* without being given fetch or write authority.
+    #[tokio::test]
+    async fn the_fixture_component_describes_and_runs_through_the_world() {
+        let engine = engine();
+        let bytes = wat::parse_file("tests/fixtures/echo-app.wat").expect("fixture parses");
+        assert!(is_component(&bytes), "the fixture must be a component");
+        let pre = link(
+            &engine,
+            "echo",
+            &Component::from_binary(&engine, &bytes).expect("compiles"),
+        )
+        .expect("the fixture links against the world");
+
+        let cfg = WasmAppsConfig::default();
+        let manifest = probe_manifest(&engine, &pre, "echo", "sha", &cfg)
+            .await
+            .expect("describe() is readable");
+        assert_eq!(manifest["description"], "echo app");
+
+        // And it RUNS: same store shape a job gets, minus the job.
+        let mut store = Store::new(
+            &engine,
+            AppStore {
+                ctx: None,
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(cfg.max_memory_bytes())
+                    .build(),
+                deadline: Instant::now() + Duration::from_secs(30),
+                calls: 0,
+                max_host_calls: cfg.max_host_calls,
+                max_payload_bytes: cfg.max_payload_bytes,
+                module_sha256: "sha".into(),
+                stats: RunStats::default(),
+            },
+        );
+        store.set_fuel(cfg.fuel_per_job).expect("fuel");
+        let instance = pre
+            .instantiate_async(&mut store)
+            .await
+            .expect("instantiates");
+        let out = instance
+            .call_run(&mut store, "{}")
+            .await
+            .expect("no trap")
+            .expect("the ok arm");
+        assert_eq!(out, "{\"ok\":true}");
     }
 
     /// A module's identity is its bytes: the catalog pins this digest and every

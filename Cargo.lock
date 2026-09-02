@@ -3788,6 +3788,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -3859,6 +3860,7 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "wat",
 ]
 
 [[package]]

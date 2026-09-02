@@ -141,6 +141,43 @@ it (previously fabricated as `"flat"`, turning a $150/hour rate into a $150 flat
 `state-licensing` reports `cost_usd: null` + `cost_unreported_calls` instead of a `$0.00` that was
 indistinguishable from a genuinely free cache hit.
 
+## Dynamic WASM apps
+
+A scraping use case can ship as a **`.wasm` component** instead of a Rust crate + registry edit + rebuild. A component dropped into `[plugins] app_dir` is discovered at boot, validated, and — with `[wasm_apps] enabled = true` — registered as an ordinary `ScrapeApp`: it appears in `GET /apps` with `runnable: true`, is enqueued at the normal door (`POST /apps/<name>/jobs`), runs on the normal worker loop, and inherits budgets, checkpoints, provenance, receipts, triggers and SSE without knowing they exist.
+
+**The contract is a WIT world**, `pumper:app@0.1.0` (`crates/engine-wasm/wit/pumper-app.wit`), versioned from day one because it is a public ABI:
+
+| direction | function | what it is |
+| --- | --- | --- |
+| import | `fetch(request-json) -> result<string, string>` | `AppContext::fetch` — tiered, governed, budgeted, VCR-recorded |
+| import | `upsert-many(dataset, items-json) -> result<string, string>` | `AppContext::upsert_many_with_provenance` — dedup + change detection + health gating |
+| import | `checkpoint(state-json) -> bool` / `restore() -> option<string>` | durable execution across attempts |
+| import | `save-artifact(name, bytes) -> result<string, string>` | the job's artifacts dir |
+| import | `progress(snapshot-json)` / `log(level, message)` | live progress and structured logs |
+| export | `describe() -> string` | the JSON manifest `GET /apps` serves |
+| export | `run(params-json) -> result<string, string>` | one job; the `ok` arm is the job result |
+
+Everything crossing the boundary is JSON text: the Rust types already have stable serde shapes, and re-declaring them as WIT records would make every field addition a breaking ABI change. **The import table is the sandbox** — there is no socket, no filesystem, no clock and no environment, so a dynamic app cannot reach the network except through the same chokepoint every compiled-in app uses, and a guest that imports anything undeclared **fails to link at load** (typed `missing_export`), never half-runs.
+
+**Bounds are per job, not per call** (`[wasm_apps]`, all with defaults): `fuel_per_job` (deterministic instruction ceiling) with `yield_interval` so the guest returns to the runtime periodically and the run is genuinely cancellable; `max_wall_secs` enforced around the call *and* re-checked at every host import; `max_host_calls`, because a guest looping on `fetch` burns host time rather than fuel; `max_payload_bytes`, refused rather than truncated (a half-read body extracted into records is a silent data defect); `max_memory_mb` per instance with `max_concurrent` bounding **live instances**, since a run holds its instance across every host call it awaits. The run's own cost comes back on the job result under `wasm` (`host_calls`, `fetches`, `records_upserted`, `fuel_used`/`fuel_budget`, `memory_bytes`), never on the records — a per-record cost would mark every record changed on every re-run.
+
+**Which build answered.** Every record a dynamic app writes is stamped `rules_hash = <the module's SHA-256>` (its code *is* its rules), the job result carries `module_sha256`, and the listing entry carries `module_sha256` + `world` + `pinned`. A `[[source]]` row with `engine = "wasm"` declares `module_sha256`, and the loader **refuses to register an app whose bytes do not match the pin** — a module swapped under the same filename stops being runnable instead of quietly becoming a different app writing into one dataset's history. See [catalog.md](catalog.md).
+
+**Every not-registered path stays visible and says why**, because a component that vanished from the listing would look like a missing file:
+
+| listing | reason |
+| --- | --- |
+| `runnable: false`, `requires: ["config:wasm_apps.enabled"]` | `[wasm_apps] enabled = false` (the **default**): running third-party code with fetch and dataset-write authority is an operator decision. Its manifest is deliberately not read — reading one means instantiating the module. |
+| `runnable: false` | the catalog pins a different `module_sha256` (both hashes are in the reason) |
+| `runnable: false` | `describe()` is not a usable manifest — not an object, an unusable `params_schema`, an unknown `cost_class`, or **an example that fails the app's own schema** (the exact check the server's manifest test runs over every compiled-in app) |
+| `runnable: false`, `requires: ["host:component-model"]` | the file is a describe-only **core module**, the older M28 shape: it exports a manifest and no `run`, so there is nothing to execute |
+
+A static app always wins a name clash; a file in a data dir never shadows a compiled-in app. Enqueueing a listed-but-not-runnable name is a typed **409** carrying that entry's own reason.
+
+**Writing one.** `plugins-src/wasm-app-template/` is a working example (fetch a listing → shape rows → `upsert-many` → checkpoint), built and installed with `just plugin-app wasm-app-template`. That recipe needs `wasm-tools` (`cargo install wasm-tools`) for the componentization step, since `cargo build --target wasm32-unknown-unknown` emits a core module. The **host's own ABI gate does not depend on that toolchain**: `crates/engine-wasm/tests/fixtures/echo-app.wat` is a hand-written component that `just test` links, describes and runs on any machine.
+
+**Not in this slice:** `research` and `sync-many` imports, `observe-extraction`, hot-reload of a running module (`POST /plugins/reload` does not swap app components), and the provisioner → module path.
+
 ## Known gaps
 
 Census YoY trend layer awaits multi-vintage accumulation.
