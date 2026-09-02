@@ -1567,6 +1567,44 @@ pub struct ClaudeConfig {
     /// the engine's own tests construct.
     #[serde(skip)]
     pub isolation_dir: Option<PathBuf>,
+
+    // ── N15 self-hosted agent loop (appended; nothing above changed) ─────────
+    /// Point the CLI subprocess at **pumper's own MCP surface** instead of the
+    /// CLI's built-in network tools. Default **OFF**: with it off the engine
+    /// writes no MCP config, passes no `--mcp-config`, and `allowed_tools`
+    /// reaches `--allowedTools` exactly as before.
+    ///
+    /// With it on, each run gets a scratch `.mcp.json` naming
+    /// [`Self::self_hosted_url`] plus a single-job token, and the allow-list
+    /// becomes [`Self::self_hosted_allowed_tools`] — so the model fetches
+    /// through the job's own metered `AppContext::fetch` (governor, cache,
+    /// profile, archive, cost ledger) instead of from an ungoverned IP.
+    ///
+    /// Requires `[mcp] enabled = true`: the tool the subprocess is being sent
+    /// to only exists when the MCP surface is mounted.
+    pub self_hosted_tools: bool,
+    /// Where the subprocess reaches this server's `/mcp`. Loopback by default;
+    /// **must match `[server] port`** — nothing derives it, because the engine
+    /// is constructed from `[claude]` alone and a second source of truth for
+    /// the port could only disagree with the listener.
+    pub self_hosted_url: String,
+    /// The API key the subprocess presents when `[auth] mode = "keys"`.
+    /// `POST /mcp` is a mutating route, so the identity layer demands `admin`
+    /// there like any other mutation — a job token authorizes *attribution*,
+    /// not access. `None` (the default) is correct in `open` mode and is a
+    /// guaranteed 401 in `keys` mode.
+    pub self_hosted_key: Option<String>,
+    /// The `--allowedTools` list used **instead of** `allowed_tools` while the
+    /// loop is on. The shipped default replaces `WebFetch`/`WebSearch` with
+    /// pumper's own `fetch`; add `WebSearch` back if you want the CLI's search
+    /// (pumper has no live-web search equivalent) or
+    /// `mcp__pumper__search` / `mcp__pumper__query_dataset` to let the agent
+    /// read what this node already scraped.
+    pub self_hosted_allowed_tools: Vec<String>,
+    /// How long one run's job token stays valid. A backstop only — the token is
+    /// revoked when the run's guard drops, whether it succeeded, failed, timed
+    /// out or was cancelled. `0` mints tokens that are already expired.
+    pub self_hosted_token_ttl_secs: u64,
 }
 
 impl ClaudeConfig {
@@ -1624,6 +1662,11 @@ impl Default for ClaudeConfig {
             roles,
             research_cache_ttl_secs: 24 * 3600,
             isolation_dir: None,
+            self_hosted_tools: false,
+            self_hosted_url: "http://127.0.0.1:8088/mcp".into(),
+            self_hosted_key: None,
+            self_hosted_allowed_tools: vec!["mcp__pumper__fetch".into()],
+            self_hosted_token_ttl_secs: 3600,
         }
     }
 }

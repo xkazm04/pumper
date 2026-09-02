@@ -30,6 +30,7 @@ mod job_budget_floor;
 mod job_control_honesty;
 mod job_receipt;
 mod mcp;
+mod mcp_fetch;
 mod mcp_live;
 mod mpsv;
 mod panic_containment;

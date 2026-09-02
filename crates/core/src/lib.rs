@@ -3,6 +3,7 @@
 // Datasets store. Embedders that only need the engines + Fetcher build with
 // `default-features = false` and get everything below the `storage` line.
 #[cfg(feature = "storage")]
+pub mod agent_tools;
 pub mod app;
 #[cfg(feature = "storage")]
 pub mod backup;

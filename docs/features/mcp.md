@@ -49,6 +49,10 @@ Claude Code / Desktop project snippet:
 rest of the API — keep it on localhost, or front it with the same reverse
 proxy you'd use for the REST surface.)
 
+Pumper writes a config of exactly this shape for its **own** subprocess when
+`[claude] self_hosted_tools` is on — with two headers added. See
+[The self-hosted agent loop](#the-self-hosted-agent-loop-claude-self_hosted_tools).
+
 ## Tools
 
 | Tool | Gated by | What it does |
@@ -61,6 +65,108 @@ proxy you'd use for the REST surface.)
 | `enqueue_job` | `[mcp] allow_enqueue` | Enqueue one job. `params` shallow-merge over the app's defaults and are **validated against the app's schema** (violations come back as a readable tool error with JSON-pointer paths). Budget clamped as above. |
 | `fetch_readable` | `[mcp] allow_enqueue` | `{url}` → enqueues a `readable` job (URL → clean Markdown in the job's `page.md` artifact) through the exact gated path; returns the job id for `wait_job`. |
 | `deep_research` | `[mcp] allow_enqueue` | `{query, budget_usd}` → enqueues a `research` job (agentic search + read + synthesize via the Claude engine). The clamped budget is both the job's spend ceiling and the app's own `max_budget_usd` param, so the rail also binds mid-run. |
+| `fetch` | a **job token** | `{url, strategy?, profile?, archive_max_age?, to_markdown?}` → fetches one URL through this host's tiered fetcher and answers **synchronously** (unlike `fetch_readable`, which enqueues a job and hands back an id). Metered against the job named by the token: governor, response cache, learned tier router, session profile, archive tier, budget ceiling and cost ledger all apply. `strategy` is `http`\|`browser`\|`auto` (default) — `auto_with_research` is refused, because the caller of this tool *is* the research tier. See [The self-hosted agent loop](#the-self-hosted-agent-loop-claude-self_hosted_tools) below. |
+
+## The self-hosted agent loop (`[claude] self_hosted_tools`)
+
+Default **OFF**. Flipped on, the Claude research tier stops fetching the web
+with the CLI's own `WebFetch` and starts fetching it through *this node*.
+
+**Why.** `ClaudeEngine` launched the subprocess with
+`--allowedTools WebSearch,WebFetch`, so the most expensive tier in the ladder
+re-fetched the same URL the http and browser tiers had just tried — from the
+same IP, with no politeness spacing, no cookie profile, no archive fallback, no
+response cache, no VCR cassette, no tier-router learning and **no ledger row**.
+Every other tier is governed and metered at the `AppContext::fetch` chokepoint;
+this one was a hole in it, and the hole was on the tier that spends money.
+
+**What happens with it on.** Per research run, the engine:
+
+1. mints a **job token** — 256 bits, in-memory, bound to that one job, revoked
+   when the run's guard drops (including on the cancel path, where none of the
+   ordinary exit code runs);
+2. writes a scratch `.mcp.json` naming `[claude] self_hosted_url` with the token
+   in an `x-pumper-job-token` header, and passes `--mcp-config <file>
+   --strict-mcp-config`;
+3. passes `[claude] self_hosted_allowed_tools` (default `["mcp__pumper__fetch"]`)
+   as `--allowedTools` **instead of** `allowed_tools` — so `WebFetch` is not on
+   the subprocess's list at all;
+4. deletes the config file and revokes the token when the run ends.
+
+The tier-3 prompt names `mcp__pumper__fetch` and adds "otherwise fetch it
+however you can", so the same sentence is correct in both config states.
+
+```toml
+[claude]
+self_hosted_tools = true
+self_hosted_url = "http://127.0.0.1:8088/mcp"   # must match [server] port
+self_hosted_key = "..."                          # only in [auth] mode = "keys"
+self_hosted_allowed_tools = ["mcp__pumper__fetch"]
+self_hosted_token_ttl_secs = 3600                # backstop; the guard is the real bound
+
+[mcp]
+enabled = true    # the tool only exists when the MCP surface is mounted
+```
+
+### The token is attribution, not access
+
+A job token says *"this fetch belongs to job X"*. It is **not** a credential for
+the MCP surface, and it deliberately travels in its own header so it cannot be
+confused with one.
+
+- **`[auth] mode = "open"`** (the default): nothing else is needed. The token
+  alone gets the `fetch` tool to identify its job.
+- **`[auth] mode = "keys"`**: `POST /mcp` is a mutating route, so the identity
+  layer requires a key with `admin` scope there like any other mutation — that
+  is pre-existing behaviour of the MCP surface, not something this loop adds.
+  Set `[claude] self_hosted_key` to such a key and the engine writes it into the
+  run's config as `Authorization: Bearer <key>` beside the job token. Leave it
+  unset in `keys` mode and every tool call the subprocess makes is a 401 from
+  the identity layer, before the token is ever read. An absent or blank key is
+  **omitted** from the config rather than written as an empty bearer.
+  Known gap, inherited from N20: the narrowest key that works today is an
+  `admin` key, and the subprocess reads untrusted scraped content, so treat the
+  loop as giving that content's author a prompt-injection path to an admin key
+  on this node. Run it on loopback, and see [auth.md](auth.md#known-gaps).
+
+Every refusal is a readable tool error tagged with the status the REST surface
+would have used:
+
+| refusal | when |
+|---|---|
+| `[unauthorized] no job token: ...` | the header was absent — what an ordinary MCP client gets |
+| `[unauthorized] unknown job token: ...` | never minted here, or already revoked with its run |
+| `[unauthorized] expired job token: ...` | past `self_hosted_token_ttl_secs` |
+| `[not_found] job '<id>' no longer exists` | the token names a job that has been deleted |
+| `[conflict] job '<id>' is <status> ...` | the job is not `running`, so nothing of its is legitimately fetching |
+
+### What the receipt says
+
+`GET /jobs/{id}/receipt` gains `cost.self_hosted_fetches` — how many fetches the
+*model* drove, counted off a zero-cost `claude_subfetch` marker row the tool
+writes beside the priced row `AppContext::fetch` already wrote (the money is
+counted once). It is `0` on every ordinary run, which is the honest answer and
+the number that used to be zero *by construction* for research runs.
+
+### Out of the v1 slice
+
+- **Only `fetch`.** `search` and `query_dataset` through the loop are one config
+  line away (`self_hosted_allowed_tools`) but are not in the shipped default and
+  are untested from this direction.
+- **No VCR.** The context this tool builds runs with VCR `Off`: recording into a
+  cassette the worker's task owns would interleave two writers, and replay would
+  have to resolve against a cassette this call never opened. So a recorded
+  research run does **not** capture the model's own fetches, and replaying one
+  will let them go live. Do not use `[vcr] replay` as an egress guarantee for a
+  self-hosted research run.
+- **No progress or checkpoints.** A fetch the model made is not a resumable step
+  of the app, so both seams are no-ops in this context.
+- **No per-call budget.** The job's `budget_usd` is the only ceiling; the tool
+  cannot be given a smaller one of its own.
+- **Tokens are Claude-only.** Nothing mints one for a non-Claude agent.
+- **`self_hosted_url` is not derived.** Nothing checks it against
+  `[server] port`; a mismatch surfaces as the subprocess reporting it has no
+  working tools.
 
 ## Resources
 

@@ -70,7 +70,7 @@ mod principals;
 mod provenance;
 mod provisioner;
 mod query;
-mod receipt;
+pub(crate) mod receipt;
 mod recipes;
 mod remote;
 mod retention;

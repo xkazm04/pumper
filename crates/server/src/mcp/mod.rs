@@ -22,9 +22,11 @@
 //! buffering). POST stays stateless — the stream is a one-way event feed, not
 //! a session.
 
+pub(crate) mod jobtoken;
 mod live;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -54,12 +56,21 @@ pub(crate) fn router() -> Router<AppState> {
 
 /// One streamable-HTTP exchange: a JSON-RPC request, notification, or batch in;
 /// a JSON response (or 202 for notification-only input) out.
-async fn handle_post(State(state): State<AppState>, Json(payload): Json<Value>) -> Response {
+async fn handle_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    // N15: the only thing read off the request itself is the job token a
+    // self-hosted Claude subprocess presents. Every other client is anonymous
+    // here and unaffected; the API key, when `[auth] mode = "keys"`, was
+    // already resolved by the identity layer this route sits behind.
+    let caller = jobtoken::McpCaller::from_headers(&headers);
     match payload {
         Value::Array(msgs) => {
             let mut responses = Vec::new();
             for msg in &msgs {
-                if let Some(resp) = handle_rpc(&state, msg).await {
+                if let Some(resp) = handle_rpc_as(&state, msg, &caller).await {
                     responses.push(resp);
                 }
             }
@@ -69,15 +80,21 @@ async fn handle_post(State(state): State<AppState>, Json(payload): Json<Value>) 
                 Json(Value::Array(responses)).into_response()
             }
         }
-        msg => match handle_rpc(&state, &msg).await {
+        msg => match handle_rpc_as(&state, &msg, &caller).await {
             Some(resp) => Json(resp).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
 }
 
-/// Dispatches one JSON-RPC message. `None` = notification (nothing to send).
-pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
+/// [`handle_rpc`] for a caller that presented something about itself — today,
+/// only a job token (N15). Kept as a separate entry point so every existing
+/// call site keeps its two-argument shape.
+pub(crate) async fn handle_rpc_as(
+    state: &AppState,
+    msg: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Option<Value> {
     let id = msg.get("id").cloned();
     let Some(method) = msg.get("method").and_then(Value::as_str) else {
         // A message with neither method nor id is garbage; with an id it is an
@@ -95,7 +112,7 @@ pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": server_tools(state) })),
-        "tools/call" => return Some(tools_call(state, id, &params).await),
+        "tools/call" => return Some(tools_call(state, id, &params, caller).await),
         "resources/list" => Ok(json!({ "resources": resources_list(state) })),
         "resources/read" => resources_read(state, &params),
         other => Err((-32601, format!("method '{other}' not found"))),
@@ -342,13 +359,61 @@ fn server_tools(state: &AppState) -> Vec<Value> {
             }
         }));
     }
+    // N15 (appended last, per the wave-2 shared-surface rule). Advertised
+    // unconditionally: the token, not a config switch, is what makes it usable,
+    // and hiding it would leave the self-hosted subprocess unable to discover
+    // the one network tool it has.
+    tools.push(json!({
+        "name": "fetch",
+        "description": "Fetch one URL through THIS host's tiered fetcher and return the content \
+            synchronously. Requires the job token pumper writes into a self-hosted Claude run's \
+            MCP config, and the fetch is metered against that job: politeness governor, response \
+            cache, learned tier router, session profile, archive tier, budget ceiling and cost \
+            ledger all apply. Unlike fetch_readable this does not enqueue a job — it answers in \
+            the same call. Returns {url, engine (archive|api_recipe|http|browser|claude), status, \
+            content, chars, cost_usd, escalations, trace}.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string", "minLength": 1 },
+                "strategy": {
+                    "type": "string", "enum": ["http", "browser", "auto"],
+                    "description": "Ladder entry point; default 'auto' (http, escalating to a \
+                        browser render when the result is thin or blocked). The paid claude tier \
+                        is never reachable from here — a research run must not recurse into \
+                        itself."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Named session profile (cookie jar / browser user-data-dir) \
+                        to fetch under."
+                },
+                "archive_max_age": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Accept an archived snapshot no older than this many seconds \
+                        instead of going live."
+                },
+                "to_markdown": {
+                    "type": "boolean",
+                    "description": "Convert the fetched page to clean Markdown (default true)."
+                }
+            },
+            "additionalProperties": false
+        }
+    }));
     tools
 }
 
 /// `tools/call`: runs a tool and wraps the outcome per MCP — a *tool* failure
 /// is a `result` with `isError: true` (the agent can read and react), while an
 /// unknown tool or unusable arguments are protocol errors.
-async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
+async fn tools_call(
+    state: &AppState,
+    id: Value,
+    params: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tools/call needs a 'name'");
     };
@@ -372,6 +437,8 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
              [mcp] allow_enqueue = true"
                 .to_string(),
         ),
+        // N15, appended last per the wave-2 shared-surface rule.
+        "fetch" => tool_fetch(state, &args, caller).await,
         other => return rpc_error(id, -32602, &format!("unknown tool '{other}'")),
     };
     let result = match outcome {
@@ -774,9 +841,143 @@ const EXPECTED_EXEMPT_DOORS: &[(&str, &str)] = &[(
      and `registry::scheduled_apps_default_params_pass_their_schema` pins those",
 )];
 
+/// Dispatches one JSON-RPC message from an anonymous caller. `None` =
+/// notification (nothing to send).
+///
+/// The live surface goes through [`handle_rpc_as`] (it carries the request's
+/// job token); this two-argument shape is what the e2e suite drives, so it is
+/// test-only rather than a second production entry point that could drift.
+///
+/// It lives HERE, below the enqueue call sites, deliberately: the door
+/// inventory (`every_door_that_creates_work_runs_the_shared_params_check`)
+/// reads each file's production half as "everything before the first
+/// `#[cfg(test)]`", so a test-gated item placed near the top of this file
+/// hides the `enqueue` doors below it from the very test that polices them.
+#[cfg(test)]
+pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
+    handle_rpc_as(state, msg, &jobtoken::McpCaller::anonymous()).await
+}
+
+// ── N15: the self-hosted agent loop's `fetch` tool ───────────────────────────
+
+/// The cost-event `detail` marking one fetch the Claude subprocess made for
+/// itself. Zero-cost audit marker beside the real ledger row `AppContext::fetch`
+/// already wrote — the money is counted once, and the receipt can still say how
+/// many of a run's fetches came from the model rather than from the app.
+pub(crate) const SELF_HOSTED_FETCH_DETAIL: &str = "claude_subfetch";
+
+/// The strategy an agent may ask for, and the one it may not.
+///
+/// `auto_with_research` is deliberately unreachable: the caller of this tool
+/// **is** the Claude tier, and letting it request a ladder that ends in another
+/// Claude run is an unbounded spend loop wearing a per-job budget as its only
+/// brake. The anti-pattern: `research_strategy_not_reachable_from_the_agent_loop`.
+fn agent_fetch_strategy(name: Option<&str>) -> Result<pumper_core::FetchStrategy, String> {
+    use pumper_core::FetchStrategy as S;
+    match name {
+        None | Some("auto") => Ok(S::Auto),
+        Some("http") => Ok(S::Http),
+        Some("browser") => Ok(S::Browser),
+        Some("auto_with_research") | Some("claude") => Err(
+            "strategy 'auto_with_research' is not available to this tool: you ARE the research \
+             tier, and a research tier that can re-enter itself has no bound but the job budget. \
+             Use 'auto' (http, escalating to a browser render)."
+                .to_string(),
+        ),
+        Some(other) => Err(format!(
+            "unknown strategy '{other}': use 'http', 'browser' or 'auto'"
+        )),
+    }
+}
+
+/// The body an agent gets back. Prefers Markdown (what the model asked the
+/// ladder for), falls back to extracted text, then to raw HTML — and says which
+/// via `content_kind`, so an empty `content` is never mistaken for an empty page.
+fn fetch_body(outcome: &pumper_core::FetchOutcome, to_markdown: bool) -> (&'static str, String) {
+    if to_markdown {
+        if let Some(md) = outcome.markdown.as_deref().filter(|m| !m.is_empty()) {
+            return ("markdown", md.to_string());
+        }
+    }
+    if let Some(text) = outcome.text.as_deref().filter(|t| !t.is_empty()) {
+        return ("text", text.to_string());
+    }
+    match outcome.html.as_deref().filter(|h| !h.is_empty()) {
+        Some(html) => ("html", html.to_string()),
+        None => ("none", String::new()),
+    }
+}
+
+/// The `fetch` tool: one synchronous fetch through the calling job's own
+/// metered [`pumper_core::AppContext::fetch`].
+///
+/// This is the whole point of N15. `fetch_readable` enqueues a job and hands
+/// back an id, which is useless to a model mid-turn; the CLI's own `WebFetch`
+/// answers in-turn but leaves the ladder entirely — no politeness spacing, no
+/// response cache, no session profile, no archive tier, no tier-router
+/// learning, and no ledger row, on the most expensive tier in the system. This
+/// answers in-turn *and* stays inside the ladder.
+async fn tool_fetch(
+    state: &AppState,
+    args: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Result<Value, String> {
+    let url = require_str(args, "url")?.to_string();
+    let strategy = agent_fetch_strategy(args.get("strategy").and_then(Value::as_str))?;
+    let to_markdown = args
+        .get("to_markdown")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let ctx = jobtoken::job_context(state, caller).await?;
+
+    let mut req = pumper_core::FetchRequest::new(url.clone());
+    req.strategy = strategy;
+    req.to_markdown = to_markdown;
+    req.profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    req.archive_max_age = args.get("archive_max_age").and_then(Value::as_u64);
+
+    let outcome = ctx.fetch(req).await.map_err(|e| e.to_string())?;
+    // The zero-cost marker beside the row `ctx.fetch` already wrote: the money
+    // is metered once (there), and this row is what lets `GET /jobs/{id}/receipt`
+    // count how much of a run's egress the model drove. Accounting must never
+    // fail the call — the fetch already happened.
+    if let Err(e) = state
+        .costs
+        .record(
+            ctx.job_id,
+            &ctx.app,
+            "mcp_fetch",
+            Some(&url),
+            0.0,
+            Some(SELF_HOSTED_FETCH_DETAIL),
+        )
+        .await
+    {
+        tracing::warn!(job = %ctx.job_id, "self-hosted fetch marker not recorded: {e}");
+    }
+    let (content_kind, content) = fetch_body(&outcome, to_markdown);
+    Ok(json!({
+        "url": outcome.url,
+        "engine": outcome.engine,
+        "status": outcome.status,
+        "content_kind": content_kind,
+        "chars": content.chars().count(),
+        "content": content,
+        "cost_usd": outcome.cost_usd,
+        "escalations": outcome.escalations,
+        "trace": outcome.trace,
+        "job_id": ctx.job_id,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_budget, validate_app_params, validate_params};
+    use super::{
+        agent_fetch_strategy, clamp_budget, fetch_body, validate_app_params, validate_params,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::Path;
@@ -961,6 +1162,56 @@ mod tests {
             );
             assert!(!reason.is_empty(), "{file}'s exemption needs a reason");
         }
+    }
+
+    /// The anti-pattern: the research tier handed a ladder that ends in another
+    /// research run. Nothing but the job budget would bound the recursion, and
+    /// a budget is a ceiling on the damage, not a design.
+    #[test]
+    fn research_strategy_not_reachable_from_the_agent_loop() {
+        use pumper_core::FetchStrategy as S;
+        assert_eq!(agent_fetch_strategy(None).unwrap(), S::Auto);
+        assert_eq!(agent_fetch_strategy(Some("auto")).unwrap(), S::Auto);
+        assert_eq!(agent_fetch_strategy(Some("http")).unwrap(), S::Http);
+        assert_eq!(agent_fetch_strategy(Some("browser")).unwrap(), S::Browser);
+        for refused in ["auto_with_research", "claude"] {
+            let err = agent_fetch_strategy(Some(refused)).unwrap_err();
+            assert!(err.contains("research tier"), "{err}");
+        }
+        assert!(agent_fetch_strategy(Some("teleport")).is_err());
+    }
+
+    /// An empty answer must be labelled, not silently returned as ordinary
+    /// empty content: a model that reads `content: ""` with no `content_kind`
+    /// cannot tell a blocked page from a genuinely blank one.
+    #[test]
+    fn an_empty_outcome_is_labelled_rather_than_returned_as_content() {
+        let mut outcome = pumper_core::FetchOutcome {
+            url: "https://example.com".into(),
+            engine: "http",
+            status: Some(200),
+            html: None,
+            markdown: None,
+            text: None,
+            escalations: Vec::new(),
+            trace: Vec::new(),
+            cost_usd: None,
+            snapshot: None,
+            network: Vec::new(),
+        };
+        assert_eq!(fetch_body(&outcome, true), ("none", String::new()));
+        outcome.html = Some("<p>hi</p>".into());
+        assert_eq!(fetch_body(&outcome, true), ("html", "<p>hi</p>".into()));
+        outcome.text = Some("hi".into());
+        assert_eq!(fetch_body(&outcome, true), ("text", "hi".into()));
+        outcome.markdown = Some("# hi".into());
+        assert_eq!(fetch_body(&outcome, true), ("markdown", "# hi".into()));
+        // An empty markdown string is not an answer; fall through to text.
+        outcome.markdown = Some(String::new());
+        assert_eq!(fetch_body(&outcome, true), ("text", "hi".into()));
+        // And a caller that did not ask for Markdown never gets it.
+        outcome.markdown = Some("# hi".into());
+        assert_eq!(fetch_body(&outcome, false), ("text", "hi".into()));
     }
 
     #[test]

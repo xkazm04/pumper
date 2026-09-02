@@ -853,10 +853,21 @@ impl Fetcher {
         // --- Claude research tier ---
         let mut claude_spend = None;
         if req.strategy == FetchStrategy::AutoWithResearch {
+            // The default tier-3 instruction now names the `fetch` tool by its
+            // MCP name. With `[claude] self_hosted_tools` on that tool is the
+            // ONLY network tool the subprocess has, and this sentence is what
+            // stops the model reporting that it cannot reach the web; with the
+            // switch off the CLI has no such tool and falls back to its own
+            // `WebFetch`, which the second clause allows. Naming the preferred
+            // route in the prose is free either way — the allow-list, not the
+            // prompt, is what enforces it.
             let prompt = req.research_prompt.clone().unwrap_or_else(|| {
                 format!(
                     "Fetch {} and extract its main textual content as clean Markdown. \
-                     Respond with only the content, no commentary.",
+                     Use the `mcp__pumper__fetch` tool if it is available to you — it goes \
+                     through this host's own governed, cached, cost-metered fetcher — and \
+                     otherwise fetch it however you can. Respond with only the content, no \
+                     commentary.",
                     req.url
                 )
             });
