@@ -4,14 +4,15 @@
 //! document.
 
 pub mod enrich;
+pub mod enrichers;
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pumper_core::config::SearchConfig;
 use pumper_core::{
-    Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
-    SearchRequest, SearchResponse,
+    Enricher, EnricherStat, Error, FacetCount, Plugins, Result, Search, SearchDoc, SearchFacets,
+    SearchHit, SearchIndexStats, SearchRequest, SearchResponse, ENTITY_AMOUNT, ENTITY_EVENT_DATE,
 };
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -24,11 +25,13 @@ use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::directory::{DirectoryLock, MmapDirectory, INDEX_WRITER_LOCK};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, Value, FAST, INDEXED, STORED, STRING, TEXT,
+    Field, IndexRecordOption, OwnedValue, Schema, Value, FAST, INDEXED, STORED, STRING, TEXT,
 };
 use tantivy::{doc, Directory, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
 
 use pumper_core::SearchSort;
+
+use crate::enrichers::Enrichment;
 
 /// Facet counts are computed over at most this many top-ranked matches — an
 /// honest sample that stays cheap on large result sets.
@@ -45,6 +48,7 @@ struct Fields {
     indexed_at: Field,
     amount: Field,
     event_date: Field,
+    entities: Field,
 }
 
 /// Background-commit cadence: the committer flushes at most this often, so a
@@ -59,6 +63,8 @@ const COMMIT_PENDING_THRESHOLD: usize = 512;
 
 pub struct TantivyIndex {
     index: Index,
+    /// The configured index-time enrichment pipeline (N11), plus its counters.
+    enrichment: Enrichment,
     /// The index directory, kept so `index_stats` can measure the on-disk
     /// footprint (Tantivy's `Index` does not expose its path portably).
     dir: std::path::PathBuf,
@@ -168,7 +174,28 @@ fn build_schema() -> Schema {
     // range predicates; STORED so hits could surface them later.
     builder.add_u64_field("amount", INDEXED | STORED | FAST);
     builder.add_i64_field("event_date", INDEXED | STORED | FAST);
+    // N11: every entity an enricher emitted, as ONE JSON object field, STORED and
+    // not indexed. This is the field that makes a new entity KIND a plugin
+    // install instead of a schema bump: `currency`, `ico`, `region` and anything
+    // else a `.wasm` can name all live inside this one field, so `build_schema`
+    // — and therefore the drift gate that wipes the corpus — does not move when
+    // the entity vocabulary does. Adding it IS one last bump (see the module
+    // note and docs/features/search.md); nothing after it needs one.
+    builder.add_json_field("entities", STORED);
     builder.build()
+}
+
+/// Every field this schema declares, as `name:type` in schema order.
+///
+/// The fingerprint the N11 guarantee is asserted against: enriching documents
+/// with entity kinds nobody compiled in must leave this string byte-identical,
+/// because a changed schema is a WIPED index (see [`schema_is_current`]).
+pub fn schema_fingerprint(schema: &Schema) -> String {
+    schema
+        .fields()
+        .map(|(_, entry)| format!("{}:{:?}", entry.name(), entry.field_type().value_type()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// True when the opened index matches the current build's schema EXACTLY —
@@ -383,24 +410,46 @@ fn open_or_recover(dir: &Path, schema: &Schema) -> Result<Index> {
     }
 }
 
-/// A document with its index-time entity enrichment already computed (M14):
-/// conservative regex-only extraction over title+body. No match = field ABSENT on
-/// the doc (a range filter then simply never matches it).
+/// A document with its index-time entity enrichment already computed (M14, N11):
+/// the full entity map, plus the two kinds that also get typed fast fields. No
+/// match = field ABSENT on the doc (a range filter then simply never matches it).
 struct EnrichedDoc {
     doc: SearchDoc,
+    entities: std::collections::BTreeMap<String, serde_json::Value>,
     amount: Option<u64>,
     event_date: Option<i64>,
 }
 
-/// Enriches a batch. Pure and lock-free by construction — this is the work that
-/// used to run inside the writer-lock closure.
-fn enrich_docs(docs: Vec<SearchDoc>) -> Vec<EnrichedDoc> {
+/// The two entity kinds that also become typed fast fields, read out of the
+/// merged entity map.
+///
+/// Kept native rather than queried out of the JSON field on purpose: `amount`
+/// and `event_date` carry the range predicates `/search` already exposes, and a
+/// JSON path cannot be range-scanned as cheaply as a dedicated fast column.
+/// An entity whose value is not the right TYPE (a plugin emitting `"currency"`
+/// under `amount`, or a negative dollar figure) is stored in `entities` and NOT
+/// promoted — the fast field keeps its type, and the filter keeps its meaning.
+fn fast_fields(
+    entities: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> (Option<u64>, Option<i64>) {
+    (
+        entities.get(ENTITY_AMOUNT).and_then(|v| v.as_u64()),
+        entities.get(ENTITY_EVENT_DATE).and_then(|v| v.as_i64()),
+    )
+}
+
+/// Runs the configured enrichment pipeline over a batch and pairs each document
+/// with its entities. Lock-free by construction — this is the work that used to
+/// run inside the writer-lock closure, and the enrichers keep it there.
+async fn enrich_docs(enrichment: &Enrichment, docs: Vec<SearchDoc>) -> Vec<EnrichedDoc> {
+    let merged = enrichment.run(&docs).await;
     docs.into_iter()
-        .map(|doc| {
-            let text = format!("{}\n{}", doc.title, doc.body);
-            let (amount, event_date) = enrich::enrich_fields(&text, doc.indexed_at);
+        .zip(merged)
+        .map(|(doc, entities)| {
+            let (amount, event_date) = fast_fields(&entities);
             EnrichedDoc {
                 doc,
+                entities,
                 amount,
                 event_date,
             }
@@ -428,7 +477,27 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 }
 
 impl TantivyIndex {
+    /// Opens the index with the enrichment pipeline `[search] enrichers`
+    /// describes, but NO plugin host — so a `plugin:` entry is a startup error
+    /// here. Use [`with_plugins`](Self::with_plugins) from a process that has
+    /// one (the server, and the `search-backfill` bin).
     pub fn new(cfg: &SearchConfig) -> Result<Self> {
+        Self::with_plugins(cfg, None)
+    }
+
+    /// The same, with the plugin host `plugin:<name>` enrichers run on.
+    pub fn with_plugins(cfg: &SearchConfig, plugins: Option<Arc<dyn Plugins>>) -> Result<Self> {
+        Self::with_enrichment(cfg, Enrichment::from_config(cfg, plugins)?)
+    }
+
+    /// The same, over an explicit enricher list — the seam tests use to prove
+    /// that an entity kind nobody compiled in still lands in the index without
+    /// moving the schema.
+    pub fn with_enrichers(cfg: &SearchConfig, enrichers: Vec<Arc<dyn Enricher>>) -> Result<Self> {
+        Self::with_enrichment(cfg, Enrichment::from_enrichers(enrichers))
+    }
+
+    fn with_enrichment(cfg: &SearchConfig, enrichment: Enrichment) -> Result<Self> {
         let schema = build_schema();
 
         // Opening is where the index's two destructive recoveries live (schema
@@ -452,6 +521,7 @@ impl TantivyIndex {
             indexed_at: field("indexed_at")?,
             amount: field("amount")?,
             event_date: field("event_date")?,
+            entities: field("entities")?,
         };
 
         let writer: IndexWriter = index
@@ -461,7 +531,11 @@ impl TantivyIndex {
             .reader()
             .map_err(|e| Error::App(format!("search reader: {e}")))?;
 
-        tracing::info!(dir = %cfg.dir.display(), "opened search index");
+        tracing::info!(
+            dir = %cfg.dir.display(),
+            enrichers = ?enrichment.names(),
+            "opened search index"
+        );
         let writer = Arc::new(Mutex::new(writer));
         let pending = Arc::new(AtomicUsize::new(0));
         let wake = Arc::new(Notify::new());
@@ -475,6 +549,7 @@ impl TantivyIndex {
         );
         Ok(Self {
             index,
+            enrichment,
             dir: cfg.dir.clone(),
             fields,
             writer,
@@ -487,6 +562,50 @@ impl TantivyIndex {
 }
 
 impl TantivyIndex {
+    /// The stored entity map of one document, by doc id — the read side of the
+    /// `entities` field, used by the enrichment tests and by anything that wants
+    /// to see what an enricher actually produced for a document.
+    ///
+    /// `None` when the id is not in the index; `Some({})` when the document is
+    /// there and carries no entities (the honest difference).
+    pub async fn stored_entities(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let reader = self.reader.clone();
+        let f = self.fields;
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<serde_json::Value>> {
+            let searcher = reader.searcher();
+            let query = TermQuery::new(Term::from_field_text(f.id, &id), IndexRecordOption::Basic);
+            let top = searcher
+                .search(&query, &TopDocs::with_limit(1).order_by_score())
+                .map_err(|e| Error::App(format!("entity lookup: {e}")))?;
+            let Some((_, address)) = top.first() else {
+                return Ok(None);
+            };
+            let doc: TantivyDocument = searcher
+                .doc(*address)
+                .map_err(|e| Error::App(format!("fetch doc: {e}")))?;
+            let entities = doc
+                .get_first(f.entities)
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    serde_json::Value::Object(
+                        obj.map(|(k, v)| {
+                            (
+                                k.to_string(),
+                                serde_json::to_value(OwnedValue::from(v))
+                                    .unwrap_or(serde_json::Value::Null),
+                            )
+                        })
+                        .collect(),
+                    )
+                })
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            Ok(Some(entities))
+        })
+        .await
+        .map_err(|e| Error::App(format!("entity lookup task panicked: {e}")))?
+    }
+
     /// Runs `edit` against the index writer on a blocking thread, then commits and
     /// reloads the reader. The lock → edit → commit → reload epilogue lives here
     /// once so the mutating paths can't drift apart.
@@ -560,9 +679,7 @@ impl Search for TantivyIndex {
         // it against every other indexing path and — until the char-boundary fix —
         // put a panic site inside the lock, where it poisoned the mutex and took
         // the whole batch with it.
-        let prepared = tokio::task::spawn_blocking(move || enrich_docs(docs))
-            .await
-            .map_err(|e| Error::App(format!("enrich task panicked: {e}")))?;
+        let prepared = enrich_docs(&self.enrichment, docs).await;
         // Deferred: the background committer flushes this, so hundreds of small
         // jobs no longer pay a full commit/fsync each. The lock section below is
         // index operations only.
@@ -585,6 +702,19 @@ impl Search for TantivyIndex {
                 }
                 if let Some(ts) = p.event_date {
                     tdoc.add_i64(f.event_date, ts);
+                }
+                // The open-kind entity map, stored whole. Absent when nothing was
+                // extracted: an empty object would make "this document was
+                // enriched and yielded nothing" and "this document predates
+                // enrichment" the same stored fact.
+                if !p.entities.is_empty() {
+                    tdoc.add_object(
+                        f.entities,
+                        p.entities
+                            .into_iter()
+                            .map(|(k, v)| (k, OwnedValue::from(v)))
+                            .collect(),
+                    );
                 }
                 w.add_document(tdoc)
                     .map_err(|e| Error::App(format!("add_document: {e}")))?;
@@ -647,6 +777,10 @@ impl Search for TantivyIndex {
     async fn doc_count(&self) -> Result<u64> {
         // num_docs reflects the last committed segment set the reader has loaded.
         Ok(self.reader.searcher().num_docs())
+    }
+
+    fn enricher_stats(&self) -> Vec<EnricherStat> {
+        self.enrichment.stats()
     }
 
     async fn index_stats(&self) -> Result<SearchIndexStats> {
@@ -866,10 +1000,14 @@ impl Search for TantivyIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_schema, classify_open_failure, drain_dir, quarantine_path, schema_is_current,
-        OpenFailure,
+        build_schema, classify_open_failure, drain_dir, fast_fields, quarantine_path,
+        schema_fingerprint, schema_is_current, OpenFailure, TantivyIndex,
     };
+    use async_trait::async_trait;
+    use pumper_core::config::SearchConfig;
+    use pumper_core::{EnrichInput, Enricher, Entity, Search, SearchDoc};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tantivy::schema::{Schema, FAST, INDEXED, STORED, STRING, TEXT};
     use tantivy::Index;
 
@@ -883,6 +1021,228 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// An enricher that emits whatever it is told to — the stand-in for a
+    /// `.wasm` an operator installed, in a test that must run on a machine with
+    /// no wasm toolchain.
+    struct FixedEnricher(&'static str, Vec<Entity>);
+
+    #[async_trait]
+    impl Enricher for FixedEnricher {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn enrich(&self, _input: &EnrichInput) -> Vec<Entity> {
+            self.1.clone()
+        }
+    }
+
+    fn doc(id: &str, body: &str) -> SearchDoc {
+        SearchDoc {
+            id: id.into(),
+            app: "grants".into(),
+            dataset: "unified".into(),
+            url: "https://example.test/x".into(),
+            title: "A grant".into(),
+            body: body.into(),
+            indexed_at: 1_767_225_600,
+        }
+    }
+
+    fn cfg(dir: PathBuf) -> SearchConfig {
+        SearchConfig {
+            dir,
+            ..Default::default()
+        }
+    }
+
+    /// THE N11 GUARANTEE. Adding an entity KIND must not change the index
+    /// schema, because a changed schema is a WIPED corpus (`schema_is_current`
+    /// — `Recovery::SchemaDrift` — `drain_dir`) that only a full
+    /// `search-backfill` restores. Before N11 every new entity field was exactly
+    /// that: a destructive event, which is why entity extraction stayed frozen
+    /// at two hard-coded regexes for its whole life.
+    ///
+    /// The anti-pattern this defends against is a future enricher that "just
+    /// adds a column": indexing documents carrying `currency`, `ico` and
+    /// `region` here must leave the fingerprint and the drift gate untouched.
+    #[tokio::test]
+    async fn new_entity_kind_does_not_change_schema_hash() {
+        let dir = scratch("entity-kinds");
+        let before = schema_fingerprint(&build_schema());
+
+        let index = TantivyIndex::with_enrichers(
+            &cfg(dir.clone()),
+            vec![Arc::new(FixedEnricher(
+                "stub",
+                vec![
+                    Entity::new("currency", "czk"),
+                    Entity::new("ico", "12345678"),
+                    Entity::new("region", "CZ-10"),
+                    Entity::new("amounts", serde_json::json!([1, 2, 3])),
+                ],
+            ))],
+        )
+        .expect("index");
+        index
+            .index(vec![doc("grants:unified:a", "smlouva na 5.000.000 Kc")])
+            .await
+            .expect("index");
+        index.flush().await.expect("flush");
+
+        assert_eq!(
+            schema_fingerprint(&index.index.schema()),
+            before,
+            "four entity kinds nobody compiled in must not move the schema"
+        );
+        assert!(
+            schema_is_current(&index.index),
+            "and the drift gate must still read the index as current — a false \
+             drift here WIPES the corpus"
+        );
+        let entities = index
+            .stored_entities("grants:unified:a")
+            .await
+            .expect("lookup")
+            .expect("the document is indexed");
+        assert_eq!(entities["currency"], serde_json::json!("czk"));
+        assert_eq!(entities["region"], serde_json::json!("CZ-10"));
+        assert_eq!(entities["amounts"], serde_json::json!([1, 2, 3]));
+
+        drop(index);
+        // Reopening with the same build must NOT trip the rebuild: the entities
+        // are data, not schema. Opened read-only (no writer lock) so this reads
+        // the on-disk state without racing the committer that just exited.
+        let reopened = Index::open_in_dir(&dir).expect("reopen");
+        assert!(
+            schema_is_current(&reopened),
+            "an index holding four uncompiled entity kinds is still CURRENT"
+        );
+        assert_eq!(
+            reopened.reader().expect("reader").searcher().num_docs(),
+            1,
+            "no wipe: the document survived the reopen"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An enricher that fails on every document must be counted, skipped, and
+    /// never allowed to fail the index. The anti-pattern: propagating the
+    /// plugin's error out of `index()`, which loses the whole batch of documents
+    /// because one optional field could not be computed.
+    #[tokio::test]
+    async fn a_trapping_enricher_is_counted_and_skipped_never_failing_the_index() {
+        struct AlwaysFails;
+        #[async_trait]
+        impl Enricher for AlwaysFails {
+            fn name(&self) -> &str {
+                "plugin:broken"
+            }
+            fn failures(&self) -> u64 {
+                // Every call "failed" — the shape a trapping plugin reports.
+                7
+            }
+            async fn enrich(&self, _input: &EnrichInput) -> Vec<Entity> {
+                Vec::new()
+            }
+        }
+
+        let dir = scratch("failing-enricher");
+        let index = TantivyIndex::with_enrichers(
+            &cfg(dir.clone()),
+            vec![
+                Arc::new(AlwaysFails),
+                Arc::new(FixedEnricher("stub", vec![Entity::new("currency", "usd")])),
+            ],
+        )
+        .expect("index");
+        index
+            .index(vec![doc("grants:unified:a", "award of $5,000")])
+            .await
+            .expect("a broken enricher must NOT fail the index");
+        index.flush().await.expect("flush");
+
+        assert_eq!(index.doc_count().await.expect("count"), 1);
+        let stats = index.enricher_stats();
+        assert_eq!(stats[0].name, "plugin:broken");
+        assert_eq!(stats[0].docs, 1, "it was offered the document");
+        assert_eq!(stats[0].entities, 0);
+        assert_eq!(
+            stats[0].failures, 7,
+            "and the failure is visible, not hidden"
+        );
+        // The enricher AFTER the broken one still ran.
+        let entities = index
+            .stored_entities("grants:unified:a")
+            .await
+            .expect("lookup")
+            .expect("indexed");
+        assert_eq!(entities["currency"], serde_json::json!("usd"));
+        drop(index);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The built-in pass keeps producing exactly what it did before N11 moved it
+    /// behind the trait: same two kinds, same values, and both promoted to their
+    /// typed fast fields so `amount_gte` / `date_before` keep matching.
+    #[tokio::test]
+    async fn the_builtin_pass_still_feeds_the_two_typed_fast_fields() {
+        let dir = scratch("builtin-parity");
+        let index = TantivyIndex::new(&cfg(dir.clone())).expect("index");
+        index
+            .index(vec![doc(
+                "grants:unified:a",
+                "award up to $250,000; applications close 2026-03-01",
+            )])
+            .await
+            .expect("index");
+        index.flush().await.expect("flush");
+
+        let entities = index
+            .stored_entities("grants:unified:a")
+            .await
+            .expect("lookup")
+            .expect("indexed");
+        assert_eq!(entities["amount"], serde_json::json!(250_000));
+        assert!(entities["event_date"].as_i64().is_some(), "{entities}");
+
+        // And the fast fields the range filters read are populated from them.
+        let hits = index
+            .query(pumper_core::SearchRequest {
+                q: "award".into(),
+                limit: 10,
+                amount_gte: Some(200_000),
+                ..Default::default()
+            })
+            .await
+            .expect("query");
+        assert_eq!(hits.total, 1, "the amount fast field still filters");
+        drop(index);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fast field keeps its TYPE. The anti-pattern: promoting whatever an
+    /// enricher put under `amount` into the u64 column, so one plugin emitting
+    /// `"amount": "lots"` either panics the index path or writes a nonsense
+    /// number that every `amount_gte` query then matches.
+    #[test]
+    fn a_wrongly_typed_entity_is_stored_but_not_promoted_to_a_fast_field() {
+        let mut entities = std::collections::BTreeMap::new();
+        entities.insert("amount".to_string(), serde_json::json!("lots"));
+        entities.insert("event_date".to_string(), serde_json::json!("soon"));
+        assert_eq!(fast_fields(&entities), (None, None));
+
+        entities.insert("amount".to_string(), serde_json::json!(-5));
+        assert_eq!(fast_fields(&entities).0, None, "dollars are unsigned");
+
+        entities.insert("amount".to_string(), serde_json::json!(250_000));
+        entities.insert(
+            "event_date".to_string(),
+            serde_json::json!(1_767_225_600i64),
+        );
+        assert_eq!(fast_fields(&entities), (Some(250_000), Some(1_767_225_600)));
     }
 
     /// The anti-pattern: naming the quarantine after the wall clock, which makes
