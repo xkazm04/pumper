@@ -343,7 +343,18 @@ impl AppState {
         let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
-            Arc::new(WasmPluginHost::new(&config.plugins)?)
+            // N10: the host side of a plugin's DECLARED capabilities. Wired
+            // unconditionally — the gate is the manifest plus `[plugins]
+            // allow_http_hosts` (empty by default), not the presence of this
+            // bridge, and a host without one would make "no plugin declared a
+            // capability" and "the operator never wired the network" the same
+            // fact. The HTTP handle is the engine whose `send` holds the
+            // governor, so plugin traffic is spaced and cached like any other.
+            let bridge = Arc::new(crate::plugin_caps::ServerCapabilityHost::new(
+                engines.http.clone(),
+                storage.pool(),
+            ));
+            Arc::new(WasmPluginHost::new(&config.plugins)?.with_capabilities(bridge))
         } else {
             Arc::new(NoPlugins)
         };

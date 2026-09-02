@@ -7,6 +7,8 @@ mod events;
 mod fanout;
 mod maintenance;
 mod mcp;
+// N10: the host side of a plugin's declared capabilities.
+mod plugin_caps;
 mod progress;
 mod refresher;
 mod registry;

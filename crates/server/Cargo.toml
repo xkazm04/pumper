@@ -11,6 +11,11 @@ path = "src/main.rs"
 # Needed at build time (not just dev): the worker's JobCheckpointer implements
 # pumper-core's async CheckpointSink trait.
 async-trait.workspace = true
+# N10: the plugin capability bridge's per-plugin kv namespace runs against the
+# store's own pool (`Storage::pool()`). It is deliberately NOT a Storage method:
+# `plugin_kv` is scratch state owned by the sandbox, not part of the job/dataset
+# model, and it should not widen the store's API surface to say so.
+sqlx.workspace = true
 pumper-core.workspace = true
 pumper-engine-http.workspace = true
 pumper-engine-archive.workspace = true
