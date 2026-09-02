@@ -120,8 +120,9 @@ fn scrape_app_methods(text: &str, header: &str) -> BTreeSet<String> {
     methods
 }
 
-/// The doc presented `ScrapeApp` as **five** methods. It has seven, and the two
-/// missing ones are the two an app author most needs to know exist:
+/// The doc presented `ScrapeApp` as **five** methods. It has eight (N18 added
+/// `executor()`), and the ones that went missing are the ones an app author most
+/// needs to know exist:
 /// `manifest()` (a declared `params_schema` makes enqueue enforce 422 instead of
 /// failing mid-run, and `registry.rs` asserts at least five apps ship rich ones)
 /// and `requires()` (what makes a credential-gated app distinguishable from a
@@ -134,7 +135,7 @@ fn the_documented_scrapeapp_surface_is_the_real_one() {
         &read("crates/core/src/app.rs"),
         "pub trait ScrapeApp: Send + Sync {",
     );
-    assert_eq!(real.len(), 7, "the trait itself changed shape: {real:?}");
+    assert_eq!(real.len(), 8, "the trait itself changed shape: {real:?}");
     let documented = scrape_app_methods(&onboarding(), "pub trait ScrapeApp: Send + Sync {");
     assert_eq!(
         documented,

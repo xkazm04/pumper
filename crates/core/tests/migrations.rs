@@ -28,6 +28,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "derived",
     // N05: the durable event log (0049).
     "events",
+    // N18: the outbound executors that have polled this coordinator (0051).
+    "executors",
     "doc_fingerprints",
     "extraction_profiles",
     "field_invariants",
