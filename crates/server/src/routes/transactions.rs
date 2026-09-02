@@ -101,8 +101,8 @@ fn render(state: &AppState, row: &Transaction) -> Value {
     tag = "transactions",
     params(ListQuery),
     responses(
-        (status = 200, description = "`{count, allow_live, transactions}`", body = Object),
-        (status = 400, description = "Unknown `state` filter", body = Object),
+        (status = 200, description = "`{count, allow_live, transactions}`", body = crate::routes::dto::TransactionListResponse),
+        (status = 400, description = "Unknown `state` filter", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_transactions(
@@ -134,8 +134,8 @@ pub(crate) async fn list_transactions(
     tag = "transactions",
     params(("id" = String, Path, description = "Transaction id")),
     responses(
-        (status = 200, description = "One ledger row", body = Object),
-        (status = 404, description = "No such transaction", body = Object),
+        (status = 200, description = "One ledger row", body = crate::routes::dto::TransactionDto),
+        (status = 404, description = "No such transaction", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_transaction(
@@ -155,9 +155,9 @@ pub(crate) async fn get_transaction(
     params(("id" = String, Path, description = "Transaction id")),
     request_body = ApproveBody,
     responses(
-        (status = 202, description = "Approved; the parked job was resumed", body = Object),
-        (status = 404, description = "No such transaction", body = Object),
-        (status = 409, description = "Refused: live submission off, not pending, expired, evidence mismatch, or the profile's daily cap", body = Object),
+        (status = 202, description = "Approved; the parked job was resumed", body = crate::routes::dto::TransactionApproved),
+        (status = 404, description = "No such transaction", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Refused: live submission off, not pending, expired, evidence mismatch, or the profile's daily cap", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn approve_transaction(
@@ -236,9 +236,9 @@ pub(crate) async fn approve_transaction(
     tag = "transactions",
     params(("id" = String, Path, description = "Transaction id")),
     responses(
-        (status = 200, description = "Rejected", body = Object),
-        (status = 404, description = "No such transaction", body = Object),
-        (status = 409, description = "Not pending", body = Object),
+        (status = 200, description = "Rejected", body = crate::routes::dto::TransactionRejected),
+        (status = 404, description = "No such transaction", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Not pending", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn reject_transaction(

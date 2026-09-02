@@ -88,7 +88,7 @@ pub(crate) struct ExportQuery {
         \"pumper.host-weather/2\", node_id, legacy_id, generated_at, sig, payload: \
         {min_observations, entries: [{host, preferred_tier, http_strikes, penalty_ms (live), \
         observations, challenge_fingerprints, updated_at}]}}`. With `?schema=1`, the legacy \
-        flat unsigned `pumper.host-weather/1` body instead."))
+        flat unsigned `pumper.host-weather/1` body instead.", body = crate::routes::dto::HostWeatherExport))
 )]
 pub(crate) async fn export_host_weather(
     State(state): State<AppState>,
@@ -186,9 +186,9 @@ struct ImportedBundle {
             changed, noops, actions: [{host, adopt_pin, raise_strikes, raise_penalty_ms, \
             notes}]}` — `actions` lists only the hosts an applied import would change \
             (`changed`); dominated entries are counted in `noops`. `verified` is false for an \
-            accepted-but-unsigned bundle."),
+            accepted-but-unsigned bundle.", body = crate::routes::dto::HostWeatherImportResponse),
         (status = 400, description = "Unknown schema, refused signature, empty/oversized bundle, \
-            or a blank host", body = Object),
+            or a blank host", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn import_host_weather(

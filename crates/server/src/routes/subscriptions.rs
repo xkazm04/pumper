@@ -52,9 +52,9 @@ pub(crate) struct CreateSubscriptionBody {
     tag = "subscriptions",
     request_body = CreateSubscriptionBody,
     responses(
-        (status = 201, description = "Created subscription", body = Object),
-        (status = 400, description = "Malformed selector, unknown sink, or a url that is not http(s)", body = Object),
-        (status = 409, description = "The durable event log is off (`[events] log_enabled = false`), so nothing would ever be delivered", body = Object),
+        (status = 201, description = "Created subscription", body = crate::routes::dto::SubscriptionDto),
+        (status = 400, description = "Malformed selector, unknown sink, or a url that is not http(s)", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "The durable event log is off (`[events] log_enabled = false`), so nothing would ever be delivered", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_subscription(
@@ -109,7 +109,7 @@ pub(crate) struct ListSubscriptionsQuery {
     path = "/subscriptions",
     tag = "subscriptions",
     params(ListSubscriptionsQuery),
-    responses((status = 200, description = "`{count, latest_seq, subscriptions}`. `latest_seq` is the log's head, so the gap between it and a row's `cursor_seq` is that subscription's backlog."))
+    responses((status = 200, description = "`{count, latest_seq, subscriptions}`. `latest_seq` is the log's head, so the gap between it and a row's `cursor_seq` is that subscription's backlog.", body = crate::routes::dto::SubscriptionListResponse))
 )]
 pub(crate) async fn list_subscriptions(
     State(state): State<AppState>,
@@ -134,8 +134,8 @@ pub(crate) async fn list_subscriptions(
     tag = "subscriptions",
     params(("id" = String, Path, description = "Subscription id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Subscription not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Subscription not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_subscription(
@@ -170,9 +170,9 @@ pub(crate) struct SubscriptionDeliveriesQuery {
     tag = "subscriptions",
     params(("id" = String, Path, description = "Subscription id"), SubscriptionDeliveriesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{subscription_id, cursor_seq, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`."),
-        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = Object),
-        (status = 404, description = "Subscription not found", body = Object),
+        (status = 200, description = "Dual-mode: `{subscription_id, cursor_seq, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`.", body = crate::routes::dto::SubscriptionDeliveryFeed),
+        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Subscription not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn subscription_deliveries(

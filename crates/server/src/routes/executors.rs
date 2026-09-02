@@ -172,8 +172,8 @@ pub(crate) struct ClaimedJob {
     responses(
         (status = 200, description = "A claimed job", body = ClaimedJob),
         (status = 204, description = "Nothing to run for this executor right now"),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn claim_job(
@@ -267,10 +267,10 @@ pub(crate) async fn claim_job(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body = ExecutorWrite,
     responses(
-        (status = 200, description = "`{owned: true}` — lease refreshed", body = Object),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
-        (status = 409, description = "`{owned: false}` — this executor no longer holds the job", body = Object),
+        (status = 200, description = "`{owned: true}` — lease refreshed", body = crate::routes::dto::ExecutorOwned),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "`{owned: false}` — this executor no longer holds the job", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn executor_heartbeat(
@@ -303,10 +303,10 @@ pub(crate) async fn executor_heartbeat(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body = ExecutorWrite,
     responses(
-        (status = 200, description = "`{saved: true}`", body = Object),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
-        (status = 409, description = "This executor no longer holds the job", body = Object),
+        (status = 200, description = "`{saved: true}`", body = crate::routes::dto::ExecutorCheckpointResponse),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "This executor no longer holds the job", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn executor_checkpoint(
@@ -334,10 +334,10 @@ pub(crate) async fn executor_checkpoint(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body = ExecutorWrite,
     responses(
-        (status = 200, description = "`{reported: true}`", body = Object),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
-        (status = 409, description = "This executor no longer holds the job", body = Object),
+        (status = 200, description = "`{reported: true}`", body = crate::routes::dto::ExecutorProgressResponse),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "This executor no longer holds the job", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn executor_progress(
@@ -379,12 +379,12 @@ pub(crate) async fn executor_progress(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body = ExecutorWrite,
     responses(
-        (status = 200, description = "`{outcome: \"succeeded\"|\"queued\"|\"failed\"}`", body = Object),
-        (status = 400, description = "Neither (or both) of `result` / `error`", body = Object),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
+        (status = 200, description = "`{outcome: \"succeeded\"|\"queued\"|\"failed\"}`", body = crate::routes::dto::ExecutorFinishResponse),
+        (status = 400, description = "Neither (or both) of `result` / `error`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
         (status = 409, description = "This executor no longer holds the job — the report is \
-            refused rather than overwriting the attempt that does", body = Object),
+            refused rather than overwriting the attempt that does", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn executor_finish(
@@ -426,9 +426,9 @@ pub(crate) async fn executor_finish(
     responses(
         (status = 200, description = "`{executors: [{id, state, capabilities, running, \
             claimed_total, last_poll_at, last_poll_age_secs, first_seen_at}], eligible_apps}`",
-            body = Object),
-        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`"),
-        (status = 404, description = "`[executors]` disabled on this node"),
+            body = crate::routes::dto::ExecutorListResponse),
+        (status = 401, description = "Missing or wrong `x-pumper-executor-secret`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[executors]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_executors(

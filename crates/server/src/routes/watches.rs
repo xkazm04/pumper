@@ -226,8 +226,8 @@ pub(crate) struct WatchesQuery {
     tag = "watches",
     params(WatchesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{watches: [Watch]}`, or `{items, next_cursor}` when `cursor` is present. Each watch is enriched with `last_delivery` (`{id, status, at}`, or **explicit `null`** when it has never delivered) so a watch that has never fired is distinguishable from one that fires into a dead receiver."),
-        (status = 400, description = "Unknown `app` (the filter names a namespace nothing delivers under; the message lists the accepted values)", body = Object),
+        (status = 200, description = "Dual-mode: `{watches: [Watch]}`, or `{items, next_cursor}` when `cursor` is present. Each watch is enriched with `last_delivery` (`{id, status, at}`, or **explicit `null`** when it has never delivered) so a watch that has never fired is distinguishable from one that fires into a dead receiver.", body = crate::routes::dto::WatchesResponse),
+        (status = 400, description = "Unknown `app` (the filter names a namespace nothing delivers under; the message lists the accepted values)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_watches(
@@ -377,9 +377,9 @@ pub(crate) async fn validate_sink<'a>(
     tag = "watches",
     request_body = CreateWatchBody,
     responses(
-        (status = 201, description = "Created watch", body = Object),
-        (status = 400, description = "Invalid sink, url missing/not http(s), or an `(app, dataset)` pair that could never fire — the message names the namespace those records actually land under", body = Object),
-        (status = 404, description = "Unknown app: the namespace is neither a registered app nor one the change fan-out delivers under", body = Object),
+        (status = 201, description = "Created watch", body = crate::routes::dto::WatchDto),
+        (status = 400, description = "Invalid sink, url missing/not http(s), or an `(app, dataset)` pair that could never fire — the message names the namespace those records actually land under", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown app: the namespace is neither a registered app nor one the change fan-out delivers under", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_watch(
@@ -440,9 +440,9 @@ pub(crate) struct WatchDeliveriesQuery {
     tag = "watches",
     params(("id" = String, Path, description = "Watch id"), WatchDeliveriesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{watch_id, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`."),
-        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = Object),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "Dual-mode: `{watch_id, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`.", body = crate::routes::dto::WatchDeliveryFeed),
+        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn watch_deliveries(
@@ -487,8 +487,8 @@ pub(crate) async fn watch_deliveries(
     tag = "watches",
     params(("id" = String, Path, description = "Watch id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_watch(
@@ -509,8 +509,8 @@ pub(crate) async fn delete_watch(
     params(("id" = String, Path, description = "Watch id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_watch_enabled(

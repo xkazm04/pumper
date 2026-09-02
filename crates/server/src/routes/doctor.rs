@@ -89,7 +89,7 @@ pub(crate) struct DoctorQuery {
     responses((status = 200, description = "Read-only store integrity report: `findings` (each \
         with a concrete remediation; EMPTY on a healthy store), plus descriptive `coverage`, \
         `tables`, `search` (index enabled/doc_count vs live record count) and per-app `artifacts` \
-        byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.")),
+        byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.", body = crate::routes::dto::DoctorReport)),
 )]
 pub(crate) async fn datasets_doctor(
     State(state): State<AppState>,

@@ -169,8 +169,8 @@ fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonF
     tag = "grants",
     params(GrantsQuery),
     responses(
-        (status = 200, description = "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). With `profile=` set the route instead returns `{profile, grants, retired}` (or `{items, next_cursor, retired}`), driven from `grants/fits`: each element is the unified record plus a `fit` block, and `retired` counts the verdicts whose opportunity has left the corpus."),
-        (status = 400, description = "Malformed `closing_before` / `closing_after` date, an unrecognized `verdict`, or `profile` combined with a corpus filter", body = Object),
+        (status = 200, description = "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). With `profile=` set the route instead returns `{profile, grants, retired}` (or `{items, next_cursor, retired}`), driven from `grants/fits`: each element is the unified record plus a `fit` block, and `retired` counts the verdicts whose opportunity has left the corpus.", body = crate::routes::dto::GrantsResponse),
+        (status = 400, description = "Malformed `closing_before` / `closing_after` date, an unrecognized `verdict`, or `profile` combined with a corpus filter", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_grants(
@@ -214,7 +214,7 @@ pub(crate) struct ClosingSoonQuery {
     path = "/grants/closing-soon",
     tag = "grants",
     params(ClosingSoonQuery),
-    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200. \"Still open\" is decided at `deadline_end_utc` — the exact `close_at` instant, or midday UTC the day after a date-only `close_date` — so a grant in that anywhere-on-Earth tail is listed with `days_left: 0`, exactly as `grants/unified` still calls it `open`."))
+    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200. \"Still open\" is decided at `deadline_end_utc` — the exact `close_at` instant, or midday UTC the day after a date-only `close_date` — so a grant in that anywhere-on-Earth tail is listed with `days_left: 0`, exactly as `grants/unified` still calls it `open`.", body = crate::routes::dto::ClosingSoonResponse))
 )]
 pub(crate) async fn closing_soon(
     State(state): State<AppState>,
@@ -405,8 +405,8 @@ pub(crate) struct CatalogQuery {
     tag = "catalog",
     params(CatalogQuery),
     responses(
-        (status = 200, description = "`{count, sources: [Source]}` — data pipelines, optionally filtered by `market` / `status` / `category`."),
-        (status = 500, description = "Catalog file malformed", body = Object),
+        (status = 200, description = "`{count, sources: [Source]}` — data pipelines, optionally filtered by `market` / `status` / `category`.", body = crate::routes::dto::CatalogSourcesResponse),
+        (status = 500, description = "Catalog file malformed", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn catalog_sources(
@@ -454,7 +454,7 @@ pub(crate) const CATALOG_STALE_GRACE: i64 = 2;
     get,
     path = "/catalog/health",
     tag = "catalog",
-    responses((status = 200, description = "`{checked, stale, contracts_enforce, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?, contract?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or no freshness window. `expected_max_age_secs` is the stale threshold (cadence × grace, tightened by a declared contract's `max_staleness_hours`). `contract` appears on sources declaring a `[source.contract]` block: `{declared, enforce, last_verdict}` where `last_verdict` is the worker's most recent publish-time evaluation (`{verdict: pass|warn|block, violations, job_id, checked_at, age_secs, stale, stale_reason?, ...}`, null before the first run since boot). Verdicts live in memory and never expire on their own, so they are aged against this same `expected_max_age_secs` window: `stale: true` marks a verdict describing a run that is no longer current, `stale: null` one that cannot be judged (the source declares no freshness expectation)."))
+    responses((status = 200, description = "`{checked, stale, contracts_enforce, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?, contract?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or no freshness window. `expected_max_age_secs` is the stale threshold (cadence × grace, tightened by a declared contract's `max_staleness_hours`). `contract` appears on sources declaring a `[source.contract]` block: `{declared, enforce, last_verdict}` where `last_verdict` is the worker's most recent publish-time evaluation (`{verdict: pass|warn|block, violations, job_id, checked_at, age_secs, stale, stale_reason?, ...}`, null before the first run since boot). Verdicts live in memory and never expire on their own, so they are aged against this same `expected_max_age_secs` window: `stale: true` marks a verdict describing a run that is no longer current, `stale: null` one that cannot be judged (the source declares no freshness expectation).", body = crate::routes::dto::CatalogHealthResponse))
 )]
 pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let catalog = pumper_core::Catalog::load().map_err(|e| {
@@ -575,8 +575,8 @@ const MAX_UNFORCED_DISABLES: usize = 3;
     path = "/catalog/reconcile",
     tag = "catalog",
     responses(
-        (status = 200, description = "`{empty, create, update, disable, orphan, covered_by_untagged, in_sync, auto_reconcile}` — the reconciliation plan. `orphan` is report-only (never applied)."),
-        (status = 500, description = "Catalog file malformed", body = Object),
+        (status = 200, description = "`{empty, create, update, disable, orphan, covered_by_untagged, in_sync, auto_reconcile}` — the reconciliation plan. `orphan` is report-only (never applied).", body = crate::routes::dto::ReconcilePlanDto),
+        (status = 500, description = "Catalog file malformed", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn catalog_reconcile(
@@ -619,9 +619,9 @@ pub(crate) struct ReconcileApplyQuery {
     tag = "catalog",
     params(ReconcileApplyQuery),
     responses(
-        (status = 200, description = "`{applied: {created, updated, disabled, orphans_untouched, errors}, plan}` — what was done, plus the plan it executed."),
-        (status = 409, description = "Plan disables too many schedules; retry with `?force=true`", body = Object),
-        (status = 500, description = "Catalog file malformed", body = Object),
+        (status = 200, description = "`{applied: {created, updated, disabled, orphans_untouched, errors}, plan}` — what was done, plus the plan it executed.", body = crate::routes::dto::ReconcileApplyResponse),
+        (status = 409, description = "Plan disables too many schedules; retry with `?force=true`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 500, description = "Catalog file malformed", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn catalog_reconcile_apply(
@@ -655,7 +655,7 @@ pub(crate) async fn catalog_reconcile_apply(
     get,
     path = "/datahub/status",
     tag = "datahub",
-    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, emit_flows, last_emission, emissions, govern}`. `emissions` = `{ok, failed, last, last_success, last_error, sync_running}` — successes and failures are counted and kept in SEPARATE slots, so a success cannot hide the last failure; entries are `{kind: job|sync, at, ok, entities?|error?}`. `last_emission` mirrors `emissions.last`. `govern` = `{enabled, interval_secs, paused_apps, last_poll, recent_actions}`, where last_poll is the most recent governance poll summary (`{at, ok, datasets_polled, poll_ms, budget_secs, schedules_disabled, syncs_enqueued, paused_apps, actions}`) or its error, and `recent_actions` is the newest 20 rows of the DURABLE audit trail (`{id, action, target, dataset, subject, evidence, detail, created_at}`, age-bounded at 90 days). Everything except `recent_actions` is in-memory: a restart zeroes it."))
+    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, emit_flows, last_emission, emissions, govern}`. `emissions` = `{ok, failed, last, last_success, last_error, sync_running}` — successes and failures are counted and kept in SEPARATE slots, so a success cannot hide the last failure; entries are `{kind: job|sync, at, ok, entities?|error?}`. `last_emission` mirrors `emissions.last`. `govern` = `{enabled, interval_secs, paused_apps, last_poll, recent_actions}`, where last_poll is the most recent governance poll summary (`{at, ok, datasets_polled, poll_ms, budget_secs, schedules_disabled, syncs_enqueued, paused_apps, actions}`) or its error, and `recent_actions` is the newest 20 rows of the DURABLE audit trail (`{id, action, target, dataset, subject, evidence, detail, created_at}`, age-bounded at 90 days). Everything except `recent_actions` is in-memory: a restart zeroes it.", body = crate::routes::dto::DatahubStatusResponse))
 )]
 pub(crate) async fn datahub_status(State(state): State<AppState>) -> Json<Value> {
     Json(crate::datahub::status_json(&state).await)
@@ -674,8 +674,8 @@ pub(crate) async fn datahub_status(State(state): State<AppState>) -> Json<Value>
     tag = "datahub",
     responses(
         (status = 200, description = "`{at, governing, gms_url, env, datasets_polled, poll_ms, budget_secs, quiet, would: {disable_schedules: [{app, dataset, evidence, schedule_ids, note}], pause_apps, resume_apps, enqueue_syncs: [{app, dataset, evidence, registered, idempotency_key, note}]}, paused_now, read_errors, poll_would_abort, totals}`. \
-            `quiet: true` means a poll right now would change nothing. `schedule_ids` names the exact catalog-managed rows a deprecation would disable (hand-made schedules are never listed — they are never touched). Unlike a real poll, a read error here does not abort: it is reported in `read_errors`, and `poll_would_abort` says whether a real poll would consequently have done nothing at all. Writes nothing."),
-        (status = 409, description = "[datahub] is disabled in config (no GMS to read)", body = Object),
+            `quiet: true` means a poll right now would change nothing. `schedule_ids` names the exact catalog-managed rows a deprecation would disable (hand-made schedules are never listed — they are never touched). Unlike a real poll, a read error here does not abort: it is reported in `read_errors`, and `poll_would_abort` says whether a real poll would consequently have done nothing at all. Writes nothing.", body = crate::routes::dto::GovernancePreview),
+        (status = 409, description = "[datahub] is disabled in config (no GMS to read)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn datahub_governance_preview(
@@ -700,8 +700,8 @@ pub(crate) async fn datahub_governance_preview(
     path = "/datahub/sync",
     tag = "datahub",
     responses(
-        (status = 200, description = "`{kind: \"sync\", at, ok, datasets, flows, trigger_edges, entities?|error?}` — the emission summary (also on /datahub/status)"),
-        (status = 409, description = "[datahub] is disabled in config, or a full sync is already running (one at a time — retry when it finishes)"),
+        (status = 200, description = "`{kind: \"sync\", at, ok, datasets, flows, trigger_edges, entities?|error?}` — the emission summary (also on /datahub/status)", body = crate::routes::dto::DatahubSyncResponse),
+        (status = 409, description = "[datahub] is disabled in config, or a full sync is already running (one at a time — retry when it finishes)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -808,8 +808,8 @@ fn program_filters(
     tag = "grants",
     params(ProgramsQuery),
     responses(
-        (status = 200, description = "Live records from `grants/programs`. Dual-mode: `{programs: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` carries `{program_key, title, agency, sources[], cycles_observed, dated_cycles, period_days, next_expected_open, next_expected_close, prediction_basis, opportunities[], recurrence_linked, deadline_extended_count, closed_early_count, extension_rate, last_award_ceiling, win_history}`. `period_days` and the next window are `null` unless the program's own dated cycles support them, with `prediction_basis` saying why; `extension_rate` is `null` when the lifecycle-event read was windowed rather than complete; `win_history` is Horizon-only."),
-        (status = 400, description = "Malformed `next_expected_before` date", body = Object),
+        (status = 200, description = "Live records from `grants/programs`. Dual-mode: `{programs: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` carries `{program_key, title, agency, sources[], cycles_observed, dated_cycles, period_days, next_expected_open, next_expected_close, prediction_basis, opportunities[], recurrence_linked, deadline_extended_count, closed_early_count, extension_rate, last_award_ceiling, win_history}`. `period_days` and the next window are `null` unless the program's own dated cycles support them, with `prediction_basis` saying why; `extension_rate` is `null` when the lifecycle-event read was windowed rather than complete; `win_history` is Horizon-only.", body = crate::routes::dto::ProgramsResponse),
+        (status = 400, description = "Malformed `next_expected_before` date", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_programs(
@@ -934,8 +934,8 @@ pub(crate) async fn find_market_profile(
     ),
     responses(
         (status = 200, description = "The `market/profile` record: `{state, state_fips, trade, soc_code, naics4, density_grain, density_key, coverage, total_market_per_10k, total_market_per_10k_basis, economics: {wage_band, wage_grain, pricing, pricing_locality, tax, compliance, valuation}, density, succession, formation, vintages}`. \
-            `coverage` is `both` or `economics_only`, and an `economics_only` row has `density: null` — never zeros, which would read as \"nobody operates here\" when the fact is \"the census publishes no cell for this trade\". `density_grain` is always `naics4`: the nonemployer series is published at 4-digit NAICS, so Plumbing, Electrical and HVAC (all 238220) share one density block. `vintages` names the year each input came from, which `updated_at` does not."),
-        (status = 404, description = "No profile for that state × trade", body = Object),
+            `coverage` is `both` or `economics_only`, and an `economics_only` row has `density: null` — never zeros, which would read as \"nobody operates here\" when the fact is \"the census publishes no cell for this trade\". `density_grain` is always `naics4`: the nonemployer series is published at 4-digit NAICS, so Plumbing, Electrical and HVAC (all 238220) share one density block. `vintages` names the year each input came from, which `updated_at` does not.", body = crate::routes::dto::MarketProfileResponse),
+        (status = 404, description = "No profile for that state × trade", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn market_profile(

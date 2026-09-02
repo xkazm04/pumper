@@ -93,11 +93,11 @@ pub(crate) struct EnqueueBody {
     params(("name" = String, Path, description = "App name")),
     request_body = EnqueueBody,
     responses(
-        (status = 202, description = "Job enqueued", body = Object),
-        (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
-        (status = 404, description = "Unknown app", body = Object),
-        (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = Object),
-        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths), or `budget_usd` is not a positive number of dollars", body = Object),
+        (status = 202, description = "Job enqueued", body = crate::routes::dto::JobDto),
+        (status = 200, description = "Idempotency-Key replay: the original job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Unknown app", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths), or `budget_usd` is not a positive number of dollars", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn enqueue_job(
@@ -208,7 +208,7 @@ pub(crate) struct ListQuery {
     path = "/jobs",
     tag = "jobs",
     params(ListQuery),
-    responses((status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset."))
+    responses((status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset.", body = crate::routes::dto::JobsResponse))
 )]
 pub(crate) async fn list_jobs(
     State(state): State<AppState>,
@@ -247,8 +247,8 @@ pub(crate) async fn list_jobs(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "The job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
+        (status = 200, description = "The job", body = crate::routes::dto::JobDetail),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_job(
@@ -277,9 +277,9 @@ pub(crate) async fn get_job(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 202, description = "Re-queued job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in a retryable (failed/cancelled) state", body = Object),
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in a retryable (failed/cancelled) state", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn retry_job(
@@ -336,8 +336,8 @@ pub(crate) fn requeued_events(requeued: &[(Uuid, String)]) -> Vec<JobEvent> {
     tag = "jobs",
     request_body = BulkRetryBody,
     responses(
-        (status = 200, description = "`{retried: <count>, ids: [uuid]}`"),
-        (status = 400, description = "status must be failed|cancelled", body = Object),
+        (status = 200, description = "`{retried: <count>, ids: [uuid]}`", body = crate::routes::dto::BulkRetryResponse),
+        (status = 400, description = "status must be failed|cancelled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn bulk_retry_jobs(
@@ -381,9 +381,9 @@ pub(crate) async fn bulk_retry_jobs(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 202, description = "Re-queued job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in `running` state", body = Object),
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in `running` state", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn reset_job(
@@ -431,9 +431,9 @@ pub(crate) struct ResumeBody {
     params(("id" = Uuid, Path, description = "Job id")),
     request_body = ResumeBody,
     responses(
-        (status = 202, description = "Re-queued job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in `waiting` state", body = Object),
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in `waiting` state", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn resume_job(
@@ -488,9 +488,9 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight). During a graceful shutdown a run that already committed to a checkpoint suspend answers `{cancelled: false, running: true, suspended: true, note}` — it was re-queued, not cancelled."),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = Object),
+        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight). During a graceful shutdown a run that already committed to a checkpoint suspend answers `{cancelled: false, running: true, suspended: true, note}` — it was re-queued, not cancelled.", body = crate::routes::dto::CancelJobResponse),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn cancel_job(
@@ -554,8 +554,8 @@ pub(crate) async fn cancel_job(
     tag = "costs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "`{job_id, app, total_usd, calls, fresh_records, cost_per_fresh_record_usd, events}`"),
-        (status = 404, description = "Job not found", body = Object),
+        (status = 200, description = "`{job_id, app, total_usd, calls, fresh_records, cost_per_fresh_record_usd, events}`", body = crate::routes::dto::JobCostsResponse),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn job_costs(
@@ -604,7 +604,7 @@ pub(crate) struct CostSummaryQuery {
     path = "/costs",
     tag = "costs",
     params(CostSummaryQuery),
-    responses((status = 200, description = "`{total_usd, by_app_engine: [{app, engine, cost_usd}], principal}`. With `?principal=` the ledger is restricted to that caller (`(unattributed)` selects the rows with no caller)"))
+    responses((status = 200, description = "`{total_usd, by_app_engine: [{app, engine, cost_usd}], principal}`. With `?principal=` the ledger is restricted to that caller (`(unattributed)` selects the rows with no caller)", body = crate::routes::dto::CostSummaryResponse))
 )]
 pub(crate) async fn cost_summary(
     State(state): State<AppState>,

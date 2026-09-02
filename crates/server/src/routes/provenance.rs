@@ -49,8 +49,8 @@ pub(crate) struct ProvenanceQuery {
     responses(
         (status = 200, description = "`{key, trust, coverage, chain: [..]}` — each chain entry \
             carries the revision's provenance stamp (job_id/source_url/artifact_sha/rules_hash, \
-            null = unknown) and, when a job is stamped, its schedule/trigger lineage"),
-        (status = 404, description = "No such record"),
+            null = unknown) and, when a job is stamped, its schedule/trigger lineage", body = crate::routes::dto::ProvenanceResponse),
+        (status = 404, description = "No such record", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_provenance(
@@ -156,11 +156,11 @@ pub(crate) struct RederiveQuery {
     responses(
         (status = 200, description = "`{verdict: reproduced|diverged, diff?}` — the archived body \
             replayed through the revision's registered ruleset, compared field-by-field against \
-            the stored snapshot. Read-only: nothing is written either way."),
-        (status = 404, description = "No such record / revision"),
+            the stored snapshot. Read-only: nothing is written either way.", body = crate::routes::dto::RederiveResponse),
+        (status = 404, description = "No such record / revision", body = crate::routes::dto::ErrorEnvelope),
         (status = 409, description = "Not replayable, with the reason: stamp incomplete \
             (artifact_sha/rules_hash unknown), ruleset not registered, archived body missing, \
-            or body no longer matching its stamped hash"),
+            or body no longer matching its stamped hash", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn rederive_provenance(

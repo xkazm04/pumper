@@ -65,7 +65,7 @@ pub(crate) struct RetentionPreviewQuery {
         (a live record or a replayable revision still addresses it; age cannot override this), \
         `cassette_*` (protected VCR cassettes, unless `artifact_retention_include_cassettes`) and \
         `within_window_*` (younger than the cutoff) — so `total_bytes` is fully accounted for and \
-        a sweep that frees little is explainable. `per_app` repeats the same four classes.")),
+        a sweep that frees little is explainable. `per_app` repeats the same four classes.", body = crate::routes::dto::RetentionPreview)),
 )]
 pub(crate) async fn retention_preview(
     State(state): State<AppState>,

@@ -106,7 +106,7 @@ fn rate_limit_allow(source_id: &str, per_min: u32) -> bool {
     get,
     path = "/ingress/sources",
     tag = "ingress",
-    responses((status = 200, description = "`{count, sources}` — secrets are never listed"))
+    responses((status = 200, description = "`{count, sources}` — secrets are never listed", body = crate::routes::dto::IngressSourceListResponse))
 )]
 pub(crate) async fn list_ingress_sources(
     State(state): State<AppState>,
@@ -130,8 +130,8 @@ pub(crate) struct CreateIngressSourceBody {
     tag = "ingress",
     request_body = CreateIngressSourceBody,
     responses(
-        (status = 201, description = "`{source, secret}` — the secret is shown once", body = Object),
-        (status = 400, description = "Empty name or empty secret", body = Object),
+        (status = 201, description = "`{source, secret}` — the secret is shown once", body = crate::routes::dto::IngressSourceCreated),
+        (status = 400, description = "Empty name or empty secret", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_ingress_source(
@@ -167,8 +167,8 @@ pub(crate) async fn create_ingress_source(
     tag = "ingress",
     params(("id" = String, Path, description = "Ingress source id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Source not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Source not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_ingress_source(
@@ -192,8 +192,8 @@ pub(crate) async fn delete_ingress_source(
     params(("id" = String, Path, description = "Ingress source id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Source not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Source not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_ingress_source_enabled(
@@ -237,14 +237,14 @@ pub(crate) async fn set_ingress_source_enabled(
     tag = "ingress",
     params(("id" = String, Path, description = "Ingress source id")),
     responses(
-        (status = 202, description = "`{event_id, seq, triggers_fired}`"),
-        (status = 400, description = "Body is not JSON", body = Object),
-        (status = 401, description = "Missing/invalid signature or stale timestamp", body = Object),
-        (status = 403, description = "Source disabled", body = Object),
-        (status = 404, description = "Unknown source", body = Object),
-        (status = 409, description = "`[ingress] enabled = false`", body = Object),
-        (status = 413, description = "Body exceeds `[ingress] max_body_bytes`", body = Object),
-        (status = 429, description = "Per-source rate limit exceeded", body = Object),
+        (status = 202, description = "`{event_id, seq, triggers_fired}`", body = crate::routes::dto::IngestResponse),
+        (status = 400, description = "Body is not JSON", body = crate::routes::dto::ErrorEnvelope),
+        (status = 401, description = "Missing/invalid signature or stale timestamp", body = crate::routes::dto::ErrorEnvelope),
+        (status = 403, description = "Source disabled", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown source", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "`[ingress] enabled = false`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 413, description = "Body exceeds `[ingress] max_body_bytes`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 429, description = "Per-source rate limit exceeded", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn ingest(

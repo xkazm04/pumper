@@ -77,7 +77,7 @@ pub(crate) fn validate_scopes(scopes: &[String]) -> Result<(), String> {
     get,
     path = "/principals",
     tag = "principals",
-    responses((status = 200, description = "`{count, principals}` — key digests are never listed"))
+    responses((status = 200, description = "`{count, principals}` — key digests are never listed", body = crate::routes::dto::PrincipalListResponse))
 )]
 pub(crate) async fn list_principals(
     State(state): State<AppState>,
@@ -111,9 +111,9 @@ pub(crate) async fn list_principals(
     tag = "principals",
     request_body = CreatePrincipalBody,
     responses(
-        (status = 201, description = "`{principal, key}` — the key is shown ONCE", body = Object),
-        (status = 400, description = "Empty name, empty/unknown scope", body = Object),
-        (status = 422, description = "`budget_usd_per_day` is not a positive number of dollars", body = Object),
+        (status = 201, description = "`{principal, key}` — the key is shown ONCE", body = crate::routes::dto::PrincipalCreated),
+        (status = 400, description = "Empty name, empty/unknown scope", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "`budget_usd_per_day` is not a positive number of dollars", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_principal(
@@ -150,8 +150,8 @@ pub(crate) async fn create_principal(
     tag = "principals",
     params(("id" = String, Path, description = "Principal id")),
     responses(
-        (status = 200, description = "`{id, enabled: false}`"),
-        (status = 404, description = "Principal not found", body = Object),
+        (status = 200, description = "`{id, enabled: false}`", body = crate::routes::dto::PrincipalDisabled),
+        (status = 404, description = "Principal not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn disable_principal(
@@ -174,8 +174,8 @@ pub(crate) async fn disable_principal(
     tag = "principals",
     params(("id" = String, Path, description = "Principal id")),
     responses(
-        (status = 200, description = "`{id, key}` — the NEW key, shown once; the old one stops working immediately", body = Object),
-        (status = 404, description = "Principal not found", body = Object),
+        (status = 200, description = "`{id, key}` — the NEW key, shown once; the old one stops working immediately", body = crate::routes::dto::PrincipalRotated),
+        (status = 404, description = "Principal not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn rotate_principal(
@@ -221,7 +221,7 @@ fn parse_audit_cursor(cursor: &str) -> Option<i64> {
     path = "/audit",
     tag = "principals",
     params(AuditQuery),
-    responses((status = 200, description = "`{items, next_cursor}` — newest first, keyset-paged on the row id"))
+    responses((status = 200, description = "`{items, next_cursor}` — newest first, keyset-paged on the row id", body = crate::routes::dto::AuditPage))
 )]
 pub(crate) async fn list_audit(
     State(state): State<AppState>,
@@ -256,7 +256,7 @@ pub(crate) struct PrincipalCostsQuery {
     path = "/principals/costs",
     tag = "principals",
     params(PrincipalCostsQuery),
-    responses((status = 200, description = "`{total_usd, by_principal}` — spend grouped by the caller who enqueued the work; rows with no caller appear as `(unattributed)` so the parts sum to the total")),
+    responses((status = 200, description = "`{total_usd, by_principal}` — spend grouped by the caller who enqueued the work; rows with no caller appear as `(unattributed)` so the parts sum to the total", body = crate::routes::dto::PrincipalCostsResponse)),
 )]
 pub(crate) async fn principal_costs(
     State(state): State<AppState>,
