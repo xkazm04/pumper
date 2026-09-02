@@ -348,6 +348,41 @@ search-backfill scope:
 plugin crate:
     cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown
 
+# Build ONE dynamic APP from plugins-src/<crate> and install it into data/apps/.
+#
+# Different from `just plugin` in the one way that matters: an app is a
+# COMPONENT (component-model binary exporting the pumper:app@0.1.0 world), not a
+# core module, so the wasm32 build is followed by a componentization step.
+# `cargo build` cannot emit a component for wasm32-unknown-unknown, so this
+# needs `wasm-tools` (`cargo install wasm-tools`) — the recipe says so rather
+# than producing a core module the host will refuse to run.
+#
+# After installing, set `[plugins] app_dir = "data/apps"` and `[wasm_apps]
+# enabled = true`, then restart: `GET /apps` lists it with `runnable: true`.
+# The host's own ABI gate does NOT depend on this recipe — it runs against the
+# hand-written component fixture in crates/engine-wasm/tests/fixtures/, so
+# `just test` proves the world on a machine with no wasm toolchain at all.
+plugin-app crate:
+    #!/usr/bin/env sh
+    set -e
+    if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
+        echo "error: the wasm32-unknown-unknown target is not installed." >&2
+        echo "       run: rustup target add wasm32-unknown-unknown" >&2
+        exit 1
+    fi
+    if ! command -v wasm-tools >/dev/null 2>&1; then
+        echo "error: wasm-tools is not installed, so the module cannot be turned" >&2
+        echo "       into a component (the host refuses core modules as apps)." >&2
+        echo "       run: cargo install wasm-tools" >&2
+        exit 1
+    fi
+    artifact=$(echo "{{crate}}" | tr '-' '_')
+    ( cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown )
+    mkdir -p data/apps
+    wasm-tools component new         "plugins-src/{{crate}}/target/wasm32-unknown-unknown/release/$artifact.wasm"         -o "data/apps/{{crate}}.wasm"
+    echo "installed data/apps/{{crate}}.wasm"
+    echo "sha256: $(sha256sum "data/apps/{{crate}}.wasm" | cut -d" " -f1)  <- the catalog's module_sha256"
+
 # Builds AND installs every plugins-src crate, which `just plugin` does for one.
 #
 # Nothing else in this repo compiles them: each plugins-src crate carries its own
@@ -373,6 +408,10 @@ plugins-install:
     mkdir -p data/plugins
     for dir in plugins-src/*/; do
         crate=$(basename "$dir")
+        # Dynamic APPS are not plugins: they build to components, install into
+        # data/apps/, and are refused by the plugin host (no extract ABI). They
+        # have their own recipe, `just plugin-app`.
+        case "$crate" in *-app-template) continue ;; esac
         # cargo underscores the artifact name; the INSTALLED file stem is the
         # plugin name the host loads — what a job's `params.plugin` and a
         # trigger's `plugins.predicate.plugin` name — so it must be the
@@ -398,6 +437,12 @@ plugins-test:
     #!/usr/bin/env sh
     set -e
     for dir in plugins-src/*/; do
+        crate=$(basename "$dir")
+        # An app template's lib is generated against a WIT world and only
+        # compiles for wasm32; its host-target tests would fail to link, which
+        # says nothing about the app. Its guard is the loader's manifest
+        # validation, plus the host's own fixture gate.
+        case "$crate" in *-app-template) echo "== $dir (skipped: wasm32-only)"; continue ;; esac
         echo "== $dir"
         ( cd "$dir" && cargo test )
     done

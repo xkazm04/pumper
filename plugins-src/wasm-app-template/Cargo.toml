@@ -1,0 +1,36 @@
+# Template for a **dynamic app**: a scraping use case that ships as a `.wasm`
+# component instead of a Rust crate + registry edit + rebuild.
+#
+# Build and install (from the repo root):
+#
+#     just plugin-app wasm-app-template
+#
+# That builds this crate for wasm32-unknown-unknown, turns the core module into
+# a component (`wasm-tools component new`), and copies it into `data/apps/`.
+# Then set, in config.toml:
+#
+#     [plugins]
+#     app_dir = "data/apps"
+#     [wasm_apps]
+#     enabled = true
+#
+# and the app appears in `GET /apps` with `runnable: true`.
+[package]
+name = "wasm-app-template"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+# Detach from the parent Pumper workspace (this targets wasm32, not the host).
+[workspace]
