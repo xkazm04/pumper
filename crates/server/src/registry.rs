@@ -113,6 +113,28 @@ pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[
         note: "the cross-source trades namespace holding operator_economics + compliance, \
            which all five trades apps publish into",
     },
+    VirtualNamespace {
+        // `trades_common::market::MARKET_APP` (N33). The one namespace here fed
+        // by TWO families: the state x trade profile is re-derived at the end of
+        // both `unified::sync_operator_economics` (the five trades apps) and
+        // `app_census_density::sync_market_blend` (the four census apps), so
+        // whichever refreshed last publishes it. Watching either family's app
+        // alone is exactly the mistake `publishes_into` exists to redirect.
+        name: "market",
+        publishers: &[
+            "state-tax",
+            "state-licensing",
+            "trade-wages",
+            "homewyse-pricing",
+            "valuation-multiples",
+            "census-density",
+            "census-nonemp",
+            "census-nesd",
+            "census-bfs",
+        ],
+        note: "the cross-FAMILY market namespace holding profile (one row per state x trade), \
+           which the five trades apps and the four census apps all publish into",
+    },
 ];
 
 /// The virtual namespace a registered app publishes into, if any — the hint
@@ -838,11 +860,20 @@ mod virtual_namespace_tests {
                     .find(|a| a.name() == *publisher)
                     .expect("checked registered above");
                 let shape = app.manifest().output_shape.unwrap_or("");
+                // The evidence a publisher owes is that its declared result
+                // NAMES the shared layer it publishes into. Two spellings exist
+                // because two families do this: the grants and trades joins
+                // report a `unified` block, and the census/market family reports
+                // its shared writes under the namespace's own name
+                // (`market_blend`, `market_profile`). Anything else is a manifest
+                // that does not mention the shared write at all.
                 assert!(
-                    shape.contains("unified"),
+                    shape.contains("unified") || shape.contains(ns.name),
                     "virtual namespace '{}' claims publisher '{publisher}', whose manifest \
-                     describes no cross-source unified block — either it never publishes \
-                     there (drop it from the seed) or its manifest is stale",
+                     describes neither a cross-source unified block nor a '{}' \
+                     one — either it never publishes there (drop it from the \
+                     seed) or its manifest is stale",
+                    ns.name,
                     ns.name
                 );
             }

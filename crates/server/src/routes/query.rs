@@ -692,3 +692,149 @@ pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<V
         )),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Market query surface (N33)
+//
+// `market/profile` is the cross-FAMILY product: one row per state × trade
+// joining `trades/operator_economics` (keyed `<ST>:<trade>`) to
+// `census/market_blend` (keyed `{naics4}:{state_fips}`). The join is done by
+// `trades_common::market`; this route is the one-call read, and the MCP
+// `market_profile` tool answers through the same function so the two surfaces
+// cannot disagree about what "not found" means.
+// ---------------------------------------------------------------------------
+
+/// Virtual app namespace holding the cross-family market product. Mirrors
+/// `trades_common::market::{MARKET_APP, PROFILE_DATASET}`; duplicated as
+/// literals rather than taking a server dependency on a library crate for two
+/// strings (the same judgment `GRANTS_APP` documents above).
+const MARKET_APP: &str = "market";
+const PROFILE_DATASET: &str = "profile";
+
+/// How many rows of one state the case-insensitive fallback may scan. A state
+/// holds one row per enabled trade (5 today); 200 is far past any plausible
+/// taxonomy and keeps a mistyped trade from reading a whole dataset.
+const MARKET_TRADE_SCAN: i64 = 200;
+
+/// The canonical record key for a state × trade profile. **Pure**, so the HTTP
+/// route, the MCP tool and any future consumer spell the key exactly one way —
+/// the key grammar is the product's contract, and a second spelling of it is
+/// how two surfaces come to disagree about which row exists.
+///
+/// The state segment is upper-cased (`tx` → `TX`, the stored form); the trade
+/// segment is only trimmed, because trade labels are display strings
+/// (`Pool service`) whose casing the taxonomy owns — matching one
+/// case-insensitively is [`find_market_profile`]'s job, not the key's.
+pub(crate) fn market_profile_key(state: &str, trade: &str) -> String {
+    format!("{}:{}", state.trim().to_uppercase(), trade.trim())
+}
+
+/// One state × trade profile, or `None` when there is no live row for it.
+///
+/// Two lookups, in order: the exact key, then a case-insensitive scan of that
+/// state's rows so an agent asking for `hvac` finds `HVAC` instead of a 404 it
+/// cannot act on. Tombstoned rows are excluded at both steps — `Datasets::get`
+/// and `list` both return removed records by design, and a removed profile is
+/// not an answer.
+pub(crate) async fn find_market_profile(
+    state: &AppState,
+    st: &str,
+    trade: &str,
+) -> Result<Option<Value>, pumper_core::Error> {
+    let key = market_profile_key(st, trade);
+    if let Some(rec) = state
+        .datasets
+        .get(MARKET_APP, PROFILE_DATASET, &key)
+        .await?
+    {
+        if rec.removed_at.is_none() {
+            return Ok(Some(rec.data));
+        }
+    }
+    let wanted = trade.trim().to_lowercase();
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let rows = state
+        .datasets
+        .list_filtered(
+            MARKET_APP,
+            PROFILE_DATASET,
+            &[pumper_core::datasets::JsonFilter::Eq {
+                path: "$.state".into(),
+                value: st.trim().to_uppercase(),
+            }],
+            None,
+            MARKET_TRADE_SCAN,
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| r.removed_at.is_none())
+        .find(|r| {
+            r.data
+                .get("trade")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.to_lowercase() == wanted)
+        })
+        .map(|r| r.data))
+}
+
+/// **One state × trade market profile**: the economics half and the density
+/// half of "should I launch as a plumber in Texas" in a single row.
+#[utoipa::path(
+    get,
+    path = "/market/profile/{state}/{trade}",
+    tag = "market",
+    params(
+        ("state" = String, Path, description = "USPS state code, any case (`TX`, `tx`). `US` is not a profile: the national roll-up lives in `trades/operator_economics`."),
+        ("trade" = String, Path, description = "Canonical trade label, matched case-insensitively (`Plumbing`, `hvac`, `Pool service`)."),
+    ),
+    responses(
+        (status = 200, description = "The `market/profile` record: `{state, state_fips, trade, soc_code, naics4, density_grain, density_key, coverage, total_market_per_10k, total_market_per_10k_basis, economics: {wage_band, wage_grain, pricing, pricing_locality, tax, compliance, valuation}, density, succession, formation, vintages}`. \
+            `coverage` is `both` or `economics_only`, and an `economics_only` row has `density: null` — never zeros, which would read as \"nobody operates here\" when the fact is \"the census publishes no cell for this trade\". `density_grain` is always `naics4`: the nonemployer series is published at 4-digit NAICS, so Plumbing, Electrical and HVAC (all 238220) share one density block. `vintages` names the year each input came from, which `updated_at` does not."),
+        (status = 404, description = "No profile for that state × trade", body = Object),
+    )
+)]
+pub(crate) async fn market_profile(
+    State(state): State<AppState>,
+    axum::extract::Path((st, trade)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    match find_market_profile(&state, &st, &trade).await? {
+        Some(profile) => Ok(Json(profile)),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no market/profile row for '{}' — the product is derived from \
+                 trades/operator_economics and census/market_blend, so it exists only for a \
+                 state a trades app has covered and a trade in the live taxonomy. Run any \
+                 trades app (or any census app) to republish it, and GET \
+                 /datasets/market/profile to see which rows exist.",
+                market_profile_key(&st, &trade)
+            ),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod market_tests {
+    use super::market_profile_key;
+
+    /// The key grammar IS the product's contract, and the anti-pattern is a
+    /// second spelling of it: a route that upper-cases the trade too would ask
+    /// for `TX:PLUMBING` and get a 404 for a row that exists. The state segment
+    /// is normalized (the store holds USPS codes); the trade segment is a
+    /// display label the taxonomy owns, so it is only trimmed — matching it
+    /// case-insensitively is `find_market_profile`'s fallback, not the key's.
+    #[test]
+    fn the_key_normalizes_the_state_and_leaves_the_trade_label_alone() {
+        assert_eq!(market_profile_key("tx", "Plumbing"), "TX:Plumbing");
+        assert_eq!(
+            market_profile_key(" TX ", " Pool service "),
+            "TX:Pool service"
+        );
+        assert_eq!(market_profile_key("Tx", "hvac"), "TX:hvac");
+        // Not "TX:HVAC": upper-casing the label would miss the stored row.
+        assert_ne!(market_profile_key("tx", "hvac"), "TX:HVAC");
+    }
+}
