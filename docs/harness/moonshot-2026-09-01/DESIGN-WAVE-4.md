@@ -31,8 +31,22 @@ that order; the coordinator resolves the `EXPECTED` list.
    accepted, resolving through the core helper `resilience::profiles::rules_source`; inline `rules`
    keep working and the run reports `repairable: false`; `source_runs.profile_version` is stamped
    from the run. The `repair` app's shadow mode then has a real consumer.
+3. **Apps can read their `[section]` config.** `registry::apps()` takes no `&Config`, so N25's
+   `[research] max_watched_sources` binds only from per-run params. Give `apps(config: &Config)`
+   (or an `AppConfig` handle on `AppContext` — pick the smaller change and say why) so an app can
+   read its own section; `research` becomes the first consumer and its default-pinning test is
+   replaced by a real plumbing test. P's scope gains `crates/server/src/registry.rs`,
+   `crates/server/src/state.rs`, `crates/apps/research/src/lib.rs` (the one read site).
+4. **App-declared schedules** — N25 emits `watch_requests[]` (ready-to-POST `/schedules` bodies)
+   because an app has no schedule-writing seam. Add `AppContext::request_schedule(body)` that the
+   worker's post-run fan-out turns into `Storage::create_managed_schedule` rows tagged
+   `managed_by = "app:<name>"`, capped by `[worker] max_app_schedules_per_run` (default 20), and
+   port `research`'s `watch_sources` onto it. P's scope gains the one fan-out call site in
+   `crates/server/src/worker.rs` (nothing else in that file).
 **Gate to prove:** all moved tests pass unchanged; an extractor run under `profile:` stamps
-`profile_version` and one under inline `rules` reports `repairable: false`.
+`profile_version` and one under inline `rules` reports `repairable: false`; a research run with
+`watch_sources: true` creates capped `app:research` schedules; `[research] max_watched_sources = 3`
+in config binds without a per-run param.
 
 ### Q — N18 Elastic executor plane (XL, policy) — card JO5
 
