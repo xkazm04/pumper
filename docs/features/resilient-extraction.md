@@ -599,11 +599,21 @@ otherwise would be the dishonest part of the design.
 
 ## 4. Where rules live: the profile registry (prerequisite for everything in §6)
 
-> **Not built.** Rules remain a job parameter. This section is a prerequisite
-> only for repair, which is also not built; detection keys on `(app, dataset)`
-> and needs none of it. The cost is that `source_runs` cannot stamp a
-> `profile_version`, so the `self_inflicted` diagnosis (§2.3) narrows the era by
-> `build_id` alone.
+> **Built (N12 step 1), store-side.** Migration `0041_extraction_profiles.sql`
+> adds `extraction_profiles` + immutable `profile_versions` and the
+> `source_runs.profile_version` column. The store API is
+> `Datasets::ensure_profile` / `add_profile_version` /
+> `set_active_profile_version` / `profile_rules` / `profile_versions`, and
+> `HealthStore::stamp_profile_version` records which version produced a run
+> (`NULL` keeps meaning *not profile-backed*, so pre-migration rows need no
+> backfill). The pure origin question — did this job say `profile` or `rules`,
+> and is it therefore repairable — is `resilience::profiles::rules_source` +
+> `repairability`.
+>
+> **Not yet wired into the `extractor` app's params door**: `POST
+> /apps/extractor/jobs {"profile": …}` is not accepted yet, so today the
+> registry is written by the `repair` app (§6) and by direct store calls.
+> Everything an existing job does is byte-for-byte unchanged.
 
 Today a `RuleSet` is a **job parameter**. It has no identity, no version, and no
 home — it arrives in `POST /apps/extractor/jobs` or sits inside a `schedules`
@@ -803,12 +813,24 @@ test asserting the equivalence.
 
 ## 6. Repair
 
-> **Not built.** No candidate generation, no validation gates, no LLM call, no
-> money spent. A degrading source is detected, quarantined and reported; fixing
-> it is an operator action followed by `POST /sources/{id}/state`. §13's build
-> order puts repair last for exactly this reason: steps 1-5 deliver most of the
-> value at none of the risk, and if the evaluation numbers come back badly steps
-> 6-8 should not land at all.
+> **Partly built (N12 steps 3-5), and OFF by default.** Tier 0 (§6.2) and the
+> seven gates (§6.4) exist as pure, tested functions; Tier 1 (§6.3, the Claude
+> proposal) does **not** — no LLM call, no money spent, and the only seam is
+> that a candidate carries an `origin` of `claude` if one ever writes it.
+>
+> | piece | where | state |
+> |---|---|---|
+> | Tier-0 inversion | `induce::invert` | built |
+> | brittle lint | `induce::lint_selector`, `lint_selector_breadth` | built |
+> | the seven gates | `resilience::repair::{gate_*, judge}` | built |
+> | promotion / rollback machine | `resilience::repair::{decide_promotion, probation_outcome}` | built |
+> | candidate + verdict persistence | `repair_attempts`, `repair_candidates` (migration 0042) | built |
+> | Tier-1 Claude candidates | — | **not built** |
+> | golden documents (§6.4.4) | `GoldenDoc` type only; no `data/golden/` store | **not built** — and gate 4 therefore REJECTS rather than skips |
+>
+> `[resilience.repair] enabled = false` is the shipping default, per §12.3's own
+> rule. With it false nothing is generated, nothing is spent and nothing is
+> written; the tables exist so the seam has a home before it has a caller.
 
 ### 6.1 When repair is even attempted
 
@@ -824,6 +846,29 @@ All of these must hold:
    for this source, of which ≥ 3 are golden docs with known expected values.
 5. `now > repair_blocked_until`, `promotions_30d < max_promotions_30d`, and the
    daily repair budget has headroom.
+
+**The `repair` app as built (N12 step 5).** `POST /apps/repair/jobs
+{"source": "<app>/<dataset>", "profile": "<name>"}`.
+
+- Refuses inertly (`{"repaired": false, "skipped": "<reason>"}`, job succeeds)
+  when repair is disabled, health detection is off, the source is unknown or is
+  not `degraded`/`quarantined`, a cooldown or the 30-day promotion budget is
+  live, the source is not profile-backed (`repairable: false`), fewer than
+  `holdout_min_docs` retained bodies carry known-good values, or the live rules
+  already reproduce those values.
+- Corpus: up to 200 records; the body from `read_source_artifact`, the expected
+  values from the newest revision **before `state_since`** — reading the current
+  record would hand the inverter the breakage and ask it to reproduce it.
+- Train/holdout is split structurally (first 6 documents invert, the rest
+  score); the candidate is never scored on a document it was derived from.
+- Cost class `free`, structurally: the app never calls `ctx.research`.
+- Result carries `candidates[]` with each verdict, `decision`, `clean_runs`,
+  `shadow_version`, `promoted_version` and `events` — the webhook kinds the run
+  WOULD emit. Dispatch is not wired: `webhook::dispatch_event` lives in the
+  server, above the app boundary.
+- **Nothing promotes today.** Gate 4 needs golden documents, `data/golden/` has
+  no store, and a gate that cannot run REFUSES rather than skipping. Every run
+  therefore ends `rejected:golden_missing` until the golden store lands.
 
 Repair runs as a dedicated app, `repair`, so **every dollar it spends is
 attributable by construction** through the existing `cost_events` ledger
@@ -1008,9 +1053,18 @@ the human reviewer: nobody approves anything, but somebody is told.
 
 ### 8.1 Promotion
 
-> **Not built** (§8.1-8.3). There is nothing to promote or roll back without the
-> profile registry and repair. `POST /sources/{id}/state` is the whole operator
-> surface. It is no longer the *only* way out of `quarantined` — §2.7's
+> **The state machine is built (N12 step 5), the API is not.**
+> `resilience::repair::decide_promotion` and `probation_outcome` are pure
+> functions with the anti-oscillation budget, the cooldown, the stale-candidate
+> drop and the one-tripped-run rollback; `HealthStore::repair_guard` recomputes
+> `promotions_30d` **from the attempt ledger** rather than trusting a counter
+> column, because a 30-day budget behind a counter nobody resets is a permanent
+> ban. There are no `/profiles/extraction/...` routes and no
+> `POST /sources/{id}/reextract` yet, so `POST /sources/{id}/state` is still the
+> whole operator HTTP surface, and the `source.repair_promoted` /
+> `source.rolled_back` webhooks are named in the `repair` app's result but not
+> yet dispatched (`webhook::dispatch_event` lives in the server, above the app
+> boundary). It is no longer the *only* way out of `quarantined` — §2.7's
 > evidence-based recovery is — but it is the shortcut for an operator who already
 > knows the source is fixed.
 
@@ -1366,13 +1420,35 @@ least prevents a coin-flip promotion.
 
 ## 12. Evaluation plan — proving a design that detects the invisible
 
-> **Not built.** The `resilience-eval` mutation harness, the historical
-> backtest and the canary source do not exist, so the recall and
-> false-positive-rate numbers below are **targets, not measurements**. Nothing
-> in this document reports an observed FPR. That is precisely why `enforce`
-> ships `false`: §12.6's soak is the only evidence currently available, and it
-> accrues in `source_runs` as the fleet runs. Treat every threshold in §9 as a
-> starting guess.
+> **§12.1 built (N12 step 2); §12.2–12.7 not.** `cargo run -p pumper-server
+> --bin resilience-eval` applies the mutation taxonomy below to a deterministic
+> synthetic corpus and runs the real detector over it. Exit codes follow the
+> repo's gate convention: 0 targets met / 2 findings / 3 could not check.
+> `--json` emits the whole score sheet; `--cohorts 5,30,200` picks the sizes.
+> The taxonomy and the harness are `pumper_core::resilience::mutate`, and the
+> same numbers are asserted as unit tests, so a change to `dom_simhash`, the
+> sketch or a threshold shows up as a recall/FPR delta in `cargo test` rather
+> than as silence in production.
+>
+> **First measured numbers** (default config, baseline 4 runs, cohorts 5/30/200,
+> recall measured at cohorts ≥ `min_cohort_docs`):
+>
+> | metric | measured | target |
+> |---|---|---|
+> | hard-break recall (rename, tag, wrapper, attr-move, deletion) | **1.000** | ≥ 0.90 |
+> | silent-corruption recall (duplicate-node, sibling-swap) | **0.500** | ≥ 0.50 |
+> | false-positive rate (build-hash churn, text-only change, no mutation) | **0.000** | ≤ 0.003 |
+>
+> Read honestly: the silent number is exactly at its floor, and it is carried
+> entirely by **duplicate-node** (distinctness collapse, caught at 1.000).
+> **Sibling-swap is not detected** — it scores 0.300 against a 0.6 threshold on
+> invariant and shape signals alone. Two same-shaped fields exchanging values is
+> the case §3 says is not detectable, and the harness now says so with a number
+> instead of a prediction. At cohort 5 nothing is judged at all (`below_cohort`),
+> which is the *unmonitored* answer, not a miss.
+>
+> The backtest (§12.2), the canary (§10.9) and the production soak (§12.6) still
+> do not exist, so `enforce` stays `false`.
 
 The thing this detects is by definition unobserved, so ground truth has to be
 *manufactured*. Six measurements, each with a number that would falsify part of

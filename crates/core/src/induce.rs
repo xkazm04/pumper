@@ -500,6 +500,499 @@ fn induced_transforms(attr: Option<&str>) -> Vec<Transform> {
 /// anchor hrefs); the list is the seam for `src`/`data-href` when it does.
 const URL_ATTRS: [&str; 3] = ["href", "src", "poster"];
 
+// ── Tier-0 repair: value → selector inversion (N12 §6.2) ────────────────────
+//
+// Induction above asks "what repeats on these pages?". Inversion asks a much
+// narrower and much more answerable question: **which rule produces THESE
+// known values from THIS markup?** The old correct values come from the
+// source's own `record_revisions`, so the search has an answer key — which is
+// the entire reason a deterministic, zero-dollar repair is possible at all.
+//
+// For the most common real redesign — the words held still, the class names
+// moved — this finds the answer for free. It is deliberately incapable of
+// inventing a value: every candidate it emits has already been checked to
+// reproduce the known values on every document it was given.
+
+/// Attributes inversion will search for an old value, in preference order.
+/// Text is searched first and is not in this list.
+const INVERT_ATTRS: [&str; 7] = [
+    "href", "src", "content", "datetime", "value", "title", "alt",
+];
+
+/// Attributes whose value is a stable identity worth anchoring a selector on —
+/// the "semantic anchors" §6.2 prefers over positional paths.
+const ANCHOR_ATTRS: [&str; 6] = [
+    "itemprop",
+    "data-testid",
+    "data-test",
+    "data-qa",
+    "data-field",
+    "name",
+];
+
+/// Candidate selectors examined per (document, field) before giving up. Bounds
+/// a pathological page; a real field has a handful of matches, not hundreds.
+const MAX_MATCHES_PER_DOC: usize = 24;
+
+/// Distinct surviving selectors kept per field.
+const MAX_SELECTORS_PER_FIELD: usize = 8;
+
+/// Knobs for [`invert`].
+#[derive(Debug, Clone)]
+pub struct InvertOptions {
+    /// Documents a selector must reproduce the known value on before it is
+    /// emitted. §6.2's "≥ 5 documents" — the cross-document intersection is
+    /// what turns a per-page hack into a rule, so this is the load-bearing
+    /// number and lowering it is how a repair overfits.
+    pub min_docs: usize,
+    /// Distinct rule sets emitted, best first.
+    pub max_candidates: usize,
+    /// Ancestor levels walked when building a scoped path.
+    pub max_depth: usize,
+}
+
+impl Default for InvertOptions {
+    fn default() -> Self {
+        Self {
+            min_docs: 5,
+            max_candidates: 3,
+            max_depth: 3,
+        }
+    }
+}
+
+/// One field's inversion evidence — why a selector was chosen, or why none was.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldInversion {
+    pub field: String,
+    /// Documents where a known old value was available to search for.
+    pub docs_with_value: usize,
+    /// Selectors that reproduced the known value on EVERY such document,
+    /// best first.
+    pub selectors: Vec<String>,
+    /// Attribute the value was found in (`None` = element text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attr: Option<String>,
+}
+
+/// The full inversion verdict: the candidate rule sets plus per-field evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct Inversion {
+    /// Compile-checked candidate rule sets, best first. Empty is the honest
+    /// answer when nothing survived the cross-document intersection — never a
+    /// half-bound rule set that would quietly drop a field.
+    pub candidates: Vec<RuleSet>,
+    pub fields: Vec<FieldInversion>,
+    /// Fields that had known values but no surviving selector.
+    pub unresolved: Vec<String>,
+}
+
+/// Inverts known-good values into candidate rule sets (Tier 0 repair).
+///
+/// `old_values[i]` are the last-known-correct field values for `new_docs[i]` —
+/// **positional**, so the caller pairs a revision with the body of the same
+/// record. A field missing (or blank) for a document is simply not searched
+/// there; a field must still clear `min_docs` documents overall.
+///
+/// Returns an [`Inversion`] whose `candidates` is empty when nothing survived.
+/// Emitting nothing is a first-class outcome here: a repair candidate that
+/// reproduces the known values on 4 of 9 documents is not a weaker repair, it
+/// is a different rule.
+pub fn invert(
+    old_values: &[BTreeMap<String, String>],
+    new_docs: &[String],
+    opts: &InvertOptions,
+) -> Inversion {
+    let empty = Inversion {
+        candidates: Vec::new(),
+        fields: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    if old_values.len() != new_docs.len() || new_docs.is_empty() {
+        return empty;
+    }
+    let min_docs = opts.min_docs.max(1);
+    if new_docs.len() < min_docs {
+        return empty;
+    }
+    let pages: Vec<Html> = new_docs.iter().map(|d| Html::parse_document(d)).collect();
+
+    // Field census: every field with a non-blank known value somewhere.
+    let mut field_names: Vec<String> = old_values
+        .iter()
+        .flat_map(|m| m.keys().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    field_names.sort();
+
+    let mut evidence: Vec<FieldInversion> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+    for field in &field_names {
+        let wanted: Vec<Option<&str>> = old_values
+            .iter()
+            .map(|m| {
+                m.get(field)
+                    .map(String::as_str)
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .collect();
+        let docs_with_value = wanted.iter().filter(|v| v.is_some()).count();
+        if docs_with_value < min_docs {
+            unresolved.push(field.clone());
+            continue;
+        }
+        let (selectors, attr) = invert_field(&pages, &wanted, opts);
+        if selectors.is_empty() {
+            unresolved.push(field.clone());
+        }
+        evidence.push(FieldInversion {
+            field: field.clone(),
+            docs_with_value,
+            selectors,
+            attr,
+        });
+    }
+
+    // A candidate rule set binds EVERY field that resolved. Candidate k takes
+    // each field's k-th surviving selector (clamped), so the alternatives are
+    // genuinely different bindings rather than the same rule three times.
+    let resolved: Vec<&FieldInversion> = evidence
+        .iter()
+        .filter(|f| !f.selectors.is_empty())
+        .collect();
+    let mut candidates: Vec<RuleSet> = Vec::new();
+    if !resolved.is_empty() {
+        let depth = resolved
+            .iter()
+            .map(|f| f.selectors.len())
+            .max()
+            .unwrap_or(1)
+            .min(opts.max_candidates.max(1));
+        let mut seen: HashSet<String> = HashSet::new();
+        for k in 0..depth {
+            let mut fields: BTreeMap<String, FieldRule> = BTreeMap::new();
+            for f in &resolved {
+                let sel = f.selectors[k.min(f.selectors.len() - 1)].clone();
+                fields.insert(
+                    f.field.clone(),
+                    FieldRule {
+                        rule: Rule::Css {
+                            selector: sel,
+                            attr: f.attr.clone(),
+                            all: false,
+                            html: false,
+                        },
+                        // Deliberately empty: the candidate must reproduce the
+                        // RECORDED values byte for byte, and a transform chain
+                        // invented here would change them.
+                        transforms: Vec::new(),
+                    },
+                );
+            }
+            let rules = RuleSet { fields };
+            let fingerprint = serde_json::to_string(&rules).unwrap_or_default();
+            if !seen.insert(fingerprint) {
+                continue;
+            }
+            // A rule set inversion built and cannot compile is a bug here,
+            // never the caller's problem — drop it rather than emit it.
+            if rules.compile().is_ok() {
+                candidates.push(rules);
+            }
+        }
+    }
+    Inversion {
+        candidates,
+        fields: evidence,
+        unresolved,
+    }
+}
+
+/// One field's inversion: the selectors that reproduce every known value.
+fn invert_field(
+    pages: &[Html],
+    wanted: &[Option<&str>],
+    opts: &InvertOptions,
+) -> (Vec<String>, Option<String>) {
+    // Proposals are seeded from the FIRST document that has a known value —
+    // any selector that works everywhere necessarily works there, so seeding
+    // from one page loses nothing and bounds the search.
+    let Some(seed) = wanted.iter().position(Option::is_some) else {
+        return (Vec::new(), None);
+    };
+    let seed_value = wanted[seed].unwrap();
+    let mut proposals: Vec<(u8, String, Option<String>)> = Vec::new();
+    for (attr, el) in locate(&pages[seed], seed_value) {
+        for (tier, sel) in selector_paths(el, opts.max_depth) {
+            proposals.push((tier, sel, attr.clone()));
+        }
+        if proposals.len() >= MAX_MATCHES_PER_DOC * 6 {
+            break;
+        }
+    }
+    // Brittle selectors never enter the intersection: rejecting them here is
+    // cheaper than validating them and rejecting them at the gate, and it stops
+    // a brittle selector from crowding out a stable one at the same tier.
+    proposals.retain(|(_, sel, _)| lint_selector(sel).is_empty());
+    // Prefer semantic anchors, then shorter paths, then alphabetical order so
+    // the same corpus always yields the same candidate list.
+    proposals.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.len().cmp(&b.1.len()))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    proposals.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut kept_attr: Option<String> = None;
+    for (_, sel, attr) in proposals {
+        // Mixing text and attribute bindings inside one field is not a thing a
+        // `css` rule can express, so the first surviving binding fixes the mode.
+        if !kept.is_empty() && kept_attr != attr {
+            continue;
+        }
+        let Ok(parsed) = Selector::parse(&sel) else {
+            continue;
+        };
+        if reproduces_everywhere(pages, wanted, &parsed, attr.as_deref()) {
+            kept_attr = attr;
+            kept.push(sel);
+            if kept.len() >= MAX_SELECTORS_PER_FIELD {
+                break;
+            }
+        }
+    }
+    (kept, kept_attr)
+}
+
+/// Whether `selector` yields exactly the known value on EVERY document that has
+/// one. This is the cross-document intersection, and it is the whole guard
+/// against a per-page hack: one disagreeing document rejects the selector.
+fn reproduces_everywhere(
+    pages: &[Html],
+    wanted: &[Option<&str>],
+    selector: &Selector,
+    attr: Option<&str>,
+) -> bool {
+    for (page, want) in pages.iter().zip(wanted) {
+        let Some(want) = want else { continue };
+        let Some(el) = page.select(selector).next() else {
+            return false;
+        };
+        // Exactly the runtime's own `css` rendering — a selector validated by a
+        // different reader than the one that will run it proves nothing.
+        let got = match attr {
+            Some(a) => match el.value().attr(a) {
+                Some(v) => v.to_string(),
+                None => return false,
+            },
+            None => el.text().collect::<String>().trim().to_string(),
+        };
+        if got != *want {
+            return false;
+        }
+    }
+    true
+}
+
+/// Every element in `page` whose text (or a searchable attribute) is exactly
+/// `value`, paired with the attribute it was found in (`None` = text).
+fn locate<'a>(page: &'a Html, value: &str) -> Vec<(Option<String>, ElementRef<'a>)> {
+    let mut out = Vec::new();
+    for node in page.root_element().descendants() {
+        let Some(el) = ElementRef::wrap(node) else {
+            continue;
+        };
+        if el.text().collect::<String>().trim() == value {
+            out.push((None, el));
+        } else {
+            for a in INVERT_ATTRS {
+                if el.value().attr(a) == Some(value) {
+                    out.push((Some(a.to_string()), el));
+                    break;
+                }
+            }
+        }
+        if out.len() >= MAX_MATCHES_PER_DOC {
+            break;
+        }
+    }
+    out
+}
+
+/// Candidate selectors that address `el`, each with its preference tier
+/// (lower = more stable). Semantic anchors first, positional paths last.
+fn selector_paths(el: ElementRef, max_depth: usize) -> Vec<(u8, String)> {
+    let mut out: Vec<(u8, String)> = Vec::new();
+    let e = el.value();
+    if let Some(id) = e.id().filter(|id| usable_class(id)) {
+        out.push((0, format!("#{id}")));
+    }
+    for a in ANCHOR_ATTRS {
+        if let Some(v) = e.attr(a).filter(|v| quotable(v)) {
+            out.push((1, format!("[{a}=\"{v}\"]")));
+        }
+    }
+    let own = path_sig(e);
+    if own.contains('.') {
+        out.push((2, own.clone()));
+    }
+    // Scoped paths: anchor the element under a class-bearing ancestor. The
+    // descendant combinator (not `>`) survives a wrapper `<div>` being inserted
+    // between them, which is one of the mutation classes this must resist.
+    let mut cur = el;
+    for depth in 0..max_depth {
+        let Some(parent) = cur.parent().and_then(ElementRef::wrap) else {
+            break;
+        };
+        if let Some(psig) = class_sig(parent.value()) {
+            out.push((3 + depth as u8, format!("{psig} {own}")));
+        }
+        cur = parent;
+    }
+    if out.is_empty() && SEMANTIC_TAGS.contains(&e.name()) {
+        out.push((9, e.name().to_string()));
+    }
+    out
+}
+
+/// Tags whose bare name is specific enough to be worth trying when an element
+/// carries no class, id or anchor attribute at all.
+const SEMANTIC_TAGS: [&str; 6] = ["h1", "title", "time", "address", "caption", "figcaption"];
+
+/// Whether an attribute value can be embedded in a `[attr="…"]` selector
+/// literally — no quote, backslash or newline to escape.
+fn quotable(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 64
+        && !v.contains('"')
+        && !v.contains('\\')
+        && !v.contains(|c: char| c.is_control())
+}
+
+// ── Brittle-selector lint (N12 §6.4.2) ──────────────────────────────────────
+
+/// One reason a selector should not be deployed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LintFinding {
+    pub selector: String,
+    /// Stable machine-readable rule id, e.g. `build_hash_class`.
+    pub rule: &'static str,
+    pub detail: String,
+}
+
+/// Selector shapes a repair candidate must never be built on.
+///
+/// Document-free by design: these are properties of the selector text, so they
+/// can reject a proposal before any document is parsed. Breadth ("matches > 5%
+/// of the document's elements") is the one gate that needs a document and lives
+/// in [`lint_selector_breadth`].
+pub fn lint_selector(selector: &str) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    let s = selector.trim();
+    let finding = |rule: &'static str, detail: String| LintFinding {
+        selector: s.to_string(),
+        rule,
+        detail,
+    };
+    if s.is_empty() {
+        out.push(finding("empty", "selector is empty".into()));
+        return out;
+    }
+    // Unanchored roots: `body`, `html`, `*`, or a bare structural tag. These
+    // match on every page ever written, so a candidate built on one is not a
+    // rule about this source at all.
+    for part in s.split(',') {
+        let last = part
+            .trim()
+            .rsplit([' ', '>', '+', '~'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if matches!(
+            last,
+            "*" | "body" | "html" | "div" | "span" | "p" | "li" | "td" | "tr"
+        ) {
+            out.push(finding(
+                "unanchored",
+                format!("`{last}` is not selective enough to be a rule"),
+            ));
+            break;
+        }
+    }
+    // Build-digest class tokens churn on every deploy, so a selector built on
+    // one is dead at the next release even though it validates perfectly today.
+    for token in s.split(['.', '#', ' ', '>', '[', ']', '"', '=', ':', ',']) {
+        if !token.is_empty() && build_hash_stem(token).is_some() {
+            out.push(finding(
+                "build_hash_class",
+                format!("`{token}` looks like a per-build digest"),
+            ));
+            break;
+        }
+    }
+    // A deep positional chain encodes the layout, not the meaning.
+    let nth = s.matches(":nth-child").count() + s.matches(":nth-of-type").count();
+    if nth > MAX_POSITIONAL_STEPS {
+        out.push(finding(
+            "positional_chain",
+            format!("{nth} positional steps (max {MAX_POSITIONAL_STEPS})"),
+        ));
+    }
+    out
+}
+
+/// `:nth-child`/`:nth-of-type` steps a selector may carry before it is judged
+/// positional rather than semantic.
+const MAX_POSITIONAL_STEPS: usize = 3;
+
+/// Default breadth ceiling: a field selector matching more than this share of a
+/// document's elements is binding to chrome, not to a field.
+pub const MAX_SELECTOR_BREADTH: f64 = 0.05;
+
+/// The one lint that needs a document: how much of the page a selector matches.
+///
+/// Returns a finding when the selector matches more than `max_ratio` of the
+/// document's elements on ANY of `docs`. A selector that fails to parse is
+/// reported rather than silently passing — an unparseable selector has not been
+/// shown to be narrow, and "could not check" is not "fine".
+pub fn lint_selector_breadth(selector: &str, docs: &[String], max_ratio: f64) -> Vec<LintFinding> {
+    let Ok(parsed) = Selector::parse(selector) else {
+        return vec![LintFinding {
+            selector: selector.to_string(),
+            rule: "unparseable",
+            detail: "selector does not parse as CSS".into(),
+        }];
+    };
+    for doc in docs {
+        let page = Html::parse_document(doc);
+        let total = page
+            .root_element()
+            .descendants()
+            .filter(|n| ElementRef::wrap(*n).is_some())
+            .count();
+        if total == 0 {
+            continue;
+        }
+        let hits = page.select(&parsed).count();
+        let ratio = hits as f64 / total as f64;
+        if ratio > max_ratio {
+            return vec![LintFinding {
+                selector: selector.to_string(),
+                rule: "too_broad",
+                detail: format!(
+                    "matches {hits}/{total} elements ({:.1}% > {:.1}%)",
+                    ratio * 100.0,
+                    max_ratio * 100.0
+                ),
+            }];
+        }
+    }
+    Vec::new()
+}
+
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
@@ -690,5 +1183,160 @@ mod tests {
     #[test]
     fn empty_corpus_yields_none() {
         assert!(induce(&[], &InduceOptions::default()).unwrap().is_none());
+    }
+
+    // ── Tier-0 inversion ────────────────────────────────────────────────────
+
+    use super::{
+        invert, lint_selector, lint_selector_breadth, InvertOptions, MAX_SELECTOR_BREADTH,
+    };
+    use std::collections::BTreeMap;
+
+    /// A detail page: the old markup binds `.price`/`.sku`; the new markup is
+    /// the same page after a CSS refactor renamed both class tokens.
+    fn detail(i: usize, renamed: bool) -> String {
+        let (p, s) = if renamed {
+            ("cost-v2", "code-v2")
+        } else {
+            ("price", "sku")
+        };
+        format!(
+            "<html><body><nav class=\"top\"><span class=\"price\">Sale</span></nav>\
+             <div class=\"card\"><h1 class=\"title\">Widget {i}</h1>\
+             <span class=\"{p}\">${i}9.00</span>\
+             <span class=\"{s}\">SKU-{i:03}</span>\
+             <a class=\"more\" href=\"/item/{i}\">Details</a></div></body></html>"
+        )
+    }
+
+    fn known(i: usize) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("price".to_string(), format!("${i}9.00")),
+            ("sku".to_string(), format!("SKU-{i:03}")),
+        ])
+    }
+
+    #[test]
+    fn inversion_rebinds_a_renamed_class_and_reproduces_the_old_values() {
+        // The commonest real redesign: the words held still, the class names
+        // moved. Tier 0 must answer it for zero dollars.
+        let olds: Vec<_> = (0..6).map(known).collect();
+        let docs: Vec<String> = (0..6).map(|i| detail(i, true)).collect();
+        let out = invert(&olds, &docs, &InvertOptions::default());
+        assert!(!out.candidates.is_empty(), "{:?}", out.unresolved);
+        assert!(out.unresolved.is_empty(), "{:?}", out.unresolved);
+
+        let compiled = out.candidates[0].compile().unwrap();
+        for (i, doc) in docs.iter().enumerate() {
+            let v = crate::extract::extract_one(&compiled, doc);
+            assert_eq!(v["price"], serde_json::json!(format!("${i}9.00")), "{v}");
+            assert_eq!(v["sku"], serde_json::json!(format!("SKU-{i:03}")), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_selector_that_only_works_on_one_page_is_not_a_rule() {
+        // THE ANTI-PATTERN: deriving a selector from one document. The nav's
+        // `.price` matches everywhere and happens to hold document 0's value,
+        // so a single-page inversion would bind to site chrome. The
+        // cross-document intersection is the only thing that rejects it.
+        let mut docs: Vec<String> = (0..6).map(|i| detail(i, true)).collect();
+        docs[0] = docs[0].replace(
+            "<span class=\"price\">Sale</span>",
+            "<span class=\"price\">$09.00</span>",
+        );
+        let olds: Vec<_> = (0..6).map(known).collect();
+        let out = invert(&olds, &docs, &InvertOptions::default());
+        for rules in &out.candidates {
+            let wire = serde_json::to_string(rules).unwrap();
+            assert!(
+                !wire.contains("nav"),
+                "bound to site chrome that only matched page 0: {wire}"
+            );
+        }
+        // …and whatever it did bind to still reproduces every known value.
+        let compiled = out.candidates[0].compile().unwrap();
+        for (i, doc) in docs.iter().enumerate() {
+            let v = crate::extract::extract_one(&compiled, doc);
+            assert_eq!(v["price"], serde_json::json!(format!("${i}9.00")), "{v}");
+        }
+    }
+
+    #[test]
+    fn inversion_emits_nothing_rather_than_a_partial_binding() {
+        // The field was deleted from the site: there is no rule that produces
+        // the old values, and saying so is the answer. A candidate that binds
+        // two of three fields would be promoted and quietly drop a column.
+        let olds: Vec<_> = (0..6).map(known).collect();
+        let docs: Vec<String> = (0..6)
+            .map(|i| {
+                detail(i, true).replace(&format!("<span class=\"cost-v2\">${i}9.00</span>"), "")
+            })
+            .collect();
+        let out = invert(&olds, &docs, &InvertOptions::default());
+        assert!(out.unresolved.contains(&"price".to_string()), "{out:?}");
+        for rules in &out.candidates {
+            assert!(
+                !rules.fields.contains_key("price"),
+                "a deleted field must never be bound: {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn too_few_documents_yield_no_candidate_at_all() {
+        // Below the intersection floor there is no evidence, only a guess.
+        let olds: Vec<_> = (0..3).map(known).collect();
+        let docs: Vec<String> = (0..3).map(|i| detail(i, true)).collect();
+        let out = invert(&olds, &docs, &InvertOptions::default());
+        assert!(out.candidates.is_empty());
+        // Mispaired inputs are a caller bug, and answering them with a
+        // confident rule set would be the worst possible response.
+        let out = invert(&olds, &[detail(0, true)], &InvertOptions::default());
+        assert!(out.candidates.is_empty());
+    }
+
+    #[test]
+    fn brittle_selectors_are_linted_out_not_shipped() {
+        // §6.4.2, as a predicate. Each of these validates perfectly on today's
+        // corpus and is dead (or meaningless) tomorrow.
+        for (sel, rule) in [
+            ("body", "unanchored"),
+            ("div", "unanchored"),
+            ("*", "unanchored"),
+            (".card > div", "unanchored"),
+            (".card-1a2b3c4d .price", "build_hash_class"),
+            (
+                "div:nth-child(2) > div:nth-child(3) > span:nth-child(1) > b:nth-child(2)",
+                "positional_chain",
+            ),
+        ] {
+            let findings = lint_selector(sel);
+            assert!(
+                findings.iter().any(|f| f.rule == rule),
+                "{sel} should trip {rule}, got {findings:?}"
+            );
+        }
+        // A stable, anchored selector passes clean.
+        assert!(lint_selector("div.card span.price").is_empty());
+        assert!(lint_selector("[itemprop=\"price\"]").is_empty());
+    }
+
+    #[test]
+    fn a_selector_matching_most_of_the_page_is_too_broad_to_be_a_field() {
+        // Padded to a realistic element count: the breadth lint is a RATIO, so
+        // on a 12-element toy page a single unique match is already 8% and
+        // every selector reads as too broad. A test that "passed" on a page
+        // that small would be measuring the fixture, not the lint.
+        let filler: String = (0..60).map(|n| format!("<p>line {n}</p>")).collect();
+        let docs: Vec<String> = (0..3)
+            .map(|i| detail(i, false).replace("</body>", &format!("{filler}</body>")))
+            .collect();
+        // `p` covers most of the page; `span.price` covers one element in ~75.
+        assert!(!lint_selector_breadth("p", &docs, MAX_SELECTOR_BREADTH).is_empty());
+        assert!(lint_selector_breadth("span.price", &docs, MAX_SELECTOR_BREADTH).is_empty());
+        // "Could not check" is not "fine": an unparseable selector is reported.
+        let bad = lint_selector_breadth("span[", &docs, MAX_SELECTOR_BREADTH);
+        assert_eq!(bad.first().map(|f| f.rule), Some("unparseable"));
     }
 }

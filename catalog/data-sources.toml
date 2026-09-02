@@ -800,3 +800,18 @@ hash = "string"
 markdown = "string"
 label = "string"
 engine = "string"
+
+[[source]]
+id = "repair"
+app = "repair"
+market = "us"
+name = "Self-healing extraction (Tier-0 repair)"
+url = "https://localhost/apps/repair"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+status = "planned"
+confidence = 3
+dataset = "extraction_profiles"
+notes = "Not a data source: an operational app over Pumper's own store. Inverts a degraded source's last-known-good values (record_revisions) against its retained bodies, scores candidates through the seven §6.4 gates, and moves an extraction_profiles.active_version pointer only after a clean shadow streak. Writes no dataset records. Tier 0 only — never calls ctx.research, so a run cannot spend. Inert unless [resilience.repair] enabled = true (default false), hence status = planned. See docs/features/resilient-extraction.md §6/§8."

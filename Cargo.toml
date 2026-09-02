@@ -55,6 +55,7 @@ app-extractor = { path = "crates/apps/extractor" }
 app-plugin = { path = "crates/apps/plugin" }
 app-smlouvy-dump-watch = { path = "crates/apps/smlouvy-dump-watch" }
 app-crawl = { path = "crates/apps/crawl" }
+app-repair = { path = "crates/apps/repair" }
 app-provisioner = { path = "crates/apps/provisioner" }
 app-transact = { path = "crates/apps/transact" }
 app-peer = { path = "crates/apps/peer" }

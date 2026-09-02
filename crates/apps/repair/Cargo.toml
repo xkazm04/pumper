@@ -1,0 +1,17 @@
+[package]
+name = "app-repair"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# Cooldown arithmetic and the 30-day promotion window.
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
+pumper-core = { workspace = true, features = ["test-support"] }

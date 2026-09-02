@@ -2171,6 +2171,257 @@ impl Datasets {
         .transpose()
     }
 
+    // ── The extraction profile registry (N12 §4) ───────────────────────────
+    //
+    // Rules as a named, versioned entity rather than a job parameter. Two
+    // tables, and the split is the whole point: `extraction_profiles` holds one
+    // MUTABLE pointer (`active_version`), `profile_versions` holds IMMUTABLE
+    // rows. A repair appends a version and may move the pointer; it never edits
+    // a rule, so rollback is a pointer move and the era a bad version wrote
+    // stays exactly identifiable.
+
+    /// Creates a profile at version 1, or returns the existing one untouched.
+    /// Idempotent by name — re-running a provisioning script must not fork a
+    /// second lineage for the same source.
+    pub async fn ensure_profile(
+        &self,
+        name: &str,
+        app: &str,
+        dataset: &str,
+        rules: &Value,
+    ) -> Result<ExtractionProfile> {
+        if let Some(existing) = self.profile(name).await? {
+            return Ok(existing);
+        }
+        let now = ts(Utc::now());
+        let hash = self.register_rules(rules).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO extraction_profiles \
+                 (name, app, dataset, active_version, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+        )
+        .bind(name)
+        .bind(app)
+        .bind(dataset)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO profile_versions \
+                 (profile, version, rules, rules_hash, origin, parent_version, evidence, \
+                  created_at) \
+             VALUES (?1, 1, ?2, ?3, 'human', NULL, NULL, ?4)",
+        )
+        .bind(name)
+        .bind(rules.to_string())
+        .bind(&hash)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.profile(name)
+            .await?
+            .ok_or_else(|| Error::App(format!("profile '{name}' vanished between insert and read")))
+    }
+
+    /// Appends an immutable version to a profile and returns its number.
+    ///
+    /// Does NOT move `active_version` — promotion is a separate, gated act
+    /// ([`Self::set_active_profile_version`]), which is what makes shadow mode
+    /// expressible at all: a candidate can exist, be scored and be rejected
+    /// without ever having been the rules anything ran with.
+    pub async fn add_profile_version(
+        &self,
+        name: &str,
+        rules: &Value,
+        origin: &str,
+        parent_version: Option<i64>,
+        evidence: Option<&Value>,
+    ) -> Result<i64> {
+        let hash = self.register_rules(rules).await?;
+        let now = ts(Utc::now());
+        let mut tx = self.pool.begin().await?;
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM profile_versions WHERE profile = ?1",
+        )
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO profile_versions \
+                 (profile, version, rules, rules_hash, origin, parent_version, evidence, \
+                  created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(name)
+        .bind(next)
+        .bind(rules.to_string())
+        .bind(&hash)
+        .bind(origin)
+        .bind(parent_version)
+        .bind(evidence.map(ToString::to_string))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(next)
+    }
+
+    /// Moves the active pointer. Refuses a version that does not exist — a
+    /// promotion to a version nobody wrote would leave the source with no rules
+    /// at all, which is worse than the broken rules it replaced.
+    pub async fn set_active_profile_version(&self, name: &str, version: i64) -> Result<()> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT version FROM profile_versions WHERE profile = ?1 AND version = ?2",
+        )
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Err(Error::App(format!(
+                "profile '{name}' has no version {version}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE extraction_profiles SET active_version = ?2, updated_at = ?3 WHERE name = ?1",
+        )
+        .bind(name)
+        .bind(version)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One profile row, or `None` when no such profile is registered.
+    pub async fn profile(&self, name: &str) -> Result<Option<ExtractionProfile>> {
+        let row: Option<(String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT name, app, dataset, active_version, created_at, updated_at \
+             FROM extraction_profiles WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(name, app, dataset, active_version, created_at, updated_at)| ExtractionProfile {
+                name,
+                app,
+                dataset,
+                active_version,
+                created_at,
+                updated_at,
+            },
+        ))
+    }
+
+    /// Every registered profile, by name.
+    pub async fn list_profiles(&self) -> Result<Vec<ExtractionProfile>> {
+        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT name, app, dataset, active_version, created_at, updated_at \
+             FROM extraction_profiles ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(name, app, dataset, active_version, created_at, updated_at)| ExtractionProfile {
+                    name,
+                    app,
+                    dataset,
+                    active_version,
+                    created_at,
+                    updated_at,
+                },
+            )
+            .collect())
+    }
+
+    /// The rules of one profile version — `None` asks for the active one.
+    ///
+    /// Returns the version actually read alongside the rules, so a caller that
+    /// asked for "active" stamps the number it got rather than re-reading it
+    /// and racing a promotion in between.
+    pub async fn profile_rules(
+        &self,
+        name: &str,
+        version: Option<i64>,
+    ) -> Result<Option<(i64, Value)>> {
+        let row: Option<(i64, String)> = match version {
+            Some(v) => {
+                sqlx::query_as(
+                    "SELECT version, rules FROM profile_versions \
+                     WHERE profile = ?1 AND version = ?2",
+                )
+                .bind(name)
+                .bind(v)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT v.version, v.rules FROM profile_versions v \
+                     JOIN extraction_profiles p \
+                       ON p.name = v.profile AND p.active_version = v.version \
+                     WHERE v.profile = ?1",
+                )
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+        row.map(|(v, raw)| {
+            serde_json::from_str(&raw)
+                .map(|rules| (v, rules))
+                .map_err(|e| {
+                    Error::Parse(format!("stored rules for '{name}' v{v} unparseable: {e}"))
+                })
+        })
+        .transpose()
+    }
+
+    /// Every version of a profile, newest first — the audit trail of repairs.
+    pub async fn profile_versions(&self, name: &str) -> Result<Vec<ProfileVersion>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT version, rules, rules_hash, origin, parent_version, evidence, created_at \
+                 FROM profile_versions WHERE profile = ?1 ORDER BY version DESC",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(version, rules, rules_hash, origin, parent_version, evidence, created_at)| {
+                    Ok(ProfileVersion {
+                        profile: name.to_string(),
+                        version,
+                        rules: serde_json::from_str(&rules).map_err(|e| {
+                            Error::Parse(format!("stored rules for '{name}' v{version}: {e}"))
+                        })?,
+                        rules_hash,
+                        origin,
+                        parent_version,
+                        evidence: evidence
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok()),
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
     /// Stamp coverage of one record's revision chain, computed in SQL so the
     /// numbers cover the WHOLE chain even when the caller pages it:
     /// `(total, with job_id, replayable = artifact_sha AND rules_hash)`.
@@ -4317,6 +4568,39 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+}
+
+/// One registered extraction profile: a named, versioned home for a `RuleSet`.
+///
+/// The `active_version` pointer is the only mutable part of the registry —
+/// everything else about a profile is append-only, which is what makes a
+/// promotion reversible by construction.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtractionProfile {
+    pub name: String,
+    pub app: String,
+    pub dataset: String,
+    pub active_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One immutable version of a profile's rules, with the evidence that justified
+/// it (`None` for a hand-written version — nothing was measured, and saying so
+/// is more honest than an empty score sheet).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileVersion {
+    pub profile: String,
+    pub version: i64,
+    pub rules: Value,
+    pub rules_hash: String,
+    /// `human` | `inversion` | `claude` | `rollback`.
+    pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    pub created_at: String,
 }
 
 #[cfg(test)]

@@ -119,7 +119,16 @@ The honest consequence: a degrading source is detected, quarantined, and reporte
 fixing it is an operator action followed by `POST /sources/{id}/state`. The design
 calls a stuck source "an acceptable terminal state", and that is what it is.
 
-### The profile registry (§4)
+### The profile registry (§4) — BUILT, store-side (N12 step 1)
+
+`0041_extraction_profiles.sql` ships `extraction_profiles` + immutable
+`profile_versions` + `source_runs.profile_version`, with the append-only
+promotion/rollback semantics (`Datasets::add_profile_version` never moves the
+active pointer; `set_active_profile_version` does, and refuses a version nobody
+wrote). What is still NOT built is the `extractor` params door: a job cannot yet
+say `{"profile": "…"}` instead of `{"rules": {…}}`, so the registry is populated
+by the `repair` app and by direct store calls. The paragraph below is the
+historical statement of why it was absent and what that cost.
 
 Rules stay a job parameter. It is a prerequisite for repair only — detection keys
 on `(app, dataset)` and needs none of it.
@@ -179,11 +188,23 @@ human reviewer: nobody approves anything, but somebody is told" — today nobody
 told unless they look. This is the single highest-value remaining piece and the
 cheapest (`webhook::dispatch_event` already exists and is the enforced path).
 
-### The evaluation harness and canary (§10.9, §12)
+### The evaluation harness and canary (§10.9, §12) — §12.1 BUILT (N12 step 2)
 
-No `resilience-eval` bin, no mutation taxonomy, no historical backtest, no
-canary source. Consequently **no recall or false-positive-rate number in this
-implementation has been measured** — see *Unverified* below.
+`--bin resilience-eval` and the mutation taxonomy
+(`crates/core/src/resilience/mutate.rs`) now exist, and the first recall/FPR
+numbers have been measured: **hard-break recall 1.000, silent-corruption recall
+0.500, false-positive rate 0.000** on a deterministic synthetic corpus at
+cohorts 30 and 200 with a 4-run baseline. The silent number sits exactly on its
+floor and is carried entirely by the duplicate-node class; **sibling-swap scores
+0.300 and is not detected**, which is the design's own "measure honestly" case
+answered with a number. Cohort 5 is `below_cohort` throughout — unmonitored, not
+missed.
+
+Still absent: the historical backtest (§12.2), the canary source (§10.9) and the
+production soak (§12.6). `enforce` therefore stays `false`, and the paragraph
+below remains the statement of what that costs.
+
+No historical backtest, no canary source.
 
 ---
 
