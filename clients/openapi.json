@@ -3149,6 +3149,32 @@
         ],
         "type": "object"
       },
+      "FitListResponse": {
+        "description": "`GET /grants/fits` without `cursor` (legacy shape).\n\nEach record's `data` is `{profile, unified_key, source, verdict, score,\nmethod, reasons[], blockers[], unknowns[]}` — typed as a record because the\nverdict row is a dataset, and the dataset's shape is documented where it is\nwritten rather than duplicated here.",
+        "properties": {
+          "fits": {
+            "items": {
+              "$ref": "#/components/schemas/RecordDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fits"
+        ],
+        "type": "object"
+      },
+      "FitsResponse": {
+        "description": "`GET /grants/fits`: `{fits: [...]}` without `cursor`, a keyset page with it.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FitListResponse"
+          },
+          {
+            "$ref": "#/components/schemas/RecordPage"
+          }
+        ]
+      },
       "GovernDisableSchedule": {
         "description": "A schedule the governance poll would disable.",
         "properties": {
@@ -3370,14 +3396,58 @@
         ],
         "type": "object"
       },
+      "GrantProfileListResponse": {
+        "description": "`GET /grants/profiles`.",
+        "properties": {
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/RecordDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "profiles"
+        ],
+        "type": "object"
+      },
+      "GrantProfileWritten": {
+        "description": "`POST /grants/profiles`.",
+        "properties": {
+          "created": {
+            "description": "`false` when this call updated an existing profile rather than making one.",
+            "type": "boolean"
+          },
+          "key": {
+            "description": "The slugged `name`. Re-POSTing the same name UPDATES that profile.",
+            "type": "string"
+          },
+          "profile": {
+            "description": "The canonical stored profile. Every absent optional field is stored as an\nexplicit `null` — absent means UNKNOWN, and unknown never blocks a fit.\nFree-form here because `grants_common::fit` owns the shape and validates\nit; restating it in the document would be a second, drifting definition.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "key",
+          "created",
+          "profile"
+        ],
+        "type": "object"
+      },
       "GrantsResponse": {
-        "description": "`GET /grants`.",
+        "description": "`GET /grants`, which is dual-mode **twice over**: on `?cursor=` as every list\nhere is, and on `?profile=`, which N31 made switch the route to the\nfit-joined view over `grants/fits` instead of the corpus. Four arms, and a\nclient narrows on the keys it finds (`grants` / `items`, plus `retired` and\n`profile` on the fit side).",
         "oneOf": [
           {
             "$ref": "#/components/schemas/GrantListResponse"
           },
           {
             "$ref": "#/components/schemas/RecordPage"
+          },
+          {
+            "$ref": "#/components/schemas/ProfileGrantsResponse"
+          },
+          {
+            "$ref": "#/components/schemas/ProfileGrantsPage"
           }
         ]
       },
@@ -4726,6 +4796,59 @@
         "required": [
           "id",
           "key"
+        ],
+        "type": "object"
+      },
+      "ProfileGrantsPage": {
+        "description": "`GET /grants?profile=` with `cursor`.",
+        "properties": {
+          "items": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retired": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "retired"
+        ],
+        "type": "object"
+      },
+      "ProfileGrantsResponse": {
+        "description": "`GET /grants?profile=` without `cursor`: the fit-joined view.",
+        "properties": {
+          "grants": {
+            "description": "Each element is the unified opportunity with a `fit` block attached.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "profile": {
+            "description": "The profile these verdicts were computed for.",
+            "type": "object"
+          },
+          "retired": {
+            "description": "Verdicts whose opportunity has left the corpus. Counted, never silently\ndropped: a fit that no longer has a grant behind it is a real thing to\nknow about, and reporting only the survivors would make a shrinking\ncorpus look like a shrinking match set.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "profile",
+          "grants",
+          "retired"
         ],
         "type": "object"
       },
@@ -10697,6 +10820,30 @@
             }
           },
           {
+            "description": "**Applicant fit (N31)**: the key of a `grants/profiles` row. Switches the\nroute to the fit-joined view — every opportunity this applicant has a\nverdict for, each with its `fit` block attached, driven from\n`grants/fits`. Combine it with `verdict=` to narrow; combining it with a\ncorpus filter (`status`, `agency`, `source`, `program`, the closing\nwindow, `min_award`) is a **400**, because the two sides live in\ndifferent datasets and ANDing two capped reads would return part of the\nanswer while looking like all of it.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Narrows `profile=` to one verdict: `eligible` | `likely` | `blocked` |\n`unknown`. Ignored when `profile` is absent.",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.",
             "in": "query",
             "name": "closing_before",
@@ -10773,7 +10920,7 @@
                 }
               }
             },
-            "description": "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty)."
+            "description": "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). With `profile=` set the route instead returns `{profile, grants, retired}` (or `{items, next_cursor, retired}`), driven from `grants/fits`: each element is the unified record plus a `fit` block, and `retired` counts the verdicts whose opportunity has left the corpus."
           },
           "400": {
             "content": {
@@ -10783,7 +10930,7 @@
                 }
               }
             },
-            "description": "Malformed `closing_before` / `closing_after` date"
+            "description": "Malformed `closing_before` / `closing_after` date, an unrecognized `verdict`, or `profile` combined with a corpus filter"
           }
         },
         "tags": [
@@ -10819,6 +10966,165 @@
               }
             },
             "description": "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200. \"Still open\" is decided at `deadline_end_utc` — the exact `close_at` instant, or midday UTC the day after a date-only `close_date` — so a grant in that anywhere-on-Earth tail is listed with `days_left: 0`, exactly as `grants/unified` still calls it `open`."
+          }
+        },
+        "tags": [
+          "grants"
+        ]
+      }
+    },
+    "/grants/fits": {
+      "get": {
+        "operationId": "list_fits",
+        "parameters": [
+          {
+            "description": "Profile key (the slugged name `POST /grants/profiles` returned).",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`eligible` | `likely` | `blocked` | `unknown`. An unrecognized value is a\n400, never a confident empty page.",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Source app of the opportunity the verdict is about.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FitsResponse"
+                }
+              }
+            },
+            "description": "Live records from `grants/fits`. Dual-mode: `{fits: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` is `{profile, unified_key, source, verdict, score, method, reasons[], blockers[], unknowns[]}`. `verdict` is `eligible` only when every gate had published evidence; `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`. `unknowns[]` names the absent field per gate, which is the list that says which source field to enrich next. The row is deliberately verdict-shaped and copies nothing from the opportunity, so a `changed` revision (and the alert it fires) means the FIT moved, not that an agency fixed a typo."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unrecognized `verdict`"
+          }
+        },
+        "summary": "**Which grants can this applicant actually apply for, and why.**",
+        "tags": [
+          "grants"
+        ]
+      }
+    },
+    "/grants/profiles": {
+      "get": {
+        "operationId": "list_grant_profiles",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GrantProfileListResponse"
+                }
+              }
+            },
+            "description": "`{profiles: [Record]}` — every live applicant profile, newest-updated first."
+          }
+        },
+        "tags": [
+          "grants"
+        ]
+      },
+      "post": {
+        "operationId": "create_grant_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GrantProfileWritten"
+                }
+              }
+            },
+            "description": "`{key, created, profile}` — the canonical stored profile. Body: `{name, org_type (nonprofit|gov|tribal|smb|university|individual), country (ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags?[], cost_share_capacity? (true|false|null), programs_watched?[]}`. The record key is the slugged `name`, so re-POSTing the same name UPDATES that profile (`created: false`). Every absent optional field is stored as an explicit `null`: absent means UNKNOWN, and unknown never blocks a fit. `ein`/`uei`/`ntee` are stored, never verified — IRS EO BMF verification is not built."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation failed — every error at once, including any UNKNOWN field (a typo'd field is refused, not dropped)"
           }
         },
         "tags": [

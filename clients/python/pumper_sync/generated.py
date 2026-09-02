@@ -1199,6 +1199,20 @@ FetchProxyResponse = TypedDict(
 """`POST /fetch-proxy` — one fetch performed through this node's local stack on
 a peer's behalf."""
 
+FitListResponse = TypedDict(
+    "FitListResponse",
+    {
+        "fits": "list[RecordDto]",
+    },
+    total=True,
+)
+"""`GET /grants/fits` without `cursor` (legacy shape).
+
+Each record's `data` is `{profile, unified_key, source, verdict, score,
+method, reasons[], blockers[], unknowns[]}` — typed as a record because the
+verdict row is a dataset, and the dataset's shape is documented where it is
+written rather than duplicated here."""
+
 GovernDisableSchedule = TypedDict(
     "GovernDisableSchedule",
     {
@@ -1281,6 +1295,26 @@ GrantListResponse = TypedDict(
     total=True,
 )
 """`GET /grants` without `cursor` (legacy shape)."""
+
+GrantProfileListResponse = TypedDict(
+    "GrantProfileListResponse",
+    {
+        "profiles": "list[RecordDto]",
+    },
+    total=True,
+)
+"""`GET /grants/profiles`."""
+
+GrantProfileWritten = TypedDict(
+    "GrantProfileWritten",
+    {
+        "created": "bool",
+        "key": "str",
+        "profile": "Json",
+    },
+    total=True,
+)
+"""`POST /grants/profiles`."""
 
 HealthResponse = TypedDict(
     "HealthResponse",
@@ -1777,6 +1811,28 @@ PrincipalRotated = TypedDict(
     total=True,
 )
 """`POST /principals/{id}/rotate` — the old key stops working immediately."""
+
+ProfileGrantsPage = TypedDict(
+    "ProfileGrantsPage",
+    {
+        "items": "list[Json]",
+        "next_cursor": "NotRequired[Optional[str]]",
+        "retired": "int",
+    },
+    total=True,
+)
+"""`GET /grants?profile=` with `cursor`."""
+
+ProfileGrantsResponse = TypedDict(
+    "ProfileGrantsResponse",
+    {
+        "grants": "list[Json]",
+        "profile": "Json",
+        "retired": "int",
+    },
+    total=True,
+)
+"""`GET /grants?profile=` without `cursor`: the fit-joined view."""
 
 ProfileInfoDto = TypedDict(
     "ProfileInfoDto",
@@ -3239,8 +3295,15 @@ AppsResponse = Union[AppListResponse, AppToolsResponse]
 #: `GET /datasets/{app}/{dataset}/changes`.
 ChangesResponse = Union[DatasetChangesResponse, RevisionPageDto]
 
-#: `GET /grants`.
-GrantsResponse = Union[GrantListResponse, RecordPage]
+#: `GET /grants/fits`: `{fits: [...]}` without `cursor`, a keyset page with it.
+FitsResponse = Union[FitListResponse, RecordPage]
+
+#: `GET /grants`, which is dual-mode **twice over**: on `?cursor=` as every list
+#: here is, and on `?profile=`, which N31 made switch the route to the
+#: fit-joined view over `grants/fits` instead of the corpus. Four arms, and a
+#: client narrows on the keys it finds (`grants` / `items`, plus `retired` and
+#: `profile` on the fit side).
+GrantsResponse = Union[GrantListResponse, RecordPage, ProfileGrantsResponse, ProfileGrantsPage]
 
 #: `GET /datasets/{app}/{dataset}/history`.
 HistoryResponse = Union[RecordHistoryResponse, RevisionPageDto]
@@ -3380,12 +3443,16 @@ __all__ = [
     "ExecutorWrite",
     "ExtractPreviewResponse",
     "FetchProxyResponse",
+    "FitListResponse",
+    "FitsResponse",
     "GovernDisableSchedule",
     "GovernEnqueueSync",
     "GovernTotals",
     "GovernWould",
     "GovernancePreview",
     "GrantListResponse",
+    "GrantProfileListResponse",
+    "GrantProfileWritten",
     "GrantsResponse",
     "HealthResponse",
     "HistoryResponse",
@@ -3430,6 +3497,8 @@ __all__ = [
     "PrincipalDto",
     "PrincipalListResponse",
     "PrincipalRotated",
+    "ProfileGrantsPage",
+    "ProfileGrantsResponse",
     "ProfileInfoDto",
     "ProfileListResponse",
     "ProgramListResponse",

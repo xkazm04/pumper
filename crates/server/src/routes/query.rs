@@ -1071,8 +1071,8 @@ fn verdict_filter(value: &Option<String>) -> Result<Option<&'static str>, ApiErr
     tag = "grants",
     request_body = Object,
     responses(
-        (status = 200, description = "`{key, created, profile}` — the canonical stored profile. Body: `{name, org_type (nonprofit|gov|tribal|smb|university|individual), country (ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags?[], cost_share_capacity? (true|false|null), programs_watched?[]}`. The record key is the slugged `name`, so re-POSTing the same name UPDATES that profile (`created: false`). Every absent optional field is stored as an explicit `null`: absent means UNKNOWN, and unknown never blocks a fit. `ein`/`uei`/`ntee` are stored, never verified — IRS EO BMF verification is not built.", body = Object),
-        (status = 400, description = "Validation failed — every error at once, including any UNKNOWN field (a typo'd field is refused, not dropped)", body = Object),
+        (status = 200, description = "`{key, created, profile}` — the canonical stored profile. Body: `{name, org_type (nonprofit|gov|tribal|smb|university|individual), country (ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags?[], cost_share_capacity? (true|false|null), programs_watched?[]}`. The record key is the slugged `name`, so re-POSTing the same name UPDATES that profile (`created: false`). Every absent optional field is stored as an explicit `null`: absent means UNKNOWN, and unknown never blocks a fit. `ein`/`uei`/`ntee` are stored, never verified — IRS EO BMF verification is not built.", body = crate::routes::dto::GrantProfileWritten),
+        (status = 400, description = "Validation failed — every error at once, including any UNKNOWN field (a typo'd field is refused, not dropped)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_grant_profile(
@@ -1108,7 +1108,7 @@ pub(crate) struct ProfilesQuery {
     path = "/grants/profiles",
     tag = "grants",
     params(ProfilesQuery),
-    responses((status = 200, description = "`{profiles: [Record]}` — every live applicant profile, newest-updated first."))
+    responses((status = 200, description = "`{profiles: [Record]}` — every live applicant profile, newest-updated first.", body = crate::routes::dto::GrantProfileListResponse))
 )]
 pub(crate) async fn list_grant_profiles(
     State(state): State<AppState>,
@@ -1167,8 +1167,8 @@ fn fit_filters(
     tag = "grants",
     params(FitsQuery),
     responses(
-        (status = 200, description = "Live records from `grants/fits`. Dual-mode: `{fits: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` is `{profile, unified_key, source, verdict, score, method, reasons[], blockers[], unknowns[]}`. `verdict` is `eligible` only when every gate had published evidence; `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`. `unknowns[]` names the absent field per gate, which is the list that says which source field to enrich next. The row is deliberately verdict-shaped and copies nothing from the opportunity, so a `changed` revision (and the alert it fires) means the FIT moved, not that an agency fixed a typo.", body = Object),
-        (status = 400, description = "Unrecognized `verdict`", body = Object),
+        (status = 200, description = "Live records from `grants/fits`. Dual-mode: `{fits: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` is `{profile, unified_key, source, verdict, score, method, reasons[], blockers[], unknowns[]}`. `verdict` is `eligible` only when every gate had published evidence; `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`. `unknowns[]` names the absent field per gate, which is the list that says which source field to enrich next. The row is deliberately verdict-shaped and copies nothing from the opportunity, so a `changed` revision (and the alert it fires) means the FIT moved, not that an agency fixed a typo.", body = crate::routes::dto::FitsResponse),
+        (status = 400, description = "Unrecognized `verdict`", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_fits(

@@ -2812,6 +2812,67 @@ pub(crate) struct ExecutorListResponse {
 }
 
 // ---------------------------------------------------------------------------
+// query.rs — applicant fit (N31)
+// ---------------------------------------------------------------------------
+
+/// `POST /grants/profiles`.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct GrantProfileWritten {
+    /// The slugged `name`. Re-POSTing the same name UPDATES that profile.
+    pub key: String,
+    /// `false` when this call updated an existing profile rather than making one.
+    pub created: bool,
+    /// The canonical stored profile. Every absent optional field is stored as an
+    /// explicit `null` — absent means UNKNOWN, and unknown never blocks a fit.
+    /// Free-form here because `grants_common::fit` owns the shape and validates
+    /// it; restating it in the document would be a second, drifting definition.
+    #[schema(value_type = Object)]
+    pub profile: Value,
+}
+
+/// `GET /grants/profiles`.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct GrantProfileListResponse {
+    pub profiles: Vec<RecordDto>,
+}
+
+/// `GET /grants/fits` without `cursor` (legacy shape).
+///
+/// Each record's `data` is `{profile, unified_key, source, verdict, score,
+/// method, reasons[], blockers[], unknowns[]}` — typed as a record because the
+/// verdict row is a dataset, and the dataset's shape is documented where it is
+/// written rather than duplicated here.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct FitListResponse {
+    pub fits: Vec<RecordDto>,
+}
+
+/// `GET /grants?profile=` without `cursor`: the fit-joined view.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProfileGrantsResponse {
+    /// The profile these verdicts were computed for.
+    #[schema(value_type = Object)]
+    pub profile: Value,
+    /// Each element is the unified opportunity with a `fit` block attached.
+    #[schema(value_type = Vec<Object>)]
+    pub grants: Vec<Value>,
+    /// Verdicts whose opportunity has left the corpus. Counted, never silently
+    /// dropped: a fit that no longer has a grant behind it is a real thing to
+    /// know about, and reporting only the survivors would make a shrinking
+    /// corpus look like a shrinking match set.
+    pub retired: i64,
+}
+
+/// `GET /grants?profile=` with `cursor`.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProfileGrantsPage {
+    #[schema(value_type = Vec<Object>)]
+    pub items: Vec<Value>,
+    pub next_cursor: Option<String>,
+    pub retired: i64,
+}
+
+// ---------------------------------------------------------------------------
 // Dual-mode unions
 // ---------------------------------------------------------------------------
 //
@@ -2923,11 +2984,25 @@ pub(crate) enum SavedSearchesResponse {
     Page(SavedSearchPage),
 }
 
-/// `GET /grants`.
+/// `GET /grants`, which is dual-mode **twice over**: on `?cursor=` as every list
+/// here is, and on `?profile=`, which N31 made switch the route to the
+/// fit-joined view over `grants/fits` instead of the corpus. Four arms, and a
+/// client narrows on the keys it finds (`grants` / `items`, plus `retired` and
+/// `profile` on the fit side).
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum GrantsResponse {
     Legacy(GrantListResponse),
+    Page(RecordPage),
+    ProfileLegacy(ProfileGrantsResponse),
+    ProfilePage(ProfileGrantsPage),
+}
+
+/// `GET /grants/fits`: `{fits: [...]}` without `cursor`, a keyset page with it.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum FitsResponse {
+    Legacy(FitListResponse),
     Page(RecordPage),
 }
 

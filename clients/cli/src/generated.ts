@@ -720,6 +720,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/grants/fits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** **Which grants can this applicant actually apply for, and why.** */
+        get: operations["list_fits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/grants/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_grant_profiles"];
+        put?: never;
+        post: operations["create_grant_profile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/grants/programs": {
         parameters: {
             query?: never;
@@ -3574,6 +3607,19 @@ export interface components {
             /** Format: int64 */
             status: number;
         };
+        /**
+         * @description `GET /grants/fits` without `cursor` (legacy shape).
+         *
+         *     Each record's `data` is `{profile, unified_key, source, verdict, score,
+         *     method, reasons[], blockers[], unknowns[]}` — typed as a record because the
+         *     verdict row is a dataset, and the dataset's shape is documented where it is
+         *     written rather than duplicated here.
+         */
+        FitListResponse: {
+            fits: components["schemas"]["RecordDto"][];
+        };
+        /** @description `GET /grants/fits`: `{fits: [...]}` without `cursor`, a keyset page with it. */
+        FitsResponse: components["schemas"]["FitListResponse"] | components["schemas"]["RecordPage"];
         /** @description A schedule the governance poll would disable. */
         GovernDisableSchedule: {
             app: string;
@@ -3645,8 +3691,32 @@ export interface components {
         GrantListResponse: {
             grants: components["schemas"]["RecordDto"][];
         };
-        /** @description `GET /grants`. */
-        GrantsResponse: components["schemas"]["GrantListResponse"] | components["schemas"]["RecordPage"];
+        /** @description `GET /grants/profiles`. */
+        GrantProfileListResponse: {
+            profiles: components["schemas"]["RecordDto"][];
+        };
+        /** @description `POST /grants/profiles`. */
+        GrantProfileWritten: {
+            /** @description `false` when this call updated an existing profile rather than making one. */
+            created: boolean;
+            /** @description The slugged `name`. Re-POSTing the same name UPDATES that profile. */
+            key: string;
+            /**
+             * @description The canonical stored profile. Every absent optional field is stored as an
+             *     explicit `null` — absent means UNKNOWN, and unknown never blocks a fit.
+             *     Free-form here because `grants_common::fit` owns the shape and validates
+             *     it; restating it in the document would be a second, drifting definition.
+             */
+            profile: Record<string, never>;
+        };
+        /**
+         * @description `GET /grants`, which is dual-mode **twice over**: on `?cursor=` as every list
+         *     here is, and on `?profile=`, which N31 made switch the route to the
+         *     fit-joined view over `grants/fits` instead of the corpus. Four arms, and a
+         *     client narrows on the keys it finds (`grants` / `items`, plus `retired` and
+         *     `profile` on the fit side).
+         */
+        GrantsResponse: components["schemas"]["GrantListResponse"] | components["schemas"]["RecordPage"] | components["schemas"]["ProfileGrantsResponse"] | components["schemas"]["ProfileGrantsPage"];
         /** @description `GET /health`. */
         HealthResponse: {
             /** @description Always `ok` — the endpoint answering at all IS the liveness signal. */
@@ -4109,6 +4179,28 @@ export interface components {
             id: string;
             /** @description Shown ONCE. */
             key: string;
+        };
+        /** @description `GET /grants?profile=` with `cursor`. */
+        ProfileGrantsPage: {
+            items: Record<string, never>[];
+            next_cursor?: string | null;
+            /** Format: int64 */
+            retired: number;
+        };
+        /** @description `GET /grants?profile=` without `cursor`: the fit-joined view. */
+        ProfileGrantsResponse: {
+            /** @description Each element is the unified opportunity with a `fit` block attached. */
+            grants: Record<string, never>[];
+            /** @description The profile these verdicts were computed for. */
+            profile: Record<string, never>;
+            /**
+             * Format: int64
+             * @description Verdicts whose opportunity has left the corpus. Counted, never silently
+             *     dropped: a fit that no longer has a grant behind it is a real thing to
+             *     know about, and reporting only the survivors would make a shrinking
+             *     corpus look like a shrinking match set.
+             */
+            retired: number;
         };
         /** @description One named login profile. Cookies and browser state are never returned. */
         ProfileInfoDto: {
@@ -6784,6 +6876,22 @@ export interface operations {
                  *     program for carry no `program_key` and never match.
                  */
                 program?: string | null;
+                /**
+                 * @description **Applicant fit (N31)**: the key of a `grants/profiles` row. Switches the
+                 *     route to the fit-joined view — every opportunity this applicant has a
+                 *     verdict for, each with its `fit` block attached, driven from
+                 *     `grants/fits`. Combine it with `verdict=` to narrow; combining it with a
+                 *     corpus filter (`status`, `agency`, `source`, `program`, the closing
+                 *     window, `min_award`) is a **400**, because the two sides live in
+                 *     different datasets and ANDing two capped reads would return part of the
+                 *     answer while looking like all of it.
+                 */
+                profile?: string | null;
+                /**
+                 * @description Narrows `profile=` to one verdict: `eligible` | `likely` | `blocked` |
+                 *     `unknown`. Ignored when `profile` is absent.
+                 */
+                verdict?: string | null;
                 /** @description Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded. */
                 closing_before?: string | null;
                 /** @description Closes on or after this `YYYY-MM-DD`. Records with no close date are excluded. */
@@ -6812,7 +6920,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). */
+            /** @description Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). With `profile=` set the route instead returns `{profile, grants, retired}` (or `{items, next_cursor, retired}`), driven from `grants/fits`: each element is the unified record plus a `fit` block, and `retired` counts the verdicts whose opportunity has left the corpus. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -6821,7 +6929,7 @@ export interface operations {
                     "application/json": components["schemas"]["GrantsResponse"];
                 };
             };
-            /** @description Malformed `closing_before` / `closing_after` date */
+            /** @description Malformed `closing_before` / `closing_after` date, an unrecognized `verdict`, or `profile` combined with a corpus filter */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6851,6 +6959,103 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClosingSoonResponse"];
+                };
+            };
+        };
+    };
+    list_fits: {
+        parameters: {
+            query?: {
+                /** @description Profile key (the slugged name `POST /grants/profiles` returned). */
+                profile?: string | null;
+                /**
+                 * @description `eligible` | `likely` | `blocked` | `unknown`. An unrecognized value is a
+                 *     400, never a confident empty page.
+                 */
+                verdict?: string | null;
+                /** @description Source app of the opportunity the verdict is about. */
+                source?: string | null;
+                limit?: number;
+                /** @description Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`. */
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Live records from `grants/fits`. Dual-mode: `{fits: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty). Each `data` is `{profile, unified_key, source, verdict, score, method, reasons[], blockers[], unknowns[]}`. `verdict` is `eligible` only when every gate had published evidence; `unknown` whenever the deciding fields are Null — a missing field never produces a `blocked`. `unknowns[]` names the absent field per gate, which is the list that says which source field to enrich next. The row is deliberately verdict-shaped and copies nothing from the opportunity, so a `changed` revision (and the alert it fires) means the FIT moved, not that an agency fixed a typo. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FitsResponse"];
+                };
+            };
+            /** @description Unrecognized `verdict` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_grant_profiles: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{profiles: [Record]}` — every live applicant profile, newest-updated first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GrantProfileListResponse"];
+                };
+            };
+        };
+    };
+    create_grant_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description `{key, created, profile}` — the canonical stored profile. Body: `{name, org_type (nonprofit|gov|tribal|smb|university|individual), country (ISO-3166 alpha-2), state?, ein?, uei?, ntee?, budget_band? {min?, max?}, focus_tags?[], cost_share_capacity? (true|false|null), programs_watched?[]}`. The record key is the slugged `name`, so re-POSTing the same name UPDATES that profile (`created: false`). Every absent optional field is stored as an explicit `null`: absent means UNKNOWN, and unknown never blocks a fit. `ein`/`uei`/`ntee` are stored, never verified — IRS EO BMF verification is not built. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GrantProfileWritten"];
+                };
+            };
+            /** @description Validation failed — every error at once, including any UNKNOWN field (a typo'd field is refused, not dropped) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
