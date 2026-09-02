@@ -13,12 +13,13 @@ grammar, the full-text index, and `catalog/data-sources.toml`.
 
 ## Enabling
 
-Default **OFF**. Two switches, deliberately separate:
+Default **OFF**. Three switches, deliberately separate:
 
 ```toml
 [mcp]
 enabled = true             # mount /mcp (POST JSON-RPC + GET SSE) at all
 allow_enqueue = false      # offer the actuating tools (spend + target load)
+allow_approve = false      # offer approve_transaction (a LIVE, irreversible web action)
 max_job_budget_usd = 1.0   # hard clamp on any MCP-enqueued job's budget_usd
 wait_job_max_secs = 60     # cap on wait_job's timeout_secs
 ```
@@ -29,6 +30,15 @@ jobs, but cannot create them. When enabled, every enqueue's `budget_usd`
 (`enqueue_job`, `deep_research`) is clamped to `max_job_budget_usd` (absent =
 the ceiling itself; `0` = free tiers only) — an agent cannot ask its way past
 the operator's rail.
+
+`allow_approve` is a **third** switch rather than a reuse of `allow_enqueue`,
+because the two authorities are not the same size: an enqueue spends money a
+ceiling bounds, while approving a transaction submits a form on a live site
+under the operator's logged-in profile and cannot be undone by anything this
+process controls. It is additionally inert unless `[transact] allow_live = true`
+— `approve_transaction` is not even listed until **both** are on, because a tool
+that is offered and then refuses every call reads to an agent as a broken
+server rather than as a policy. See [apps.md § transact](apps.md#transact-evidence-approval-submit).
 
 ## Client config (`.mcp.json`)
 
@@ -61,6 +71,8 @@ proxy you'd use for the REST surface.)
 | `enqueue_job` | `[mcp] allow_enqueue` | Enqueue one job. `params` shallow-merge over the app's defaults and are **validated against the app's schema** (violations come back as a readable tool error with JSON-pointer paths). Budget clamped as above. |
 | `fetch_readable` | `[mcp] allow_enqueue` | `{url}` → enqueues a `readable` job (URL → clean Markdown in the job's `page.md` artifact) through the exact gated path; returns the job id for `wait_job`. |
 | `deep_research` | `[mcp] allow_enqueue` | `{query, budget_usd}` → enqueues a `research` job (agentic search + read + synthesize via the Claude engine). The clamped budget is both the job's spend ceiling and the app's own `max_budget_usd` param, so the rail also binds mid-run. |
+| `list_pending_transactions` | — | `{limit?}` → the approval inbox: every `transact` transaction awaiting a human decision (`transaction_id`, `idempotency_key`, `profile`, `state`, `evidence_sha`, derived `expires_at`), plus the node's `allow_live` and `approve_enabled` flags. Always offered — reading the inbox releases nothing — and stale rows are swept first, so nothing is listed that the approve door would refuse. Read the full evidence bundle through `wait_job`'s `input_request` or `GET /transactions/{id}`. |
+| `approve_transaction` | `[mcp] allow_approve` **and** `[transact] allow_live` | `{transaction_id, evidence_sha}` → approves one pending transaction and resumes the job parked on it, which then performs the irreversible action **once**. `evidence_sha` is **required here** although the HTTP door treats it as optional: an agent approving without naming what it read is exactly the case this gate exists for. Goes through the same pure decision function and the same `state = 'pending'` SQL guard as the HTTP door, so an agent and a human cannot get different answers about a stale approval, and a race between them cannot submit twice. The commit re-probes the live page and refuses again if it drifted. |
 
 ## Resources
 

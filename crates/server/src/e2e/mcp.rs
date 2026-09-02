@@ -168,10 +168,18 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .filter_map(|t| t["name"].as_str())
         .collect();
     // wait_job is read-only (awaits status, spends nothing) so it is always
-    // offered; the actuating tools are not.
+    // offered, and so is list_pending_transactions (N01) — seeing what is
+    // waiting on a human costs nothing and releases nothing. The actuating
+    // tools are not.
     assert_eq!(
         names,
-        vec!["list_apps", "query_dataset", "search", "wait_job"]
+        vec![
+            "list_apps",
+            "query_dataset",
+            "search",
+            "wait_job",
+            "list_pending_transactions"
+        ]
     );
 
     // Calling the withheld tool is a readable tool error naming the switch.
@@ -181,6 +189,24 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     assert_eq!(resp["result"]["isError"], true);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("allow_enqueue"), "{text}");
+
+    // N01: approving a live action is withheld behind its OWN pair of switches,
+    // and `allow_enqueue` does not imply it. A default node refuses and names
+    // both keys rather than leaving an agent to guess which one is missing.
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "approve_transaction",
+            json!({ "transaction_id": "tx", "evidence_sha": "sha" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("allow_approve"), "{text}");
+    assert!(text.contains("allow_live"), "{text}");
+    assert!(text.contains("Nothing was submitted"), "{text}");
 
     // Opted in, the tool appears.
     let (state, _store2) = mcp_state(true).await;
@@ -192,6 +218,12 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     .unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
+    // ...but opting into enqueue still does not offer the approval tool: the
+    // two authorities are not the same size.
+    assert!(
+        !tools.iter().any(|t| t["name"] == "approve_transaction"),
+        "allow_enqueue must not imply the authority to release an irreversible action"
+    );
 }
 
 #[tokio::test]
