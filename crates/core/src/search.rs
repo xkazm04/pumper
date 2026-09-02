@@ -314,22 +314,57 @@ pub trait Enricher: Send + Sync {
     /// `GET /search/status`.
     fn name(&self) -> &str;
 
-    /// Entities for one document's text. `now` is the document's own timestamp
-    /// (`SearchDoc::indexed_at`), which the date rules judge "upcoming" against.
-    async fn enrich(&self, text: &str, now: i64) -> Vec<Entity>;
+    /// Documents this enricher has FAILED on since boot (a trap, malformed
+    /// output, a plugin nobody installed) -- each of which yielded no entities
+    /// and did NOT fail the index. Default 0: an enricher with no failure mode.
+    ///
+    /// It lives on the trait rather than in the pipeline because only the
+    /// enricher can tell "I ran and found nothing" from "I could not run", and
+    /// collapsing those two into one empty result is what makes a permanently
+    /// broken enricher indistinguishable from a corpus with nothing in it.
+    fn failures(&self) -> u64 {
+        0
+    }
 
-    /// Entities for a whole batch, `result[i]` for `texts[i]`.
+    /// Entities for one document.
+    async fn enrich(&self, input: &EnrichInput) -> Vec<Entity>;
+
+    /// Entities for a whole batch, `result[i]` for `inputs[i]`.
     ///
     /// Provided as a loop over [`enrich`](Enricher::enrich); overridden by
     /// implementations whose work is worth doing in one go (the built-in regex
     /// pass hands the whole batch to one blocking thread, which is where that
     /// CPU work has to stay).
-    async fn enrich_batch(&self, texts: &[String], now: i64) -> Vec<Vec<Entity>> {
-        let mut out = Vec::with_capacity(texts.len());
-        for text in texts {
-            out.push(self.enrich(text, now).await);
+    async fn enrich_batch(&self, inputs: &[EnrichInput]) -> Vec<Vec<Entity>> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            out.push(self.enrich(input).await);
         }
         out
+    }
+}
+
+/// One document as an enricher reads it.
+///
+/// `now` is the DOCUMENT's own timestamp (`SearchDoc::indexed_at`), not the wall
+/// clock: the built-in date rules only accept an "upcoming" deadline, and
+/// judging a backfilled 2019 record against today would silently drop every
+/// deadline it carries. It travels with the text so a batch cannot accidentally
+/// share one document's clock with the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichInput {
+    pub text: String,
+    pub now: i64,
+}
+
+impl EnrichInput {
+    /// The text an enricher reads for a document: its title and body, the same
+    /// pair the built-in pass has always scanned.
+    pub fn from_doc(doc: &SearchDoc) -> Self {
+        Self {
+            text: format!("{}\n{}", doc.title, doc.body),
+            now: doc.indexed_at,
+        }
     }
 }
 
