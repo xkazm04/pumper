@@ -359,7 +359,15 @@ impl AppState {
             Arc::new(NoPlugins)
         };
         let search: Arc<dyn Search> = if config.search.enabled {
-            Arc::new(TantivyIndex::new(&config.search)?)
+            // N11: the index-time enrichment pipeline runs `plugin:<name>`
+            // enrichers on the SAME host every other hook uses, so they share
+            // its fuel budget, memory cap, admission gate and telemetry. Passed
+            // even when `[plugins] enabled = false` (a `NoPlugins`), so a
+            // `plugin:` enricher fails openly per document rather than at boot.
+            Arc::new(TantivyIndex::with_plugins(
+                &config.search,
+                Some(plugins.clone()),
+            )?)
         } else {
             Arc::new(NoSearch)
         };
