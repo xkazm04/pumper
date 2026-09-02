@@ -536,8 +536,17 @@ impl Storage {
         Ok(rows > 0)
     }
 
-    /// Cancels a job that has not started yet, returning the cancelled job's
-    /// **app** (`None` = there was nothing queued to cancel).
+    /// Cancels a job that no worker task is currently executing — `queued`
+    /// (not started yet) or `waiting` (N02: parked on external input, its
+    /// executor long gone) — returning the cancelled job's **app**
+    /// (`None` = there was nothing cancellable).
+    ///
+    /// `waiting` belongs here rather than on the token path for the same
+    /// reason `queued` does: there is no in-flight future to interrupt, so
+    /// the cancel is a plain guarded write. Without it a parked job would be
+    /// uncancellable — the door would find no registered token, fall through
+    /// to the 409 branch, and tell the operator the job was *already
+    /// terminal*, which is the opposite of true.
     ///
     /// The app rides back with the outcome because the caller has to *announce*
     /// this transition, and a `JobEvent` with a blank app is invisible to every
@@ -547,7 +556,7 @@ impl Storage {
     pub async fn cancel(&self, id: Uuid) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?2 \
-             WHERE id = ?1 AND status = 'queued' RETURNING app",
+             WHERE id = ?1 AND status IN ('queued', 'waiting') RETURNING app",
         )
         .bind(id.to_string())
         .bind(now())
@@ -3968,6 +3977,74 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+}
+
+#[cfg(test)]
+mod cancel_reaches_parked_jobs_tests {
+    use crate::testing::TempStore;
+    use crate::{EnqueueOptions, JobStatus};
+    use serde_json::json;
+
+    /// A parked job has no executor and no registered cancel token, so the
+    /// cancel door's only route to it is this guarded write. When the guard
+    /// was `status = 'queued'` alone, `DELETE /jobs/{id}` on a job waiting on
+    /// a human found no token, fell through to the terminal branch, and
+    /// answered *already terminal* — leaving the only exit an expiry sweep
+    /// that is off by default.
+    #[tokio::test]
+    async fn cancel_reaches_a_parked_job_not_only_a_queued_one() {
+        let store = TempStore::new("cancel-parked").await;
+        let job = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        // Claim it, then park it exactly as the worker's outcome arm does.
+        let claimed = store
+            .storage
+            .claim_next(&[], 0.0)
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        assert!(store
+            .storage
+            .await_input(
+                claimed.id,
+                claimed.attempts,
+                &json!({"kind": "approval"}),
+                None
+            )
+            .await
+            .unwrap());
+
+        let app = store
+            .storage
+            .cancel(job.id)
+            .await
+            .unwrap()
+            .expect("a parked job is cancellable");
+        assert_eq!(app, "waiter", "the event needs the job's real app");
+        let row = store.storage.get(job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+        assert!(row.finished_at.is_some());
+
+        // And the guard still refuses what it always refused: a running job
+        // belongs to the token path, a terminal one to the 409.
+        let other = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        store.storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+        assert!(
+            store.storage.cancel(other.id).await.unwrap().is_none(),
+            "a running job is cancelled through its token, not this write"
+        );
+        assert!(
+            store.storage.cancel(job.id).await.unwrap().is_none(),
+            "an already-cancelled job is not cancelled twice"
+        );
+    }
 }
 
 #[cfg(test)]

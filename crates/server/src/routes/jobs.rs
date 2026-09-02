@@ -452,7 +452,9 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     }
 }
 
-/// Cancels a job. A `queued` job is cancelled synchronously; a `running` job
+/// Cancels a job. A `queued` job — or a `waiting` one, parked on external
+/// input with no executor to interrupt — is cancelled synchronously; a
+/// `running` job
 /// has its cancellation token fired so the worker aborts the app future and
 /// marks it `cancelled` (the response reports `running: true`). A terminal job
 /// is `409`, an unknown one `404`.
