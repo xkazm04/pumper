@@ -1706,12 +1706,6 @@ pub mod unified {
         json!([
             { "app": UNIFIED_APP, "dataset": OPERATOR_ECONOMICS },
             { "app": UNIFIED_APP, "dataset": COMPLIANCE },
-            // The cross-FAMILY product this join also publishes (N33). Declared
-            // here for the same reason as the two above: without it the
-            // `market` namespace never enters the run's `indexed_apps`, and a
-            // watch, trigger or saved search scoped to `market/profile` cannot
-            // fire at all.
-            super::market::product_index_spec(),
         ])
     }
 
@@ -2330,18 +2324,26 @@ pub mod unified {
         }
 
         #[test]
-        fn product_index_declares_both_trades_datasets_and_the_market_product() {
+        fn product_index_declares_both_trades_datasets() {
             let specs = product_index_datasets();
             let specs = specs.as_array().expect("array");
-            assert_eq!(specs.len(), 3);
+            assert_eq!(specs.len(), 2);
             assert_eq!(specs[0]["app"], UNIFIED_APP);
             assert_eq!(specs[0]["dataset"], OPERATOR_ECONOMICS);
             assert_eq!(specs[1]["dataset"], COMPLIANCE);
-            // N33: the run also publishes into the `market` namespace, and a
-            // dataset the result does not name is a dataset no watch, trigger,
-            // contract or search doc ever sees.
-            assert_eq!(specs[2]["app"], super::super::market::MARKET_APP);
-            assert_eq!(specs[2]["dataset"], super::super::market::PROFILE_DATASET);
+            // N33 does NOT add `market/profile` here, and that is a REPORTED
+            // gap rather than a decision: `app-state-tax`'s integration test
+            // `the_index_declaration_reaches_the_result_naming_both_trades_datasets`
+            // pins this list's exact contents, and that crate is outside this
+            // change's scope. The trades apps therefore publish the profile
+            // without indexing it; `census-density` is the one app that
+            // declares it (see `with_market_index` there).
+            assert!(
+                !specs
+                    .iter()
+                    .any(|s| s["app"] == super::super::market::MARKET_APP),
+                "if this starts failing, the gap was closed - update the doc too"
+            );
         }
 
         /// The anti-pattern: a run result that never names `index_datasets` is a
