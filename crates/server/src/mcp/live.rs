@@ -37,7 +37,8 @@ pub(crate) struct LiveFilter {
     /// Only events emitted by this app (exact match on the event's `app`).
     app: Option<String>,
     /// Comma-separated event kinds to keep — job statuses (`queued`,
-    /// `running`, `succeeded`, `failed`, `cancelled`) and/or `external`.
+    /// `running`, `waiting`, `succeeded`, `failed`, `cancelled`) and/or
+    /// `external`.
     kind: Option<String>,
 }
 
@@ -222,7 +223,7 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
     // and the listen loop cannot be missed.
     let mut rx = state.events.subscribe();
     let job = fetch(state, id).await?;
-    if job.status.is_terminal() {
+    if wait_settles_on(job.status) {
         let status = job.status.as_str().to_string();
         return Ok(finished(job, &status));
     }
@@ -235,14 +236,14 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
                 // The terminal transition may be among the dropped events —
                 // storage is the truth, so re-check it instead of the ring.
                 let job = fetch(state, id).await?;
-                if job.status.is_terminal() {
+                if wait_settles_on(job.status) {
                     let status = job.status.as_str().to_string();
                     return Ok(finished(job, &status));
                 }
             }
             Ok(Ok((_seq, event))) => {
                 if event.job_id == id
-                    && JobStatus::parse(event.status.as_str()).is_some_and(|s| s.is_terminal())
+                    && JobStatus::parse(event.status.as_str()).is_some_and(wait_settles_on)
                 {
                     let job = fetch(state, id).await?;
                     return Ok(finished(job, &event.status));
@@ -269,6 +270,63 @@ async fn fetch(state: &AppState, id: uuid::Uuid) -> Result<pumper_core::Job, Str
         .ok_or_else(|| format!("unknown job '{id}'"))
 }
 
+/// Pure: the statuses that END a `wait_job` call.
+///
+/// Terminal statuses, **plus `waiting`** (N02). A parked job is not terminal —
+/// its stream stays open, its schedule slot stays held — but it is the one
+/// non-terminal state where continuing to wait is provably useless: the job is
+/// blocked on the caller. Returning here is what turns MCP's fire-and-poll loop
+/// into a conversation: the agent gets `input_request`, answers with
+/// `resume_job`, and waits again.
+///
+/// The anti-pattern it replaces, and why this is a named predicate rather than
+/// three inline `matches!`: `wait_job` asked "is it terminal?" in three places
+/// (the pre-read, the lag re-read, the event match). A parked job satisfied none
+/// of them, so an agent that asked a question through a job blocked until its
+/// own `wait_job_max_secs` cap and then reported `timed_out` — the deadlock the
+/// feature exists to remove.
+fn wait_settles_on(status: JobStatus) -> bool {
+    status.is_terminal() || status == JobStatus::Waiting
+}
+
 fn finished(job: pumper_core::Job, status: &str) -> Value {
-    json!({ "timed_out": false, "status": status, "job": job })
+    // `input_request` is lifted to the top level (it also rides `job`) because it
+    // is the actionable half of a `waiting` answer and the agent must not have to
+    // know the job row's shape to find it. Absent on every other status — an
+    // omitted field, never a `null` that reads as "asked for nothing".
+    let input_request = job.input_request.clone();
+    let mut body = json!({ "timed_out": false, "status": status, "job": job });
+    if let (Some(request), Value::Object(map)) = (input_request, &mut body) {
+        map.insert("input_request".into(), request);
+        map.insert(
+            "note".into(),
+            json!(
+                "this job is PARKED, not finished: it is asking for the input in \
+                 `input_request`. Answer it with the resume_job tool (or POST \
+                 /jobs/{id}/resume), then call wait_job again."
+            ),
+        );
+    }
+    body
+}
+
+#[cfg(test)]
+mod wait_settles_tests {
+    use super::wait_settles_on;
+    use pumper_core::JobStatus;
+
+    /// A parked job must end the wait. Before N02 `wait_job` settled only on a
+    /// terminal status, so a job asking its own caller a question blocked that
+    /// caller for the full `wait_job_max_secs` window and then answered
+    /// `timed_out` — with the question sitting unread in the row.
+    #[test]
+    fn waiting_settles_the_wait_not_only_terminal_statuses() {
+        assert!(wait_settles_on(JobStatus::Waiting));
+        assert!(wait_settles_on(JobStatus::Succeeded));
+        assert!(wait_settles_on(JobStatus::Failed));
+        assert!(wait_settles_on(JobStatus::Cancelled));
+        // And the states where waiting longer really is the right answer.
+        assert!(!wait_settles_on(JobStatus::Queued));
+        assert!(!wait_settles_on(JobStatus::Running));
+    }
 }

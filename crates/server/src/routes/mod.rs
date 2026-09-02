@@ -195,6 +195,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(retry_job))
         .routes(routes!(bulk_retry_jobs))
         .routes(routes!(reset_job))
+        .routes(routes!(resume_job))
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
         .routes(routes!(job_receipt))
@@ -555,6 +556,7 @@ mod api_spec_tests {
         "POST /jobs/{id}/retry",
         "POST /jobs/retry",
         "POST /jobs/{id}/reset",
+        "POST /jobs/{id}/resume",
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
         "GET /jobs/{id}/receipt",
