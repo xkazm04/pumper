@@ -5606,6 +5606,7 @@ dependencies = [
 name = "trades-common"
 version = "0.1.0"
 dependencies = [
+ "census-common",
  "chrono",
  "pumper-core",
  "serde_json",

@@ -5,6 +5,12 @@ edition.workspace = true
 
 [dependencies]
 pumper-core.workspace = true
+# The FIPS half of the trades<->census crosswalk (`state_fips_for_abbr`), used
+# by `market::sync_market_profile`. Both are library crates (never registered
+# apps), and census-common does not depend on this crate, so there is no cycle
+# and no app-depends-on-app edge — the same shape as census-density depending on
+# this crate for the trade taxonomy.
+census-common.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 tracing.workspace = true

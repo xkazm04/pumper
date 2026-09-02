@@ -1399,6 +1399,30 @@ pub mod taxonomy {
         out
     }
 
+    /// The 4-digit NAICS group ONE trade's businesses are counted under —
+    /// the census half of the `<ST>:<trade>` ↔ `{naics4}:{state_fips}`
+    /// crosswalk (`census/market_blend` cells are keyed by the 4-digit group,
+    /// because the nonemployer series is published at no finer grain).
+    ///
+    /// `None` when the entry declares no NAICS at all: a registry trade a human
+    /// added without codes has no census counterpart, and inventing one (an
+    /// empty string, a sector guess) would join it to the wrong market.
+    ///
+    /// **Deliberately lossy, and the loss is the point to state:** Plumbing and
+    /// HVAC both declare 238220 and therefore share group `2382`, so they get
+    /// the SAME density block from the SAME cell. That is what the census
+    /// publishes — the two trades are fused in the source — and it is why every
+    /// row that carries this join is labeled `density_grain: "naics4"` rather
+    /// than presenting a per-trade count Census never measured.
+    ///
+    /// The first declared code wins when a trade lists several: the codes are
+    /// authored in significance order (seed entries declare exactly one), and a
+    /// silent merge of two groups' cells would double-count establishments.
+    pub fn naics4_for_trade(entry: &TradeEntry) -> Option<String> {
+        let code: String = entry.naics.first()?.trim().chars().take(4).collect();
+        (!code.is_empty()).then_some(code)
+    }
+
     /// NAICS codes from the REGISTRY for the census apps: `None` when the
     /// registry dataset is absent/empty (caller keeps its compile-time
     /// defaults — zero behavior change), `Some(codes)` otherwise.
@@ -1438,6 +1462,50 @@ pub mod taxonomy {
             );
             assert_eq!(Trade::from_label("Lawn care"), Some(Trade::Landscaping));
             assert_eq!(Trade::from_label("Landscaping"), Some(Trade::Landscaping));
+        }
+
+        /// The fused-group fact, pinned: Plumbing and HVAC are ONE census
+        /// cell. A change that gave them different groups would be a claim the
+        /// census does not support, and this is the test that argues back.
+        #[test]
+        fn plumbing_and_hvac_share_one_naics4_group() {
+            let by = |label: &str| {
+                seed_entries()
+                    .into_iter()
+                    .find(|e| e.label == label)
+                    .expect("seed trade")
+            };
+            assert_eq!(naics4_for_trade(&by("Plumbing")).as_deref(), Some("2382"));
+            assert_eq!(naics4_for_trade(&by("HVAC")).as_deref(), Some("2382"));
+            assert_eq!(naics4_for_trade(&by("Electrical")).as_deref(), Some("2382"));
+            assert_eq!(
+                naics4_for_trade(&by("Landscaping")).as_deref(),
+                Some("5617")
+            );
+            assert_eq!(
+                naics4_for_trade(&by("Pool service")).as_deref(),
+                Some("5617")
+            );
+        }
+
+        /// A registry trade with no NAICS has no census counterpart, and the
+        /// answer is None — never `""`, which would key a blend cell lookup on
+        /// `":48"` and quietly match nothing while LOOKING joined.
+        #[test]
+        fn a_trade_without_naics_gets_no_group_not_an_empty_one() {
+            let bare = TradeEntry {
+                label: "Roofing".into(),
+                soc_code: "47-2181".into(),
+                naics: vec![],
+                aliases: vec!["roof".into()],
+                source: "approved".into(),
+            };
+            assert_eq!(naics4_for_trade(&bare), None);
+            let blank = TradeEntry {
+                naics: vec!["   ".into()],
+                ..bare.clone()
+            };
+            assert_eq!(naics4_for_trade(&blank), None);
         }
 
         #[test]
@@ -1638,6 +1706,12 @@ pub mod unified {
         json!([
             { "app": UNIFIED_APP, "dataset": OPERATOR_ECONOMICS },
             { "app": UNIFIED_APP, "dataset": COMPLIANCE },
+            // The cross-FAMILY product this join also publishes (N33). Declared
+            // here for the same reason as the two above: without it the
+            // `market` namespace never enters the run's `indexed_apps`, and a
+            // watch, trigger or saved search scoped to `market/profile` cannot
+            // fire at all.
+            super::market::product_index_spec(),
         ])
     }
 
@@ -1771,6 +1845,11 @@ pub mod unified {
         /// Inputs whose read came back AT its cap, so the join ran over a WINDOW
         /// of them rather than the whole dataset. Empty = complete.
         pub inputs_truncated: Vec<String>,
+        /// What the `market/profile` publish did in the same run (N33), or the
+        /// reason it did nothing. Never fatal to the trades join: the profile is
+        /// a downstream product, and losing it must not lose the economics
+        /// refresh that was just written.
+        pub profile: Value,
     }
 
     impl JoinOutcome {
@@ -1792,6 +1871,7 @@ pub mod unified {
                     "join_complete": self.inputs_truncated.is_empty(),
                 }),
             );
+            map.insert("market_profile".into(), self.profile.clone());
             if !self.inputs_truncated.is_empty() {
                 let warning = format!(
                     "trades join ran over a truncated read of: {}",
@@ -2021,11 +2101,28 @@ pub mod unified {
         summary.unchanged += state_summary.unchanged;
         summary.removed.append(&mut state_summary.removed);
 
+        // LAST WRITER PUBLISHES (N33): the cross-family `market/profile` is
+        // rebuilt at the end of this join and at the end of
+        // `sync_market_blend`, so whichever family refreshed last republishes
+        // the product and it is never a cycle behind either half.
+        //
+        // A profile failure is REPORTED, not propagated: the economics rows
+        // above are already written, and turning a downstream join's error into
+        // this run's error would roll a successful refresh into a failed job.
+        let profile = match super::market::sync_market_profile(ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "market/profile publish failed");
+                json!({ "profiled": 0, "error": e.to_string() })
+            }
+        };
+
         Ok(JoinOutcome {
             summary,
             dataset,
             trust,
             inputs_truncated,
+            profile,
         })
     }
 
@@ -2233,13 +2330,18 @@ pub mod unified {
         }
 
         #[test]
-        fn product_index_declares_both_trades_datasets() {
+        fn product_index_declares_both_trades_datasets_and_the_market_product() {
             let specs = product_index_datasets();
             let specs = specs.as_array().expect("array");
-            assert_eq!(specs.len(), 2);
+            assert_eq!(specs.len(), 3);
             assert_eq!(specs[0]["app"], UNIFIED_APP);
             assert_eq!(specs[0]["dataset"], OPERATOR_ECONOMICS);
             assert_eq!(specs[1]["dataset"], COMPLIANCE);
+            // N33: the run also publishes into the `market` namespace, and a
+            // dataset the result does not name is a dataset no watch, trigger,
+            // contract or search doc ever sees.
+            assert_eq!(specs[2]["app"], super::super::market::MARKET_APP);
+            assert_eq!(specs[2]["dataset"], super::super::market::PROFILE_DATASET);
         }
 
         /// The anti-pattern: a run result that never names `index_datasets` is a
@@ -2273,10 +2375,14 @@ pub mod unified {
                 dataset: OPERATOR_ECONOMICS.to_string(),
                 trust: None,
                 inputs_truncated: Vec::new(),
+                profile: json!({ "profiled": 2 }),
             };
             let mut out = json!({ "records": 1 });
             complete.merge_into(&mut out);
             assert_eq!(out["unified"]["join_complete"], true);
+            // N33: the market publish is reported on the same result, so a
+            // profile that silently did nothing is visible in the job record.
+            assert_eq!(out["market_profile"]["profiled"], 2);
             assert_eq!(out["unified"]["dataset"], "trades/operator_economics");
             assert!(out.get("warnings").is_none(), "nothing to warn about");
 
@@ -2285,10 +2391,14 @@ pub mod unified {
                 dataset: format!("{OPERATOR_ECONOMICS}@q"),
                 trust: Some("quarantined"),
                 inputs_truncated: vec!["state-tax/tax".into()],
+                profile: json!({ "profiled": 0, "error": "boom" }),
             };
             let mut out = json!({ "records": 1, "warnings": ["pre-existing"] });
             truncated.merge_into(&mut out);
             assert_eq!(out["unified"]["join_complete"], false);
+            // A failed profile is REPORTED here, never raised as the run's own
+            // error: the economics rows are already written.
+            assert_eq!(out["market_profile"]["error"], "boom");
             assert_eq!(out["unified"]["inputs_truncated"], json!(["state-tax/tax"]));
             assert_eq!(out["unified"]["trust"], "quarantined");
             assert_eq!(
@@ -2385,6 +2495,620 @@ pub mod unified {
             let mut ok = Vec::new();
             crate::validate::require_rate(&mut ok, "top_marginal_rate", Some(13.3));
             assert!(ok.is_empty());
+        }
+    }
+}
+
+/// The **state × trade market profile** (`market/profile`): one row that carries
+/// both halves of "should I launch as a plumber in Texas, and what will it
+/// cost/earn?".
+///
+/// The two Ledgerline-facing products answer halves of that question under keys
+/// a consumer cannot join without a crosswalk:
+/// `trades/operator_economics` is keyed `<ST>:<trade>` and
+/// `census/market_blend` `{naics4}:{state_fips}`. Both libraries needed for the
+/// crosswalk are already linked here — `taxonomy::naics4_for_trade` gives a
+/// trade its census group, `census_common::state_fips_for_abbr` gives a USPS
+/// code its FIPS — so the join belongs in the repo, once, rather than in every
+/// consumer.
+///
+/// The write rides whichever family refreshed last: `sync_market_profile` is
+/// called at the end of both `unified::sync_operator_economics` and
+/// `app_census_density::sync_market_blend`, so a profile is never a cycle
+/// behind either side.
+pub mod market {
+    use super::taxonomy;
+    use pumper_core::datasets::DerivedPaths;
+    use pumper_core::{AppContext, Result};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// Virtual app namespace holding the cross-family market product. Owned by
+    /// no app: the trades apps and the census apps both publish into it.
+    pub const MARKET_APP: &str = "market";
+    /// One row per state × trade, keyed `<ST>:<trade>` — the trades key, because
+    /// that is the key a human asks the question in.
+    pub const PROFILE_DATASET: &str = "profile";
+
+    /// The one grain this join can ever have. NES (the nonemployer half of the
+    /// blend) is published at 4-digit NAICS and no finer, so a trade's density
+    /// is its 4-digit GROUP's density: Plumbing, Electrical and HVAC all read
+    /// cell `2382`, Landscaping and Pool service both read `5617`. The label is
+    /// on every row so a consumer cannot mistake a group figure for a per-trade
+    /// one — the same discipline the blend applies with `succession_grain` and
+    /// the formation block's `grain`.
+    pub const DENSITY_GRAIN: &str = "naics4";
+
+    /// Read caps. Economics is ~51 states × N trades (+ the `US:` roll-ups);
+    /// the blend is naics4 × state. Both are set well past today's sizes so the
+    /// join cannot silently truncate, and a read that comes back AT its cap is
+    /// reported, never hidden.
+    const ECONOMICS_READ_LIMIT: i64 = 5_000;
+    const BLEND_READ_LIMIT: i64 = 20_000;
+
+    /// The datasets the profile is derived from, named in its provenance.
+    const PROFILE_INPUTS: [&str; 2] = ["trades/operator_economics", "census/market_blend"];
+
+    /// Record paths that are the SAME value on many profile rows because they
+    /// are national facts replicated by the join, and are therefore excluded
+    /// from the change-detection hash.
+    ///
+    /// `economics.wage_band` / `economics.valuation` / `economics.tax.federal`
+    /// are national on every state row (`unified::STATE_ROW_DERIVED_PATHS` makes
+    /// the identical exclusion one layer down); `formation` is the BFS national
+    /// sector velocity — the API serves no state geography — replicated onto
+    /// every state of that sector, and it moves WEEKLY, which without this line
+    /// would mark all ~255 profile rows `changed` every Friday for one national
+    /// number. `vintages.formation_bfs_as_of` is that block's own period stamp
+    /// and has to travel with it, or the exclusion leaks back in through the
+    /// vintages block.
+    ///
+    /// Every excluded fact is still stored and still readable on the row —
+    /// `DerivedPaths` narrows the hash and nothing else — and each is announced
+    /// in its own right by the dataset that owns it.
+    const PROFILE_DERIVED_PATHS: [&str; 5] = [
+        "economics.wage_band",
+        "economics.valuation",
+        "economics.tax.federal",
+        "formation",
+        "vintages.formation_bfs_as_of",
+    ];
+
+    fn profile_derived_paths() -> DerivedPaths {
+        DerivedPaths::new(PROFILE_DERIVED_PATHS)
+    }
+
+    /// The `index_datasets` spec a run declares for the market product, so a
+    /// watch / trigger / saved search scoped to the `market` namespace can fire
+    /// at all (`worker::load_run_changes` is scoped by `run_indexed_apps`).
+    pub fn product_index_spec() -> Value {
+        json!({ "app": MARKET_APP, "dataset": PROFILE_DATASET })
+    }
+
+    /// Provenance for a write into the virtual [`MARKET_APP`] namespace — the
+    /// namespace belongs to no app, so `ctx.datasets` is called directly and
+    /// `AppContext`'s automatic stamping never runs.
+    fn derived_provenance(ctx: &AppContext, dataset: &str) -> pumper_core::Provenance {
+        pumper_core::Provenance {
+            job_id: Some(ctx.job_id.to_string()),
+            source_url: Some(format!(
+                "derived://{MARKET_APP}/{dataset}?inputs={}&as_of={}",
+                PROFILE_INPUTS.join(","),
+                pumper_core::datasets::ts(chrono::Utc::now())
+            )),
+            ..pumper_core::Provenance::default()
+        }
+    }
+
+    /// Where a market write goes and what trust stamp it carries — the
+    /// app-layer equivalent of `AppContext::write_target`, which the raw
+    /// `ctx.datasets` path bypasses. A quarantined `market/profile` diverts to
+    /// `profile@q` and the canonical layer keeps its last healthy rows.
+    async fn write_target(ctx: &AppContext, dataset: &str) -> (String, Option<&'static str>) {
+        let state = ctx.health.enforced_state(MARKET_APP, dataset).await;
+        (
+            pumper_core::resilience::write_dataset(dataset, state),
+            state.trust(),
+        )
+    }
+
+    /// `label -> naics4` for the live taxonomy. A trade with no NAICS is absent
+    /// (see [`taxonomy::naics4_for_trade`]) rather than mapped to a guess.
+    pub fn naics4_by_trade(entries: &[taxonomy::TradeEntry]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .filter_map(|e| taxonomy::naics4_for_trade(e).map(|n| (e.label.clone(), n)))
+            .collect()
+    }
+
+    /// Blend cells indexed by `{naics4}:{state_fips}` — built from each record's
+    /// own fields, not by splitting its key, so a key-format change on the
+    /// census side cannot make this silently match nothing.
+    fn blend_index(blend: &[Value]) -> BTreeMap<String, &Value> {
+        blend
+            .iter()
+            .filter_map(|c| {
+                let naics4 = c.get("naics4").and_then(Value::as_str)?;
+                let fips = c.get("state_fips").and_then(Value::as_str)?;
+                Some((format!("{naics4}:{fips}"), c))
+            })
+            .collect()
+    }
+
+    /// A null-valued vintages block — the honest shape when no density cell was
+    /// found. The keys are present (a consumer reads the same fields either
+    /// way); the values are Null, never 0 and never a fabricated year.
+    fn empty_vintages() -> Value {
+        json!({
+            "employer_cbp_year": Value::Null,
+            "solo_nes_year": Value::Null,
+            "owner_age_nesd_year": Value::Null,
+            "formation_bfs_as_of": Value::Null,
+            "base_acs_year": Value::Null,
+        })
+    }
+
+    /// One field off a JSON object, Null when absent — so an input that has not
+    /// grown a field yet produces an explicit Null rather than a missing key.
+    fn field(v: &Value, name: &str) -> Value {
+        v.get(name).cloned().unwrap_or(Value::Null)
+    }
+
+    /// **The join, as a pure function.** `economics` are live
+    /// `trades/operator_economics` records, `blend` live `census/market_blend`
+    /// records, `naics4` the taxonomy crosswalk.
+    ///
+    /// Driven by the economics side: it is the one keyed by state × trade, which
+    /// is the grain of the question. The `US:<trade>` national roll-ups are
+    /// deliberately skipped — a national row has no state FIPS and therefore no
+    /// density cell, and emitting it would put a permanently half-empty row in a
+    /// state-keyed dataset.
+    ///
+    /// **Coverage is honest and is never zeros.** A trade whose group has no
+    /// blend cell (NES publishes nothing for it, or the census apps have not
+    /// run) yields `coverage: "economics_only"` with `density: null` — not
+    /// `total_market: 0`, which reads as "nobody operates here" when it means
+    /// "we did not measure".
+    pub fn build_profiles(
+        economics: &[Value],
+        blend: &[Value],
+        naics4: &BTreeMap<String, String>,
+    ) -> Vec<(String, Value)> {
+        let cells = blend_index(blend);
+        let mut out: Vec<(String, Value)> = Vec::new();
+        for row in economics {
+            let (Some(state), Some(trade)) = (
+                row.get("state").and_then(Value::as_str),
+                row.get("trade").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            // National roll-up rows are the OTHER product's shape; see above.
+            let Some(fips) = census_common::state_fips_for_abbr(state) else {
+                continue;
+            };
+            let group = naics4.get(trade);
+            let density_key = group.map(|g| format!("{g}:{fips}"));
+            let cell = density_key.as_ref().and_then(|k| cells.get(k.as_str()));
+            let coverage = if cell.is_some() {
+                "both"
+            } else {
+                "economics_only"
+            };
+            let density = cell.map(|c| {
+                json!({
+                    "employer_establishments": field(c, "employer_establishments"),
+                    "employer_naics": field(c, "employer_naics"),
+                    "employer_naics_covered": field(c, "employer_naics_covered"),
+                    "solo_operators": field(c, "solo_operators"),
+                    "total_market": field(c, "total_market"),
+                    "solo_share": field(c, "solo_share"),
+                    "base": field(c, "base"),
+                    "denominator_kind": field(c, "denominator_kind"),
+                    // The blend's OWN coverage marker travels with the block: a
+                    // cell that counted employers only is half a market, and
+                    // `total_market_per_10k_basis` says so in words.
+                    "coverage": field(c, "coverage"),
+                })
+            });
+            let succession = cell.and_then(|c| {
+                (!c.get("pct_owners_55plus")
+                    .map(Value::is_null)
+                    .unwrap_or(true))
+                .then(|| {
+                    json!({
+                        "pct_owners_55plus": field(c, "pct_owners_55plus"),
+                        "succession_grain": field(c, "succession_grain"),
+                        "owner_age_year": field(c, "owner_age_year"),
+                        "succession_receipts": field(c, "succession_receipts"),
+                    })
+                })
+            });
+            let value = json!({
+                "state": state,
+                "state_fips": fips,
+                "trade": trade,
+                "soc_code": field(row, "soc_code"),
+                "naics4": group.cloned().map(Value::from).unwrap_or(Value::Null),
+                // Constant, and on EVERY row including the half ones: it
+                // describes the finest grain this join can have, not whether a
+                // cell happened to be found.
+                "density_grain": DENSITY_GRAIN,
+                "density_key": density_key.clone().map(Value::from).unwrap_or(Value::Null),
+                "coverage": coverage,
+                // The headline number a launch ranking sorts on, hoisted to the
+                // top level with its basis (catalog contracts check top-level
+                // fields only) and Null — never 0 — when there is no cell.
+                "total_market_per_10k": cell
+                    .map(|c| field(c, "total_market_per_10k"))
+                    .unwrap_or(Value::Null),
+                "total_market_per_10k_basis": cell
+                    .map(|c| field(c, "total_market_per_10k_basis"))
+                    .unwrap_or(Value::Null),
+                "economics": {
+                    "wage_band": field(row, "wage_band"),
+                    "wage_grain": field(row, "wage_grain"),
+                    "pricing": field(row, "pricing"),
+                    "pricing_locality": field(row, "pricing_locality"),
+                    "tax": field(row, "tax"),
+                    "compliance": field(row, "compliance"),
+                    "valuation": field(row, "valuation"),
+                },
+                "density": density.unwrap_or(Value::Null),
+                "succession": succession.unwrap_or(Value::Null),
+                "formation": cell.map(|c| field(c, "formation")).unwrap_or(Value::Null),
+                // The union of both sides' input vintages. The blend already
+                // computes its five; the trades side carries none of its own
+                // (its inputs are Claude-researched reference data with no
+                // published vintage), so the block is the blend's, or all-Null.
+                "vintages": cell.map(|c| field(c, "vintages")).unwrap_or_else(empty_vintages),
+            });
+            out.push((format!("{state}:{trade}"), value));
+        }
+        out
+    }
+
+    /// Rebuilds `market/profile` from the current state of both products and
+    /// upserts it. Returns a compact summary for the job result.
+    ///
+    /// **Degrades, never half-publishes.** With no economics rows there is
+    /// nothing keyed by state × trade to build on, so the run reports
+    /// `profiled: 0` with a note and writes nothing — the same shape
+    /// `sync_market_blend` uses when one of its halves has never run.
+    pub async fn sync_market_profile(ctx: &AppContext) -> Result<Value> {
+        let mut truncated: Vec<&str> = Vec::new();
+        let (entries, taxonomy_at_cap) = taxonomy::taxonomy_at_cap(ctx).await?;
+        if taxonomy_at_cap {
+            truncated.push("trades/taxonomy");
+        }
+        let naics4 = naics4_by_trade(&entries);
+
+        let econ_raw = ctx
+            .datasets
+            .list(
+                super::unified::UNIFIED_APP,
+                super::unified::OPERATOR_ECONOMICS,
+                ECONOMICS_READ_LIMIT,
+            )
+            .await?;
+        if super::unified::read_hit_cap(econ_raw.len(), ECONOMICS_READ_LIMIT) {
+            truncated.push("trades/operator_economics");
+        }
+        let economics: Vec<Value> = super::live_records(econ_raw)
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+        if economics.is_empty() {
+            return Ok(json!({
+                "profiled": 0,
+                "note": "no live trades/operator_economics rows yet — run a trades app to enable \
+                         the market profile",
+            }));
+        }
+
+        let blend_raw = ctx
+            .datasets
+            .list("census", "market_blend", BLEND_READ_LIMIT)
+            .await?;
+        if super::unified::read_hit_cap(blend_raw.len(), BLEND_READ_LIMIT) {
+            truncated.push("census/market_blend");
+        }
+        let blend: Vec<Value> = super::live_records(blend_raw)
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+
+        let items = build_profiles(&economics, &blend, &naics4);
+        let with_density = items
+            .iter()
+            .filter(|(_, v)| v["coverage"] == "both")
+            .count();
+        let (dataset, trust) = write_target(ctx, PROFILE_DATASET).await;
+        let prov = derived_provenance(ctx, &dataset);
+        let summary = ctx
+            .datasets
+            .upsert_many_derived(
+                MARKET_APP,
+                &dataset,
+                &items,
+                trust,
+                Some(&prov),
+                &profile_derived_paths(),
+            )
+            .await?;
+        let mut out = json!({
+            "dataset": format!("{MARKET_APP}/{dataset}"),
+            "profiled": items.len(),
+            // Coverage as a COUNT of each honest state, never a percentage of
+            // rows we pretended were complete.
+            "with_density": with_density,
+            "economics_only": items.len() - with_density,
+            "density_grain": DENSITY_GRAIN,
+            "inputs_truncated": truncated,
+            "profile_complete": truncated.is_empty(),
+            "new": summary.new.len(),
+            "changed": summary.changed.len(),
+            "unchanged": summary.unchanged,
+        });
+        if let (false, Value::Object(map)) = (truncated.is_empty(), &mut out) {
+            map.insert(
+                "warnings".into(),
+                json!([format!(
+                    "market profile ran over a truncated read of: {} — the coverage counts \
+                     describe what was read, not what exists",
+                    truncated.join(", ")
+                )]),
+            );
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn crosswalk() -> BTreeMap<String, String> {
+            naics4_by_trade(&taxonomy::seed_entries())
+        }
+
+        fn economics_row(state: &str, trade: &str) -> Value {
+            json!({
+                "trade": trade,
+                "state": state,
+                "soc_code": "47-2152",
+                "wage_band": { "median_hourly": 30.0 },
+                "wage_grain": "national",
+                "pricing": { "median": 400.0 },
+                "pricing_locality": state,
+                "tax": { "federal": { "qbi_deduction_pct": 20.0 }, "state": { "top_marginal_rate": 0.0 } },
+                "compliance": { "license": "exam_license" },
+                "valuation": { "sde_multiple_median": 2.5 },
+            })
+        }
+
+        fn blend_cell(naics4: &str, fips: &str) -> Value {
+            json!({
+                "naics4": naics4,
+                "state_fips": fips,
+                "state": "Texas",
+                "employer_establishments": 4_000,
+                "employer_naics": ["238220"],
+                "employer_naics_covered": [],
+                "solo_operators": 6_000,
+                "total_market": 10_000,
+                "solo_share": 0.6,
+                "base": 30_000_000,
+                "denominator_kind": "population",
+                "total_market_per_10k": 3.33,
+                "total_market_per_10k_basis": "employer+solo",
+                "pct_owners_55plus": 0.31,
+                "succession_grain": "naics_sector",
+                "owner_age_year": "2022",
+                "succession_receipts": 1_000_000,
+                "formation": { "sector": "23", "grain": "naics_sector_national", "as_of_period": "2026-06" },
+                "coverage": "both",
+                "vintages": {
+                    "employer_cbp_year": "2022",
+                    "solo_nes_year": "2021",
+                    "owner_age_nesd_year": "2022",
+                    "formation_bfs_as_of": "2026-06",
+                    "base_acs_year": "2023",
+                },
+            })
+        }
+
+        /// **The gate.** Plumbing and HVAC are two trades whose businesses the
+        /// census cannot tell apart (both file under 238220). They must get two
+        /// DISTINCT profiles — their economics differ — carrying the SAME
+        /// density block, labeled `density_grain: "naics4"` so nobody reads a
+        /// group figure as a per-trade count.
+        #[test]
+        fn plumbing_and_hvac_are_two_profiles_over_one_density_cell() {
+            let econ = vec![economics_row("TX", "Plumbing"), economics_row("TX", "HVAC")];
+            let rows = build_profiles(&econ, &[blend_cell("2382", "48")], &crosswalk());
+            assert_eq!(rows.len(), 2);
+            let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["TX:Plumbing", "TX:HVAC"]);
+            for (_, v) in &rows {
+                assert_eq!(v["density_grain"], DENSITY_GRAIN);
+                assert_eq!(v["density_key"], "2382:48");
+                assert_eq!(v["density"]["total_market"], 10_000);
+                assert_eq!(v["total_market_per_10k"], 3.33);
+                assert_eq!(v["coverage"], "both");
+                assert_eq!(v["state_fips"], "48");
+            }
+            assert_ne!(rows[0].1["trade"], rows[1].1["trade"]);
+        }
+
+        /// A trade the census publishes no cell for is HALF a profile, and says
+        /// so. The anti-pattern is a zeroed density block: `total_market: 0`
+        /// reads as "nobody operates in this state", which is a market claim,
+        /// when the fact is "we did not measure it".
+        #[test]
+        fn a_missing_density_cell_is_partial_coverage_not_zeros() {
+            let econ = vec![economics_row("TX", "Plumbing")];
+            let rows = build_profiles(&econ, &[], &crosswalk());
+            assert_eq!(rows.len(), 1);
+            let v = &rows[0].1;
+            assert_eq!(v["coverage"], "economics_only");
+            assert!(v["density"].is_null(), "{}", v["density"]);
+            assert!(v["total_market_per_10k"].is_null());
+            assert!(v["succession"].is_null());
+            assert!(v["formation"].is_null());
+            // The economics half is whole, and the grain label is still on the
+            // row: it describes the join, not the luck of a lookup.
+            assert_eq!(v["density_grain"], DENSITY_GRAIN);
+            assert_eq!(v["economics"]["pricing"]["median"], 400.0);
+            // Every vintage key is present and Null — a consumer reads the same
+            // shape either way and never an invented year.
+            for key in [
+                "employer_cbp_year",
+                "solo_nes_year",
+                "owner_age_nesd_year",
+                "formation_bfs_as_of",
+                "base_acs_year",
+            ] {
+                assert!(v["vintages"][key].is_null(), "{key} should be Null");
+            }
+        }
+
+        /// The `US:<trade>` roll-up the trades layer also writes has no state
+        /// FIPS, so it can never carry density. Emitting it would put a
+        /// permanently half-empty row in a state-keyed dataset — and joining it
+        /// on a passed-through "US" would key a cell `2382:US` that exists
+        /// nowhere.
+        #[test]
+        fn a_national_rollup_row_is_not_a_state_profile() {
+            let econ = vec![
+                economics_row("US", "Plumbing"),
+                economics_row("TX", "Plumbing"),
+            ];
+            let rows = build_profiles(&econ, &[blend_cell("2382", "48")], &crosswalk());
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, "TX:Plumbing");
+        }
+
+        /// A registry trade with no NAICS has no census counterpart: it still
+        /// gets its economics profile (the data is real), with a Null
+        /// `naics4`/`density_key` saying why the other half is absent.
+        #[test]
+        fn a_trade_outside_the_crosswalk_keeps_its_economics_half() {
+            let econ = vec![economics_row("TX", "Roofing")];
+            let rows = build_profiles(&econ, &[blend_cell("2382", "48")], &crosswalk());
+            assert_eq!(rows.len(), 1);
+            let v = &rows[0].1;
+            assert!(v["naics4"].is_null());
+            assert!(v["density_key"].is_null());
+            assert_eq!(v["coverage"], "economics_only");
+        }
+
+        /// A cell that counted only one side of the market carries its own
+        /// coverage marker and basis onto the profile, so a per-10k figure can
+        /// never be compared against a full-market one without seeing which it
+        /// is.
+        #[test]
+        fn a_one_sided_cell_carries_its_basis_onto_the_profile() {
+            let mut cell = blend_cell("2382", "48");
+            cell["coverage"] = json!("employer_only");
+            cell["total_market_per_10k_basis"] =
+                json!("employer_only — solo operators NOT counted");
+            let rows = build_profiles(&[economics_row("TX", "Plumbing")], &[cell], &crosswalk());
+            let v = &rows[0].1;
+            // The PROFILE's coverage says both halves of the JOIN are present;
+            // the density block's own marker says the cell is one-sided. Two
+            // different facts, both on the record.
+            assert_eq!(v["coverage"], "both");
+            assert_eq!(v["density"]["coverage"], "employer_only");
+            assert!(v["total_market_per_10k_basis"]
+                .as_str()
+                .is_some_and(|b| b.contains("NOT counted")));
+        }
+
+        /// Succession is Null, never a fabricated 0%, when NES-D published
+        /// nothing for the cell's sector.
+        #[test]
+        fn a_cell_without_owner_ages_has_no_succession_block() {
+            let mut cell = blend_cell("2382", "48");
+            cell["pct_owners_55plus"] = Value::Null;
+            let rows = build_profiles(&[economics_row("TX", "Plumbing")], &[cell], &crosswalk());
+            assert!(rows[0].1["succession"].is_null());
+            // ...and the rest of the density block is unaffected.
+            assert_eq!(rows[0].1["density"]["total_market"], 10_000);
+        }
+
+        /// The seam that would LOOK adopted and do nothing: `remove_path` walks
+        /// objects by `.`-separated segments and an absent path is a silent
+        /// no-op, so a misspelled exclusion silently stops excluding. Each
+        /// declared path is checked against a real joined record.
+        #[test]
+        fn derived_paths_name_blocks_the_join_actually_writes() {
+            let rows = build_profiles(
+                &[economics_row("TX", "Plumbing")],
+                &[blend_cell("2382", "48")],
+                &crosswalk(),
+            );
+            let row = &rows[0].1;
+            for path in PROFILE_DERIVED_PATHS {
+                assert!(
+                    object_path_exists(row, path),
+                    "declared path {path:?} is not in the record the join writes — \
+                     `remove_path` would no-op and the exclusion would do nothing"
+                );
+            }
+            // Real per-state facts that must STAY in the hash, or a genuine
+            // change to them would never be announced.
+            for path in [
+                "economics.pricing",
+                "economics.compliance",
+                "economics.tax.state",
+                "density",
+                "succession",
+                "total_market_per_10k",
+            ] {
+                assert!(object_path_exists(row, path), "fixture drifted: {path}");
+                assert!(
+                    !PROFILE_DERIVED_PATHS.contains(&path),
+                    "{path} is a real per-state fact and must stay in the hash"
+                );
+            }
+            assert_eq!(
+                profile_derived_paths(),
+                DerivedPaths::new(PROFILE_DERIVED_PATHS)
+            );
+        }
+
+        /// Mirrors `pumper_core::datasets::remove_path`: `.`-separated, walking
+        /// OBJECTS only, so a path spelling is checked against the same
+        /// traversal the change-detection hash uses.
+        fn object_path_exists(value: &Value, path: &str) -> bool {
+            let mut cursor = value;
+            let mut segments = path.split('.').peekable();
+            while let Some(segment) = segments.next() {
+                let Value::Object(map) = cursor else {
+                    return false;
+                };
+                match map.get(segment) {
+                    Some(next) if segments.peek().is_some() => cursor = next,
+                    Some(_) => return true,
+                    None => return false,
+                }
+            }
+            false
+        }
+
+        /// The crosswalk itself, at the grain the profile is written in: five
+        /// seed trades collapse onto TWO census groups, which is exactly why
+        /// every row is labeled.
+        #[test]
+        fn the_seed_taxonomy_collapses_onto_two_census_groups() {
+            let map = crosswalk();
+            assert_eq!(map.get("Plumbing").map(String::as_str), Some("2382"));
+            assert_eq!(map.get("HVAC").map(String::as_str), Some("2382"));
+            assert_eq!(map.get("Electrical").map(String::as_str), Some("2382"));
+            assert_eq!(map.get("Landscaping").map(String::as_str), Some("5617"));
+            assert_eq!(map.get("Pool service").map(String::as_str), Some("5617"));
+            let groups: std::collections::BTreeSet<&String> = map.values().collect();
+            assert_eq!(groups.len(), 2);
         }
     }
 }
