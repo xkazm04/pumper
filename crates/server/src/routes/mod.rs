@@ -513,7 +513,7 @@ mod catalog_tests {
     }
 
     fn registered() -> Vec<std::sync::Arc<dyn pumper_core::ScrapeApp>> {
-        crate::registry::apps()
+        crate::registry::apps(&pumper_core::Config::default())
     }
 
     #[test]

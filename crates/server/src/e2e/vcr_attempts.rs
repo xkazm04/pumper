@@ -463,7 +463,10 @@ async fn a_replay_of_a_raw_engine_app_is_refused_not_run_live() {
 /// registry, so the binding is asserted here.
 #[test]
 fn every_declared_replay_bypass_names_a_registered_app() {
-    let registered: Vec<&'static str> = crate::registry::apps().iter().map(|a| a.name()).collect();
+    let registered: Vec<&'static str> = crate::registry::apps(&pumper_core::Config::default())
+        .iter()
+        .map(|a| a.name())
+        .collect();
     for (app, _, _) in REPLAY_BYPASS_APPS {
         assert!(
             registered.contains(app),

@@ -189,7 +189,7 @@ Both datasets are declared in the result's `index_datasets`, so their revisions 
 
 **`[research] max_watched_sources`** (default 20) is the operator rail. One cap governs the record write, the snapshot fetch and the watch proposal, so `sources_truncated: true` has a single meaning: this run cited more sources than it acted on. A citation list past 20 is a survey, not a citation set, and every entry past it costs a real metered fetch.
 
-*Plumbing caveat, stated rather than hidden:* the app reads the cap from `ResearchConfig::default()` (the single definition of the number, pinned by a test), **not** from the loaded `config.toml` — `registry::apps()` builds the app list without a `&Config`, and an app receives no config handle. An operator who edits the key today must also pass `max_watched_sources` per run (or per schedule params) for it to bind. Closing that needs `apps()` to take the config, which was outside this change's file scope.
+*Plumbed (P.3, wave 4):* `registry::apps(&config)` now takes the loaded config and constructs `Research::with_config(&config.research)`, so the app carries its own `[research]` section and reads the cap off `self`. Precedence is per-run param → the operator's `config.toml` key → the shipped default (20). Editing `[research] max_watched_sources` binds on the next run with no per-run param. This is the general seam: an app that owns a `[section]` is CONSTRUCTED with it in `registry::apps`; apps that own no section are registered exactly as before.
 
 ### Snapshots
 
@@ -239,7 +239,6 @@ Nothing in this app creates a trigger. The loop that makes the knowledge base *s
 
 - **Superseded findings are not removed.** A run that produces 3 findings for a topic that previously had 5 leaves `#3` and `#4` in place. `sync_many` would fix it but is dataset-wide, and `research/findings` holds every topic, so a full-snapshot sync would delete every other topic's records.
 - **No schedule or trigger is created by the app** (above).
-- **`[research] max_watched_sources` is not plumbed from `config.toml`** (above).
 - **No `explain` read-only mode** that re-scores existing findings against snapshots without a new session, and `connector-api-watch`'s `change_summary_request` was **not** extracted into a shared `explain-diff` role — it is not a pure move (it carries Personas-specific tag vocabulary and its own caching), so it stays where it is.
 
 ## Conventions for new apps

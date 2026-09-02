@@ -20,7 +20,7 @@ async fn mcp_state(allow_enqueue: bool) -> (AppState, pumper_core::testing::Temp
     let (mut state, store) = test_state(vec![
         Arc::new(FakeApp),
         Arc::new(app_readable::Readable),
-        Arc::new(app_research::Research),
+        Arc::new(app_research::Research::default()),
     ])
     .await;
     let mut config = (*state.config).clone();

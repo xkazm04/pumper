@@ -25,7 +25,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub struct Research;
+/// The research app, holding the operator's `[research]` section.
+///
+/// Registered with the real config (`registry::apps(&config)`), so an operator
+/// key like `max_watched_sources` binds without every caller repeating it as a
+/// per-run param. `Default` is the config's own default, which is what an
+/// embedder or a test that constructs the app bare gets.
+#[derive(Debug, Clone, Default)]
+pub struct Research {
+    config: ResearchConfig,
+}
+
+impl Research {
+    /// Builds the app around one operator's `[research]` section.
+    pub fn with_config(config: &ResearchConfig) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+}
 
 /// Checkpoint blob version — bump on shape change; a mismatch restores fresh.
 const STATE_VERSION: u32 = 1;
@@ -666,7 +684,13 @@ impl ScrapeApp for Research {
             .filter(|t| !t.is_empty())
             .unwrap_or(query.as_str())
             .to_string();
-        let kb = build_knowledge(&ctx, &topic, &report, &KbOptions::from_params(&ctx.params)).await;
+        let kb = build_knowledge(
+            &ctx,
+            &topic,
+            &report,
+            &KbOptions::from_params(&ctx.params, &self.config),
+        )
+        .await;
 
         let result = json!({
             "query": query,
@@ -1093,7 +1117,7 @@ struct KbOptions {
 }
 
 impl KbOptions {
-    fn from_params(params: &Value) -> Self {
+    fn from_params(params: &Value, config: &ResearchConfig) -> Self {
         Self {
             persist: params
                 .get("persist")
@@ -1107,15 +1131,15 @@ impl KbOptions {
                 .get("watch_sources")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            // The operator's `[research] max_watched_sources` is the DEFAULT
-            // here (see the plumbing note in docs/features/apps.md §research):
-            // `ResearchConfig::default()` is the single definition of the
-            // number, so the app and the config key cannot drift apart.
+            // Precedence: a per-run param, else the OPERATOR'S
+            // `[research] max_watched_sources` as it was actually loaded — not
+            // `ResearchConfig::default()`, which pinned the shipped number and
+            // made an operator's config.toml key a decoration.
             cap: params
                 .get("max_watched_sources")
                 .and_then(Value::as_u64)
                 .map(|n| n as usize)
-                .unwrap_or_else(|| ResearchConfig::default().max_watched_sources),
+                .unwrap_or(config.max_watched_sources),
             archive_max_age: params.get("archive_max_age").and_then(Value::as_u64),
             watch_cron: params
                 .get("watch_cron")
@@ -1761,30 +1785,59 @@ mod tests {
         }
 
         #[test]
-        fn the_default_cap_is_the_operators_config_default_not_a_second_number() {
-            // The app and `[research] max_watched_sources` must not drift: the
-            // config struct is the one definition of the default.
-            let opts = KbOptions::from_params(&json!({}));
-            assert_eq!(opts.cap, ResearchConfig::default().max_watched_sources);
-            assert_eq!(opts.cap, 20);
-            // …and a caller may tighten it per run.
+        fn the_operators_configured_cap_binds_without_a_per_run_param() {
+            // THE REFUTED BEHAVIOR: the default came from
+            // `ResearchConfig::default()`, so `[research] max_watched_sources
+            // = 3` in config.toml bound NOTHING — the run capped at the shipped
+            // 20 and only a per-run param could move it.
+            let operator = ResearchConfig {
+                max_watched_sources: 3,
+            };
+            assert_eq!(KbOptions::from_params(&json!({}), &operator).cap, 3);
+            // The shipped default is still the default when the operator set
+            // nothing, and the config struct stays its one definition.
+            let shipped = ResearchConfig::default();
             assert_eq!(
-                KbOptions::from_params(&json!({"max_watched_sources": 3})).cap,
-                3
+                KbOptions::from_params(&json!({}), &shipped).cap,
+                shipped.max_watched_sources
+            );
+            assert_eq!(shipped.max_watched_sources, 20);
+            // …and a per-run param still wins over the operator's key.
+            assert_eq!(
+                KbOptions::from_params(&json!({"max_watched_sources": 7}), &operator).cap,
+                7
+            );
+        }
+
+        #[test]
+        fn the_app_carries_the_section_it_was_registered_with() {
+            // The plumbing itself: `registry::apps(&config)` hands the app its
+            // own `[research]` section, and `run()` reads it off `self`.
+            let cfg = ResearchConfig {
+                max_watched_sources: 5,
+            };
+            assert_eq!(Research::with_config(&cfg).config.max_watched_sources, 5);
+            assert_eq!(
+                Research::default().config.max_watched_sources,
+                ResearchConfig::default().max_watched_sources
             );
         }
 
         #[test]
         fn the_side_effects_are_off_by_default_and_persistence_is_on() {
-            let opts = KbOptions::from_params(&json!({}));
+            let opts = KbOptions::from_params(&json!({}), &ResearchConfig::default());
             assert!(opts.persist, "a structured run's records are the point");
             assert!(!opts.snapshot, "snapshots are metered fetches");
             assert!(!opts.watch, "watches are standing commitments");
             assert_eq!(opts.watch_cron, DEFAULT_WATCH_CRON);
-            assert!(!KbOptions::from_params(&json!({"persist": false})).persist);
+            assert!(
+                !KbOptions::from_params(&json!({"persist": false}), &ResearchConfig::default())
+                    .persist
+            );
             // A blank cron falls back rather than proposing an invalid schedule.
             assert_eq!(
-                KbOptions::from_params(&json!({"watch_cron": "   "})).watch_cron,
+                KbOptions::from_params(&json!({"watch_cron": "   "}), &ResearchConfig::default())
+                    .watch_cron,
                 DEFAULT_WATCH_CRON
             );
         }
@@ -1933,7 +1986,7 @@ mod tests {
                 researcher,
             )
             .await;
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("completed"));
             assert_eq!(result["structured"], json!(true));
             assert_eq!(result["steps"], json!(1));
@@ -1958,7 +2011,7 @@ mod tests {
                 researcher,
             )
             .await;
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("no_session"));
             assert_eq!(result["structured"], json!(false));
             assert_eq!(result["steps"], json!(1));
@@ -1980,7 +2033,7 @@ mod tests {
                 researcher.clone(),
             )
             .await;
-            let err = Research
+            let err = Research::default()
                 .run(ctx)
                 .await
                 .expect_err("an empty research run is a failure, not an empty success");
@@ -2023,7 +2076,7 @@ mod tests {
                     "partial": "found so far",
                 }))
                 .build();
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["resumed_from_checkpoint"], json!(true));
             assert_eq!(
                 result["resumed"],
@@ -2074,7 +2127,7 @@ mod tests {
                 .engines(engines_with(Arc::new(Dead), Arc::new(Dead), researcher))
                 .artifacts_dir(blocker.join("job"))
                 .build();
-            let result = Research
+            let result = Research::default()
                 .run(ctx)
                 .await
                 .expect("a finished run is not undone by a failed artifact dump");
@@ -2095,7 +2148,7 @@ mod tests {
                 .artifacts_dir(blocker.join("job"))
                 .restored(done)
                 .build();
-            let restored = Research
+            let restored = Research::default()
                 .run(ctx)
                 .await
                 .expect("a restored finished result is not undone by a failed artifact dump");
@@ -2119,7 +2172,7 @@ mod tests {
                 researcher.clone(),
             )
             .await;
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("step_cap"));
             assert_eq!(result["structured"], json!(false));
             assert_eq!(result["steps"], json!(MAX_STEPS));
@@ -2189,7 +2242,7 @@ mod tests {
                 researcher.clone(),
             )
             .await;
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             let spent = result["cost_usd"].as_f64().unwrap();
             assert!(spent <= 0.5 + 1e-9, "run spent {spent}, ceiling was 0.50");
             assert_eq!(result["stop_reason"], json!("budget_exhausted"));
@@ -2207,7 +2260,7 @@ mod tests {
                 researcher.clone(),
             )
             .await;
-            Research.run(ctx).await.unwrap();
+            Research::default().run(ctx).await.unwrap();
             let ceilings: Vec<f64> = researcher
                 .ceilings()
                 .into_iter()
@@ -2239,7 +2292,7 @@ mod tests {
                 .engines(engines_with(Arc::new(Dead), Arc::new(Dead), Arc::new(Dead)))
                 .restored(restored)
                 .build();
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("budget_exhausted"));
             assert_eq!(result["steps"], json!(0));
             assert_eq!(result["cost_usd"], json!(0.60));
@@ -2264,7 +2317,7 @@ mod tests {
                 researcher.clone(),
             )
             .await;
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("turns_exhausted"));
             assert_eq!(result["steps"], json!(3));
             assert_eq!(result["num_turns"], json!(3));
@@ -2290,7 +2343,7 @@ mod tests {
                 ))
                 .budget_usd(1.0)
                 .build();
-            let result = Research.run(ctx).await.unwrap();
+            let result = Research::default().run(ctx).await.unwrap();
             assert_eq!(result["stop_reason"], json!("budget_exhausted"));
             assert_eq!(result["steps"], json!(1));
             assert_eq!(researcher.call_count(), 1);

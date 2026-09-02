@@ -136,7 +136,7 @@ fn ctx_with_site(
 async fn a_structured_run_writes_provenance_stamped_findings_and_sources() {
     let store = TempStore::new("research-kb-writes").await;
     let researcher = scripted(report_json(&["VAT threshold is 2M CZK", "It rose in 2023"]));
-    let out = Research
+    let out = Research::default()
         .run(ctx(
             &store,
             json!({"query": "Czech VAT thresholds"}),
@@ -217,7 +217,7 @@ async fn a_second_run_on_the_same_topic_updates_the_keys_instead_of_duplicating_
     // knowledge. Without `topic` the run would fork a second copy of the
     // findings under its own slug, which is exactly the failure this pins.
     let store = TempStore::new("research-kb-update").await;
-    let first = Research
+    let first = Research::default()
         .run(ctx(
             &store,
             json!({"query": "Czech VAT thresholds"}),
@@ -227,7 +227,7 @@ async fn a_second_run_on_the_same_topic_updates_the_keys_instead_of_duplicating_
         .unwrap();
     assert_eq!(first["datasets"]["findings_new"], json!(2));
 
-    let second = Research
+    let second = Research::default()
         .run(ctx(
             &store,
             json!({
@@ -278,7 +278,7 @@ async fn snapshot_sources_archives_the_citation_stamps_its_sha_and_spends_on_the
         (ONE, &one_page()),
         (TWO, "<html><body>   </body></html>"),
     ]));
-    let out = Research
+    let out = Research::default()
         .run(ctx_with_site(
             &store,
             json!({"query": "Czech VAT thresholds", "snapshot_sources": true}),
@@ -367,7 +367,7 @@ async fn snapshot_sources_archives_the_citation_stamps_its_sha_and_spends_on_the
 #[tokio::test]
 async fn the_source_cap_bites_and_says_so_instead_of_silently_dropping() {
     let store = TempStore::new("research-kb-cap").await;
-    let out = Research
+    let out = Research::default()
         .run(ctx(
             &store,
             json!({
