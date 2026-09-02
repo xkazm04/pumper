@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use pumper_core::agent_tools::{self, AgentTools, JobToken, MCP_SERVER_NAME};
 use pumper_core::config::ClaudeConfig;
 use pumper_core::error::ClaudeFailure;
 use pumper_core::{Error, ResearchOutput, ResearchRequest, Researcher, Result};
@@ -116,7 +117,24 @@ impl ClaudeEngine {
         if self.cfg.skip_permissions {
             args.push("--dangerously-skip-permissions".into());
         }
-        if !self.cfg.allowed_tools.is_empty() {
+        // N15: with the self-hosted loop on, this run reaches the web through
+        // pumper's own `/mcp` rather than the CLI's `WebFetch` — a per-run
+        // config file naming the loopback endpoint and a single-job token, plus
+        // the allow-list that replaces the built-in network tools. `token` is
+        // held in `Launch` so the grant dies with the process, not on a timer.
+        let mut token: Option<JobToken> = None;
+        if let Some(tools) = self.agent_tools(req, &mut token) {
+            let file =
+                ScratchFile::write_as(&scratch_root, "mcp", "json", &mcp_config_json(&tools))?;
+            args.push("--mcp-config".into());
+            args.push(file.path().to_string_lossy().into_owned());
+            args.push("--strict-mcp-config".into());
+            scratch.push(file);
+            if !tools.allowed_tools.is_empty() {
+                args.push("--allowedTools".into());
+                args.push(tools.allowed_tools.join(","));
+            }
+        } else if !self.cfg.allowed_tools.is_empty() {
             args.push("--allowedTools".into());
             args.push(self.cfg.allowed_tools.join(","));
         }
@@ -175,14 +193,93 @@ impl ClaudeEngine {
         if let Some(dir) = &workdir {
             cmd.current_dir(dir);
         }
-        Ok(Launch { cmd, scratch })
+        Ok(Launch {
+            cmd,
+            scratch,
+            token,
+        })
     }
+
+    /// The MCP access this run gets, or `None` when the loop is off.
+    ///
+    /// Three conditions, all required, none inferred: the operator turned
+    /// `[claude] self_hosted_tools` on, the runtime stamped a `job_id` on the
+    /// request (a raw `Researcher` call from a test or an embedder has none,
+    /// and a fetch with nothing to attribute it to is exactly what this feature
+    /// exists to end), and the allow-list is non-empty. The minted guard is
+    /// parked in `token` so the caller can keep it alive for the whole run.
+    fn agent_tools(
+        &self,
+        req: &ResearchRequest,
+        token: &mut Option<JobToken>,
+    ) -> Option<AgentTools> {
+        if !self.cfg.self_hosted_tools {
+            return None;
+        }
+        let job_id = req.job_id?;
+        let minted = agent_tools::mint(
+            job_id,
+            Duration::from_secs(self.cfg.self_hosted_token_ttl_secs),
+        );
+        let tools = AgentTools {
+            url: self.cfg.self_hosted_url.clone(),
+            token: minted.secret().to_string(),
+            api_key: self.cfg.self_hosted_key.clone(),
+            allowed_tools: self.cfg.self_hosted_allowed_tools.clone(),
+        };
+        *token = Some(minted);
+        Some(tools)
+    }
+}
+
+/// The per-run `.mcp.json` handed to the CLI as `--mcp-config`.
+///
+/// Streamable-HTTP, one server, two headers: the job token (attribution — which
+/// job's budget and ledger these fetches land on) and, only when the operator
+/// configured one, the API key that gets past `[auth] mode = "keys"`. The key
+/// header is **omitted entirely** rather than written empty: an
+/// `Authorization: Bearer ` with nothing after it is a malformed credential the
+/// identity layer would refuse with a message about the wrong thing.
+///
+/// Extracted and tested because this file is the one place a secret leaves the
+/// process, and its shape is not observable from any running test.
+fn mcp_config_json(tools: &AgentTools) -> String {
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        agent_tools::JOB_TOKEN_HEADER.to_string(),
+        Value::String(tools.token.clone()),
+    );
+    if let Some(key) = tools
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        headers.insert(
+            "Authorization".to_string(),
+            Value::String(format!("Bearer {key}")),
+        );
+    }
+    serde_json::json!({
+        "mcpServers": {
+            MCP_SERVER_NAME: {
+                "type": "http",
+                "url": tools.url,
+                "headers": Value::Object(headers),
+            }
+        }
+    })
+    .to_string()
 }
 
 /// A command plus the scratch files that must outlive the process reading them.
 struct Launch {
     cmd: Command,
     scratch: Vec<ScratchFile>,
+    /// The run's MCP job token. Held only to be dropped: its `Drop` revokes the
+    /// grant, so the token stops resolving the moment this run ends — including
+    /// on the cancellation path, where nothing else executes.
+    token: Option<JobToken>,
 }
 
 /// A file handed to the subprocess by path, removed when the run ends —
@@ -191,12 +288,18 @@ struct ScratchFile(PathBuf);
 
 impl ScratchFile {
     fn write(dir: &Path, kind: &str, body: &str) -> Result<Self> {
+        Self::write_as(dir, kind, "txt", body)
+    }
+
+    /// [`Self::write`] with an explicit extension — the MCP config must be
+    /// `.json` for the CLI to parse it as one.
+    fn write_as(dir: &Path, kind: &str, ext: &str, body: &str) -> Result<Self> {
         // pid + counter: two concurrent research jobs in one process must not
         // hand the CLI the same path, and a stale file from a previous run of a
         // recycled pid must not be readable as this run's prompt.
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = dir.join(format!(
-            "pumper-{kind}-{}-{}.txt",
+            "pumper-{kind}-{}-{}.{ext}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
@@ -235,6 +338,7 @@ impl Researcher for ClaudeEngine {
         let Launch {
             mut cmd,
             scratch: _scratch,
+            token: _token,
         } = self.command(&req, &resolved)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -872,13 +976,181 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_shim_argv, envelope_text, is_plain_model_id, parse_loose_json, tree_kill_argv,
-        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, MAX_SHIM_COMMAND_LINE,
+        check_shim_argv, envelope_text, is_plain_model_id, mcp_config_json, parse_loose_json,
+        tree_kill_argv, unknown_role_message, AgentTools, ClaudeEngine, RunScope, ShimRefusal,
+        MAX_SHIM_COMMAND_LINE,
     };
     use pumper_core::config::{ClaudeConfig, ClaudeRole};
     use pumper_core::ResearchRequest;
     use serde_json::json;
     use std::time::Duration;
+
+    // -- N15: the self-hosted agent loop -------------------------------------
+
+    fn self_hosted_cfg() -> ClaudeConfig {
+        ClaudeConfig {
+            self_hosted_tools: true,
+            self_hosted_url: "http://127.0.0.1:8088/mcp".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Reads the value that follows `flag` in an argv, or `None`.
+    fn arg_after(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1).cloned())
+    }
+
+    /// The argv the engine would build, without spawning anything.
+    fn built_argv(cfg: &ClaudeConfig, req: &ResearchRequest) -> Vec<String> {
+        let engine = ClaudeEngine::new(cfg);
+        let resolved = engine.resolve(req).expect("resolve");
+        let launch = engine.command(req, &resolved).expect("command");
+        launch
+            .cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// THE anti-pattern the whole item exists to close: the most expensive tier
+    /// fetching the web with the CLI's own `WebFetch` -- from pumper's IP, past
+    /// the governor, the cache, the archive tier, the profile vault and the
+    /// cost ledger, leaving no row anywhere. With the loop on, the allow-list
+    /// the subprocess is launched with must not name it.
+    #[test]
+    fn self_hosted_allowlist_not_carrying_webfetch() {
+        let cfg = self_hosted_cfg();
+        assert!(
+            cfg.allowed_tools.iter().any(|t| t == "WebFetch"),
+            "the pre-N15 default is what this test is displacing"
+        );
+        let mut req = ResearchRequest::new("what changed on example.com");
+        req.job_id = Some(uuid::Uuid::new_v4());
+        let args = built_argv(&cfg, &req);
+        let allowed = arg_after(&args, "--allowedTools").expect("--allowedTools");
+        assert_eq!(allowed, "mcp__pumper__fetch");
+        assert!(!allowed.contains("WebFetch"), "{allowed}");
+        assert!(!allowed.contains("WebSearch"), "{allowed}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+        let path = arg_after(&args, "--mcp-config").expect("--mcp-config");
+        assert!(path.ends_with(".json"), "the CLI parses it as JSON: {path}");
+    }
+
+    /// Default OFF means byte-for-byte the old argv: no `--mcp-config`, no
+    /// `--strict-mcp-config`, and `allowed_tools` reaching `--allowedTools`
+    /// exactly as configured.
+    #[test]
+    fn the_loop_off_leaves_the_argv_untouched() {
+        let mut req = ResearchRequest::new("hello");
+        req.job_id = Some(uuid::Uuid::new_v4());
+        let args = built_argv(&ClaudeConfig::default(), &req);
+        assert!(!args.iter().any(|a| a == "--mcp-config"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+        assert_eq!(
+            arg_after(&args, "--allowedTools").as_deref(),
+            Some("WebSearch,WebFetch")
+        );
+    }
+
+    /// A research call with nothing to attribute a fetch to (a raw `Researcher`
+    /// call from a test or an embedder -- `AppContext::research` always stamps
+    /// one) must NOT get the loop. Minting a token for job `None` would be a
+    /// fetch tool with no ledger to spend on: the ungoverned egress this item
+    /// removes, re-created behind a config key that says it is gone.
+    #[test]
+    fn no_job_id_not_given_a_self_hosted_token() {
+        let args = built_argv(&self_hosted_cfg(), &ResearchRequest::new("orphan"));
+        assert!(!args.iter().any(|a| a == "--mcp-config"), "{args:?}");
+        assert_eq!(
+            arg_after(&args, "--allowedTools").as_deref(),
+            Some("WebSearch,WebFetch"),
+            "and it falls back to the ordinary allow-list rather than to nothing"
+        );
+    }
+
+    /// The token guard dies with the run: once the `Launch` is dropped the
+    /// token no longer resolves, so a leaked config file is worthless.
+    #[test]
+    fn a_finished_run_not_leaving_a_live_token() {
+        let cfg = self_hosted_cfg();
+        let mut req = ResearchRequest::new("expiring");
+        req.job_id = Some(uuid::Uuid::new_v4());
+        let engine = ClaudeEngine::new(&cfg);
+        let resolved = engine.resolve(&req).expect("resolve");
+        let secret = {
+            let launch = engine.command(&req, &resolved).expect("command");
+            let secret = launch.token.as_ref().expect("minted").secret().to_string();
+            assert!(matches!(
+                pumper_core::agent_tools::resolve(Some(&secret)),
+                pumper_core::agent_tools::TokenVerdict::Valid(_)
+            ));
+            secret
+        };
+        assert_eq!(
+            pumper_core::agent_tools::resolve(Some(&secret)),
+            pumper_core::agent_tools::TokenVerdict::Unknown
+        );
+    }
+
+    /// The config file is the one place a secret leaves this process. It must
+    /// carry the job token, name the server `pumper` (the allow-list's
+    /// `mcp__pumper__*` prefix depends on it), and -- the anti-pattern --
+    /// **omit** the auth header rather than write an empty bearer, which the
+    /// identity layer would refuse with a message about the wrong thing.
+    #[test]
+    fn mcp_config_omits_an_absent_key_rather_than_writing_an_empty_bearer() {
+        let base = AgentTools {
+            url: "http://127.0.0.1:8088/mcp".into(),
+            token: "deadbeef".into(),
+            api_key: None,
+            allowed_tools: vec!["mcp__pumper__fetch".into()],
+        };
+        let open: serde_json::Value = serde_json::from_str(&mcp_config_json(&base)).expect("json");
+        let server = &open["mcpServers"]["pumper"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:8088/mcp");
+        assert_eq!(server["headers"]["x-pumper-job-token"], "deadbeef");
+        assert!(server["headers"].get("Authorization").is_none());
+
+        for blank in ["", "   "] {
+            let cfg = AgentTools {
+                api_key: Some(blank.into()),
+                ..base.clone()
+            };
+            let v: serde_json::Value = serde_json::from_str(&mcp_config_json(&cfg)).expect("json");
+            assert!(
+                v["mcpServers"]["pumper"]["headers"]
+                    .get("Authorization")
+                    .is_none(),
+                "a blank key must not become an empty bearer ({blank:?})"
+            );
+        }
+
+        let keyed = AgentTools {
+            api_key: Some("k3y".into()),
+            ..base
+        };
+        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(&keyed)).expect("json");
+        assert_eq!(
+            v["mcpServers"]["pumper"]["headers"]["Authorization"],
+            "Bearer k3y"
+        );
+    }
+
+    /// Everything the loop adds to the command line must survive cmd.exe's
+    /// second parse on the Windows shim path -- otherwise the feature would be
+    /// refused before spawning on exactly one platform.
+    #[test]
+    fn the_self_hosted_argv_crosses_the_shim_intact() {
+        let cfg = self_hosted_cfg();
+        let mut req = ResearchRequest::new("shim");
+        req.job_id = Some(uuid::Uuid::new_v4());
+        let args = built_argv(&cfg, &req);
+        assert!(check_shim_argv("claude", &args).is_ok(), "{args:?}");
+    }
 
     fn argv(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()

@@ -500,6 +500,10 @@ impl AppContext {
             self.meter("claude", None, 0.0, Some("vcr_replay")).await;
             return Ok(out);
         }
+        // The engine mints this run's MCP job token from here (N15), so the
+        // fetches the model makes are attributed to the job that paid for the
+        // model. Stamped at the chokepoint, never accepted from a request body.
+        req.job_id = Some(self.job_id);
         let cacheable = req.resume_session.is_none() && self.research_cache.enabled();
         let key = cacheable.then(|| ResearchCache::key(&req));
         if let Some(key) = &key {

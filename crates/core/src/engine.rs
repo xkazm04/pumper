@@ -1145,6 +1145,18 @@ pub struct ResearchRequest {
     /// Constrain the final answer to this JSON schema (`--json-schema`).
     #[serde(default)]
     pub json_schema: Option<Value>,
+    /// The job this research run belongs to, stamped by
+    /// [`crate::AppContext::research`] — never by a request body, hence
+    /// `serde(skip)`.
+    ///
+    /// The engine needs it for exactly one thing (N15): minting the
+    /// single-job MCP token the self-hosted agent loop's `fetch` tool requires,
+    /// so the fetches the model makes land on the same ledger and budget its
+    /// tokens do. It is deliberately NOT part of
+    /// [`crate::cache::ResearchCache::key`] — two jobs asking the identical
+    /// question must still share one cached answer.
+    #[serde(skip)]
+    pub job_id: Option<uuid::Uuid>,
 }
 
 impl ResearchRequest {
