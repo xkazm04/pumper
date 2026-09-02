@@ -110,3 +110,31 @@ export interface SyncProgress {
   upserted: number;
   tombstoned: number;
 }
+
+/** One row of the durable event log (N05), as `GET /events/log` returns it. */
+export interface PumperEvent<T = unknown> {
+  /** Monotonic sequence — the cursor. The same number `Last-Event-ID` carries on
+   *  the SSE stream, and it survives a server restart. */
+  seq: number;
+  /** `job.succeeded` | `dataset.changed` | `external` | `transaction.submitted` | … */
+  kind: string;
+  app: string;
+  /** Job id, dataset name, transaction id — whatever this kind is about. */
+  subject_id: string;
+  payload: T;
+  created_at: string;
+}
+
+/** One page of `GET /events/log`. */
+export interface PumperEventPage<T = unknown> {
+  count: number;
+  /** The cursor to send as `after` next time, or `null` when this page did not
+   *  fill — i.e. you are caught up and should back off rather than spin. */
+  next_after: number | null;
+  /** The log's head, so `latest_seq - after` is your backlog. */
+  latest_seq: number;
+  /** Rows currently retained (the log is pruned past `[events] log_retention_days`). */
+  retained: number;
+  retention_days: number;
+  events: Array<PumperEvent<T>>;
+}

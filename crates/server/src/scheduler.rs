@@ -151,6 +151,17 @@ async fn tick_once(
     if state.config.webhooks.auto_retry {
         crate::webhook::drain_due(state).await;
     }
+    // And the N05 subscription outbox: flush the event bus's pending rows into
+    // the durable log, then push every enabled subscription (and every watch,
+    // which is a subscription with a dataset selector) forward from its cursor.
+    //
+    // It rides THIS tick rather than owning a timer for the same reason the
+    // drain above does — and because it is the same class of work: a bounded
+    // catch-up that must happen even when no job is finishing. A finished job's
+    // fan-out drains it too, so this is the safety net (a crash mid-drain, a
+    // receiver that was down, a subscription re-enabled while the queue is
+    // idle), not the hot path.
+    crate::subscriptions::drain(state).await;
     // And the cache refresher ([refresher], default OFF): revalidate cached
     // entries whose learned change cadence says a change is near — spawned
     // (non-blocking) and strictly idle-slot via Governor::try_acquire, so
@@ -993,25 +1004,24 @@ pub(crate) fn peer_reconcile_plan(peers: &[PeerConfig]) -> Vec<PeerSchedule> {
 /// history keyed on its id, and deleting it to re-create it later would erase
 /// the record of a peer that used to sync and stopped.
 async fn apply_peer_schedules(state: &AppState, plan: &[PeerSchedule]) -> anyhow::Result<usize> {
-    let pool = state.storage.pool();
     let wanted: std::collections::HashSet<&str> = plan.iter().map(|p| p.id.as_str()).collect();
     let mut applied = 0usize;
     for row in plan {
-        sqlx::query(
-            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, created_at) \
-             VALUES (?1, 'peer', ?2, ?3, ?4, 0, ?5, ?6) \
-             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, params = excluded.params, \
-               enabled = excluded.enabled \
-             WHERE schedules.managed_by = excluded.managed_by",
-        )
-        .bind(&row.id)
-        .bind(&row.cron)
-        .bind(row.params.to_string())
-        .bind(row.enabled as i64)
-        .bind(crate::routes::mesh::PEER_MANAGED_BY)
-        .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-        .execute(&pool)
-        .await?;
+        // Through the storage layer (N05 carry-forward). This used to be a raw
+        // `sqlx::query` right here: a second hand-written INSERT..ON CONFLICT
+        // beside `Storage`'s, re-stating the column list, the timestamp format
+        // and the `managed_by` fence — and no storage-level test could see it.
+        state
+            .storage
+            .upsert_managed_schedule(
+                &row.id,
+                "peer",
+                &row.cron,
+                &row.params,
+                row.enabled,
+                crate::routes::mesh::PEER_MANAGED_BY,
+            )
+            .await?;
         applied += 1;
     }
     for existing in state.storage.list_schedules().await? {

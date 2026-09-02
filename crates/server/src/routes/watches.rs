@@ -1,6 +1,16 @@
 //! Dataset change webhooks: list (delivery-enriched), create (namespace-gated),
 //! delete, enable/disable, and the per-watch delivery log — the
 //! `dataset.changed` delivery subscriptions.
+//!
+//! **Since N05 these routes are a thin adapter.** A watch IS a cursor
+//! subscription with a `{kinds: ["dataset.changed"], app, dataset}` selector:
+//! the `watches` table stays the source of truth for watch rows and every route
+//! here keeps working unchanged, but the fan-out runs through the shared outbox
+//! (`crate::subscriptions`), so a watch now has a durable cursor and resumes
+//! after a restart or a disable instead of missing whatever happened while it
+//! was away. `POST /watches` is **deprecated** in favour of
+//! `POST /subscriptions` and will be removed one release after N05; see
+//! `docs/features/events-webhooks.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -298,6 +308,69 @@ pub(crate) struct CreateWatchBody {
     sink: Option<String>,
 }
 
+/// Validates a `(sink, url)` pair and returns the url to store.
+///
+/// Extracted from `create_watch` because N05's `POST /subscriptions` takes the
+/// same pair and must refuse it identically: a `plugin:` sink naming a module
+/// that was never installed, or a `webhook` sink with no scheme, is a
+/// subscription that looks configured and dead-letters every event. Two copies
+/// of this gate would mean one door quietly accepting what the other refuses.
+///
+/// The four sinks and what `url` means for each:
+/// - `file`: nothing. The path derives from the subscriber id alone (the
+///   traversal guard lives in the delivery layer), so any supplied url is
+///   dropped rather than half-honored.
+/// - `webhook` / `slack`: the http(s) endpoint. Required.
+/// - `plugin:<name>` (N10): OPTIONAL, and it is the *connector's target* — it
+///   reaches the module as `params.target`. It must be http(s) when present,
+///   because it rides the delivery row's pseudo-URL after `?target=` and a `?`
+///   in the stored value would be re-parsed as the separator.
+pub(crate) async fn validate_sink<'a>(
+    state: &AppState,
+    sink: &str,
+    url: Option<&'a str>,
+) -> Result<&'a str, ApiError> {
+    match sink {
+        "file" => Ok(""),
+        "webhook" | "slack" => {
+            let url = url.unwrap_or("");
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "url must be http(s)".into(),
+                ));
+            }
+            Ok(url)
+        }
+        other if other.starts_with(crate::webhook::PLUGIN_SINK_PREFIX) => {
+            let name = &other[crate::webhook::PLUGIN_SINK_PREFIX.len()..];
+            if !state.plugins.has(name) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "no executable plugin named '{name}' is loaded — build and install it \
+                         (`just plugins-install`), then POST /plugins/reload"
+                    ),
+                ));
+            }
+            let url = url.unwrap_or("");
+            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "a plugin sink's url is the connector's target and must be http(s) \
+                     (or omitted, for a connector with its destination built in)"
+                        .into(),
+                ));
+            }
+            Ok(url)
+        }
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown sink '{other}' (expected webhook, file, slack, or plugin:<name>)"),
+        )),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/watches",
@@ -324,61 +397,20 @@ pub(crate) async fn create_watch(
         return Err(ApiError(status, msg));
     }
     let sink = body.sink.as_deref().unwrap_or("webhook");
-    let url = match sink {
-        // The file path derives from the watch id only (path-traversal guard
-        // lives in the delivery layer); any supplied url is ignored.
-        "file" => "",
-        "webhook" | "slack" => {
-            let url = body.url.as_deref().unwrap_or("");
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "url must be http(s)".into(),
-                ));
-            }
-            url
-        }
-        // N10: `plugin:<name>` delivers through the WASM plugin host. The
-        // module must already be loaded — a watch pointed at a plugin that was
-        // never installed would look configured and dead-letter every event.
-        // `url` is OPTIONAL here and is the connector's target: it reaches the
-        // module as `params.target`, and a connector that has its destination
-        // compiled in ignores it (see docs/features/events-webhooks.md).
-        other if other.starts_with(crate::webhook::PLUGIN_SINK_PREFIX) => {
-            let name = &other[crate::webhook::PLUGIN_SINK_PREFIX.len()..];
-            if !state.plugins.has(name) {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "no executable plugin named '{name}' is loaded — build and install it \
-                         (`just plugins-install`), then POST /plugins/reload"
-                    ),
-                ));
-            }
-            let url = body.url.as_deref().unwrap_or("");
-            // The target rides on the delivery row's pseudo-URL as
-            // `?target=…`, so a `?` in the stored value would be re-parsed as
-            // the separator. Refuse at the door rather than truncate later.
-            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "a plugin sink's url is the connector's target and must be http(s) \
-                     (or omitted, for a connector with its destination built in)"
-                        .into(),
-                ));
-            }
-            url
-        }
-        other => {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("unknown sink '{other}' (expected webhook, file, slack, or plugin:<name>)"),
-            ));
-        }
-    };
+    let url = validate_sink(&state, sink, body.url.as_deref()).await?;
+
     let watch = state
         .storage
-        .create_watch(&body.app, dataset, url, body.secret.as_deref(), sink)
+        // From NOW (N05): a watch has never delivered a change that happened
+        // before it existed, and the durable log would let it.
+        .create_watch(
+            &body.app,
+            dataset,
+            url,
+            body.secret.as_deref(),
+            sink,
+            state.events.latest_seq() as i64,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(watch)))
 }

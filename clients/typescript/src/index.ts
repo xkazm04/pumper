@@ -8,6 +8,8 @@ export { memoryWatermark, kvWatermark } from "./watermark.js";
 export { PumperHttpError, type HttpOptions } from "./http.js";
 export type {
   DatasetRef,
+  PumperEvent,
+  PumperEventPage,
   PumperRecord,
   PumperRevision,
   RevisionChange,

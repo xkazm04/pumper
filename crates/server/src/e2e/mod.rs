@@ -20,6 +20,7 @@ mod dynamic_apps;
 mod engine_conformance;
 mod enqueue_door_parity;
 mod error_contract;
+mod event_log;
 mod fanout_offslot;
 mod fetch_proxy;
 mod harness;

@@ -19,6 +19,8 @@ mod registry;
 mod routes;
 mod scheduler;
 mod state;
+// N05: cursor subscriptions over the durable event log.
+mod subscriptions;
 mod triggers;
 mod webhook;
 mod worker;

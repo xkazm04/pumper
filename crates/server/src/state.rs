@@ -221,7 +221,16 @@ impl AppState {
         let webhook_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
-        let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
+        // N05: the ring becomes a read-through cache over the `events` table
+        // when `[events] log_enabled` (default ON). Still no IO here — `emit`
+        // only QUEUES rows; the write happens at the head of the subscription
+        // outbox, and the counter is seeded from `MAX(seq)` by `init`.
+        let bus = EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY);
+        let events = Arc::new(if config.events.log_enabled {
+            bus.with_log(config.events.pending_capacity)
+        } else {
+            bus
+        });
         // Dynamic-app discovery (M28 v1). The one exception to "no IO" here,
         // and only when `[plugins] app_dir` is explicitly set (default: unset →
         // zero IO, so test states stay pure): scans the dir once and freezes the
@@ -406,6 +415,26 @@ impl AppState {
             search,
             registry,
         })?;
+
+        // N05: the sequence picks up where the last process left off, so a
+        // client's `Last-Event-ID` still names the event it named before the
+        // restart. Best-effort: a log that cannot be read starts at 0, which is
+        // the pre-N05 behaviour and is said out loud rather than assumed.
+        if state.events.logs() {
+            match state.storage.max_event_seq().await {
+                Ok(seq) => {
+                    state.events.seed_seq(seq as u64);
+                    tracing::info!(
+                        seq,
+                        retention_days = state.config.events.log_retention_days,
+                        "event log resumed"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "event log: could not read MAX(seq) ({e}); the sequence RESTARTS at 0 and                      resuming clients will be told to reset"
+                ),
+            }
+        }
 
         if state.health.enabled() {
             tracing::info!(

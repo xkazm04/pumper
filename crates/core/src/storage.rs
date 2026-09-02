@@ -116,9 +116,14 @@ pub struct Watch {
     /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
     #[serde(skip_serializing)]
     pub secret: Option<String>,
-    /// Delivery connector: `"webhook"` | `"file"` | `"slack"` (0031).
+    /// Delivery connector: `"webhook"` | `"file"` | `"slack"` (0031), or
+    /// `"plugin:<name>"` (N10).
     pub sink: String,
     pub enabled: bool,
+    /// N05: the highest `events.seq` this watch already has a delivery row for.
+    /// A watch is a subscription with a dataset selector, and the outbox drain
+    /// advances this exactly the way it advances a `subscriptions` cursor.
+    pub cursor_seq: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1382,8 +1387,17 @@ impl Storage {
 
     // ---- Dataset watches ---------------------------------------------------
 
-    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"`);
-    /// callers validate the value — storage stores it verbatim.
+    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"` |
+    /// `"plugin:<name>"`); callers validate the value — storage stores it
+    /// verbatim.
+    ///
+    /// `from_seq` is where the watch's cursor starts (N05), and it is a REQUIRED
+    /// argument rather than a default because getting it wrong is silent and
+    /// wrong in an expensive direction. A watch created on a live server must
+    /// start at the log's head: with `0` it would replay every retained
+    /// `dataset.changed` event — including changes from before it existed — as
+    /// real deliveries at a real receiver, which is precisely what a watch has
+    /// never done. `0` is the deliberate "replay what you still have".
     pub async fn create_watch(
         &self,
         app: &str,
@@ -1391,11 +1405,12 @@ impl Storage {
         url: &str,
         secret: Option<&str>,
         sink: &str,
+        from_seq: i64,
     ) -> Result<Watch> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, cursor_seq, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
         )
         .bind(&id)
         .bind(app)
@@ -1403,6 +1418,7 @@ impl Storage {
         .bind(url)
         .bind(secret)
         .bind(sink)
+        .bind(from_seq.max(0))
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -1413,7 +1429,7 @@ impl Storage {
 
     pub async fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
         let row: Option<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches WHERE id = ?1",
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches WHERE id = ?1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -1424,7 +1440,7 @@ impl Storage {
     /// Watches for an app (all watches when `app` is None).
     pub async fn list_watches(&self, app: Option<&str>) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) ORDER BY app, dataset",
         )
         .bind(app)
@@ -1443,7 +1459,7 @@ impl Storage {
     ) -> Result<Vec<Watch>> {
         let (after_ts, after_id) = split_after(after);
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -1460,7 +1476,7 @@ impl Storage {
     /// Enabled watches for an app — the delivery set for change webhooks.
     pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE app = ?1 AND enabled = 1",
         )
         .bind(app)
@@ -1510,6 +1526,233 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ---- Durable event log (N05) -------------------------------------------
+
+    /// Appends a batch of already-sequenced events in ONE transaction.
+    ///
+    /// `seq` is supplied by the caller (the in-memory bus stamped it and put it
+    /// on the wire as the SSE id), so this is `INSERT OR IGNORE`: re-appending a
+    /// seq the log already holds is a no-op rather than a unique-violation that
+    /// would poison a whole batch. Returns the number of rows that landed.
+    ///
+    /// Batched because the alternative -- one round trip per emitted event --
+    /// puts the write amplification of the whole bus on the emit path. Under WAL
+    /// one transaction of N inserts is one fsync, so a burst costs what a single
+    /// event does.
+    pub async fn append_events(&self, events: &[NewEvent]) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let ts = now();
+        let mut tx = self.pool.begin().await?;
+        let mut landed = 0usize;
+        for ev in events {
+            let r = sqlx::query(
+                "INSERT OR IGNORE INTO events (seq, kind, app, subject_id, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(ev.seq)
+            .bind(&ev.kind)
+            .bind(&ev.app)
+            .bind(&ev.subject_id)
+            .bind(ev.payload.to_string())
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+            landed += r.rows_affected() as usize;
+        }
+        tx.commit().await?;
+        Ok(landed)
+    }
+
+    /// Highest sequence the log holds (0 when empty) -- what the bus seeds its
+    /// counter from at boot so `Last-Event-ID` survives a restart.
+    pub async fn max_event_seq(&self) -> Result<i64> {
+        let seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    /// Rows currently in the log -- the honest denominator for `GET /events/log`
+    /// and the retention report.
+    pub async fn count_events(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Keyset page of the log: events with `seq > after`, ascending, optionally
+    /// filtered by kind and/or app. Ascending because a cursor consumer reads
+    /// FORWARD -- a descending page could not express "the next N after my
+    /// cursor".
+    pub async fn events_after(
+        &self,
+        after: i64,
+        kind: Option<&str>,
+        app: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<EventRecord>> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT seq, kind, app, subject_id, payload, created_at FROM events \
+             WHERE seq > ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR app = ?3) \
+             ORDER BY seq ASC LIMIT ?4",
+        )
+        .bind(after)
+        .bind(kind)
+        .bind(app)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(EventRecord::try_from).collect()
+    }
+
+    /// Deletes log rows older than `days`. `days <= 0` deletes nothing -- a
+    /// retention knob turned off must never be read as "keep zero days".
+    pub async fn prune_events(&self, days: i64) -> Result<u64> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let r = sqlx::query("DELETE FROM events WHERE created_at < ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ---- Cursor subscriptions (N05) -----------------------------------------
+
+    /// Creates a subscription. `cursor_seq` starts at `from_seq`, so a consumer
+    /// can either start from now (`latest_seq`) or replay the retained log from
+    /// any earlier point -- the only two things a durable cursor is for.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_subscription(
+        &self,
+        name: Option<&str>,
+        selector: &Value,
+        sink: &str,
+        url: &str,
+        secret: Option<&str>,
+        from_seq: i64,
+        principal_id: Option<&str>,
+    ) -> Result<Subscription> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO subscriptions (id, name, selector, sink, url, secret, cursor_seq, \
+             enabled, principal_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(selector.to_string())
+        .bind(sink)
+        .bind(url)
+        .bind(secret)
+        .bind(from_seq)
+        .bind(principal_id)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_subscription(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_subscription(&self, id: &str) -> Result<Option<Subscription>> {
+        let row: Option<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, name, selector, sink, url, secret, cursor_seq, enabled, principal_id, \
+             created_at, last_delivered_at, last_error FROM subscriptions WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Subscription::try_from).transpose()
+    }
+
+    /// All subscriptions, newest first. `enabled_only` is the drain's view.
+    pub async fn list_subscriptions(&self, enabled_only: bool) -> Result<Vec<Subscription>> {
+        let rows: Vec<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, name, selector, sink, url, secret, cursor_seq, enabled, principal_id, \
+             created_at, last_delivered_at, last_error FROM subscriptions \
+             WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at DESC, id DESC",
+        )
+        .bind(enabled_only as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Subscription::try_from).collect()
+    }
+
+    pub async fn set_subscription_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let r = sqlx::query("UPDATE subscriptions SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn delete_subscription(&self, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM subscriptions WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Advances a subscription's cursor -- **monotonically**. The `cursor_seq <
+    /// ?2` fence is the whole at-least-once contract: two concurrent drains, or
+    /// a drain racing a restart, can only ever move the cursor forward, so an
+    /// event is never skipped by an out-of-order write.
+    pub async fn advance_subscription_cursor(&self, id: &str, seq: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE subscriptions SET cursor_seq = ?2, last_delivered_at = ?3, last_error = NULL \
+             WHERE id = ?1 AND cursor_seq < ?2",
+        )
+        .bind(id)
+        .bind(seq)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records why a drain could not advance this subscription. The cursor is
+    /// deliberately NOT moved: an event whose delivery row could not be written
+    /// has not been handed off, and the next tick must retry it.
+    pub async fn record_subscription_error(&self, id: &str, error: &str) -> Result<()> {
+        sqlx::query("UPDATE subscriptions SET last_error = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every enabled watch, across all apps -- the outbox drain's view of the
+    /// watch-derived half of the subscription set.
+    pub async fn enabled_watches_all(&self) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at \
+             FROM watches WHERE enabled = 1 ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    /// [`Storage::advance_subscription_cursor`] for a watch -- same monotonic
+    /// fence, because a watch IS a subscription with a dataset selector.
+    pub async fn advance_watch_cursor(&self, id: &str, seq: i64) -> Result<bool> {
+        let r = sqlx::query("UPDATE watches SET cursor_seq = ?2 WHERE id = ?1 AND cursor_seq < ?2")
+            .bind(id)
+            .bind(seq)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     // ---- Reactive triggers ---------------------------------------------------
@@ -2757,6 +3000,48 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Upserts a schedule OWNED by `tag` (`managed_by`) -- the storage-layer
+    /// writer every managed reconcile goes through.
+    ///
+    /// The anti-pattern it replaces: `scheduler.rs` reconciled `[[peer]]` rows
+    /// with a raw `sqlx::query` against the `schedules` table (N16), a second
+    /// hand-written INSERT..ON CONFLICT beside this module's -- one that had to
+    /// re-state the column list, the timestamp format and the ownership fence,
+    /// and that no storage-level test could see.
+    ///
+    /// The `WHERE schedules.managed_by = excluded.managed_by` clause is the
+    /// fence and is not optional: it is what stops a managed reconcile from
+    /// overwriting a hand-made schedule that happens to share an id. Returns
+    /// whether a row was written (`false` = an existing row owned by somebody
+    /// else, left untouched).
+    pub async fn upsert_managed_schedule(
+        &self,
+        id: &str,
+        app: &str,
+        cron: &str,
+        params: &Value,
+        enabled: bool,
+        tag: &str,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, params = excluded.params, \
+               enabled = excluded.enabled \
+             WHERE schedules.managed_by = excluded.managed_by",
+        )
+        .bind(id)
+        .bind(app)
+        .bind(cron)
+        .bind(params.to_string())
+        .bind(enabled as i64)
+        .bind(tag)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     /// Enables/disables a schedule owned by `tag`. Returns `false` when the row
     /// doesn't exist *or isn't owned by `tag`* — the fence.
     pub async fn set_managed_schedule_enabled(
@@ -3228,7 +3513,8 @@ pub struct RevisionCount {
 /// `total_ms` spans claim → end of fan-out and is **not** the sum of the named
 /// stages: the queue's own bookkeeping (completion write, checkpoint clear,
 /// yield record) sits between them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, sqlx::FromRow)]
+#[serde(default)]
 pub struct JobStages {
     /// The attempt these numbers describe.
     pub attempt: i64,
@@ -3607,6 +3893,15 @@ pub struct TriggerRun {
 /// `GET /watches/{id}/deliveries` to answer anything at all — an e2e drives a
 /// real dispatch through both ends rather than trusting the string twice.
 pub const DELIVERY_KIND_WATCH: &str = "change";
+
+/// `webhook_deliveries.kind` for a delivery a **cursor subscription** produced
+/// (N05); the row's `ref_id` is then the subscription id.
+///
+/// Deliberately NOT `change`: a watch's deliveries and a subscription's are
+/// queried by different routes and resolve their signing secret from different
+/// tables, so one value could not serve both without
+/// `webhook::resolve_secret` guessing which.
+pub const DELIVERY_KIND_SUBSCRIPTION: &str = "subscription";
 
 /// The `trigger_id` a decision carries when it is about the evaluation SET, not
 /// about one trigger — the only such case is the set failing to load, which
@@ -3999,6 +4294,7 @@ struct WatchRow {
     secret: Option<String>,
     sink: String,
     enabled: i64,
+    cursor_seq: i64,
     created_at: String,
 }
 
@@ -4014,6 +4310,7 @@ impl TryFrom<WatchRow> for Watch {
             secret: r.secret,
             sink: r.sink,
             enabled: r.enabled != 0,
+            cursor_seq: r.cursor_seq,
             created_at: parse_ts(&r.created_at)?,
         })
     }
@@ -4950,5 +5247,119 @@ impl Storage {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.unwrap_or((None, None)))
+    }
+}
+
+// ---- Durable event log + cursor subscriptions (N05) --------------------------
+
+/// One event on its way into the log: the bus already stamped `seq`, so this is
+/// the durable half of an emit, not a second identity.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    pub seq: i64,
+    pub kind: String,
+    pub app: String,
+    pub subject_id: String,
+    pub payload: Value,
+}
+
+/// One row of the append-only event log.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventRecord {
+    pub seq: i64,
+    pub kind: String,
+    pub app: String,
+    pub subject_id: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    seq: i64,
+    kind: String,
+    app: String,
+    subject_id: String,
+    payload: String,
+    created_at: String,
+}
+
+impl TryFrom<EventRow> for EventRecord {
+    type Error = Error;
+
+    fn try_from(r: EventRow) -> Result<EventRecord> {
+        Ok(EventRecord {
+            seq: r.seq,
+            kind: r.kind,
+            app: r.app,
+            subject_id: r.subject_id,
+            // A payload that no longer parses is rendered as the raw string
+            // rather than dropped: the log is the record of what happened, and
+            // "unreadable" is a fact a consumer must be able to see.
+            payload: serde_json::from_str(&r.payload).unwrap_or(Value::String(r.payload)),
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// A durable cursor subscription: an event selector, a sink, and the highest
+/// sequence already handed to that sink.
+#[derive(Debug, Clone, Serialize)]
+pub struct Subscription {
+    pub id: String,
+    pub name: Option<String>,
+    /// `{kinds: [..], app, dataset, filters: [{pointer, equals}]}` — parsed and
+    /// matched by the server's `subscriptions` module.
+    pub selector: Value,
+    /// `webhook` | `slack` | `file` | `plugin:<name>`.
+    pub sink: String,
+    pub url: String,
+    /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub cursor_seq: i64,
+    pub enabled: bool,
+    pub principal_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    /// Why the last drain could not advance the cursor. `null` once a drain
+    /// succeeds — a stale error string is worse than none.
+    pub last_error: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SubscriptionRow {
+    id: String,
+    name: Option<String>,
+    selector: String,
+    sink: String,
+    url: String,
+    secret: Option<String>,
+    cursor_seq: i64,
+    enabled: i64,
+    principal_id: Option<String>,
+    created_at: String,
+    last_delivered_at: Option<String>,
+    last_error: Option<String>,
+}
+
+impl TryFrom<SubscriptionRow> for Subscription {
+    type Error = Error;
+
+    fn try_from(r: SubscriptionRow) -> Result<Subscription> {
+        Ok(Subscription {
+            id: r.id,
+            name: r.name,
+            selector: serde_json::from_str(&r.selector).unwrap_or(Value::Null),
+            sink: r.sink,
+            url: r.url,
+            secret: r.secret,
+            cursor_seq: r.cursor_seq,
+            enabled: r.enabled != 0,
+            principal_id: r.principal_id,
+            created_at: parse_ts(&r.created_at)?,
+            last_delivered_at: r.last_delivered_at.as_deref().map(parse_ts).transpose()?,
+            last_error: r.last_error,
+        })
     }
 }

@@ -6,8 +6,14 @@
 //! consumed read-only — subscribe + replay, never refactored): every SSE event
 //! carries the bus's monotonic sequence as its wire id, so a client that
 //! reconnects with `Last-Event-ID` is replayed the gap it missed, or is sent a
-//! `notifications/pumper/reset` when the gap has already fallen out of the
-//! ring. Buffering is bounded twice over — the broadcast channel and the replay
+//! `notifications/pumper/reset` when the gap is unrecoverable.
+//!
+//! Since N05 the gap is looked for in the durable log when the ring has already
+//! evicted it — through the SAME [`crate::routes::replay_or_log`] the plain
+//! `/events` feed uses, so an agent and a browser reconnecting at the same
+//! sequence are told the same thing. `reset` is consequently rare: it now means
+//! the log was pruned past the cursor (or is off), not merely that 1024 events
+//! went by. Buffering is bounded twice over — the broadcast channel and the replay
 //! ring both have fixed capacities — so a slow consumer can never block the
 //! bus: it *lags*, gets a warning log, and is recovered from the ring (or told
 //! to reset) instead of stalling emitters.
@@ -23,7 +29,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::events::{JobEvent, Replay};
+use crate::events::JobEvent;
 use crate::state::AppState;
 
 /// JSON-RPC method carried by every bridged bus event.
@@ -74,7 +80,7 @@ pub(crate) async fn handle_get(
     // "read the ring" and "listen live"; the overlap is deduped by `last_seq`.
     let mut rx = state.events.subscribe();
     let shutdown = state.shutdown.clone();
-    let (initial, mut last_seq) = replay_backlog(&state, after, &filter);
+    let (initial, mut last_seq) = replay_backlog(&state, after, &filter).await;
     let stream = async_stream::stream! {
         for ev in initial {
             yield Ok(ev);
@@ -109,7 +115,7 @@ pub(crate) async fn handle_get(
                         "slow MCP notification consumer lagged the event bus; \
                          recovering from the replay ring"
                     );
-                    for ev in recover(&state, &mut last_seq, &filter) {
+                    for ev in recover(&state, &mut last_seq, &filter).await {
                         yield Ok(ev);
                     }
                 }
@@ -131,16 +137,17 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
 /// Connect-time replay for a resuming client: buffered events it missed
 /// (post-filter), preceded by a reset notification when the gap is too old.
 /// Returns the events plus the highest sequence id now delivered.
-fn replay_backlog(state: &AppState, after: Option<u64>, filter: &LiveFilter) -> (Vec<Event>, u64) {
+async fn replay_backlog(
+    state: &AppState,
+    after: Option<u64>,
+    filter: &LiveFilter,
+) -> (Vec<Event>, u64) {
     let Some(after) = after else {
         return (Vec::new(), 0);
     };
-    match state.events.replay(after) {
-        Replay::Reset => {
-            let latest = state.events.latest_seq();
-            (vec![reset_event(latest)], latest)
-        }
-        Replay::Events(events) => {
+    match crate::routes::replay_or_log(state, after).await {
+        Err(latest) => (vec![reset_event(latest)], latest),
+        Ok(events) => {
             let mut last = after;
             let mut out = Vec::new();
             for (seq, event) in events {
@@ -156,14 +163,13 @@ fn replay_backlog(state: &AppState, after: Option<u64>, filter: &LiveFilter) -> 
 
 /// Recovers a lagged live subscriber from the replay ring, advancing
 /// `last_seq`, or emits a single reset notification when the gap is gone.
-fn recover(state: &AppState, last_seq: &mut u64, filter: &LiveFilter) -> Vec<Event> {
-    match state.events.replay(*last_seq) {
-        Replay::Reset => {
-            let latest = state.events.latest_seq();
+async fn recover(state: &AppState, last_seq: &mut u64, filter: &LiveFilter) -> Vec<Event> {
+    match crate::routes::replay_or_log(state, *last_seq).await {
+        Err(latest) => {
             *last_seq = latest;
             vec![reset_event(latest)]
         }
-        Replay::Events(events) => {
+        Ok(events) => {
             let mut out = Vec::new();
             for (seq, event) in events {
                 *last_seq = seq;
