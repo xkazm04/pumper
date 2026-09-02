@@ -2124,6 +2124,12 @@ async fn finalize_with_stages(
     // Terminal-job triggers: the job's final status is an event other apps can
     // chain on (e.g. "when crawl succeeds, run extract").
     crate::triggers::fire_terminal_triggers(state, &job).await;
+    // Workflow barriers (N03): if this job is a step of a declared run, land its
+    // outcome and enqueue whatever its completion unblocked. Same seam, same
+    // fail-open discipline as the trigger fan-out above — `finalize` is the one
+    // point EVERY terminal path reaches, which is why the barrier lives here and
+    // nowhere else.
+    crate::workflow::on_step_terminal(state, &job).await;
 }
 
 fn publish(state: &AppState, event: JobEvent) {

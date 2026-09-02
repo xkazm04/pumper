@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use axum::extract::State;
 use axum::Json;
+use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::routes::error::ApiError;
@@ -314,13 +315,61 @@ pub(crate) async fn economics_report(
         })
         .collect();
 
+    // Who the money was spent FOR (N20). The other half of the same ledger the
+    // windows above group by app: `by_principal` groups it by the caller that
+    // enqueued the work, over the baseline window and over all time, with rows
+    // that carry no caller reported under `(unattributed)` rather than dropped —
+    // a by-principal report whose parts do not sum to its total is a lie about
+    // where the money went, and on an `open`-mode node that bucket is ALL of it.
+    let baseline_since = Utc::now() - chrono::Duration::days(WINDOWS[1].1);
+    let by_principal = principal_block(
+        &state
+            .costs
+            .summary_by_principal(Some(baseline_since))
+            .await?,
+    );
+    let by_principal_all_time = principal_block(&state.costs.summary_by_principal(None).await?);
+
     Ok(Json(json!({
         // The deferred enforcement seam, surfaced so a dashboard can show
         // whether this report is advisory (today: always) or acted on.
         "enforce": state.config.economics.enforce,
         "windows": windows,
         "advice": advice,
+        "by_principal": {
+            "window": WINDOWS[1].0,
+            "rows": by_principal,
+            "all_time": by_principal_all_time,
+        },
     })))
+}
+
+/// Renders per-caller spend rows, largest first.
+///
+/// `principal_id` stays `null` for the unattributed bucket while `principal`
+/// carries the label: a dashboard that keys on the id must not mistake the
+/// placeholder for a real principal it could look up, and a human reading the
+/// table needs a name in the cell.
+fn principal_block(rows: &[pumper_core::costs::PrincipalCostSummary]) -> Vec<Value> {
+    let mut out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "principal_id": r.principal_id,
+                "principal": r.label(),
+                "calls": r.calls,
+                "cost_usd": r.cost_usd,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let (x, y) = (
+            b["cost_usd"].as_f64().unwrap_or(0.0),
+            a["cost_usd"].as_f64().unwrap_or(0.0),
+        );
+        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 #[cfg(test)]

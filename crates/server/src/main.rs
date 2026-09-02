@@ -16,6 +16,7 @@ mod state;
 mod triggers;
 mod webhook;
 mod worker;
+mod workflow;
 
 use std::time::Duration;
 
