@@ -56,6 +56,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Saved searches | `GET /searches?limit=&cursor=` · `POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
 | Events | `GET /events` (SSE all jobs; monotonic ids + `Last-Event-ID` resume — see [events-webhooks.md](events-webhooks.md)) |
 | Hosts | `GET /hosts?limit=&cursor=` (learned tier memory + politeness per host) · `GET /hosts/{host}` (404 unknown) · `DELETE /hosts/{host}/memory` (reset strikes+pin+penalty; 404 unknown) |
+| Recipes | `GET /recipes?host=&limit=` — discovered JSON-API endpoints behind rendered pages (API X-ray), best overlap score first: `{recipes: [{id, host, url_template, params, json_paths, score, validated, validation_reason, validated_at, consecutive_failures, discovered_at, last_seen_at}]}`. `validation_reason`/`validated_at` are Null until a replay has judged the recipe. Read-only; rows are written by the discovery pass (see [fetching.md § API X-ray loop](fetching.md#api-x-ray-loop-fetcher-xray-default-off)) |
 | Profiles | `GET /profiles` (session vault: named login profiles; see below) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 | Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |

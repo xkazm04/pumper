@@ -1571,6 +1571,14 @@ pub struct FetcherConfig {
     /// cookie jar) and `browser/` (that profile's Chrome user-data-dir). Created
     /// on first use. Default: `data/profiles`.
     pub profiles_dir: PathBuf,
+    /// API X-ray loop (N14), default OFF. When ON the fetcher captures the
+    /// network calls of every *escalated* browser render (the render that
+    /// happened because the http tier lost or was skipped), consults learned
+    /// API recipes ahead of the live ladder, and lets an unvalidated candidate
+    /// prove itself on one replay. OFF — the default — leaves the ladder
+    /// byte-for-byte as it was: no capture, no discovery, no recipe tier
+    /// beyond the explicit `[recipes] enabled` / `use_recipes` opt-ins.
+    pub xray: bool,
 }
 
 impl Default for FetcherConfig {
@@ -1580,6 +1588,7 @@ impl Default for FetcherConfig {
             host_memory_ttl_secs: 7 * 24 * 3600,
             host_penalty_persist_secs: 60,
             profiles_dir: "data/profiles".into(),
+            xray: false,
         }
     }
 }

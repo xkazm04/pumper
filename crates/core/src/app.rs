@@ -978,6 +978,7 @@ mod tests {
                 via: via.into(),
                 captured_at: captured_at.map(str::to_string),
             }),
+            network: Vec::new(),
         }
     }
 

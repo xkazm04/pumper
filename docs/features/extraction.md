@@ -144,6 +144,14 @@ The worker indexes those datasets **delta-driven from the change feed** (`datase
 
 `records` remains the quick sample a human or agent wants when reading a job result; the dataset (`GET /datasets/extractor/<dataset>`) is the record of truth.
 
+### API X-ray discovery (`[fetcher] xray`)
+
+The extractor is the discovery caller of the [API X-ray loop](fetching.md#api-x-ray-loop-fetcher-xray-default-off), and the only app that can be: discovery scores a page's captured JSON calls by how many of the *extracted* field values each payload contains, and the extractor is where both halves exist at the same moment.
+
+In **urls mode**, with `[fetcher] xray` on, a fetch that escalated to the browser brings its captured calls back on `FetchOutcome.network`. After extraction, each such document's calls are scored against **that document's own record**; a payload clearing the heuristic's bar (≥3 matched values at ≥25% overlap) is stored as an unvalidated recipe, and the raw captures are written to the job's `network-capture.json` artifact. The pass is best-effort — a discovery or write failure is logged and never fails the extraction — and completely inert with the X-ray off (no captures exist, so there is nothing to score). Source mode, backfill and the Wayback modes read stored bodies, which have no live render behind them and therefore never discover anything.
+
+Known gaps: one artifact name per job, so a run that captures on several pages keeps only the last page's raw capture (the recipes themselves are all stored); and discovery sees the single record a document produced (a listing's rows live inside it), so a rule set that reads little off the page gives the overlap heuristic little to match on — a thin extraction discovers nothing rather than guessing.
+
 ### Replay-CI (`replay` param)
 
 `{"replay": {"rules": …, "baseline_rules"?: …, "against": {app, dataset, url_pattern?, versions, max_pages}, "bisect_field"?: …}}` runs a **candidate** rule set over stored bodies and diffs it against a baseline — strictly read-only (job result + a `replay-report.json` artifact, never a dataset record). The report carries `fields` (per top-level field: `match_rate`, `baseline_match_rate`, `delta`, and bounded `added`/`lost`/`changed` value samples), `regressions`/`regressed_urls` per URL, and `bisect` (the adjacent observation pair where a field's match flipped).

@@ -1311,6 +1311,7 @@ mod tests {
             trace: Vec::new(),
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         }
     }
 

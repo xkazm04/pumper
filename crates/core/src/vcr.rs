@@ -609,6 +609,9 @@ pub fn to_fetch_outcome(entry: &CassetteEntry, replay_of: Uuid) -> Result<FetchO
         // A recorded archive win replays as an archive win, capture time and
         // all — read back through the same seam that wrote it.
         snapshot: crate::engine::snapshot_provenance(&entry.headers),
+        // Captures are not recorded on the cassette: a replayed fetch has no
+        // live render behind it, so the X-ray has nothing honest to discover.
+        network: Vec::new(),
     })
 }
 
@@ -1013,6 +1016,7 @@ mod tests {
             trace: Vec::new(),
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         }
     }
 

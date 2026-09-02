@@ -62,6 +62,48 @@ pub(crate) fn penalty_is_restorable(
     penalty_ms > 0 && penalty_updated_at.is_some_and(|at| at >= cutoff)
 }
 
+/// The learned tier a host can be pinned to. `'browser'` is earned by
+/// [`STRIKE_LIMIT`] consecutive http losses; `'api_recipe'` is earned the
+/// moment a validated API recipe actually serves a fetch for that host — the
+/// cheapest possible outcome, and the one the API X-ray loop exists to reach.
+pub const PREFERRED_BROWSER: &str = "browser";
+pub const PREFERRED_API_RECIPE: &str = "api_recipe";
+
+/// What one tiered-fetch outcome teaches the router about a host.
+///
+/// Extracted so the vocabulary of `tier_memory.preferred` is decided by one
+/// tested function rather than by the shape of three SQL statements. The
+/// anti-pattern it closes (`api_recipe_pin_not_left_standing_after_a_render`):
+/// a host pinned to `api_recipe` whose recipe later stops serving — it was
+/// un-validated, or deleted — kept advertising `preferred_tier: api_recipe` on
+/// `GET /hosts` while every fetch was in fact paying for a Chrome render, i.e.
+/// the one surface that reports the loop working would have reported it working
+/// precisely when it had stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TierLesson {
+    /// An http win: the cheap tier works here — clear strikes and any pin.
+    HttpWorks,
+    /// An api-recipe win: this host is served without fetching the page at all.
+    ApiRecipeWorks,
+    /// The http tier lost while a higher tier won: one strike toward the pin.
+    HttpStrike,
+    /// A page tier served this fetch, so an `api_recipe` pin (if any) is stale.
+    /// Teaches nothing about the http tier — a browser/claude win without an
+    /// http attempt is not an http loss — so it only ever clears that pin.
+    PageTierServed,
+}
+
+pub(crate) fn tier_lesson(winner: &str, http_lost: bool) -> TierLesson {
+    match winner {
+        "http" => TierLesson::HttpWorks,
+        PREFERRED_API_RECIPE => TierLesson::ApiRecipeWorks,
+        _ if http_lost => TierLesson::HttpStrike,
+        // A win on a page tier (browser/claude/archive) is proof this host is
+        // NOT currently being served by a recipe, whatever the row says.
+        _ => TierLesson::PageTierServed,
+    }
+}
+
 /// One host's learned state — the row behind `GET /hosts`.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostProfile {
@@ -125,7 +167,40 @@ impl TierMemory {
     pub async fn record(&self, host: &str, winner: &str, http_lost: bool) -> Result<()> {
         let host = host.to_lowercase();
         let now = ts(Utc::now());
-        if winner == "http" {
+        let lesson = tier_lesson(winner, http_lost);
+        if lesson == TierLesson::ApiRecipeWorks {
+            // The cheapest outcome in the ladder: one governed JSON GET served
+            // the page. Pin it the same way a browser pin is earned — and reset
+            // the http strikes, because nothing about the http tier was tested.
+            sqlx::query(
+                "INSERT INTO tier_memory (host, http_strikes, preferred, updated_at, observations) \
+                 VALUES (?1, 0, ?3, ?2, 1) \
+                 ON CONFLICT(host) DO UPDATE SET http_strikes = 0, preferred = ?3, \
+                 updated_at = excluded.updated_at, observations = observations + 1",
+            )
+            .bind(&host)
+            .bind(&now)
+            .bind(PREFERRED_API_RECIPE)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if lesson == TierLesson::PageTierServed {
+            // A page tier served this fetch, so an api-recipe pin is stale.
+            // Touches only rows that carry that pin: a browser/claude win still
+            // teaches nothing about the http tier, and must not reset aging.
+            sqlx::query(
+                "UPDATE tier_memory SET preferred = NULL, updated_at = ?2 \
+                 WHERE host = ?1 AND preferred = ?3",
+            )
+            .bind(&host)
+            .bind(&now)
+            .bind(PREFERRED_API_RECIPE)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        if lesson == TierLesson::HttpWorks {
             sqlx::query(
                 "INSERT INTO tier_memory (host, http_strikes, preferred, updated_at, observations) \
                  VALUES (?1, 0, NULL, ?2, 1) \
@@ -136,7 +211,7 @@ impl TierMemory {
             .bind(&now)
             .execute(&self.pool)
             .await?;
-        } else if http_lost {
+        } else if lesson == TierLesson::HttpStrike {
             let cutoff = self.stale_cutoff();
             sqlx::query(
                 "INSERT INTO tier_memory (host, http_strikes, preferred, updated_at, observations) \
@@ -155,8 +230,6 @@ impl TierMemory {
             .execute(&self.pool)
             .await?;
         }
-        // A browser/claude win without an http attempt (skipped or explicit
-        // strategy) teaches nothing about the http tier: no write.
         Ok(())
     }
 
@@ -723,6 +796,27 @@ mod penalty_age_tests {
             Some("2020-01-01T00:00:00.000000Z"),
             NEVER_STALE
         ));
+    }
+
+    /// The router's vocabulary, decided in one place (N14). `api_recipe` is a
+    /// third learned state, not a flavour of the browser pin — and a render
+    /// that served the page is proof no recipe did, which is the only thing
+    /// that can retire a stale `api_recipe` pin.
+    #[test]
+    fn an_api_recipe_win_pins_the_host_and_a_render_retires_that_pin() {
+        assert_eq!(
+            tier_lesson("api_recipe", false),
+            TierLesson::ApiRecipeWorks,
+            "the cheapest tier winning must be learnable, not silently dropped"
+        );
+        assert_eq!(tier_lesson("http", false), TierLesson::HttpWorks);
+        // An http loss under a higher-tier win is still one strike toward the
+        // browser pin — the api_recipe state must not weaken that ladder.
+        assert_eq!(tier_lesson("browser", true), TierLesson::HttpStrike);
+        assert_eq!(tier_lesson("claude", true), TierLesson::HttpStrike);
+        // A page tier served it, so any api_recipe pin on this host is stale.
+        assert_eq!(tier_lesson("browser", false), TierLesson::PageTierServed);
+        assert_eq!(tier_lesson("archive", false), TierLesson::PageTierServed);
     }
 }
 

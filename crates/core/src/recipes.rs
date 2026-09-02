@@ -112,6 +112,50 @@ pub fn payload_overlaps(json_paths: &[String], payload: &Value) -> bool {
     json_paths.iter().any(|p| present.contains(p.as_str()))
 }
 
+/// The verdict of one recipe replay, as a short reason string: `None` = the
+/// replay proved the recipe (success status, JSON body, the expected field
+/// paths still present), `Some(reason)` = it did not, and why.
+///
+/// THE ANTI-PATTERN THIS CLOSES (`replay_reason_not_inferred_from_validated`):
+/// the fetcher computed this reason inline and threw it away into a prose trail
+/// line, so `GET /recipes` could only show a bare `validated: false` — which
+/// reads identically for "discovered a minute ago, never tried" and "tried, and
+/// the endpoint returned HTML". The one renderer feeds both the trail and the
+/// stored [`RecipeSource::record_failure`] verdict, so they cannot drift.
+pub fn replay_reason(
+    is_success: bool,
+    parsed: Option<&Value>,
+    json_paths: &[String],
+) -> Option<&'static str> {
+    match parsed {
+        _ if !is_success => Some("non-success status"),
+        None => Some("non-JSON payload"),
+        Some(v) if !payload_overlaps(json_paths, v) => {
+            Some("payload lost the expected field paths")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The stored verdict of a replay that DID prove the recipe — the positive half
+/// of [`replay_reason`], so both halves of the `validation_reason` column have
+/// exactly one writer.
+pub const VALIDATED_REASON: &str = "replay matched the expected field paths";
+
+/// Whether an *unvalidated* candidate is still worth a replay: a candidate that
+/// has already failed `max_failures` times in a row is burned and must never be
+/// tried again.
+///
+/// THE ANTI-PATTERN THIS CLOSES (`burned_candidate_not_retried_forever`):
+/// `record_failure` only ever demotes a *validated* recipe, so an unvalidated
+/// junk candidate accumulated strikes and was still replayed ahead of the live
+/// ladder on every single fetch of that host — one wasted governed request per
+/// fetch, forever. A validated recipe is unaffected: its own strike ladder
+/// un-validates it first, and that is what drops it in here.
+pub fn candidate_is_burned(consecutive_failures: u32, max_failures: u32) -> bool {
+    consecutive_failures >= max_failures.max(1)
+}
+
 /// Read side of the fetcher's `api_recipe` tier plus its strike/validation
 /// state machine. Object-safe so the `Fetcher` (which compiles without the
 /// `storage` feature) can hold `Option<Arc<dyn RecipeSource>>`; [`RecipeStore`]
@@ -120,23 +164,32 @@ pub fn payload_overlaps(json_paths: &[String], payload: &Value) -> bool {
 pub trait RecipeSource: Send + Sync {
     /// Best recipe for `host`: validated recipes first, then best score. With
     /// `include_unvalidated = false` (the `auto_validate`-OFF fetcher default)
-    /// only validated recipes are returned.
+    /// only validated recipes are returned; with it on, an unvalidated
+    /// candidate is offered for one proving replay **until it is burned**
+    /// ([`candidate_is_burned`] over `max_failures`).
     async fn best_for_host(
         &self,
         host: &str,
         include_unvalidated: bool,
+        max_failures: u32,
     ) -> crate::Result<Option<ApiRecipe>>;
 
     /// A successful overlapping replay: resets the consecutive-failure counter,
-    /// and with `validate = true` (the `auto_validate` path) also marks the
-    /// recipe validated.
+    /// stamps the [`VALIDATED_REASON`] verdict, and with `validate = true` (the
+    /// `auto_validate` path) also marks the recipe validated.
     async fn record_success(&self, id: &str, validate: bool) -> crate::Result<()>;
 
-    /// A failed/thin replay: increments the consecutive-failure counter.
-    /// Returns `true` when this strike crossed `unvalidate_after` and a
-    /// validated recipe was demoted back to unvalidated (counter reset so the
-    /// next validation attempt starts clean).
-    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool>;
+    /// A failed/thin replay: increments the consecutive-failure counter and
+    /// stores `reason` (from [`replay_reason`]) as the recipe's standing
+    /// validation verdict. Returns `true` when this strike crossed
+    /// `unvalidate_after` and a validated recipe was demoted back to
+    /// unvalidated (counter reset so the next validation attempt starts clean).
+    async fn record_failure(
+        &self,
+        id: &str,
+        unvalidate_after: u32,
+        reason: &str,
+    ) -> crate::Result<bool>;
 }
 
 /// Normalizes a leaf value for overlap comparison: strings are trimmed +
@@ -307,6 +360,14 @@ pub struct RecipeStore {
     pool: sqlx::SqlitePool,
 }
 
+/// The one timestamp rendering every recipe column uses (RFC-3339, micros, Z) —
+/// the same format `discovered_at`/`last_seen_at` have been written with since
+/// migration 0025, so the new verdict columns sort against them.
+#[cfg(feature = "storage")]
+fn now_ts() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
 #[cfg(feature = "storage")]
 impl RecipeStore {
     pub fn new(pool: sqlx::SqlitePool) -> Self {
@@ -315,7 +376,7 @@ impl RecipeStore {
 
     /// Inserts or refreshes one discovered recipe. Returns the stored id.
     pub async fn upsert(&self, recipe: &ApiRecipe) -> crate::Result<String> {
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = now_ts();
         let id = if recipe.id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -349,22 +410,15 @@ impl RecipeStore {
         Ok(stored.0)
     }
 
-    /// Lists recipes, best score first, optionally filtered by host.
+    /// Lists recipes, best score first, optionally filtered by host. Carries
+    /// the full validation state — the flag, the last verdict's reason, when it
+    /// was reached, and the standing strike count — so a reader can tell
+    /// "never tried" from "tried and refused".
     pub async fn list(&self, host: Option<&str>, limit: i64) -> crate::Result<Vec<Value>> {
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            f64,
-            i64,
-            String,
-            String,
-        )> = sqlx::query_as(
+        let rows: Vec<RecipeRow> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated, \
-                        discovered_at, last_seen_at \
+                        discovered_at, last_seen_at, validation_reason, validated_at, \
+                        consecutive_failures \
                  FROM api_recipes \
                  WHERE (?1 IS NULL OR host = ?1) \
                  ORDER BY score DESC, host, url_template \
@@ -376,23 +430,25 @@ impl RecipeStore {
         .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(id, host, url_template, params, json_paths, score, validated, disc, seen)| {
-                    serde_json::json!({
-                        "id": id,
-                        "host": host,
-                        "url_template": url_template,
-                        "params": serde_json::from_str::<Value>(&params)
-                            .unwrap_or(Value::Null),
-                        "json_paths": serde_json::from_str::<Value>(&json_paths)
-                            .unwrap_or(Value::Null),
-                        "score": score,
-                        "validated": validated != 0,
-                        "discovered_at": disc,
-                        "last_seen_at": seen,
-                    })
-                },
-            )
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "host": r.host,
+                    "url_template": r.url_template,
+                    "params": serde_json::from_str::<Value>(&r.params).unwrap_or(Value::Null),
+                    "json_paths": serde_json::from_str::<Value>(&r.json_paths)
+                        .unwrap_or(Value::Null),
+                    "score": r.score,
+                    "validated": r.validated != 0,
+                    // Null until a replay has actually judged this recipe —
+                    // honest absence, not a fabricated "not validated yet".
+                    "validation_reason": r.validation_reason,
+                    "validated_at": r.validated_at,
+                    "consecutive_failures": r.consecutive_failures,
+                    "discovered_at": r.discovered_at,
+                    "last_seen_at": r.last_seen_at,
+                })
+            })
             .collect())
     }
 
@@ -408,6 +464,26 @@ impl RecipeStore {
     }
 }
 
+/// One `api_recipes` row as `GET /recipes` renders it. A named struct rather
+/// than a 12-wide tuple: the column list and the JSON keys stay readable, and a
+/// column added to the SELECT cannot silently shift every later binding.
+#[cfg(feature = "storage")]
+#[derive(sqlx::FromRow)]
+struct RecipeRow {
+    id: String,
+    host: String,
+    url_template: String,
+    params: String,
+    json_paths: String,
+    score: f64,
+    validated: i64,
+    discovered_at: String,
+    last_seen_at: String,
+    validation_reason: Option<String>,
+    validated_at: Option<String>,
+    consecutive_failures: i64,
+}
+
 /// The real [`RecipeSource`]: rows from `api_recipes`, strikes in its
 /// `consecutive_failures` column (migration 0028).
 #[cfg(feature = "storage")]
@@ -417,16 +493,21 @@ impl RecipeSource for RecipeStore {
         &self,
         host: &str,
         include_unvalidated: bool,
+        max_failures: u32,
     ) -> crate::Result<Option<ApiRecipe>> {
+        // A burned candidate (`consecutive_failures >= max_failures`) is
+        // excluded from the unvalidated half — see `candidate_is_burned`.
         let row: Option<(String, String, String, String, String, f64, i64)> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated \
              FROM api_recipes \
-             WHERE host = ?1 AND (validated = 1 OR ?2) \
+             WHERE host = ?1 \
+               AND (validated = 1 OR (?2 AND consecutive_failures < ?3)) \
              ORDER BY validated DESC, score DESC, url_template \
              LIMIT 1",
         )
         .bind(host)
         .bind(include_unvalidated)
+        .bind(i64::from(max_failures.max(1)))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
@@ -446,23 +527,35 @@ impl RecipeSource for RecipeStore {
         sqlx::query(
             "UPDATE api_recipes \
              SET consecutive_failures = 0, \
-                 validated = CASE WHEN ?2 THEN 1 ELSE validated END \
+                 validated = CASE WHEN ?2 THEN 1 ELSE validated END, \
+                 validation_reason = ?3, \
+                 validated_at = ?4 \
              WHERE id = ?1",
         )
         .bind(id)
         .bind(validate)
+        .bind(VALIDATED_REASON)
+        .bind(now_ts())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool> {
+    async fn record_failure(
+        &self,
+        id: &str,
+        unvalidate_after: u32,
+        reason: &str,
+    ) -> crate::Result<bool> {
         let row: Option<(i64, i64)> = sqlx::query_as(
-            "UPDATE api_recipes SET consecutive_failures = consecutive_failures + 1 \
+            "UPDATE api_recipes SET consecutive_failures = consecutive_failures + 1, \
+                 validation_reason = ?2, validated_at = ?3 \
              WHERE id = ?1 \
              RETURNING consecutive_failures, validated",
         )
         .bind(id)
+        .bind(reason)
+        .bind(now_ts())
         .fetch_optional(&self.pool)
         .await?;
         let Some((failures, validated)) = row else {
@@ -494,6 +587,58 @@ mod tests {
             content_type: "application/json".into(),
             body,
         }
+    }
+
+    /// N14. `validated: false` alone cannot distinguish "never tried" from
+    /// "tried, and the endpoint served HTML" — the reason is computed once and
+    /// stored, so `GET /recipes` shows the verdict instead of implying one.
+    #[test]
+    fn replay_reason_names_why_a_replay_was_refused() {
+        let paths = vec!["$.items[*].title".to_string()];
+        let good = json!({"items": [{"title": "Alpha Grant"}]});
+
+        // The proving replay: success, JSON, expected paths still present.
+        assert_eq!(replay_reason(true, Some(&good), &paths), None);
+
+        // A non-success status is the FIRST thing said about the replay, even
+        // when the body happens to parse — an error page that mentions the
+        // right fields must never validate a recipe.
+        assert_eq!(
+            replay_reason(false, Some(&good), &paths),
+            Some("non-success status")
+        );
+        assert_eq!(
+            replay_reason(false, None, &paths),
+            Some("non-success status")
+        );
+        // A 200 that is not JSON at all (an HTML login wall, typically).
+        assert_eq!(replay_reason(true, None, &paths), Some("non-JSON payload"));
+        // A 200 of valid JSON whose shape no longer carries the data.
+        assert_eq!(
+            replay_reason(true, Some(&json!({"items": [{"name": "Alpha"}]})), &paths),
+            Some("payload lost the expected field paths")
+        );
+        // A recipe with no expected paths cannot be proven by anything.
+        assert_eq!(
+            replay_reason(true, Some(&good), &[]),
+            Some("payload lost the expected field paths")
+        );
+    }
+
+    /// N14. THE ANTI-PATTERN: `record_failure` only ever demotes a *validated*
+    /// recipe, so an unvalidated junk candidate kept being replayed ahead of
+    /// the live ladder on every fetch of that host — one wasted governed
+    /// request per fetch, forever. A burned candidate is out of the running.
+    #[test]
+    fn burned_candidate_not_retried_forever() {
+        assert!(!candidate_is_burned(0, 3));
+        assert!(!candidate_is_burned(2, 3));
+        assert!(candidate_is_burned(3, 3));
+        assert!(candidate_is_burned(9, 3));
+        // A misconfigured `max_failures = 0` must not mean "burn on discovery,
+        // before a single replay"; the floor is one honest try.
+        assert!(!candidate_is_burned(0, 0));
+        assert!(candidate_is_burned(1, 0));
     }
 
     #[test]
@@ -672,30 +817,51 @@ mod tests {
         recipes.set_validated(&id, true).await.unwrap();
 
         // Two strikes under a threshold of 3: still validated.
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
-        let r = recipes.best_for_host("example.com", false).await.unwrap();
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
+        let r = recipes
+            .best_for_host("example.com", false, 3)
+            .await
+            .unwrap();
         assert!(r.is_some_and(|r| r.validated), "2 strikes must not demote");
 
         // A success in between resets the counter...
         recipes.record_success(&id, false).await.unwrap();
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
         // ...so it takes 3 fresh consecutive failures to demote.
         assert!(
-            recipes.record_failure(&id, 3).await.unwrap(),
+            recipes
+                .record_failure(&id, 3, "non-JSON payload")
+                .await
+                .unwrap(),
             "third consecutive strike must un-validate"
         );
         assert!(
             recipes
-                .best_for_host("example.com", false)
+                .best_for_host("example.com", false, 3)
                 .await
                 .unwrap()
                 .is_none(),
             "a demoted recipe is invisible to validated-only lookups"
         );
         // Unknown id: no panic, no demotion signal.
-        assert!(!recipes.record_failure("nope", 3).await.unwrap());
+        assert!(!recipes
+            .record_failure("nope", 3, "replay failed")
+            .await
+            .unwrap());
     }
 
     #[cfg(feature = "test-support")]
@@ -715,7 +881,7 @@ mod tests {
 
         // Validated-only lookup: the lower-scoring validated recipe wins.
         let r = recipes
-            .best_for_host("example.com", false)
+            .best_for_host("example.com", false, 3)
             .await
             .unwrap()
             .unwrap();
@@ -723,7 +889,7 @@ mod tests {
         assert!(r.validated);
         // Opportunistic lookup still prefers validated over raw score.
         let r = recipes
-            .best_for_host("example.com", true)
+            .best_for_host("example.com", true, 3)
             .await
             .unwrap()
             .unwrap();
@@ -733,7 +899,7 @@ mod tests {
         );
         // Host filter must hold.
         assert!(recipes
-            .best_for_host("other.example", true)
+            .best_for_host("other.example", true, 3)
             .await
             .unwrap()
             .is_none());
@@ -743,14 +909,14 @@ mod tests {
         // validated-only lookup flips to it.
         recipes.set_validated(&low_id, false).await.unwrap();
         let hi = recipes
-            .best_for_host("example.com", true)
+            .best_for_host("example.com", true, 3)
             .await
             .unwrap()
             .unwrap();
         assert!(!hi.validated);
         recipes.record_success(&hi.id, true).await.unwrap();
         let r = recipes
-            .best_for_host("example.com", false)
+            .best_for_host("example.com", false, 3)
             .await
             .unwrap()
             .unwrap();
