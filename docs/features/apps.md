@@ -11,7 +11,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 | `crawl` | Broad crawler (see [crawling.md](crawling.md)) |
 | `extractor` | Fetch a URL + apply a params-supplied extraction RuleSet |
 | `plugin` | Run a sandboxed WASM plugin over documents (fuel + memory limited), deduping the JSON outputs into a dataset. **Four modes**: `urls` (fetch each live through the metered chokepoint), `source` (run over already-crawled stored bodies, no re-fetch; `as_of` / `versions: "all"` resolve through the crawl archive; `limit` caps the no-keys sweep and the result reports `truncated`), `source.backfill` (fan the whole `page_versions` archive in checkpointed batches), and `observatory` (corpus-scale differential replay of every loaded plugin against sampled stored pages, scoring per-(plugin, site) drift). The named plugin must be **loaded and runnable** — an unknown/uninstalled/disabled one is refused before any fetch, terminally. Write-mode results report `{dataset, ran, errors, errors_by_class, plugin_reported_errors, new/changed/unchanged, cost}` with a **bounded** `records` echo (`records_echo`, default 100) and `index_datasets` naming the dataset written, so records are indexed from the change feed rather than from the echo (withheld on a degraded/quarantined source). A run whose every attempted document failed fails the job. See [extraction.md](extraction.md#wasm-plugin-sandbox-engine-wasm-plugin-app) |
-| `research` | Agentic web research via the Claude engine (roles: `research` = Sonnet @ effort `high`, `compose` = Opus @ `xhigh`); JSON report. `session_id` param **resumes** a prior run to drill down on its accumulated context (the query becomes a follow-up) instead of re-paying the full agentic loop. `max_budget_usd` is a **run total**, not a per-call cap: it is enforced against the run's cumulative spend (including spend restored from a checkpoint), every step is issued with only the remaining headroom, and a run with under a cent left stops with `stop_reason: budget_exhausted` and returns its partial findings. `max_turns` is likewise a run total; each step is charged `min(reported num_turns, that step's cap)`, because the CLI's counter is not unambiguously per-invocation on a resumed session. Durable execution: `turns_per_step` chunks the run into checkpointed steps so a crash/reap/suspend resumes the agent session instead of restarting. **A run that produced no content at all fails the job** — naming the stop reason, steps and spend — instead of returning `{report: ""}` as a success; a non-empty partial *is* still a success, and an in-shape but content-free report (`{"summary":"","key_findings":[],"sources":[]}`) is not `structured`. The `report.json` artifact write is best-effort (a filesystem failure is logged, never costs a paid re-run). Result: `{query, report, structured, resumed, resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, stop_reason}` — `report` is an object `{summary, key_findings, sources}` only when `structured` is true, otherwise a raw string; `steps`/`cost_usd`/`duration_ms`/`num_turns` are cumulative across resumed attempts; `resumed` means the caller named the session while `resumed_from_checkpoint` means the runtime re-claimed an interrupted attempt. Contract pinned by `crates/apps/research/tests/result_contract.rs` |
+| `research` | Agentic web research via the Claude engine (roles: `research` = Sonnet @ effort `high`, `compose` = Opus @ `xhigh`); JSON report. `session_id` param **resumes** a prior run to drill down on its accumulated context (the query becomes a follow-up) instead of re-paying the full agentic loop. `max_budget_usd` is a **run total**, not a per-call cap: it is enforced against the run's cumulative spend (including spend restored from a checkpoint), every step is issued with only the remaining headroom, and a run with under a cent left stops with `stop_reason: budget_exhausted` and returns its partial findings. `max_turns` is likewise a run total; each step is charged `min(reported num_turns, that step's cap)`, because the CLI's counter is not unambiguously per-invocation on a resumed session. Durable execution: `turns_per_step` chunks the run into checkpointed steps so a crash/reap/suspend resumes the agent session instead of restarting. **A run that produced no content at all fails the job** — naming the stop reason, steps and spend — instead of returning `{report: ""}` as a success; a non-empty partial *is* still a success, and an in-shape but content-free report (`{"summary":"","key_findings":[],"sources":[]}`) is not `structured`. The `report.json` artifact write is best-effort (a filesystem failure is logged, never costs a paid re-run). Result: `{query, report, structured, resumed, resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, stop_reason}` — `report` is an object `{summary, key_findings, sources}` only when `structured` is true, otherwise a raw string; `steps`/`cost_usd`/`duration_ms`/`num_turns` are cumulative across resumed attempts; `resumed` means the caller named the session while `resumed_from_checkpoint` means the runtime re-claimed an interrupted attempt. Contract pinned by `crates/apps/research/tests/result_contract.rs`. Every structured run also **writes datasets**: `research/findings` (one record per key finding, keyed `{slug(topic)}#{i}`) and `research/sources` (one per cited URL), provenance-stamped and declared in `index_datasets`; `snapshot_sources` archives each citation through the metered tiered fetcher and stamps `artifact_sha`, `watch_sources` proposes a `POST /schedules` body per citation. See [§research: a living knowledge base](#research-a-living-knowledge-base) |
 | `provisioner` | **Proposal compiler**, not a provisioner: one sentence (`prompt`) → a reviewed `[[source]]` proposal. Researches 1–3 candidate URLs via the Claude engine, samples each through the tiered fetcher (`to_markdown`, archive tier at `sample_archive_max_age`, default 86400s; API recipes on), drafts a declarative `RuleSet` against the primary sample and **dry-runs it through the real extraction engine**, repairing up to `max_iterations` (default 2, cap 5). Emits one record per prompt into **`provisioner/proposals`** (key = the slugified prompt, so a re-compile is a revision, not a duplicate), plus `proposal.json` and `sample-N.{html,md,txt}` artifacts. Record: `{prompt, catalog_row, catalog_toml, rule_set, seeds, samples, cadence, budget, sample_stats, confidence (0–100), confidence_scale, catalog_confidence (1–5), accepted, verdict, provisioned, intended_dataset, iterations, cost_usd}`. **`samples`** carries, per seed, the fetch tier that actually won, which `FetchOutcome` field held the body, its byte count and a `tier:verdict` trace.<br>**Scoring is per-document.** The draft is written against the primary sample, so the accept bar reads *that document only*: a strict majority of its fields must **hold** (the rule bound, and the transform chain did not reduce the value to nothing). The other candidates are **held-out evidence** — `sample_stats.held_out[]` reports `{url, fields_held, fields_total, fields_missing}` per candidate — and never enter the bar, because they are different sites with different markup and adding one must not move the pass threshold. `confidence` is the share of the primary document's fields that hold. **Three degenerate drafts are rejected deterministically**, before any repair spend and whatever the match rate, with the reason in `sample_stats.rejections[]` and the top-level `rejections`: a rule set of nothing but `const` rules (constants always bind, so it would score 100 while reading nothing off the page); an `each` field yielding **0 items on every** document examined (`ContainerEmpty` is not a miss for a *proven* selector, but a draft has no track record); and a field whose selector matched an element the transforms could not coerce (`to_number` over `"Add to cart"` — the wrong-element signature, which the engine has always computed and the dry run used to ignore). A rejected draft scores `confidence = 0`. **The emitted row is inert by construction**: `status = "planned"`, empty `cron`, `app = ""`, `access = "scrape"`, `engine` = the tier that really served the sample, `confidence` on the catalog's documented 1–5 scale, and `dataset = "proposed:<key>"` — a marker, not a resolvable `<app>/<name>` path, because nothing writes it yet. A **rejected** dry run still emits a record, marked `verdict: "rejected"` in the record *and* `REJECTED` in the row's own `notes` (the pasteable TOML fragment is the only artifact a reviewer may read). The metered discovery stage is checkpointed, so a reaped/suspended compile resumes without re-spending it. Params: `{prompt (required), budget_usd, max_iterations, sample_archive_max_age}`. On-demand only — no schedule. The record also carries a `status` field (`planned` at compile time) driven by the `GET/POST /provisioner/proposals...` lifecycle routes — see [http-api.md § Provisioner proposal lifecycle](http-api.md#provisioner-proposal-lifecycle-provisionerproposals) and "Known gaps" below |
 | `transact` | Execute a declarative browser flow to the confirmation state and emit an evidence bundle; with `submit: true` it stages an approval and parks, and an approved commit performs the one irreversible action. See [§ `transact`: evidence, approval, submit](#transact-evidence-approval-submit) |
 | `hackernews` | HN front-page stories into a change-detected dataset (`stories`, keyed by HN item id). Params `{pages: 1-5}` (30 stories/page). The template app for classic fetch-and-parse, and the app `just smoke` drives end to end.<br>**A partial parse cannot tombstone (2026-08-14):** the write is a full-snapshot `sync_many`, so a run that read 15 of the 30 story rows the page served used to tombstone the other 15 and report success — the empty-parse guard only catches 0-of-N. HN publishes no total, but the page states its own extent: `tr.athing` rows *served*. The run now reports `rows_seen` and a `parse {rows_seen, parsed, skipped, skipped_no_title, skipped_no_id, share, floor, partial}` block, and when `parsed ÷ rows_seen` is below the floor (1.0) the write is **downgraded to an upsert** with `removals_suppressed` naming the shortfall — the smlouvy/cordis pattern. Deliberately judged on parsed-÷-served and **not** on "did the page serve 30 rows": a genuinely shrinking front page serves fewer rows that all parse, and that still tombstones (otherwise the app would be permanently upsert-only in the one case removal exists for). A short page is *reported* in `warnings[]`, never gated on.<br>**`removed` is emitted, and id-less rows are dropped:** the result carries `removed` (it promised tombstoning in `output_shape` while emitting only `{count, new, changed, unchanged, stories}`, so a run that removed 15 stories and one that removed none were byte-identical). A row with no `id` attribute used to be keyed `rank-{n}` — rank is positional, so each run's `rank-7` overwrote a *different* story and manufactured a fake `changed` revision; such rows are now skipped and counted in `skipped_no_id`, which feeds the floor. `id` is consequently never null in a `stories` record. |
@@ -152,6 +152,95 @@ The whole product is a bundle a human reads before approving a live submit, so e
 **Out of scope (deliberately):** the job's **`params`** still contain whatever the caller typed into a `type` step's `text` — params are persisted verbatim for every app, so redacting them is a job-model change, not a transact one. `dom.html` is not redacted either (a password input does not echo its value into the DOM's `value` attribute). Artifacts are not encrypted at rest.
 
 **Known gaps:** no screenshots, no iframe/shadow-DOM traversal, no URL/SSRF policy on the flow's `url`, no session-handle resume across the approval (the flow is rebuilt), no auto-approval policy engine.
+
+## `research`: a living knowledge base
+
+A research run used to leave a job result and a `report.json` artifact and nothing else — the most expensive producer in the fleet was the only one that wrote no dataset. It now writes two, so findings and citations become records that search, watches, triggers, derived datasets, the SDK and peers already know how to consume.
+
+### The two datasets
+
+| dataset | key | record | written when |
+| --- | --- | --- | --- |
+| `research/findings` | `{slug(topic)}#{index}` | `{topic, index, finding, sources[]}` | `persist` (default **true**) and the report was `structured` |
+| `research/sources` | the cited URL | `{url, title, snapshot, snapshot_error}` | same, one per cited URL that survived the cap |
+
+`slug(topic)` is lowercase-alphanumeric with single dashes, capped at 60 chars. It is deterministic on purpose: **that is what makes a re-run update its findings instead of appending a second copy of them.** Nothing per-run (session id, query text, spend, job id) is stored in a record — a per-run value would mark every record `changed` on every run and turn watches, triggers and the yield ledger into a churn feed. The run that produced a revision is recoverable from its provenance `job_id`.
+
+**`topic` is the key space, not the question.** It defaults to `query`. A follow-up run asks something different ("Source X changed, update the findings") but belongs to the same body of knowledge, so it passes the **original** query as `topic` and updates those records rather than forking a second set under its own slug.
+
+Both datasets are declared in the result's `index_datasets`, so their revisions reach the search index and saved-search alerts like any other product dataset.
+
+### Provenance (M12)
+
+- `findings` revisions carry `job_id` only. A finding is synthesis, not a fetched body: it has no `source_url` of its own and never claims one.
+- `sources` revisions carry `source_url` always (the cited URL — the post-redirect URL when the body was actually fetched) and `artifact_sha` **only when a snapshot was really saved**. An unarchived citation is not re-derivable, and stamping a hash for it would be exactly the fabrication `Provenance` forbids. `rules_hash` stays Null (no RuleSet is involved), so a source revision never reports `replayable()`.
+
+### Params
+
+| param | default | what it does |
+| --- | --- | --- |
+| `topic` | the `query` | key space for the findings records |
+| `persist` | `true` | write the two datasets at all |
+| `snapshot_sources` | `false` | fetch each cited URL through `ctx.fetch` (metered) and save it as `source-N.md`, stamping `artifact_sha` |
+| `archive_max_age` | — | snapshots only: accept an archived body up to N seconds old instead of going live |
+| `watch_sources` | `false` | emit one ready-to-POST `/schedules` body per cited URL in `watch_requests` |
+| `watch_cron` | `0 0 7 * * *` | cron for those proposed watches |
+| `max_watched_sources` | `[research] max_watched_sources` (20) | per-run ceiling on **every** per-source action |
+
+**`[research] max_watched_sources`** (default 20) is the operator rail. One cap governs the record write, the snapshot fetch and the watch proposal, so `sources_truncated: true` has a single meaning: this run cited more sources than it acted on. A citation list past 20 is a survey, not a citation set, and every entry past it costs a real metered fetch.
+
+*Plumbing caveat, stated rather than hidden:* the app reads the cap from `ResearchConfig::default()` (the single definition of the number, pinned by a test), **not** from the loaded `config.toml` — `registry::apps()` builds the app list without a `&Config`, and an app receives no config handle. An operator who edits the key today must also pass `max_watched_sources` per run (or per schedule params) for it to bind. Closing that needs `apps()` to take the config, which was outside this change's file scope.
+
+### Snapshots
+
+`snapshot_sources: true` fetches each surviving citation through the **tiered fetcher** — governor, response cache, archive tier, learned tier router, cost ledger — and saves the Markdown as `source-N.md` in the job's artifact dir. The source record then carries `snapshot: {artifact, chars, sha256, fetched_url}` and the revision is stamped with that sha, so the citation can be re-read exactly as it was when the report cited it.
+
+Every failure mode is recorded, never fatal: a fetch error, a 200 that extracts to nothing (the same judgement `watch` and `readable` make), or a failed artifact write all produce `snapshot_error` on the record and a `snapshots.failed` count. The report has already been paid for; losing it because a cited page 404s would re-buy the whole run on the next attempt. Headroom is re-read before **each** snapshot, so a 20-URL citation list cannot walk past the job's ceiling one page at a time.
+
+**This is unrelated to `[claude] self_hosted_tools`.** That switch makes the research *subprocess* fetch through this node's `fetch` MCP tool under a per-job token, during the agentic loop. Snapshots are this app calling `ctx.fetch` itself, after the subprocess is gone, to archive what the report cited. They behave identically with the switch on or off.
+
+### Watched sources: a proposal, not a schedule
+
+`watch_sources: true` returns `watch_requests` — ready-to-POST `/schedules` bodies, one per cited URL:
+
+```json
+{ "app": "watch", "cron": "0 0 7 * * *", "params": { "url": "https://example.com/vat" } }
+```
+
+The app does **not** create them. An `AppContext` exposes datasets, artifacts and engines — not the job store — so an app has no schedule-writing seam, exactly as `provisioner` emits a `planned` catalog row and schedules nothing. Creating the schedules is one `POST /schedules` per entry.
+
+### The follow-up recipe (documented, not auto-created)
+
+Nothing in this app creates a trigger. The loop that makes the knowledge base *self-maintaining* is two deliberate objects:
+
+1. `POST /schedules` for each `watch_requests` entry above — the cited page is now fingerprinted into `watch/pages` on a cron, with a field-level diff per revision.
+2. A trigger on that change, enqueuing `research` back into the same topic:
+
+```json
+{
+  "on": { "app": "watch", "dataset": "pages" },
+  "then": { "app": "research" },
+  "params": {
+    "topic": "Current Czech VAT registration thresholds for sole traders",
+    "query": "Source <url> changed: <diff excerpt>. Update the findings.",
+    "session_id": "<the prior run's session_id>",
+    "max_budget_usd": 0.25
+  }
+}
+```
+
+`topic` is what keeps the follow-up updating the same records instead of forking a new set; `max_budget_usd` is the per-topic spend rail. See [triggers.md](triggers.md) for the trigger surface itself and for the fan-out caps that bound a noisy source.
+
+### MCP
+
+`deep_research` still enqueues and returns a job id; the awaited result carries `session_id` and `datasets.findings` / `datasets.sources`, which `query_dataset` reads as the agent's memory. See [mcp.md](mcp.md).
+
+### Known gaps (v1)
+
+- **Superseded findings are not removed.** A run that produces 3 findings for a topic that previously had 5 leaves `#3` and `#4` in place. `sync_many` would fix it but is dataset-wide, and `research/findings` holds every topic, so a full-snapshot sync would delete every other topic's records.
+- **No schedule or trigger is created by the app** (above).
+- **`[research] max_watched_sources` is not plumbed from `config.toml`** (above).
+- **No `explain` read-only mode** that re-scores existing findings against snapshots without a new session, and `connector-api-watch`'s `change_summary_request` was **not** extracted into a shared `explain-diff` role — it is not a pure move (it carries Personas-specific tag vocabulary and its own caching), so it stays where it is.
 
 ## Conventions for new apps
 

@@ -15,12 +15,15 @@
 //! *report* only, never re-metered.
 
 use async_trait::async_trait;
+use pumper_core::config::ResearchConfig;
+use pumper_core::extract::extracted_nothing;
 use pumper_core::{
-    salvage_json, AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest,
-    Result, ScrapeApp,
+    salvage_json, AppContext, AppManifest, ChangeKind, CostClass, Error, FetchRequest,
+    ManifestExample, Provenance, ResearchRequest, Result, ScrapeApp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub struct Research;
 
@@ -312,7 +315,13 @@ impl ScrapeApp for Research {
          the run stops with stop_reason=budget_exhausted and returns its \
          partial findings rather than exceeding it)}. Progress is \
          checkpointed durably after every step: a crashed/reaped/suspended job \
-         resumes where it left off without re-spending restored budget."
+         resumes where it left off without re-spending restored budget. \
+         Every structured run also becomes DATASETS: one `research/findings` record \
+         per key finding (keyed `{slug(topic)}#{i}`) and one `research/sources` \
+         record per cited URL, both provenance-stamped (`persist`, default true). \
+         `snapshot_sources` archives each cited URL through the metered tiered \
+         fetcher and stamps `artifact_sha` so the citation is re-derivable; \
+         `watch_sources` proposes a `POST /schedules` body per cited URL."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -344,6 +353,36 @@ impl ScrapeApp for Research {
                         "type": "number",
                         "minimum": 0,
                         "description": "Total Claude spend ceiling for the whole run (all steps, plus spend restored from a checkpoint) — not a per-call limit. Each step is capped at the remaining headroom; when less than a cent is left the run stops with stop_reason=budget_exhausted and returns its partial findings."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Key space for this run's findings records (default: the query). A follow-up run passes the ORIGINAL query here so it updates that topic's findings instead of forking a second copy under its own slug."
+                    },
+                    "persist": {
+                        "type": "boolean",
+                        "description": "Write research/findings + research/sources records for this run (default true). Nothing is written for an unstructured report - there are no key findings or citations to write."
+                    },
+                    "snapshot_sources": {
+                        "type": "boolean",
+                        "description": "Fetch each cited URL through the tiered fetcher (metered) and save it as a source-N.md artifact, stamping artifact_sha on the source record so the citation is re-derivable. Default false."
+                    },
+                    "archive_max_age": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Snapshot fetches only: accept an archived body up to N seconds old instead of going live."
+                    },
+                    "watch_sources": {
+                        "type": "boolean",
+                        "description": "Emit one ready-to-POST /schedules body per cited URL in watch_requests. This app creates no schedules itself. Default false."
+                    },
+                    "watch_cron": {
+                        "type": "string",
+                        "description": "Cron (6 fields, with seconds) for the proposed source watches. Default \"0 0 7 * * *\"."
+                    },
+                    "max_watched_sources": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-run ceiling on per-source actions (record, snapshot, watch proposal). Default: [research] max_watched_sources (20). A run that cites more reports sources_truncated: true."
                     }
                 },
                 "additionalProperties": true
@@ -367,11 +406,22 @@ impl ScrapeApp for Research {
                         "max_budget_usd": 0.25
                     }),
                 },
+                ManifestExample {
+                    description: "Living knowledge base: persist findings + sources, archive every citation, and propose a daily watch per source",
+                    params: json!({
+                        "query": "Current Czech VAT registration thresholds for sole traders, with sources",
+                        "snapshot_sources": true,
+                        "watch_sources": true,
+                        "max_budget_usd": 0.5
+                    }),
+                },
             ],
             output_shape: Some(
-                "{query, report: {summary, key_findings, sources}, structured, resumed, \
+                "{query, topic, report: {summary, key_findings, sources}, structured, resumed, \
                  resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, \
-                 stop_reason} — the research report is NESTED under `report`, and only when \
+                 stop_reason, datasets: {persisted, findings, sources, findings_new, \
+                 findings_changed, sources_new, sources_changed, error}, snapshots: {attempted, \
+                 saved, failed}, watch_requests[], sources_truncated, index_datasets[]} — the research report is NESTED under `report`, and only when \
                  `structured` is true; when it is false `report` is the agent's raw answer as a \
                  bare string, so `summary`/`key_findings`/`sources` are never top-level keys. \
                  `session_id` is resumable — pass it back as the `session_id` param to drill \
@@ -383,7 +433,18 @@ impl ScrapeApp for Research {
                  explains why the loop ended (completed, step_cap, turns_exhausted, \
                  budget_exhausted, no_session, single_call) — `structured: false` alone can't \
                  distinguish a truncated report from other causes. A run that produced no \
-                 content at all fails the job instead of returning an empty report.",
+                 content at all fails the job instead of returning an empty report. \
+                 `topic` is the key space this run's records live under (the `topic` param, \
+                 else `query`): `datasets.findings` are the keys written to \
+                 `research/findings` (`{slug(topic)}#{index}`) and `datasets.sources` the \
+                 cited URLs written to `research/sources`; both are empty when `persist` is \
+                 false or the report was unstructured, and `datasets.error` names a store \
+                 failure that was reported rather than allowed to discard a paid-for report. \
+                 `snapshots` counts `snapshot_sources` fetches (attempted/saved/failed - a \
+                 failed snapshot is recorded on the source record, never fatal). \
+                 `watch_requests` are ready-to-POST `/schedules` bodies the run PROPOSES for \
+                 the cited URLs (`watch_sources`); this app creates no schedules itself. \
+                 `sources_truncated` says the per-run source cap bit.",
             ),
             cost_class: CostClass::Claude,
         }
@@ -591,8 +652,25 @@ impl ScrapeApp for Research {
             Some(v) => v,
             None => Value::String(last_text),
         };
+
+        // N25: the report becomes datasets. `topic` is the KEY SPACE, not the
+        // question: a follow-up run asks something different ("Source X changed,
+        // update the findings") but belongs to the same body of knowledge, so it
+        // passes the original query back as `topic` and updates those records
+        // instead of forking a second copy under its own slug.
+        let topic = ctx
+            .params
+            .get("topic")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(query.as_str())
+            .to_string();
+        let kb = build_knowledge(&ctx, &topic, &report, &KbOptions::from_params(&ctx.params)).await;
+
         let result = json!({
             "query": query,
+            "topic": topic,
             "report": report,
             "structured": structured,
             "resumed": resumed_callers_session(caller_resumed, resumed_from_checkpoint),
@@ -603,6 +681,17 @@ impl ScrapeApp for Research {
             "num_turns": state.turns_used,
             "session_id": state.session_id,
             "stop_reason": stop_reason.as_str(),
+            "datasets": kb.datasets,
+            "snapshots": kb.snapshots,
+            "watch_requests": kb.watch_requests,
+            "sources_truncated": kb.sources_truncated,
+            // Routes this run's `research/findings` + `research/sources`
+            // revisions into the search index and the saved-search alerts, the
+            // same way the extractor routes its own product dataset.
+            "index_datasets": [
+                { "app": "research", "dataset": FINDINGS_DATASET },
+                { "app": "research", "dataset": SOURCES_DATASET },
+            ],
         });
 
         // Final checkpoint carries the whole result: a crash between here and
@@ -728,6 +817,518 @@ async fn save_report_artifact(ctx: &AppContext, result: &Value) {
     if let Err(e) = ctx.save_artifact("report.json", &bytes).await {
         tracing::warn!("research: report.json artifact write failed (result unaffected): {e}");
     }
+}
+
+// ── N25: research as a living knowledge base ─────────────────────────────────
+//
+// Everything below turns one paid run's report into two datasets:
+// `research/findings` (one record per key finding) and `research/sources` (one
+// record per cited URL). The run's own loop above is untouched — this stage
+// reads the finished report and writes, so a failure here can never cost a
+// re-run of the model.
+//
+// NOTE on the self-hosted fetch loop (N15): `[claude] self_hosted_tools` makes
+// the research SUBPROCESS fetch through this node's `fetch` MCP tool under a
+// per-job token. `snapshot_sources` below is a different thing entirely — it is
+// this app calling `ctx.fetch` directly, after the subprocess is gone, to
+// archive the URLs the report cited. The two are independent: snapshots behave
+// identically with `self_hosted_tools` on or off.
+
+/// Dataset holding one record per key finding, keyed `{slug(topic)}#{index}`.
+const FINDINGS_DATASET: &str = "findings";
+/// Dataset holding one record per cited URL, keyed by the URL itself.
+const SOURCES_DATASET: &str = "sources";
+/// Default cron for a proposed source watch: once a day, 07:00 UTC.
+const DEFAULT_WATCH_CRON: &str = "0 0 7 * * *";
+/// Max chars of a slug — it is a key, not a title.
+const SLUG_CAP_CHARS: usize = 60;
+
+/// One source the report cited.
+#[derive(Debug, Clone, PartialEq)]
+struct Cited {
+    url: String,
+    title: Option<String>,
+}
+
+/// What a snapshot attempt produced for one cited URL.
+#[derive(Debug, Clone, PartialEq)]
+enum Snapshot {
+    /// Not attempted (`snapshot_sources` off, or the budget ran out first).
+    Skipped,
+    /// The body was fetched, saved and hashed — the citation is re-derivable.
+    Saved {
+        artifact: String,
+        chars: usize,
+        sha256: String,
+        fetched_url: String,
+    },
+    /// Attempted and failed. The reason is recorded rather than dropped, and it
+    /// never fails the run: the report was already paid for.
+    Failed { reason: String },
+}
+
+/// A stable record key from free text: lowercase, non-alphanumerics collapsed
+/// to single dashes, trimmed, capped. This is what makes a re-run of the same
+/// topic UPDATE its findings instead of appending a second copy of them, so it
+/// must stay deterministic — never fold in a timestamp, a session id or a job
+/// id.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut len = 0usize;
+    let mut pending_dash = false;
+    for c in text.trim().to_lowercase().chars() {
+        if !c.is_alphanumeric() {
+            pending_dash = true;
+            continue;
+        }
+        let width = usize::from(pending_dash && len > 0) + 1;
+        if len + width > SLUG_CAP_CHARS {
+            break;
+        }
+        if pending_dash && len > 0 {
+            out.push('-');
+        }
+        pending_dash = false;
+        out.push(c);
+        len += width;
+    }
+    if out.is_empty() {
+        "topic".to_string()
+    } else {
+        out
+    }
+}
+
+/// Record key for the i-th key finding of a topic.
+fn finding_key(topic_slug: &str, index: usize) -> String {
+    format!("{topic_slug}#{index}")
+}
+
+/// The sources a report cited, in order, deduped by URL.
+///
+/// Deliberately tolerant of shape (the array is model output): an entry may be
+/// a bare URL string or an object with `url`/`title`. Deliberately intolerant of
+/// scheme: anything that is not `http(s)` is dropped rather than stored, because
+/// every downstream use of this list — the snapshot fetch, the proposed watch,
+/// the record key — treats it as a URL to fetch, and a `file:///etc/passwd` in a
+/// model's citation list must never become one.
+fn cited_sources(report: &Value) -> Vec<Cited> {
+    let Some(items) = report.get("sources").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Cited> = Vec::new();
+    for item in items {
+        let (url, title) = match item {
+            Value::String(s) => (s.trim().to_string(), None),
+            Value::Object(_) => (
+                item.get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                item.get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from),
+            ),
+            _ => continue,
+        };
+        if !is_web_url(&url) {
+            continue;
+        }
+        if out.iter().any(|c| c.url == url) {
+            continue;
+        }
+        out.push(Cited { url, title });
+    }
+    out
+}
+
+/// Whether a cited string is a URL this node would actually fetch.
+fn is_web_url(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://")) && url.len() > "https://".len()
+}
+
+/// Applies the per-run fan-out ceiling to the cited list, reporting whether it
+/// bit. ONE cap governs every per-source action (record, snapshot, watch) so
+/// `sources_truncated` has a single meaning.
+fn cap_sources(cited: &[Cited], cap: usize) -> (&[Cited], bool) {
+    if cited.len() > cap {
+        (&cited[..cap], true)
+    } else {
+        (cited, false)
+    }
+}
+
+/// The `findings` records for one report. Each record is about the FINDING, not
+/// about the run that produced it: the query text, the session and the spend
+/// live in the job result and in the revision's `job_id` provenance. Putting a
+/// per-run value in here would mark every record `changed` on every run and turn
+/// watches, triggers and the yield ledger into a churn feed.
+fn finding_records(
+    topic: &str,
+    findings: &[Value],
+    source_urls: &[String],
+) -> Vec<(String, Value)> {
+    let topic_slug = slug(topic);
+    findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| has_content(f))
+        .map(|(i, finding)| {
+            (
+                finding_key(&topic_slug, i),
+                json!({
+                    "topic": topic,
+                    "index": i,
+                    "finding": finding.clone(),
+                    "sources": source_urls,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// The `sources` record for one cited URL and whatever its snapshot produced.
+fn source_record(cited: &Cited, snapshot: &Snapshot) -> Value {
+    let mut rec = json!({
+        "url": cited.url,
+        "title": cited.title,
+        "snapshot": Value::Null,
+        "snapshot_error": Value::Null,
+    });
+    let map = rec.as_object_mut().expect("json! built an object");
+    match snapshot {
+        Snapshot::Skipped => {}
+        Snapshot::Saved {
+            artifact,
+            chars,
+            sha256,
+            fetched_url,
+        } => {
+            map.insert(
+                "snapshot".into(),
+                json!({
+                    "artifact": artifact,
+                    "chars": chars,
+                    "sha256": sha256,
+                    "fetched_url": fetched_url,
+                }),
+            );
+        }
+        Snapshot::Failed { reason } => {
+            map.insert("snapshot_error".into(), json!(reason));
+        }
+    }
+    rec
+}
+
+/// The provenance of a `sources` record.
+///
+/// `source_url` is always the cited URL — that is what the record is about, and
+/// on a snapshot it is the POST-REDIRECT url the body actually came from.
+/// `artifact_sha` is stamped **only** when a body was really fetched and saved:
+/// a citation nobody archived is not re-derivable, and claiming a hash for it is
+/// exactly the fabrication `Provenance`'s contract forbids.
+fn source_provenance(cited: &Cited, snapshot: &Snapshot) -> Provenance {
+    match snapshot {
+        Snapshot::Saved {
+            sha256,
+            fetched_url,
+            ..
+        } => Provenance {
+            source_url: Some(fetched_url.clone()),
+            artifact_sha: Some(sha256.clone()),
+            ..Provenance::default()
+        },
+        _ => Provenance {
+            source_url: Some(cited.url.clone()),
+            ..Provenance::default()
+        },
+    }
+}
+
+/// Whether there is still money to spend on the NEXT snapshot fetch. `None` is
+/// "this job carries no ceiling", not "this job is broke".
+fn snapshot_affordable(remaining: Option<f64>) -> bool {
+    !matches!(remaining, Some(r) if r <= 0.0)
+}
+
+/// The `POST /schedules` body that would put one cited URL under a standing
+/// `watch`. The app EMITS these rather than creating them: an app has no
+/// schedule-writing seam (`AppContext` exposes datasets, artifacts and engines,
+/// not the job store), exactly as `provisioner` emits a `planned` catalog row
+/// and schedules nothing. See docs/features/apps.md §research for the recipe.
+fn watch_request(url: &str, cron: &str) -> Value {
+    json!({ "app": "watch", "cron": cron, "params": { "url": url } })
+}
+
+/// Artifact name for the i-th snapshotted source.
+fn snapshot_artifact_name(index: usize) -> String {
+    format!("source-{index}.md")
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// The N25 params, parsed once from `ctx.params`.
+struct KbOptions {
+    /// Write `findings`/`sources` records at all (default true).
+    persist: bool,
+    /// Fetch and archive each cited URL (default false — it is metered).
+    snapshot: bool,
+    /// Emit a `POST /schedules` body per cited URL (default false).
+    watch: bool,
+    /// Per-run ceiling on per-source actions.
+    cap: usize,
+    /// Passed through to the snapshot fetch: accept an archived body up to N
+    /// seconds old instead of going live (`readable`'s archive tier).
+    archive_max_age: Option<u64>,
+    /// Cron for the proposed watches.
+    watch_cron: String,
+}
+
+impl KbOptions {
+    fn from_params(params: &Value) -> Self {
+        Self {
+            persist: params
+                .get("persist")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            snapshot: params
+                .get("snapshot_sources")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            watch: params
+                .get("watch_sources")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            // The operator's `[research] max_watched_sources` is the DEFAULT
+            // here (see the plumbing note in docs/features/apps.md §research):
+            // `ResearchConfig::default()` is the single definition of the
+            // number, so the app and the config key cannot drift apart.
+            cap: params
+                .get("max_watched_sources")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or_else(|| ResearchConfig::default().max_watched_sources),
+            archive_max_age: params.get("archive_max_age").and_then(Value::as_u64),
+            watch_cron: params
+                .get("watch_cron")
+                .and_then(Value::as_str)
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or(DEFAULT_WATCH_CRON)
+                .to_string(),
+        }
+    }
+}
+
+/// What the knowledge-base stage produced, in the shape the result publishes.
+struct Knowledge {
+    datasets: Value,
+    snapshots: Value,
+    watch_requests: Vec<Value>,
+    sources_truncated: bool,
+}
+
+impl Knowledge {
+    /// The empty stage: an unstructured run has no findings and no citations to
+    /// persist, so it publishes the same keys with nothing in them rather than
+    /// dropping keys a consumer codes against.
+    fn empty() -> Self {
+        Self {
+            datasets: json!({
+                "persisted": false,
+                "findings": [],
+                "sources": [],
+                "findings_new": 0,
+                "findings_changed": 0,
+                "sources_new": 0,
+                "sources_changed": 0,
+                "error": Value::Null,
+            }),
+            snapshots: json!({ "attempted": 0, "saved": 0, "failed": 0 }),
+            watch_requests: Vec::new(),
+            sources_truncated: false,
+        }
+    }
+}
+
+/// Snapshots one cited URL through the metered tiered fetcher and saves it as a
+/// job artifact, so the citation can be re-read exactly as it was when the
+/// report cited it.
+///
+/// Every failure mode returns [`Snapshot::Failed`] instead of an error: the
+/// research report has already been paid for, and losing it because a cited page
+/// 404s would re-buy the whole run on the next attempt.
+async fn snapshot_source(
+    ctx: &AppContext,
+    index: usize,
+    cited: &Cited,
+    archive_max_age: Option<u64>,
+) -> Snapshot {
+    let mut req = FetchRequest::new(&cited.url);
+    req.to_markdown = true;
+    req.archive_max_age = archive_max_age;
+    let outcome = match ctx.fetch(req).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return Snapshot::Failed {
+                reason: format!("fetch failed: {e}"),
+            }
+        }
+    };
+    let markdown = outcome
+        .markdown
+        .clone()
+        .or_else(|| outcome.text.clone())
+        .unwrap_or_default();
+    if extracted_nothing(&markdown) {
+        // Same judgement `watch` and `readable` make: a 200 that yields no
+        // readable text is a failed extraction, and hashing the empty body
+        // would stamp `artifact_sha` on a snapshot of nothing.
+        return Snapshot::Failed {
+            reason: format!(
+                "extracted no content (engine {}, status {:?})",
+                outcome.engine, outcome.status
+            ),
+        };
+    }
+    let artifact = snapshot_artifact_name(index);
+    if let Err(e) = ctx.save_artifact(&artifact, markdown.as_bytes()).await {
+        return Snapshot::Failed {
+            reason: format!("artifact write failed: {e}"),
+        };
+    }
+    Snapshot::Saved {
+        artifact,
+        chars: markdown.chars().count(),
+        sha256: hex_sha256(markdown.as_bytes()),
+        fetched_url: outcome.url.clone(),
+    }
+}
+
+/// Turns a finished report into the two datasets, the snapshots and the
+/// proposed watches. Never fails the run: a store or filesystem failure here is
+/// reported in `datasets.error` and logged, because the model call it would
+/// discard is the most expensive thing this app does.
+async fn build_knowledge(
+    ctx: &AppContext,
+    topic: &str,
+    report: &Value,
+    opts: &KbOptions,
+) -> Knowledge {
+    let cited = cited_sources(report);
+    let (capped, sources_truncated) = cap_sources(&cited, opts.cap);
+
+    let mut snapshots = Vec::with_capacity(capped.len());
+    let mut attempted = 0usize;
+    let mut saved = 0usize;
+    let mut failed = 0usize;
+    for (i, c) in capped.iter().enumerate() {
+        if !opts.snapshot {
+            snapshots.push(Snapshot::Skipped);
+            continue;
+        }
+        // The run's remaining headroom is re-read per source: a snapshot is a
+        // metered fetch like any other, and a 20-URL citation list must not be
+        // able to walk past the job's ceiling one page at a time.
+        let remaining = ctx.remaining_budget_usd().await.unwrap_or(None);
+        if !snapshot_affordable(remaining) {
+            snapshots.push(Snapshot::Skipped);
+            continue;
+        }
+        attempted += 1;
+        let snap = snapshot_source(ctx, i, c, opts.archive_max_age).await;
+        match &snap {
+            Snapshot::Saved { .. } => saved += 1,
+            Snapshot::Failed { .. } => failed += 1,
+            Snapshot::Skipped => {}
+        }
+        snapshots.push(snap);
+    }
+
+    let watch_requests = if opts.watch {
+        capped
+            .iter()
+            .map(|c| watch_request(&c.url, &opts.watch_cron))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut out = Knowledge {
+        snapshots: json!({ "attempted": attempted, "saved": saved, "failed": failed }),
+        watch_requests,
+        sources_truncated,
+        ..Knowledge::empty()
+    };
+    if !opts.persist {
+        return out;
+    }
+
+    let source_urls: Vec<String> = capped.iter().map(|c| c.url.clone()).collect();
+    let mut error: Option<String> = None;
+    let mut written_sources: Vec<String> = Vec::new();
+    let (mut sources_new, mut sources_changed) = (0usize, 0usize);
+    for (c, snap) in capped.iter().zip(snapshots.iter()) {
+        let record = source_record(c, snap);
+        match ctx
+            .upsert_with_provenance(SOURCES_DATASET, &c.url, &record, source_provenance(c, snap))
+            .await
+        {
+            Ok(change) => {
+                match change {
+                    ChangeKind::New => sources_new += 1,
+                    ChangeKind::Changed => sources_changed += 1,
+                    ChangeKind::Unchanged => {}
+                }
+                written_sources.push(c.url.clone());
+            }
+            Err(e) => {
+                tracing::warn!("research: sources upsert failed for {}: {e}", c.url);
+                error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+
+    let findings = report
+        .get("key_findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let items = finding_records(topic, &findings, &source_urls);
+    let mut written_findings: Vec<String> = Vec::new();
+    let (mut findings_new, mut findings_changed) = (0usize, 0usize);
+    if !items.is_empty() {
+        match ctx.upsert_many(FINDINGS_DATASET, &items).await {
+            Ok(summary) => {
+                findings_new = summary.new.len();
+                findings_changed = summary.changed.len();
+                written_findings = items.iter().map(|(k, _)| k.clone()).collect();
+            }
+            Err(e) => {
+                tracing::warn!("research: findings upsert failed: {e}");
+                error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+
+    out.datasets = json!({
+        "persisted": true,
+        "findings": written_findings,
+        "sources": written_sources,
+        "findings_new": findings_new,
+        "findings_changed": findings_changed,
+        "sources_new": sources_new,
+        "sources_changed": sources_changed,
+        "error": error,
+    });
+    out
 }
 
 #[cfg(test)]
@@ -1061,6 +1662,241 @@ mod tests {
     fn partial_truncation_is_char_boundary_safe() {
         assert_eq!(truncate_chars("héllo", 3), "hél");
         assert_eq!(truncate_chars("short", 100), "short");
+    }
+
+    // ── N25: research as a living knowledge base ────────────────────────────
+
+    mod knowledge_base {
+        use super::*;
+
+        /// A realistic slice of a structured report's `sources` array: objects
+        /// with titles, one duplicate, one bare string, and two entries no node
+        /// should ever fetch.
+        fn report_with_sources() -> Value {
+            json!({
+                "summary": "s",
+                "key_findings": ["f1", "f2"],
+                "sources": [
+                    {"url": "https://a.example/one", "title": "One"},
+                    {"url": "https://a.example/one", "title": "One again"},
+                    "https://b.example/two",
+                    {"url": "file:///etc/passwd", "title": "Local"},
+                    {"url": "javascript:alert(1)"},
+                    {"url": "  https://c.example/three  ", "title": "   "},
+                    {"title": "no url at all"},
+                    42
+                ]
+            })
+        }
+
+        #[test]
+        fn a_slug_is_stable_so_a_rerun_updates_rather_than_forks() {
+            // The same topic must produce the same key space on every run —
+            // this is the whole mechanism behind "a second run updates".
+            assert_eq!(
+                slug("Current Czech VAT thresholds, with sources"),
+                slug("current czech VAT   thresholds,   with sources!!")
+            );
+            assert_eq!(slug("Rust 1.80 - what changed?"), "rust-1-80-what-changed");
+            // No leading/trailing dashes, and a punctuation-only topic still
+            // yields a usable key rather than an empty one.
+            assert_eq!(slug("  ...hello... "), "hello");
+            assert_eq!(slug("???"), "topic");
+            assert_eq!(slug(""), "topic");
+            // Capped: a key, not a title.
+            assert!(slug(&"word ".repeat(60)).chars().count() <= SLUG_CAP_CHARS);
+        }
+
+        #[test]
+        fn finding_keys_are_topic_scoped_and_indexed() {
+            assert_eq!(finding_key("czech-vat", 0), "czech-vat#0");
+            assert_eq!(finding_key("czech-vat", 7), "czech-vat#7");
+        }
+
+        #[test]
+        fn a_citation_that_is_not_a_web_url_is_dropped_not_stored() {
+            // Every downstream use of this list treats the entry as a URL to
+            // fetch, so `file://` / `javascript:` must never reach it — and a
+            // duplicate must not become two records with the same key.
+            let cited = cited_sources(&report_with_sources());
+            let urls: Vec<&str> = cited.iter().map(|c| c.url.as_str()).collect();
+            assert_eq!(
+                urls,
+                vec![
+                    "https://a.example/one",
+                    "https://b.example/two",
+                    "https://c.example/three"
+                ]
+            );
+            // A blank title is absent, not an empty string.
+            assert_eq!(cited[0].title.as_deref(), Some("One"));
+            assert_eq!(cited[1].title, None);
+            assert_eq!(cited[2].title, None);
+        }
+
+        #[test]
+        fn an_unstructured_report_cites_nothing_rather_than_erroring() {
+            assert!(cited_sources(&Value::String("prose, not json".into())).is_empty());
+            assert!(cited_sources(&json!({"summary": "s"})).is_empty());
+            assert!(cited_sources(&json!({"sources": "not an array"})).is_empty());
+        }
+
+        #[test]
+        fn capping_sources_says_so_instead_of_silently_acting_on_a_prefix() {
+            let cited: Vec<Cited> = (0..5)
+                .map(|i| Cited {
+                    url: format!("https://x.example/{i}"),
+                    title: None,
+                })
+                .collect();
+            let (kept, truncated) = cap_sources(&cited, 3);
+            assert_eq!(kept.len(), 3);
+            assert!(truncated);
+            let (kept, truncated) = cap_sources(&cited, 5);
+            assert_eq!(kept.len(), 5);
+            assert!(!truncated, "an exactly-full list is not truncated");
+            let (kept, truncated) = cap_sources(&cited, 50);
+            assert_eq!(kept.len(), 5);
+            assert!(!truncated);
+        }
+
+        #[test]
+        fn the_default_cap_is_the_operators_config_default_not_a_second_number() {
+            // The app and `[research] max_watched_sources` must not drift: the
+            // config struct is the one definition of the default.
+            let opts = KbOptions::from_params(&json!({}));
+            assert_eq!(opts.cap, ResearchConfig::default().max_watched_sources);
+            assert_eq!(opts.cap, 20);
+            // …and a caller may tighten it per run.
+            assert_eq!(
+                KbOptions::from_params(&json!({"max_watched_sources": 3})).cap,
+                3
+            );
+        }
+
+        #[test]
+        fn the_side_effects_are_off_by_default_and_persistence_is_on() {
+            let opts = KbOptions::from_params(&json!({}));
+            assert!(opts.persist, "a structured run's records are the point");
+            assert!(!opts.snapshot, "snapshots are metered fetches");
+            assert!(!opts.watch, "watches are standing commitments");
+            assert_eq!(opts.watch_cron, DEFAULT_WATCH_CRON);
+            assert!(!KbOptions::from_params(&json!({"persist": false})).persist);
+            // A blank cron falls back rather than proposing an invalid schedule.
+            assert_eq!(
+                KbOptions::from_params(&json!({"watch_cron": "   "})).watch_cron,
+                DEFAULT_WATCH_CRON
+            );
+        }
+
+        #[test]
+        fn a_finding_record_carries_no_per_run_value_so_a_rerun_is_unchanged() {
+            // The anti-pattern: stamping the session id, the query text or the
+            // spend into the record. Change detection would then mark every
+            // record `changed` on every run and turn watches, triggers and the
+            // yield ledger into a churn feed.
+            let findings = vec![json!("f1"), json!("f2")];
+            let urls = vec!["https://a.example/one".to_string()];
+            let first = finding_records("czech vat", &findings, &urls);
+            let second = finding_records("czech vat", &findings, &urls);
+            assert_eq!(first, second);
+            assert_eq!(first[0].0, "czech-vat#0");
+            assert_eq!(first[1].0, "czech-vat#1");
+            let rendered = serde_json::to_string(&first[0].1).unwrap();
+            for per_run in ["session", "job_id", "cost", "duration"] {
+                assert!(
+                    !rendered.contains(per_run),
+                    "`{per_run}` is a per-run value and must not be in the record: {rendered}"
+                );
+            }
+            // Empty findings are dropped rather than stored as blank records.
+            let sparse = finding_records("t", &[json!(""), json!("real"), Value::Null], &urls);
+            assert_eq!(sparse.len(), 1);
+            // …and the index is the report's, so the key still names position 1.
+            assert_eq!(sparse[0].0, "t#1");
+        }
+
+        #[test]
+        fn an_unarchived_citation_never_claims_an_artifact_sha() {
+            let cited = Cited {
+                url: "https://a.example/one".into(),
+                title: Some("One".into()),
+            };
+            for snap in [
+                Snapshot::Skipped,
+                Snapshot::Failed {
+                    reason: "fetch failed: 404".into(),
+                },
+            ] {
+                let prov = source_provenance(&cited, &snap);
+                assert_eq!(prov.source_url.as_deref(), Some("https://a.example/one"));
+                assert_eq!(
+                    prov.artifact_sha, None,
+                    "nothing was archived, so nothing is re-derivable"
+                );
+                assert!(!prov.replayable());
+            }
+            let saved = Snapshot::Saved {
+                artifact: "source-0.md".into(),
+                chars: 12,
+                sha256: "abc".into(),
+                fetched_url: "https://a.example/one/final".into(),
+            };
+            let prov = source_provenance(&cited, &saved);
+            assert_eq!(prov.artifact_sha.as_deref(), Some("abc"));
+            // The POST-REDIRECT url is what the body actually came from.
+            assert_eq!(
+                prov.source_url.as_deref(),
+                Some("https://a.example/one/final")
+            );
+        }
+
+        #[test]
+        fn a_failed_snapshot_is_recorded_on_the_record_not_dropped() {
+            let cited = Cited {
+                url: "https://a.example/one".into(),
+                title: None,
+            };
+            let rec = source_record(
+                &cited,
+                &Snapshot::Failed {
+                    reason: "fetch failed: 404".into(),
+                },
+            );
+            assert_eq!(rec["snapshot"], Value::Null);
+            assert_eq!(rec["snapshot_error"], json!("fetch failed: 404"));
+            // Skipped is honest absence in BOTH fields, not a fabricated error.
+            let rec = source_record(&cited, &Snapshot::Skipped);
+            assert_eq!(rec["snapshot"], Value::Null);
+            assert_eq!(rec["snapshot_error"], Value::Null);
+        }
+
+        #[test]
+        fn no_job_ceiling_is_headroom_not_a_broke_job() {
+            assert!(snapshot_affordable(None));
+            assert!(snapshot_affordable(Some(0.01)));
+            assert!(!snapshot_affordable(Some(0.0)));
+            assert!(!snapshot_affordable(Some(-1.0)));
+        }
+
+        #[test]
+        fn a_watch_request_is_a_postable_schedules_body() {
+            // It has to be copy-pasteable into `POST /schedules`, because this
+            // app cannot create the schedule itself.
+            let req = watch_request("https://a.example/one", DEFAULT_WATCH_CRON);
+            assert_eq!(req["app"], json!("watch"));
+            assert_eq!(req["cron"], json!("0 0 7 * * *"));
+            assert_eq!(req["params"]["url"], json!("https://a.example/one"));
+        }
+
+        #[test]
+        fn snapshot_artifacts_are_single_safe_segments() {
+            // `save_artifact` refuses anything with a separator; the name is
+            // built from an index, so this pins that it stays that way.
+            let name = snapshot_artifact_name(3);
+            assert_eq!(name, "source-3.md");
+            assert!(!name.contains('/') && !name.contains('\\') && !name.contains(".."));
+        }
     }
 
     // ── run() loop, wired through TestContext/ScriptedResearcher ───────────

@@ -815,3 +815,35 @@ status = "planned"
 confidence = 3
 dataset = "extraction_profiles"
 notes = "Not a data source: an operational app over Pumper's own store. Inverts a degraded source's last-known-good values (record_revisions) against its retained bodies, scores candidates through the seven §6.4 gates, and moves an extraction_profiles.active_version pointer only after a clean shadow streak. Writes no dataset records. Tier 0 only — never calls ctx.research, so a run cannot spend. Inert unless [resilience.repair] enabled = true (default false), hence status = planned. See docs/features/resilient-extraction.md §6/§8."
+
+[[source]]
+id = "research-findings"
+app = "research"
+market = "global"
+name = "Agentic research findings (Claude research, self-derived)"
+url = "local Claude CLI (agentic web research; no upstream endpoint)"
+category = "registry"
+engine = "claude"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "findings"
+notes = "N25. One record per key finding of a structured research run, keyed {slug(topic)}#{index}, written behind persist (default true). Model synthesis, not a fetched source: revisions carry job_id provenance only, never source_url or artifact_sha. On demand (no cron) — a topic is refreshed by re-running it with the same `topic`, which UPDATES its keys instead of forking a second set. Superseded keys from a longer prior run are not removed in v1. Costs real money per run (cost_class=claude). See docs/features/apps.md #research-a-living-knowledge-base."
+
+[[source]]
+id = "research-sources"
+app = "research"
+market = "global"
+name = "Cited sources of agentic research runs (with optional snapshots)"
+url = "the URLs a research report cites (fetched through the tiered fetcher)"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "sources"
+notes = "N25. One record per cited URL, keyed by the URL. Revisions always stamp source_url; artifact_sha ONLY when snapshot_sources actually archived the body as source-N.md, so an unarchived citation never claims to be re-derivable. Capped per run by [research] max_watched_sources (default 20) — the same cap bounds the record write, the snapshot fetch and the proposed watch, and a run that cites more reports sources_truncated. watch_sources emits POST /schedules bodies; the app creates no schedules itself. See docs/features/apps.md #research-a-living-knowledge-base."
