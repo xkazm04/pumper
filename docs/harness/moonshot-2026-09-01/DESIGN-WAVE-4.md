@@ -43,10 +43,19 @@ that order; the coordinator resolves the `EXPECTED` list.
    `managed_by = "app:<name>"`, capped by `[worker] max_app_schedules_per_run` (default 20), and
    port `research`'s `watch_sources` onto it. P's scope gains the one fan-out call site in
    `crates/server/src/worker.rs` (nothing else in that file).
+5. **Small wave-3 leftovers** (FIXES-WAVE-3 §3, §5, §6): move the event-log retention prune from
+   the outbox drain into `main.rs`'s `store_janitor` (it must run even when no other janitor knob
+   is on); add the shaping-vs-binding cross-reference paragraph to `docs/features/trigger-plugins.md`;
+   add a `docs/features/ingress.md` entry to `scripts/docs/feature-doc-map.json` mapping
+   `crates/server/src/routes/ingress.rs`. P's scope gains `crates/server/src/main.rs` (janitor only),
+   `crates/server/src/subscriptions.rs` (remove the drain-side prune), those two docs files.
 **Gate to prove:** all moved tests pass unchanged; an extractor run under `profile:` stamps
 `profile_version` and one under inline `rules` reports `repairable: false`; a research run with
 `watch_sources: true` creates capped `app:research` schedules; `[research] max_watched_sources = 3`
-in config binds without a per-run param.
+in config binds without a per-run param; the janitor prunes events older than the retention window
+with every other janitor knob off.
+
+**Migrations:** master is at **0050**; take 0051+.
 
 ### Q — N18 Elastic executor plane (XL, policy) — card JO5
 
