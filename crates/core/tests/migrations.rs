@@ -54,6 +54,11 @@ const EXPECTED_TABLES: &[&str] = &[
     "triggers",
     "watches",
     "webhook_deliveries",
+    // N03 workflow runs (0046): the declared plan, its executions, and the
+    // per-(run, step) cells that ARE the join barrier's state.
+    "workflow_defs",
+    "workflow_runs",
+    "workflow_steps",
 ];
 
 async fn table_names(pool: &SqlitePool) -> BTreeSet<String> {
