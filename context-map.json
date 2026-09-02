@@ -458,14 +458,16 @@
       "db_tables": [
         "records"
       ],
-      "description": "Two MPSV open-data apps: mpsv-ispv ingests the Czech ISPV average-earnings dataset (CZ-ISCO occupation × wage/salary sphere, median/mean/decile spread) quarterly; mpsv-vpm ingests the national vacancy register (~300k live postings) daily and aggregates it into per-role/region salary distributions, vacancy lifecycle metrics, and a salary nowcast projecting current medians from the ISPV anchor.",
+      "description": "Three MPSV open-data apps: mpsv-ciselniky mirrors the MPSV \u010d\u00edseln\u00edky (codebooks) as label tables keyed by the same codebook URI the vacancy feed publishes, so skills, education and region ids resolve to readable names; mpsv-ispv ingests the Czech ISPV average-earnings dataset (CZ-ISCO occupation × wage/salary sphere, median/mean/decile spread) quarterly; mpsv-vpm ingests the national vacancy register (~300k live postings) daily and aggregates it into per-role/region salary distributions, vacancy lifecycle metrics, and a salary nowcast projecting current medians from the ISPV anchor.",
       "entry_points": [
         "crates/apps/mpsv-ispv/src/lib.rs",
-        "crates/apps/mpsv-vpm/src/lib.rs"
+        "crates/apps/mpsv-vpm/src/lib.rs",
+        "crates/apps/mpsv-ciselniky/src/lib.rs"
       ],
       "file_paths": [
         "crates/apps/mpsv-ispv/src/lib.rs",
-        "crates/apps/mpsv-vpm/src/lib.rs"
+        "crates/apps/mpsv-vpm/src/lib.rs",
+        "crates/apps/mpsv-ciselniky/src/lib.rs"
       ],
       "group": "Market Data",
       "group_id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
