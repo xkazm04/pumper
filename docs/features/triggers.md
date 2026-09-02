@@ -4,6 +4,8 @@ Multi-stage flows (`crawl → extract → research → alert`) compose declarati
 
 ## Trigger row (`triggers` table)
 
+`bind` and `each` (N04) are optional on every kind — see [Param binding and fan-out](#param-binding-and-fan-out) below.
+
 `source_kind` = `dataset` (fires on a run's revision batch; filters `source_dataset` (`'*'` = any) + `on_change` ∈ `new|changed|removed|fresh|any`, default `fresh`) or `job` (fires on terminal state; `on_status` ∈ `succeeded|failed|any`, default `succeeded`). Target: `target_app` (must be registered; `source_app` may be a virtual namespace like `grants`), static `params` template, and the **trigger's own** `budget_usd` / `priority` / `max_attempts` (never inherited from the source).
 
 ## The `_trigger` contract (what the target app reads)
@@ -11,6 +13,49 @@ Multi-stage flows (`crawl → extract → research → alert`) compose declarati
 The target job's params = template with `_trigger` merged over it (injected wins): `{trigger_id, source_kind, app, dataset|status, kind, count, keys (capped at [triggers] key_cap, default 200), keys_truncated, source_job_id, result_summary?, depth, chain}`. `keys` is the target's **work list**, not a sample of one — `extractor` and `plugin` process exactly those records — so `keys_truncated` states whether `key_cap` cut it short rather than leaving the target to infer it by comparing `keys.len()` against `count` (which stays exact). A transform plugin cannot narrow or delete either: both are host-owned, see [trigger-plugins.md](trigger-plugins.md).
 
 **What `keys_truncated` means to a target.** A capped hop is a **partial run over a partial delta**, and the target has to say so in its own result — the host's warn log is not a machine-readable answer for whoever reads the job. `extractor` and `plugin` both read it and report `truncated: true` in their source-mode result (see [extraction.md](extraction.md)); the rest of that run is not "coming later", it is simply not in this hop, so a reader that wants the whole delta re-runs by key or lifts `key_cap`. Targets that *don't* read `keys` (they use `count`/`dataset` and query the datasets API themselves) are unaffected — their work scope was never the key list. Only the host sets the flag; a target must not synthesize it from `source.keys`, which is caller-supplied and uncapped. Full data is **never inlined** — fetch by key via the datasets API or by `source_job_id` via `GET /jobs/{id}`.
+
+## Param binding and fan-out
+
+`_trigger` is an envelope the target reads *provenance* from. It is not the target's params — apps read their own top-level keys (`crawl` reads `url`), so before N04 a trigger's `params` template had to hard-code every value and the event could not steer the job. Two optional columns close that.
+
+### `bind` — lift a value out of the event into the target's params
+
+```json
+{
+  "source_kind": "external",
+  "source_app": "<ingress source id>",
+  "target_app": "crawl",
+  "params": { "max_pages": 200 },
+  "bind": { "url": "/_trigger/payload/repository/html_url" }
+}
+```
+
+- A map of `{target param name → JSON pointer}` (RFC 6901: starts with `/`). Pointers resolve against the **`{template, _trigger}` view** — the same object `merged_params` produces — so `/_trigger/...` reads the event and `/max_pages` reads the template.
+- Resolution happens **before** the target-schema door, so a bound param is validated exactly like a templated one and a bad bind shows up as `bad_params` if the value is the wrong shape.
+- Every pointer reads the same **pre-bind** view, so binds cannot read each other's output and the result does not depend on map order.
+- A pointer that resolves to nothing does **not** enqueue: it records the `bind_miss` decision naming the param and the pointer. Firing anyway would have run the target with the static template's stale value, which is what made "the event steers this job" unfalsifiable.
+- Refused at create (400): a pointer in the dotted `$.path` form (that is the **filter** grammar, not this one), and `_trigger` as a bind target — the envelope carries the `depth`/`chain` cycle guards, which a trigger author may not forge, the same authority a sandboxed transform is denied.
+
+### `each` — one job per record
+
+```json
+{ "each": "/_trigger/payload/records", "bind": { "url": "/_trigger/item/url" } }
+```
+
+- A JSON pointer to an **array** in that same view. One hop per element, each carrying `_trigger.item`, `_trigger.item_index`, `_trigger.fan_out_total` and `_trigger.fan_out_truncated`.
+- Capped by `[triggers] fan_out_cap` (default **50**). `fan_out_total` stays **exact** while the hop list is capped — the `keys_truncated` contract one level up: a partial fan-out nobody declares is a silent partial run.
+- Idempotency key is the batch key plus the element index (`…:i:{index}`), so element N is not suppressed as a redelivery of element 0.
+- Not valid for `source_kind: "job"` (400): a terminal-job envelope carries a fixed scalar summary, never an array.
+- A pointer that misses, or that lands on something that is not an array, is a `bind_miss`. An **empty** array is not an error — it is zero hops, recorded as `fan_out_empty` so "I wired it and nothing happened" still has an answer.
+
+### Config
+
+```toml
+[triggers]
+fan_out_cap = 50   # max hops ONE event may fan out into via `each`
+```
+
+**Not in v1**: `${...}` string templating (a bind lifts a whole value, it does not interpolate one into a string), binding *into* nested arrays, and a bind that computes rather than copies.
 
 ## Guarantees
 
@@ -22,6 +67,7 @@ The target job's params = template with `_trigger` merged over it (injected wins
   | Dataset hop (saved-search view materialization) | `trig:{trigger_id}:{source_job_id}:view:{saved_search_id}:ds:{dataset}` |
   | Terminal-job hop | `trig:{trigger_id}:{source_job_id}` |
   | External (ingress) hop | `trig:{trigger_id}:{event_id}` |
+| Any of the above under `each` | that key + `:i:{element index}` |
 
   A materialized [saved-search view](search.md) fires its dataset triggers under the *view's* app while keeping the **source job's id** for provenance, so its key is scoped by the saved search — otherwise a view feeding the source job's own app would collide with the run's own hop. Datasets are walked in sorted order, so hop ordering within a run is stable rather than hash-random.
 - **Cycle guard**: the provenance `chain` (trigger ids) rides in `_trigger`; a repeated id skips the hop (warn log). `depth` capped by `[triggers] max_depth` (default 8).
@@ -33,7 +79,7 @@ The target job's params = template with `_trigger` merged over it (injected wins
 
 Handlers live in `crates/server/src/routes/triggers.rs`; the fire/decide logic in `crates/server/src/triggers.rs`.
 
-`GET/POST /triggers` (kind-aware validation), `DELETE /triggers/{id}`, `POST /triggers/{id}/enabled`, `POST /triggers/{id}/test` (dry-run against the most recent source job → `would_fire` + resolved params + reason; `?fire=true` enqueues for real, idempotency-bypassed), `GET /triggers/{id}/runs` (lineage **and** the decision ledger — below).
+`GET/POST /triggers` (kind-aware validation), `DELETE /triggers/{id}`, `POST /triggers/{id}/enabled`, `POST /triggers/{id}/test` (dry-run against the most recent source job → `would_fire` + `resolved_params` + reason; with `bind`/`each` it plans the **same** hops the live path would, adding `bound_params` (the bound param names) and `fan_out: {each, hops, total, truncated, cap}`, and answers `would_fire: false` with `outcome: "bind_miss"` / `"fan_out_empty"` when the plan cannot be built; `?fire=true` enqueues **every** planned hop for real, idempotency-bypassed, and returns `{fired, job, jobs}`), `GET /triggers/{id}/runs` (lineage **and** the decision ledger — below).
 
 The dry-run also returns `hooks: {unusable_plugins, incidents}` whenever the trigger has plugin hooks. `unusable_plugins` names configured hook plugins this host cannot execute — non-empty means the hop is **ungated** however `would_fire` reads, which is precisely the state a dry-run is meant to expose. `incidents` carries each hook's ledger `outcome` + `detail`, in the same vocabulary the decision ledger uses, so a hook that trapped is reported as a trap instead of as a fabricated `pass=false`.
 
@@ -62,6 +108,8 @@ Every evaluation of a trigger against one source event is recorded, fires and **
 | `cycle` / `depth` | Provenance guards (`chain`, `[triggers] max_depth`) |
 | `target_unregistered` | `target_app` is not a registered app (`detail` = the app) |
 | `bad_params` | The resolved hop params (the trigger's `params` template with the `_trigger` envelope merged over it) fail the **target** app's declared `params_schema`, so the hop was not enqueued. `detail` is the same pointer-path message `POST /apps/{name}/jobs` answers with. Fix the template — a hop that cannot pass the enqueue door was only ever going to fail on the target app |
+| `bind_miss` | A `bind` (or `each`) JSON pointer resolved to nothing — or, for `each`, to something that is not an array. The hop is **not** enqueued; `detail` names the param and the pointer. See [Param binding and fan-out](#param-binding-and-fan-out) |
+| `fan_out_empty` | `each` resolved to an **empty** array, so the event produced zero hops. Not an error — recorded because "nothing fired" with no row at all is the silence this ledger exists to end |
 | `dedup` | A job already exists for this hop's idempotency key (`detail` = the key) |
 | `enqueue_failed` | The enqueue itself errored (`detail` = the error) |
 | `eval_set_error` | The evaluation set could not be loaded, dropping **every** edge of that source event. Recorded against the sentinel `trigger_id = "*"`, since no individual trigger was reached — read it with `GET /triggers/*/runs`… which 404s, so query the table directly for now (see gaps) |
@@ -76,7 +124,7 @@ Ledger writes are **fail-open**: a write that fails is logged loudly and the hop
 
 `app` filters on `source_app` and is **validated**: an unmatchable value is a `400` naming the accepted ones, not a `200` with an empty list (which reads as "you have no triggers on that source" — the opposite answer). The accepted set is deliberately wider than the watch namespaces, because a `source_kind = "external"` trigger's `source_app` is an ingress source id: registered apps + virtual namespaces (see [events-webhooks.md § Watchable namespaces](events-webhooks.md#watch-namespaces)) + ingress source ids + `*` + every `source_app` already stored. That last term is what keeps a filter over existing rows working however the create rules tighten.
 
-`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, budget_usd?, priority?, max_attempts?, filters?, plugins?}`. The `plugins` object attaches sandboxed WASM hooks in three slots — `predicate`, `transform` and (N10) `post_enqueue`, which runs after the hop's job exists, receives its `job_id`, and gates nothing. See [trigger-plugins.md](trigger-plugins.md). `budget_usd` must be **> 0** (422 otherwise): omitting it means "no ceiling", so `0` cannot also mean "spend nothing" — and a silently-dropped `0` here would be worse than one bad job, because the value is stored on the trigger row and replayed into every hop it fires.
+`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, bind?, each?, budget_usd?, priority?, max_attempts?, filters?, plugins?}`. The `plugins` object attaches sandboxed WASM hooks in three slots — `predicate`, `transform` and (N10) `post_enqueue`, which runs after the hop's job exists, receives its `job_id`, and gates nothing. See [trigger-plugins.md](trigger-plugins.md). `budget_usd` must be **> 0** (422 otherwise): omitting it means "no ceiling", so `0` cannot also mean "spend nothing" — and a silently-dropped `0` here would be worse than one bad job, because the value is stored on the trigger row and replayed into every hop it fires.
 
 ## Evaluation-set caching
 
@@ -84,7 +132,9 @@ The set of enabled triggers for a scope — `(dataset|job, app)` or `(external, 
 
 ## Non-goals (by design)
 
-Per-record fan-out, named pipeline grouping/UI, backfill on create.
+Named pipeline grouping/UI, backfill on create. (Per-record fan-out **was** on this list; `each` is what removed it — see [Param binding and fan-out](#param-binding-and-fan-out).)
+
+`${...}` string templating stays a non-goal of a trigger: `bind` lifts a whole value out of the envelope, it does not interpolate one into a string.
 
 Fan-in/join barriers and `{{…}}` param templating are **no longer** non-goals of
 the platform — they are what [workflows.md](workflows.md) (N03) adds, as a

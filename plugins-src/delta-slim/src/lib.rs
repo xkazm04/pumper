@@ -32,6 +32,29 @@
 //! "no keys": it sends the extractor down its "every live record, up to 10,000"
 //! path. Shrinking what a WEBHOOK carries is legitimate; shrinking what a JOB
 //! does is not, and the throttle for that is `[triggers] key_cap` on the host.
+//!
+//! ## Shaping the envelope vs binding the params (N04)
+//!
+//! These are now two DISTINCT powers, and this plugin only has the first:
+//!
+//! - **Shaping** (this plugin) rewrites the `_trigger` OBJECT. Its output *is*
+//!   `params._trigger` and is merged under that one key, so it can make the
+//!   envelope smaller or differently shaped but can never put a value where the
+//!   target app actually reads it. `crawl` reads `params.url`; no transform can
+//!   write `params.url`.
+//! - **Binding** (the trigger row's `bind` map, host-side) lifts a value OUT of
+//!   the resolved `{template, _trigger}` view and INTO the target's own
+//!   top-level params, by JSON pointer, before the target-schema door.
+//!
+//! They compose in that order: this plugin runs first and its output becomes
+//! the `_trigger` half of the view, then `bind` resolves pointers against the
+//! result. So a transform that DROPS a key a `bind` points at turns the hop
+//! into a `bind_miss` -- the bind refuses rather than firing with a stale
+//! template value. If you slim an envelope a trigger binds from, keep the
+//! bound paths in `params.keep`.
+//!
+//! Per-record fan-out (`each`) is host-side for the same reason the work scope
+//! is: it decides how many JOBS exist, which is not a shaping decision.
 
 use serde_json::{json, Map, Value};
 

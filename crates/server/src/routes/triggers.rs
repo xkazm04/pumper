@@ -125,6 +125,64 @@ pub(crate) struct CreateTriggerBody {
     /// a missing plugin at fire time takes the fail-open path, loudly.
     #[schema(value_type = Object)]
     plugins: Option<pumper_core::TriggerPluginHooks>,
+    /// N04 param binding: `{"<target param>": "<JSON pointer>"}` resolved
+    /// against the `{template, _trigger}` view BEFORE the target-schema door,
+    /// so the event can steer the target's own params (`{"url":
+    /// "/_trigger/payload/repository/html_url"}`) instead of only riding under
+    /// `_trigger`. A pointer that resolves to nothing is the ledger outcome
+    /// `bind_miss` and the hop is not enqueued.
+    #[schema(value_type = Object)]
+    bind: Option<serde_json::Map<String, Value>>,
+    /// N04 per-record fan-out: a JSON pointer to an ARRAY in that same view.
+    /// One hop per element, each carrying `_trigger.item` / `item_index` /
+    /// `fan_out_total` / `fan_out_truncated`, capped by `[triggers]
+    /// fan_out_cap`.
+    each: Option<String>,
+}
+
+/// Create-time validation of `bind` / `each`.
+///
+/// The anti-pattern this closes: a pointer written in the dotted `$.path`
+/// grammar the *filters* use (`"payload.url"`) is accepted by any
+/// pointer-resolving call and then misses on every single event forever, with
+/// nothing anywhere saying the SYNTAX was wrong rather than the data absent.
+/// Syntax is decidable at create time, so it is decided at create time.
+///
+/// `_trigger` is refused as a bind target for the same reason a sandboxed
+/// transform cannot rewrite the host-owned keys: it is the envelope the cycle
+/// guards (`depth`, `chain`) and every target's provenance live in.
+pub(crate) fn validate_binding(
+    bind: Option<&serde_json::Map<String, Value>>,
+    each: Option<&str>,
+) -> Result<(), String> {
+    for (param, pointer) in bind.into_iter().flatten() {
+        if param == crate::triggers::BIND_RESERVED_PARAM {
+            return Err(format!(
+                "'{}' cannot be a bind target: it is the envelope every pointer resolves \
+                 against and the target's provenance (depth/chain) lives in",
+                crate::triggers::BIND_RESERVED_PARAM
+            ));
+        }
+        let Some(pointer) = pointer.as_str() else {
+            return Err(format!("bind '{param}' must be a JSON-pointer string"));
+        };
+        if !crate::triggers::valid_pointer(pointer) {
+            return Err(format!(
+                "bind '{param}' -> '{pointer}' is not a JSON pointer: it must be empty or \
+                 start with '/' (e.g. '/_trigger/payload/url'). The dotted '$.path' form is \
+                 the FILTER grammar, not this one"
+            ));
+        }
+    }
+    if let Some(each) = each.filter(|e| !e.is_empty()) {
+        if !crate::triggers::valid_pointer(each) {
+            return Err(format!(
+                "each '{each}' is not a JSON pointer: it must start with '/' \
+                 (e.g. '/_trigger/payload/commits')"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Create-time validation for one plugin hook: a non-empty plugin name, and
@@ -248,6 +306,20 @@ pub(crate) async fn create_trigger(
             Some(h)
         }
     };
+    // N04: pointer syntax, and `each` only where the kind's envelope can carry
+    // an array. A `job` hop's `_trigger` is a fixed scalar summary, so an
+    // `each` on one could only ever point into the trigger's own static
+    // template - which is a workflow, not a reactive edge.
+    validate_binding(body.bind.as_ref(), body.each.as_deref()).map_err(bad)?;
+    let each = body.each.as_deref().filter(|e| !e.is_empty());
+    if each.is_some() && body.source_kind == "job" {
+        return Err(bad(
+            "each is not valid for source_kind 'job': a terminal-job envelope carries a fixed \
+             scalar summary, never an array (use source_kind 'dataset' over `_trigger/keys`, or \
+             'external' over the payload)"
+                .into(),
+        ));
+    }
     let params = body.params.unwrap_or_else(|| json!({}));
     let trigger = state
         .storage
@@ -268,6 +340,8 @@ pub(crate) async fn create_trigger(
             max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
             filters,
             plugin_hooks,
+            bind: body.bind.as_ref().filter(|b| !b.is_empty()),
+            each,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(trigger)))
@@ -334,7 +408,7 @@ pub(crate) struct TestTriggerQuery {
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), TestTriggerQuery),
     responses(
-        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job}`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
+        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job, jobs}` (every planned hop; `job` is the first). With `bind`/`each` the SAME plan the live path would build is resolved, so `resolved_params` are the bound params of the first hop and `bound_params` / `fan_out: {each, hops, total, truncated, cap}` describe the rest; a plan that cannot be built answers `would_fire: false` with `outcome: \"bind_miss\"` or `\"fan_out_empty\"`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
         (status = 404, description = "Trigger not found", body = Object),
         (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = Object),
     )
@@ -460,36 +534,90 @@ pub(crate) async fn test_trigger(
             "hooks": hooks,
         })));
     };
-    let resolved_params = crate::triggers::merged_params(&trigger.params, obj);
+    // N04: the dry-run resolves the SAME plan the live path would - binding and
+    // fan-out included - because a preview that stopped at `merged_params`
+    // would show params the live hop never enqueues the moment a `bind` exists,
+    // which is the one thing this endpoint is for.
+    let hops = match crate::triggers::plan_hops(&trigger, obj, &state.config.triggers) {
+        Ok(hops) => hops,
+        Err(miss) => {
+            return Ok(Json(json!({
+                "would_fire": false,
+                "reason": miss.detail(),
+                "outcome": "bind_miss",
+                "hooks": hooks,
+            })))
+        }
+    };
+    let Some(first) = hops.first() else {
+        return Ok(Json(json!({
+            "would_fire": false,
+            "reason": format!(
+                "each '{}' resolved to an empty array - zero hops",
+                trigger.each.as_deref().unwrap_or("")
+            ),
+            "outcome": "fan_out_empty",
+            "hooks": hooks,
+        })));
+    };
+    let resolved_params = first.params.clone();
+    // Only present for a fan-out trigger, so a plain trigger's response shape is
+    // byte-for-byte what it was.
+    let fan_out = trigger.each.as_deref().map(|each| {
+        json!({
+            "each": each,
+            "hops": hops.len(),
+            "total": first.trigger_obj().get("fan_out_total").cloned(),
+            "truncated": first.trigger_obj().get("fan_out_truncated").cloned(),
+            "cap": state.config.triggers.fan_out_cap,
+        })
+    });
 
     if !query.fire {
         return Ok(Json(json!({
             "would_fire": true,
             "target_app": trigger.target_app,
             "source_job_id": source.id,
+            // The FIRST hop's params, bound exactly as the live path binds them.
             "resolved_params": resolved_params,
+            "bound_params": trigger.bind.as_ref().map(|b| {
+                b.keys().cloned().collect::<Vec<_>>()
+            }),
+            "fan_out": fan_out,
             "hooks": hooks,
         })));
     }
     // Real fire: the same params door the live fire path applies, so `?fire=true`
-    // cannot create work the trigger itself would have refused.
-    if let Err(msg) =
-        crate::mcp::validate_app_params(&state.registry, &trigger.target_app, &resolved_params)
-    {
-        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
+    // cannot create work the trigger itself would have refused. Every planned
+    // hop goes through it - a fan-out that previewed N hops must not fire one.
+    for hop in &hops {
+        if let Err(msg) =
+            crate::mcp::validate_app_params(&state.registry, &trigger.target_app, &hop.params)
+        {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
+        }
     }
     // No idempotency key so tests are repeatable.
-    let opts = EnqueueOptions {
-        params: resolved_params,
-        max_attempts: trigger.max_attempts,
-        priority: trigger.priority,
-        budget_usd: trigger.budget_usd,
-        trigger_id: Some(trigger.id.clone()),
-        ..Default::default()
-    };
-    let job = state.storage.enqueue(&trigger.target_app, opts).await?;
+    let mut jobs = Vec::with_capacity(hops.len());
+    for hop in hops {
+        let opts = EnqueueOptions {
+            params: hop.params,
+            max_attempts: trigger.max_attempts,
+            priority: trigger.priority,
+            budget_usd: trigger.budget_usd,
+            trigger_id: Some(trigger.id.clone()),
+            ..Default::default()
+        };
+        jobs.push(state.storage.enqueue(&trigger.target_app, opts).await?);
+    }
     state.notify.notify_one();
-    Ok(Json(json!({ "fired": true, "job": job })))
+    Ok(Json(json!({
+        "fired": true,
+        // `job` stays the first hop so every pre-N04 caller reads the same
+        // field; `jobs` is the whole fan-out.
+        "job": jobs.first(),
+        "jobs": jobs,
+    })))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -506,7 +634,8 @@ pub(crate) struct RunsQuery {
 /// `runs` is the job lineage (`jobs.trigger_id`) — the jobs the trigger
 /// actually enqueued. `decisions` is the ledger (`trigger_runs`): one row per
 /// evaluation of this trigger against one source event, INCLUDING the negatives
-/// (`no_change_match`, `status_mismatch`, `filter_miss`, `dedup`, `cycle`,
+/// (`no_change_match`, `status_mismatch`, `filter_miss`, `bind_miss`,
+/// `fan_out_empty`, `dedup`, `cycle`,
 /// `depth`, `target_unregistered`, `bad_params`, `predicate_veto`,
 /// `plugin_missing`, `hook_trap`, `hook_malformed`, `hook_not_executable`,
 /// `hook_host_error`, `bad_filters`, `eval_set_error`, `enqueue_failed`), which

@@ -27,6 +27,8 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger");
@@ -122,6 +124,8 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
             max_attempts: 1,
             filters: Some(&["$.ref:eq:refs/heads/main".to_string()]),
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create external trigger");
@@ -146,6 +150,8 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create wildcard trigger");
@@ -378,6 +384,8 @@ async fn trigger_plugin_hooks_roundtrip() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: Some(&hooks),
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger with hooks");
@@ -421,6 +429,8 @@ async fn trigger_plugin_hooks_roundtrip() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: Some(&empty),
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger with empty hooks");

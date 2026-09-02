@@ -455,6 +455,8 @@ async fn the_health_gate_runs_before_the_watch_and_trigger_hooks() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

@@ -1550,11 +1550,18 @@ impl Storage {
             .plugin_hooks
             .filter(|h| h.predicate.is_some() || h.transform.is_some() || h.post_enqueue.is_some())
             .map(|h| serde_json::to_string(h).unwrap_or_else(|_| "{}".into()));
+        // NULL when the map is empty — an empty bind map is no binding at all,
+        // and storing `{}` would make "declared, binds nothing" indistinguishable
+        // from "never declared" in every read of this row.
+        let bind_json = t
+            .bind
+            .filter(|b| !b.is_empty())
+            .map(|b| serde_json::to_string(b).unwrap_or_else(|_| "{}".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
              on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
-             filters, plugin_hooks) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
+             filters, plugin_hooks, bind, each_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(&id)
         .bind(t.name)
@@ -1571,6 +1578,8 @@ impl Storage {
         .bind(now())
         .bind(filters_json)
         .bind(hooks_json)
+        .bind(bind_json)
+        .bind(t.each)
         .execute(&self.pool)
         .await?;
         self.bump_trigger_generation();
@@ -3390,7 +3399,7 @@ impl TryFrom<JobRow> for Job {
 
 const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
                                on_status, target_app, params, budget_usd, priority, \
-                               max_attempts, enabled, created_at, filters, plugin_hooks";
+                               max_attempts, enabled, created_at, filters, plugin_hooks,                                bind, each_path";
 
 /// One sandboxed WASM hook on a trigger: the plugin to run plus the `params`
 /// half of the `extract_v2` envelope it receives (so one module serves many
@@ -3466,6 +3475,17 @@ pub struct Trigger {
     /// Sandboxed WASM predicate/transform hooks (M15 v1). All source kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_hooks: Option<TriggerPluginHooks>,
+    /// N04 param binding: `{target param name -> JSON pointer}` resolved
+    /// against the `{template, _trigger}` view before the target-schema door,
+    /// so an event can steer the target's OWN params instead of only riding
+    /// under `_trigger`. A pointer that resolves to nothing is `bind_miss`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<serde_json::Map<String, Value>>,
+    /// N04 per-record fan-out: a JSON pointer to an array in that same view.
+    /// One hop per element (`_trigger.item`, `_trigger.item_index`), capped by
+    /// `[triggers] fan_out_cap`.
+    #[serde(rename = "each", skip_serializing_if = "Option::is_none")]
+    pub each: Option<String>,
 }
 
 impl Trigger {
@@ -3493,6 +3513,10 @@ pub struct NewTrigger<'a> {
     pub filters: Option<&'a [String]>,
     /// Sandboxed WASM predicate/transform hooks (M15 v1).
     pub plugin_hooks: Option<&'a TriggerPluginHooks>,
+    /// N04: `{target param -> JSON pointer}` lifted out of the envelope.
+    pub bind: Option<&'a serde_json::Map<String, Value>>,
+    /// N04: JSON pointer to the array to fan out over.
+    pub each: Option<&'a str>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3513,6 +3537,8 @@ struct TriggerRow {
     created_at: String,
     filters: Option<String>,
     plugin_hooks: Option<String>,
+    bind: Option<String>,
+    each_path: Option<String>,
 }
 
 impl TryFrom<TriggerRow> for Trigger {
@@ -3542,6 +3568,8 @@ impl TryFrom<TriggerRow> for Trigger {
                 .plugin_hooks
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            bind: r.bind.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            each: r.each_path,
         })
     }
 }
@@ -3647,6 +3675,18 @@ pub const TRIGGER_OUTCOMES: &[&str] = &[
     // later with a message nobody connects back to the trigger template.
     // `detail` carries the pointer-path message the enqueue door would answer.
     "bad_params",
+    // N04: a `bind` pointer resolved to nothing, so the target param it was
+    // supposed to fill would have been absent (or, worse, silently left at the
+    // template's stale value). The hop is NOT enqueued: a binding that did not
+    // bind is a broken edge, and firing it anyway is what made "the event was
+    // supposed to steer this job" unfalsifiable. `detail` names the param and
+    // the pointer that missed.
+    "bind_miss",
+    // N04: a trigger declared `each` and the array it points at was EMPTY, so
+    // the event produced zero hops. Not an error and not a miss - but recorded,
+    // because "nothing fired" with no row at all is the exact silence this
+    // ledger exists to end.
+    "fan_out_empty",
     // A job already exists for this hop's idempotency key.
     "dedup",
     // The enqueue itself failed.

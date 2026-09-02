@@ -233,6 +233,8 @@ async fn an_unidentified_replay_dedupes_instead_of_enqueuing_forever() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

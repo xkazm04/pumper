@@ -96,7 +96,8 @@ POST /triggers
   "source_app": "<ingress source id, or '*'>",
   "filters": ["$.ref:eq:refs/heads/main"],
   "target_app": "crawl",
-  "params": { "url": "https://acme.dev/docs" }
+  "params": { "max_pages": 200 },
+  "bind": { "url": "/_trigger/payload/repository/html_url" }
 }
 ```
 
@@ -108,6 +109,13 @@ POST /triggers
 - The fired job's `params._trigger` carries
   `{source_kind: "external", source_id, source_name, event_id, payload, depth, chain}` —
   the payload is inlined because ingress bodies are size-capped at the door.
+- `bind` lifts values **out** of that envelope and into the target's own
+  top-level params, so the event steers the job instead of the trigger
+  hard-coding it; `each` fans one delivery out into one job per record it
+  carries. Both are JSON pointers into the `{template, _trigger}` view, and a
+  pointer that resolves to nothing records `bind_miss` rather than firing with
+  the template's stale value. Full contract in
+  [triggers.md § Param binding and fan-out](triggers.md#param-binding-and-fan-out).
 - Cycle/depth guards, priority, `budget_usd` and `max_attempts` behave exactly
   as for dataset/job triggers (see `triggers.md`).
 
@@ -129,7 +137,9 @@ POST /triggers
    # -> { "source": { "id": "1c2d...", ... }, "secret": "8a41...e2" }
    ```
 
-3. Create the trigger — only pushes to `main` should re-crawl:
+3. Create the trigger — only pushes to `main` should re-crawl, and the URL
+   comes from the **push payload** rather than being hard-coded, so one trigger
+   on `source_app: "*"` serves every repo that points at this node:
 
    ```bash
    curl -s -X POST localhost:8088/triggers \
@@ -139,9 +149,20 @@ POST /triggers
        "source_app": "1c2d...",
        "filters": ["$.ref:eq:refs/heads/main"],
        "target_app": "crawl",
-       "params": { "url": "https://acme.dev/docs", "max_pages": 200 }
+       "params": { "max_pages": 200 },
+       "bind": { "url": "/_trigger/payload/repository/html_url" }
      }'
    ```
+
+   `bind` resolves before the target-schema door. If a delivery arrives without
+   `repository.html_url`, the hop is **not** enqueued and the ledger
+   (`GET /triggers/{id}/runs`) records `bind_miss` naming the pointer — the job
+   never runs against a stale hard-coded URL.
+
+   To crawl one page **per commit** instead of the repository root, add
+   `"each": "/_trigger/payload/commits"` and bind from the element:
+   `"bind": { "url": "/_trigger/item/url" }`. That fires one `crawl` job per
+   commit, capped by `[triggers] fan_out_cap`.
 
 4. In the GitHub repo: **Settings → Webhooks → Add webhook** with
    - Payload URL: `https://<your-host>/ingest/1c2d...`
@@ -152,9 +173,9 @@ POST /triggers
    — pumper verifies that header directly, no relay needed.
 
 5. Push to `main`. The delivery lands as an `external` event on `GET /events`,
-   the trigger matches `$.ref`, and a `crawl` job is enqueued with the push
-   payload in `params._trigger.payload`. Pushes to other branches emit the
-   event but fire nothing.
+   the trigger matches `$.ref`, and a `crawl` job is enqueued with `params.url`
+   **bound from the payload** and the whole push in `params._trigger.payload`.
+   Pushes to other branches emit the event but fire nothing.
 
 ## Config reference
 

@@ -798,6 +798,11 @@ pub struct TriggersConfig {
     pub max_depth: u32,
     /// Max keys inlined into `params._trigger.keys` (`count` stays exact).
     pub key_cap: usize,
+    /// N04: max hops ONE source event may fan out into via a trigger's `each`
+    /// pointer. Elements past the cap are not enqueued and the hops that were
+    /// say so (`_trigger.fan_out_truncated`), the `keys_truncated` precedent —
+    /// a partial fan-out nobody declares is a silent partial run.
+    pub fan_out_cap: usize,
 }
 
 impl Default for TriggersConfig {
@@ -805,6 +810,7 @@ impl Default for TriggersConfig {
         Self {
             max_depth: 8,
             key_cap: 200,
+            fan_out_cap: 50,
         }
     }
 }

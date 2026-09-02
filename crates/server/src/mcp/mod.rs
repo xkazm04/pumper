@@ -467,6 +467,165 @@ fn server_tools(state: &AppState) -> Vec<Value> {
             }
         }));
     }
+    // N04: the pipeline-AUTHORING tools. Everything above lets an agent run a
+    // job; these let it wire the edge that runs jobs by itself, which is a
+    // standing commitment rather than one enqueue — so all five ride
+    // `allow_enqueue`, including the two reads, because a decision ledger and a
+    // dry-run are only useful to something that can author. Appended before
+    // `fetch`, which stays LAST (the e2e inventory pins it).
+    if state.config.mcp.allow_enqueue {
+        tools.push(json!({
+            "name": "create_trigger",
+            "description": "Create a standing reactive EDGE: when a source event happens, \
+                enqueue a target app. source_kind is 'dataset' (a run's change batch), 'job' (a \
+                terminal status) or 'external' (an inbound signed webhook on /ingest). Use \
+                `bind` to steer the target's OWN params from the event — a map of {target \
+                param: JSON pointer} resolved against the {template, _trigger} view, e.g. \
+                {\"url\": \"/_trigger/payload/repository/html_url\"} — and `each` (a JSON \
+                pointer to an array) to fan ONE event out into one job per element, which then \
+                read `/_trigger/item`. A pointer that resolves to nothing does NOT enqueue: it \
+                records the `bind_miss` decision, which trigger_decisions shows. Dry-run the \
+                edge with test_trigger before you rely on it. Same door, same validation as \
+                POST /triggers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["source_kind", "source_app", "target_app"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "source_kind": { "type": "string", "enum": ["dataset", "job", "external"] },
+                    "source_app": {
+                        "type": "string",
+                        "description": "The source app or namespace; for 'external', an ingress \
+                            source id (see create_ingress_source) or '*' for any source."
+                    },
+                    "source_dataset": { "type": "string" },
+                    "on_change": {
+                        "type": "string",
+                        "enum": ["new", "changed", "removed", "fresh", "any"]
+                    },
+                    "on_status": { "type": "string", "enum": ["succeeded", "failed", "any"] },
+                    "target_app": { "type": "string" },
+                    "params": {
+                        "type": "object",
+                        "description": "Static params template. `_trigger` is merged over it, \
+                            and `bind` is applied on top of that."
+                    },
+                    "bind": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "{target param: JSON pointer}. Pointers are RFC 6901 \
+                            (start with '/'), NOT the dotted '$.path' form `filters` uses."
+                    },
+                    "each": {
+                        "type": "string",
+                        "description": "JSON pointer to an array; one job per element, capped by \
+                            the operator's [triggers] fan_out_cap. Not valid for source_kind \
+                            'job'."
+                    },
+                    "filters": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "source_kind 'external' only: '$.path:op:value' specs \
+                            ANDed against the inbound payload."
+                    },
+                    "budget_usd": { "type": "number", "exclusiveMinimum": 0 },
+                    "priority": { "type": "integer" },
+                    "max_attempts": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "test_trigger",
+            "description": "DRY-RUN one trigger against its most recent matching source job and \
+                return what it would do: would_fire, the fully resolved target params (binding \
+                and fan-out applied exactly as the live path applies them), the fan-out shape \
+                when `each` is set, and any hook incidents. Nothing is enqueued unless you pass \
+                fire: true, which enqueues every planned hop with the idempotency key bypassed \
+                (so it is repeatable) and is refused if the resolved params fail the target \
+                app's schema. External triggers have no source job to preview — exercise those \
+                by POSTing a signed event to /ingest/{source}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["trigger_id"],
+                "properties": {
+                    "trigger_id": { "type": "string" },
+                    "fire": {
+                        "type": "boolean",
+                        "description": "Actually enqueue the planned hops (default false)."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "trigger_decisions",
+            "description": "Why an edge did or did not fire: one page of the DECISION LEDGER for \
+                one trigger, newest first, plus the jobs it enqueued. Every evaluation is \
+                recorded, skips included — `fired`, `bind_miss` (a bind/each pointer resolved to \
+                nothing), `fan_out_empty`, `filter_miss`, `no_change_match`, `status_mismatch`, \
+                `bad_params`, `dedup`, `cycle`, `depth`, `predicate_veto`, the hook faults, \
+                `target_unregistered`, `enqueue_failed`. This is the tool that answers 'I wired \
+                it and nothing happened'. Page with the returned next_cursor.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["trigger_id"],
+                "properties": {
+                    "trigger_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "cursor": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "create_watch",
+            "description": "Subscribe an external destination to a dataset's changes: every new \
+                or changed record under app/dataset is delivered to `url` (sink 'webhook', the \
+                default, or 'slack'), appended to data/sinks/<id>.ndjson (sink 'file'), or run \
+                through an installed WASM connector (sink 'plugin:<name>'). `app` is the \
+                NAMESPACE records land under, which is not always the app that produced them \
+                (grant sources publish into 'grants'); an (app, dataset) pair that could never \
+                fire is refused with the namespace that would. Same door as POST /watches.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["app"],
+                "properties": {
+                    "app": { "type": "string" },
+                    "dataset": { "type": "string", "description": "'*' (default) = every dataset." },
+                    "url": { "type": "string" },
+                    "secret": {
+                        "type": "string",
+                        "description": "Delivery bodies are HMAC-SHA256 signed with it."
+                    },
+                    "sink": { "type": "string", "description": "webhook | file | slack | plugin:<name>" }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "create_ingress_source",
+            "description": "Create a named credential an EXTERNAL system can POST signed events \
+                to at /ingest/{id}, which is what a source_kind 'external' trigger reacts to. \
+                The signing secret is returned by this call and NEVER again — hand it to the \
+                sender now or delete the source and make another. GitHub-style \
+                x-hub-signature-256 is accepted as-is. The CRUD works while [ingress] enabled = \
+                false, so sources can be staged before the operator flips the switch; until \
+                then /ingest returns 409.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "secret": {
+                        "type": "string",
+                        "description": "Bring your own signing secret; omitted = generated and \
+                            returned once."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
     // N15 (appended last, per the wave-2 shared-surface rule). Advertised
     // unconditionally: the token, not a config switch, is what makes it usable,
     // and hiding it would leave the self-hosted subprocess unable to discover
@@ -559,6 +718,28 @@ async fn tools_call(
             "approving live transactions is disabled on this MCP surface — the operator must \
              set BOTH [mcp] allow_approve = true and [transact] allow_live = true. Nothing \
              was submitted."
+                .to_string(),
+        ),
+        // N04: the pipeline-authoring tools, appended before `fetch`.
+        "create_trigger" if state.config.mcp.allow_enqueue => {
+            tool_create_trigger(state, &args).await
+        }
+        "test_trigger" if state.config.mcp.allow_enqueue => tool_test_trigger(state, &args).await,
+        "trigger_decisions" if state.config.mcp.allow_enqueue => {
+            tool_trigger_decisions(state, &args).await
+        }
+        "create_watch" if state.config.mcp.allow_enqueue => tool_create_watch(state, &args).await,
+        "create_ingress_source" if state.config.mcp.allow_enqueue => {
+            tool_create_ingress_source(state, &args).await
+        }
+        "create_trigger"
+        | "test_trigger"
+        | "trigger_decisions"
+        | "create_watch"
+        | "create_ingress_source" => Err(
+            "authoring reactive pipelines is disabled on this MCP surface — the operator must \
+             set [mcp] allow_enqueue = true. A trigger is a STANDING commitment to enqueue \
+             work, so it rides the same switch as a single enqueue"
                 .to_string(),
         ),
         // N15, appended last per the wave-2 shared-surface rule.
@@ -1162,6 +1343,118 @@ async fn tool_approve_transaction(state: &AppState, args: &Value) -> Result<Valu
         "note": "the parked job was released; it re-probes the live page and submits only if \
                  it still hashes to the approved evidence. Poll it with wait_job.",
     }))
+}
+
+// -- N04: the pipeline-authoring tools ---------------------------------------
+
+/// Turns one HTTP handler's refusal into a readable tool error.
+///
+/// The status is carried into the text rather than dropped, because an agent
+/// that cannot tell "unknown target app" (404) from "invalid on_change" (400)
+/// from "budget_usd must be > 0" (422) will retry the wrong half of its body.
+fn door_error(e: crate::routes::ApiError) -> String {
+    let crate::routes::ApiError(status, message) = e;
+    format!("[{}] {message}", status.as_u16())
+}
+
+/// Deserializes an agent's `arguments` into one of the HTTP request bodies.
+///
+/// The bodies ARE the schema: reusing them is what makes "same door, same
+/// validation" true rather than aspirational, and a field the REST surface
+/// gains is a field this tool gains with it.
+fn tool_body<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, String> {
+    serde_json::from_value(args.clone()).map_err(|e| format!("invalid arguments: {e}"))
+}
+
+/// The `create_trigger` tool (N04): authors one reactive edge through the same
+/// handler `POST /triggers` runs — kind-aware validation, the pointer-syntax
+/// check on `bind`/`each`, the `budget_usd > 0` floor, all of it.
+async fn tool_create_trigger(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateTriggerBody = tool_body(args)?;
+    let (_, axum::Json(trigger)) =
+        crate::routes::create_trigger(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    Ok(json!({
+        "created": true,
+        "trigger": trigger,
+        "note": "the edge is live. Dry-run it with test_trigger, and read why it did or did \
+                 not fire with trigger_decisions.",
+    }))
+}
+
+/// The `test_trigger` tool (N04): the dry-run, wrapped.
+async fn tool_test_trigger(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "trigger_id")?.to_string();
+    let fire = args.get("fire").and_then(Value::as_bool).unwrap_or(false);
+    let query: crate::routes::TestTriggerQuery = tool_body(&json!({ "fire": fire }))?;
+    let axum::Json(out) = crate::routes::test_trigger(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(query),
+    )
+    .await
+    .map_err(door_error)?;
+    Ok(out)
+}
+
+/// The `trigger_decisions` tool (N04): one page of the ledger.
+async fn tool_trigger_decisions(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "trigger_id")?.to_string();
+    let mut q = serde_json::Map::new();
+    if let Some(limit) = args.get("limit") {
+        q.insert("limit".into(), limit.clone());
+    }
+    if let Some(cursor) = args.get("cursor") {
+        q.insert("cursor".into(), cursor.clone());
+    }
+    let query: crate::routes::RunsQuery = tool_body(&Value::Object(q))?;
+    let axum::Json(out) = crate::routes::trigger_runs(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(query),
+    )
+    .await
+    .map_err(door_error)?;
+    Ok(out)
+}
+
+/// The `create_watch` tool (N04): a dataset subscription, through the same
+/// namespace gate `POST /watches` applies — so an agent cannot create the
+/// `(app, dataset)` pair that could never fire and that the HTTP door refuses.
+async fn tool_create_watch(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateWatchBody = tool_body(args)?;
+    let (_, axum::Json(watch)) =
+        crate::routes::create_watch(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    Ok(json!({ "created": true, "watch": watch }))
+}
+
+/// The `create_ingress_source` tool (N04): the secret is in the response and
+/// nowhere else, ever again — exactly as `POST /ingress/sources` behaves.
+async fn tool_create_ingress_source(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateIngressSourceBody = tool_body(args)?;
+    let (_, axum::Json(mut out)) =
+        crate::routes::create_ingress_source(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    if let Value::Object(map) = &mut out {
+        map.insert(
+            "note".into(),
+            Value::String(
+                "this is the ONLY time the secret is returned — hand it to the sender now. \
+                 The sender POSTs signed bodies to /ingest/{source.id}; a source_kind \
+                 'external' trigger on that id then reacts to them."
+                    .into(),
+            ),
+        );
+        map.insert(
+            "ingress_enabled".into(),
+            Value::Bool(state.config.ingress.enabled),
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
