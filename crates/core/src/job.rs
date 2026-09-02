@@ -8,6 +8,13 @@ use uuid::Uuid;
 pub enum JobStatus {
     Queued,
     Running,
+    /// Parked on the outside world: the app called
+    /// [`crate::AppContext::await_input`], its checkpoint was forced, and its
+    /// worker permit was released. Non-terminal — `GET /jobs/{id}/stream` stays
+    /// open, the schedule slot stays held — and it leaves the state only through
+    /// `POST /jobs/{id}/resume` (back to `queued`, with attempt headroom) or the
+    /// `waiting_expires_at` sweep (to `failed`).
+    Waiting,
     Succeeded,
     Failed,
     Cancelled,
@@ -18,6 +25,7 @@ impl JobStatus {
         match self {
             JobStatus::Queued => "queued",
             JobStatus::Running => "running",
+            JobStatus::Waiting => "waiting",
             JobStatus::Succeeded => "succeeded",
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
@@ -28,6 +36,7 @@ impl JobStatus {
         match s {
             "queued" => Some(JobStatus::Queued),
             "running" => Some(JobStatus::Running),
+            "waiting" => Some(JobStatus::Waiting),
             "succeeded" => Some(JobStatus::Succeeded),
             "failed" => Some(JobStatus::Failed),
             "cancelled" => Some(JobStatus::Cancelled),
@@ -69,6 +78,25 @@ pub struct Job {
     pub trigger_id: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// What a `waiting` job asked the outside world for — the app's own JSON
+    /// request, verbatim (`{kind, ...}` is the convention, nothing is imposed).
+    /// `None` on a job that has never parked.
+    pub input_request: Option<Value>,
+    /// When this job entered `waiting`. Survives the resume, so "how long did
+    /// the human take?" is answerable from the row.
+    pub waiting_since: Option<DateTime<Utc>>,
+    /// When an unresumed wait becomes a permanent failure. `None` = wait
+    /// forever (the default: `[waiting] expiry_secs = 0`).
+    pub waiting_expires_at: Option<DateTime<Utc>>,
+    /// The input `POST /jobs/{id}/resume` stored, handed to the resumed attempt
+    /// as `ctx.restore_input()`.
+    ///
+    /// **Never serialized**, for the same reason as `callback_secret`: the
+    /// payloads this field exists to carry are approvals, one-time codes and
+    /// credentials handed to a parked job, and `GET /jobs` is an unauthenticated
+    /// read on a default install.
+    #[serde(skip_serializing)]
+    pub resumed_input: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -79,9 +107,10 @@ pub struct Job {
 mod tests {
     use super::JobStatus;
 
-    const ALL: [JobStatus; 5] = [
+    const ALL: [JobStatus; 6] = [
         JobStatus::Queued,
         JobStatus::Running,
+        JobStatus::Waiting,
         JobStatus::Succeeded,
         JobStatus::Failed,
         JobStatus::Cancelled,
@@ -94,6 +123,22 @@ mod tests {
         assert!(JobStatus::Cancelled.is_terminal());
         assert!(!JobStatus::Queued.is_terminal());
         assert!(!JobStatus::Running.is_terminal());
+        assert!(!JobStatus::Waiting.is_terminal());
+    }
+
+    /// The anti-pattern: `waiting` classified terminal because it is "not
+    /// running". A parked job is *mid-run* — its checkpoint is live, its
+    /// schedule slot is held, and `GET /jobs/{id}/stream` must stay open until
+    /// it really ends. Terminality here would close the stream, fire the
+    /// terminal triggers and dispatch the result callback on a job that has not
+    /// produced a result.
+    #[test]
+    fn waiting_is_non_terminal_not_a_sixth_ending() {
+        assert!(!JobStatus::Waiting.is_terminal());
+        assert_eq!(JobStatus::parse("waiting"), Some(JobStatus::Waiting));
+        assert_eq!(JobStatus::Waiting.as_str(), "waiting");
+        let terminal: Vec<_> = ALL.iter().filter(|s| s.is_terminal()).collect();
+        assert_eq!(terminal.len(), 3, "adding `waiting` must not add an ending");
     }
 
     /// Meta-test: the string-literal terminal predicate that the SSE and trigger

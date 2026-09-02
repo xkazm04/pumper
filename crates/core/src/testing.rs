@@ -357,6 +357,7 @@ pub struct TestContext<'a> {
     artifacts_dir: Option<std::path::PathBuf>,
     research_cache_ttl_secs: u64,
     restored: Option<Value>,
+    resumed_input: Option<Value>,
     checkpoints: Option<Arc<dyn CheckpointSink>>,
     vcr: crate::vcr::Vcr,
 }
@@ -373,6 +374,7 @@ impl<'a> TestContext<'a> {
             artifacts_dir: None,
             research_cache_ttl_secs: 0,
             restored: None,
+            resumed_input: None,
             checkpoints: None,
             vcr: crate::vcr::Vcr::Off,
         }
@@ -390,6 +392,13 @@ impl<'a> TestContext<'a> {
     /// Runs the context in a VCR mode (default: `Off`).
     pub fn vcr(mut self, vcr: crate::vcr::Vcr) -> Self {
         self.vcr = vcr;
+        self
+    }
+
+    /// Hands the context the input a `POST /jobs/{id}/resume` supplied, as the
+    /// worker does when it re-claims a job that had parked on `await_input`.
+    pub fn resumed_input(mut self, input: Value) -> Self {
+        self.resumed_input = Some(input);
         self
     }
 
@@ -459,6 +468,7 @@ impl<'a> TestContext<'a> {
                 .checkpoints
                 .unwrap_or_else(|| Arc::new(NoCheckpoints) as Arc<dyn CheckpointSink>),
             restored: self.restored,
+            resumed_input: self.resumed_input,
             vcr: self.vcr,
             artifacts_dir: self
                 .artifacts_dir

@@ -35,6 +35,7 @@ pub struct Config {
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
+    pub waiting: WaitingConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -1710,6 +1711,43 @@ impl Default for SearchConfig {
             enabled: true,
             dir: "data/search-index".into(),
             max_materialize_results: 500,
+        }
+    }
+}
+
+/// `[waiting]` — the deadline policy for jobs parked on external input (N02).
+///
+/// A job enters [`crate::JobStatus::Waiting`] when its app calls
+/// `ctx.await_input(..)`, and leaves it through `POST /jobs/{id}/resume`. That
+/// is a wait on a *human or agent*, so the only question this section answers is
+/// how long the runtime is willing to hold the row before declaring the answer
+/// never came.
+///
+/// **Default is `0` = wait forever**, which is the byte-for-byte behaviour of a
+/// build without this feature: nothing sweeps, nothing expires, and a parked job
+/// stays parked until somebody answers it or cancels it. An operator opts into a
+/// deadline deliberately, because the alternative default — a timer that fails
+/// approvals nobody got to over a weekend — is the kind of silent data-losing
+/// policy this repo makes opt-in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WaitingConfig {
+    /// How long a parked job may wait before the expiry sweep fails it
+    /// permanently (`error: "awaited input not provided ..."`, through
+    /// `finalize`, so callbacks and terminal triggers fire like any other
+    /// permanent failure). `0` = no deadline.
+    pub expiry_secs: u64,
+    /// Rows one expiry sweep will fail before stopping. The sweep piggybacks the
+    /// scheduler tick, so it is bounded per pass rather than proportional to how
+    /// long the deadline was ignored; the remainder is taken by the next tick.
+    pub expire_batch: i64,
+}
+
+impl Default for WaitingConfig {
+    fn default() -> Self {
+        Self {
+            expiry_secs: 0,
+            expire_batch: 100,
         }
     }
 }
