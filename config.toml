@@ -227,9 +227,24 @@ dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /
 fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
 max_memory_mb = 64          # hard linear-memory cap per call (per instance)
 max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU core); bounds aggregate wasm memory + blocking-pool use
-# app_dir = "data/apps"     # OPTIONAL (M28 v1): dir scanned at boot for dynamic-app .wasm modules exporting describe().
-#                           # Discovered apps are LISTED read-only in GET /apps (dynamic: true, runnable: false) and
-#                           # enqueue rejects them with 409 — running them needs the component-model host (next slice).
+# app_dir = "data/apps"     # OPTIONAL: dir scanned at boot for dynamic-app .wasm modules.
+#                           # A describe-only CORE module is LISTED read-only in GET /apps (dynamic: true,
+#                           # runnable: false) — it exports a manifest and no run, so there is nothing to
+#                           # execute. A COMPONENT exporting the pumper:app@0.1.0 world becomes a runnable
+#                           # app when [wasm_apps] below is enabled. See docs/features/apps.md.
+
+# Running the components found in [plugins] app_dir. OFF by default: giving
+# third-party code fetch and dataset-write authority is an operator decision,
+# so a module already on disk stays listed-but-inert until this is flipped.
+[wasm_apps]
+enabled = false
+# fuel_per_job = 2000000000  # whole-job CPU instruction ceiling (never re-armed per call)
+# yield_interval = 10000000  # fuel between yields back to the runtime; what makes a run cancellable
+# max_memory_mb = 128        # per live instance; aggregate ceiling = max_concurrent x this
+# max_wall_secs = 900        # wall clock around the run, re-checked at every host import
+# max_concurrent = 0         # concurrent RUNS (0 = one per CPU core); bounds live wasm memory
+# max_host_calls = 10000     # a guest looping on fetch burns host time, not fuel — this bounds it
+# max_payload_bytes = 33554432  # per host call, refused (never truncated) when exceeded
 
 # Embedded full-text search (Tantivy) — in-process, no external service.
 [search]

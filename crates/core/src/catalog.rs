@@ -60,6 +60,16 @@ pub struct Source {
     pub dataset: String,
     #[serde(default)]
     pub notes: String,
+    /// SHA-256 of the WASM module that serves this source, lowercase hex.
+    ///
+    /// Required (and only meaningful) when `engine = "wasm"`: the dynamic-app
+    /// loader hashes the module's bytes and **refuses to register an app whose
+    /// hash does not match this pin** (see [`module_pin`]). That makes the
+    /// catalog row the deployment record — a module swapped on disk under the
+    /// same filename stops being runnable instead of silently becoming a
+    /// different app writing into the same dataset's history.
+    #[serde(default)]
+    pub module_sha256: String,
     /// Declared data contract (`[source.contract]`) — the producer-side floor
     /// this source's output must clear at publish time. `None` = no contract,
     /// nothing checked. See [`Contract`].
@@ -83,7 +93,7 @@ pub const CADENCES: &[&str] = &[
     "annual",
 ];
 /// Closed vocabulary for `engine`.
-pub const ENGINES: &[&str] = &["http", "browser", "claude", "bulk"];
+pub const ENGINES: &[&str] = &["http", "browser", "claude", "bulk", "wasm"];
 /// Closed vocabulary for `access`.
 pub const ACCESS_KINDS: &[&str] = &["key-free", "api-key", "bulk", "scrape"];
 /// Closed vocabulary for `category` — the browsing axis.
@@ -96,6 +106,79 @@ pub const CATEGORIES: &[&str] = &[
 ];
 /// Top of the `confidence` scale (1-5; 0 = not declared).
 pub const MAX_CONFIDENCE: u8 = 5;
+
+/// The `engine` value that makes a `[[source]]` row a **dynamic WASM app**:
+/// the unit that serves it is a component in `[plugins] app_dir`, not a
+/// compiled-in Rust crate.
+pub const WASM_ENGINE: &str = "wasm";
+
+/// Length of a lowercase-hex SHA-256 digest.
+const SHA256_HEX_LEN: usize = 64;
+
+/// Whether `value` is a well-formed lowercase-hex SHA-256 digest.
+///
+/// Deliberately strict about case: the loader compares pins by string equality
+/// after trimming, and "the same hash in two spellings" is exactly the kind of
+/// near-miss that turns a pin into decoration.
+pub fn is_sha256_hex(value: &str) -> bool {
+    value.len() == SHA256_HEX_LEN && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The catalog finding for a row's `(engine, module_sha256)` pair, or `None`
+/// when the pair is coherent.
+///
+/// Two ways a row lies about a module, and both used to parse cleanly:
+/// an `engine = "wasm"` row with no `module_sha256` claims a deployment record
+/// it does not have (any module that happens to carry the filename would run),
+/// and a `module_sha256` on an `http`/`browser` row pins nothing at all — no
+/// loader ever reads it, so it is a note that looks like a guard.
+pub fn wasm_pin_finding(id: &str, engine: &str, module_sha256: &str) -> Option<String> {
+    let engine = engine.trim();
+    let hash = module_sha256.trim();
+    if engine == WASM_ENGINE {
+        if hash.is_empty() {
+            return Some(format!(
+                "source '{id}': engine = \"wasm\" requires module_sha256 (the lowercase-hex SHA-256 of the component the loader must find on disk)"
+            ));
+        }
+        if !is_sha256_hex(hash) {
+            return Some(format!(
+                "source '{id}': module_sha256 = {hash:?} is not a lowercase-hex SHA-256 digest"
+            ));
+        }
+        return None;
+    }
+    (!hash.is_empty()).then(|| {
+        format!(
+            "source '{id}': module_sha256 is set but engine = {engine:?}, so nothing ever checks it — only engine = \"wasm\" rows are hash-pinned"
+        )
+    })
+}
+
+/// What a module's actual digest says about its catalog pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModulePin {
+    /// No catalog row pins this module: it is loadable, but nothing vouches
+    /// for which build it is.
+    Unpinned,
+    /// The bytes on disk hash to exactly what the catalog declared.
+    Match,
+    /// The catalog declares a different build. The loader must refuse to
+    /// register the app rather than run an unknown one under a pinned name.
+    Mismatch,
+}
+
+/// Judges a module's `actual` digest against the catalog `expected` pin.
+///
+/// Case- and whitespace-insensitive on the *expected* side only, because a pin
+/// is hand-written into TOML while `actual` is computed here.
+pub fn module_pin(expected: Option<&str>, actual: &str) -> ModulePin {
+    match expected.map(str::trim).filter(|e| !e.is_empty()) {
+        None => ModulePin::Unpinned,
+        Some(expected) if expected.eq_ignore_ascii_case(actual.trim()) => ModulePin::Match,
+        Some(_) => ModulePin::Mismatch,
+    }
+}
 
 impl Source {
     /// A source is on the scheduler iff it declares a non-empty cron.
@@ -387,6 +470,12 @@ impl Catalog {
             check("engine", &source.engine, ENGINES, true);
             check("access", &source.access, ACCESS_KINDS, true);
             check("category", &source.category, CATEGORIES, true);
+            // Not a closed vocabulary but the same class of defect: a
+            // declaration whose consumer can never read it (see
+            // `wasm_pin_finding`).
+            if let Some(finding) = wasm_pin_finding(id, &source.engine, &source.module_sha256) {
+                out.push(finding);
+            }
             // 0 is "not declared" (the serde default for an absent field);
             // anything above the scale is a typo, not a stronger claim.
             if source.confidence > MAX_CONFIDENCE {
@@ -752,6 +841,7 @@ mod tests {
             confidence: 0,
             dataset: String::new(),
             notes: String::new(),
+            module_sha256: String::new(),
             contract: None,
         };
         assert_eq!(src("daily").cadence_secs(), Some(86_400));
@@ -1243,5 +1333,75 @@ access = \"oauth\"");
         let s = sched("hand", "my-experiment", "0 0 1 * * *", true, false);
         let plan = cat(LIVE_DAILY).reconcile_plan(&[s]);
         assert!(plan.disable.is_empty() && plan.orphan.is_empty() && plan.update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wasm_pin_tests {
+    use super::{module_pin, wasm_pin_finding, Catalog, ModulePin};
+
+    const SHA: &str = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+
+    /// A `wasm` row with no pin is a deployment record that records nothing:
+    /// any module that happens to land under the filename would run as this
+    /// source. It must be a catalog finding, not a clean parse.
+    #[test]
+    fn a_wasm_row_without_a_module_hash_is_a_finding_not_a_clean_row() {
+        let finding = wasm_pin_finding("quotes", "wasm", "").expect("must be a finding");
+        assert!(finding.contains("module_sha256"), "{finding}");
+        assert!(wasm_pin_finding("quotes", "wasm", SHA).is_none());
+    }
+
+    /// The mirror defect: a hash on a row no loader ever hashes.
+    #[test]
+    fn a_module_hash_on_a_non_wasm_row_is_a_finding_not_a_note() {
+        let finding = wasm_pin_finding("grants-gov", "http", SHA).expect("must be a finding");
+        assert!(finding.contains("nothing ever checks it"), "{finding}");
+        assert!(wasm_pin_finding("grants-gov", "http", "").is_none());
+    }
+
+    /// A pin that is not a digest pins nothing — "latest" would compare unequal
+    /// to every real hash and refuse every module, which reads as a broken
+    /// loader instead of a broken row.
+    #[test]
+    fn a_pin_must_be_a_sha256_not_any_string() {
+        assert!(wasm_pin_finding("quotes", "wasm", "latest").is_some());
+        assert!(wasm_pin_finding("quotes", "wasm", &SHA[..63]).is_some());
+        assert!(wasm_pin_finding("quotes", "wasm", &format!("{SHA}z")).is_some());
+    }
+
+    /// The loader's verdict: an unpinned module loads, a matching one loads,
+    /// and a mismatch is REFUSED rather than run under the pinned name.
+    #[test]
+    fn a_mismatched_module_is_refused_not_loaded_as_the_pinned_app() {
+        assert_eq!(module_pin(None, SHA), ModulePin::Unpinned);
+        assert_eq!(module_pin(Some(""), SHA), ModulePin::Unpinned);
+        assert_eq!(module_pin(Some(SHA), SHA), ModulePin::Match);
+        assert_eq!(
+            module_pin(Some(&SHA.to_uppercase()), SHA),
+            ModulePin::Match,
+            "a hand-typed uppercase pin is the same build"
+        );
+        let other = SHA.replace("aa11", "bb22");
+        assert_eq!(module_pin(Some(&other), SHA), ModulePin::Mismatch);
+    }
+
+    /// The vocabulary gate carries the pin findings too, so a bad row fails to
+    /// parse instead of being believed.
+    #[test]
+    fn parse_rejects_a_wasm_row_without_a_pin() {
+        let raw = r#"
+[[source]]
+id = "quotes"
+name = "Quotes"
+status = "planned"
+engine = "wasm"
+"#;
+        let err = Catalog::parse(raw).expect_err("must not parse");
+        assert!(err.to_string().contains("module_sha256"), "{err}");
+
+        let ok = format!("{raw}module_sha256 = \"{SHA}\"\n");
+        let catalog = Catalog::parse(&ok).expect("a pinned wasm row parses");
+        assert_eq!(catalog.sources[0].module_sha256, SHA);
     }
 }

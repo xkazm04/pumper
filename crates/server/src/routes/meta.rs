@@ -1065,11 +1065,30 @@ pub(crate) async fn list_apps(
                     })
                 })
                 .collect();
-            // Dynamic WASM apps (M28 v1): appended after the compiled-in apps,
-            // carrying `dynamic: true, runnable: false` + a reason — visible so
-            // an operator can see what `[plugins] app_dir` picked up, but never
-            // enqueueable (the enqueue handler rejects them with the same reason).
-            let mut apps = apps;
+            // Dynamic WASM apps: appended after the compiled-in apps, each
+            // carrying `dynamic: true` plus either the provenance of a
+            // registered component (`runnable: true`, `world`, `module_sha256`)
+            // or the reason it is not one — visible so an operator can see what
+            // `[plugins] app_dir` picked up either way.
+            //
+            // A RUNNABLE dynamic app is in the registry too (that is what makes
+            // it enqueueable), so its plain registry-derived entry is dropped
+            // here in favour of the richer dynamic one: listing the same app
+            // twice, once with and once without its module hash, is how a
+            // listing starts disagreeing with itself.
+            let dynamic_names: std::collections::HashSet<&str> = state
+                .dynamic_apps
+                .iter()
+                .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+                .collect();
+            let mut apps: Vec<_> = apps
+                .into_iter()
+                .filter(|a| {
+                    !a.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|n| dynamic_names.contains(n))
+                })
+                .collect();
             apps.extend(state.dynamic_apps.iter().cloned());
             Ok(Json(json!({ "apps": apps })))
         }

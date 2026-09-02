@@ -26,6 +26,8 @@
 //! failure semantics — trigger hooks fail OPEN (a trap/malformed output never
 //! wedges the pipeline), extraction propagates the error.
 
+pub mod app_host;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};

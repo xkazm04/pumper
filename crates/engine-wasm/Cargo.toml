@@ -8,5 +8,11 @@ pumper-core.workspace = true
 wasmtime.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Compiles the hand-written component fixture in tests/fixtures/ — the only
+# way to exercise the component host without an external wasm toolchain.
+wat = "1"
