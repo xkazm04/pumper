@@ -6,6 +6,11 @@
 -- queued for approval), but `POST /transactions/{id}/approve` answers 409 and
 -- nothing can ever reach the `submitted` state.
 --
+-- There is deliberately no `expires_at` column: the approval deadline is
+-- DERIVED (`created_at + [transact] approval_ttl_secs`) rather than frozen at
+-- staging time, so shortening the TTL retires the stale mandates already in the
+-- ledger instead of leaving them behind a deadline nobody can move.
+--
 -- `idempotency_key` is UNIQUE, and that uniqueness IS the double-submit lock:
 -- one key can only ever own one ledger row, and only a `pending` row can be
 -- approved, so a second approve on a key that already submitted matches
@@ -36,9 +41,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     -- Artifact path of the post-submit evidence bundle, relative to the
     -- committing job's artifact dir.
     receipt_path    TEXT,
-    -- Approval deadline stamped at `pending` from `[transact] approval_ttl_secs`.
-    -- NULL = never expires.
-    expires_at      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );

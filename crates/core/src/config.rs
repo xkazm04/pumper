@@ -2753,14 +2753,18 @@ impl Default for TransactConfig {
 }
 
 impl TransactConfig {
-    /// The approval deadline for a transaction staged `now`, or `None` when
-    /// `approval_ttl_secs = 0` (never expires).
+    /// The approval deadline of a transaction created at `created_at`, or
+    /// `None` when `approval_ttl_secs = 0` (never expires).
+    ///
+    /// Derived rather than stored, so the TTL is a live operator control: the
+    /// door, the sweep and the API response all compute the same deadline from
+    /// the same key.
     pub fn approval_deadline(
         &self,
-        now: chrono::DateTime<chrono::Utc>,
+        created_at: chrono::DateTime<chrono::Utc>,
     ) -> Option<chrono::DateTime<chrono::Utc>> {
         (self.approval_ttl_secs > 0)
-            .then(|| now + chrono::Duration::seconds(self.approval_ttl_secs as i64))
+            .then(|| created_at + chrono::Duration::seconds(self.approval_ttl_secs as i64))
     }
 
     /// The per-profile daily cap as the ledger's decision function wants it:

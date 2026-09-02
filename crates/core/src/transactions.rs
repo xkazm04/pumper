@@ -33,9 +33,10 @@
 // without the `storage` feature this ledger needs. Re-exported here because
 // this module is where the approval lifecycle is documented.
 pub use crate::engine::{commit_guard, evidence_digest, CommitRefusal};
-use crate::{Error, Result, Storage};
+use crate::{Error, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
+use sqlx::SqlitePool;
 
 // ── state ────────────────────────────────────────────────────────────────────
 
@@ -112,7 +113,6 @@ pub struct Transaction {
     pub approved_at: Option<DateTime<Utc>>,
     pub submitted_at: Option<DateTime<Utc>>,
     pub receipt_path: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -253,7 +253,6 @@ struct TxRow {
     approved_at: Option<String>,
     submitted_at: Option<String>,
     receipt_path: Option<String>,
-    expires_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -272,7 +271,6 @@ impl TxRow {
             approved_at: self.approved_at.as_deref().map(parse_ts).transpose()?,
             submitted_at: self.submitted_at.as_deref().map(parse_ts).transpose()?,
             receipt_path: self.receipt_path,
-            expires_at: self.expires_at.as_deref().map(parse_ts).transpose()?,
             created_at: parse_ts(&self.created_at)?,
             updated_at: parse_ts(&self.updated_at)?,
         })
@@ -280,8 +278,8 @@ impl TxRow {
 }
 
 const TX_COLUMNS: &str = "id, idempotency_key, app, job_id, profile, state, evidence_sha, \
-                          approved_by, approved_at, submitted_at, receipt_path, expires_at, \
-                          created_at, updated_at";
+                          approved_by, approved_at, submitted_at, receipt_path, created_at, \
+                          updated_at";
 
 /// What a dry-run stage hands the ledger.
 pub struct NewTransaction<'a> {
@@ -290,7 +288,6 @@ pub struct NewTransaction<'a> {
     pub job_id: Option<&'a str>,
     pub profile: Option<&'a str>,
     pub evidence_sha: &'a str,
-    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Upserts the `pending` row a dry run owes its idempotency key, returning the
@@ -302,34 +299,32 @@ pub struct NewTransaction<'a> {
 /// keeps the UNIQUE index a real lock rather than an advisory one. Only a
 /// `pending` row is refreshed with the new evidence, because re-reviewing a
 /// still-open request against newer evidence is exactly right.
-pub async fn stage_pending(storage: &Storage, new: NewTransaction<'_>) -> Result<Transaction> {
-    let pool = storage.pool();
+pub async fn stage_pending(pool: &SqlitePool, new: NewTransaction<'_>) -> Result<Transaction> {
     let now = Utc::now();
-    if let Some(existing) = by_key(storage, new.idempotency_key).await? {
+    if let Some(existing) = by_key(pool, new.idempotency_key).await? {
         if existing.state != TransactionState::Pending {
             return Ok(existing);
         }
         sqlx::query(
             "UPDATE transactions SET job_id = ?2, profile = ?3, evidence_sha = ?4, \
-             expires_at = ?5, updated_at = ?6 WHERE id = ?1 AND state = 'pending'",
+             updated_at = ?5 WHERE id = ?1 AND state = 'pending'",
         )
         .bind(&existing.id)
         .bind(new.job_id)
         .bind(new.profile)
         .bind(new.evidence_sha)
-        .bind(new.expires_at.map(ts))
         .bind(ts(now))
-        .execute(&pool)
+        .execute(pool)
         .await?;
-        return get(storage, &existing.id)
+        return get(pool, &existing.id)
             .await?
             .ok_or_else(|| Error::Parse("transaction vanished mid-stage".into()));
     }
     let id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO transactions (id, idempotency_key, app, job_id, profile, state, \
-         evidence_sha, expires_at, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8)",
+         evidence_sha, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7)",
     )
     .bind(&id)
     .bind(new.idempotency_key)
@@ -337,38 +332,37 @@ pub async fn stage_pending(storage: &Storage, new: NewTransaction<'_>) -> Result
     .bind(new.job_id)
     .bind(new.profile)
     .bind(new.evidence_sha)
-    .bind(new.expires_at.map(ts))
     .bind(ts(now))
-    .execute(&pool)
+    .execute(pool)
     .await?;
-    get(storage, &id)
+    get(pool, &id)
         .await?
         .ok_or_else(|| Error::Parse("transaction vanished after insert".into()))
 }
 
-pub async fn get(storage: &Storage, id: &str) -> Result<Option<Transaction>> {
+pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Transaction>> {
     let row: Option<TxRow> = sqlx::query_as(&format!(
         "SELECT {TX_COLUMNS} FROM transactions WHERE id = ?1"
     ))
     .bind(id)
-    .fetch_optional(&storage.pool())
+    .fetch_optional(pool)
     .await?;
     row.map(TxRow::decode).transpose()
 }
 
-pub async fn by_key(storage: &Storage, key: &str) -> Result<Option<Transaction>> {
+pub async fn by_key(pool: &SqlitePool, key: &str) -> Result<Option<Transaction>> {
     let row: Option<TxRow> = sqlx::query_as(&format!(
         "SELECT {TX_COLUMNS} FROM transactions WHERE idempotency_key = ?1"
     ))
     .bind(key)
-    .fetch_optional(&storage.pool())
+    .fetch_optional(pool)
     .await?;
     row.map(TxRow::decode).transpose()
 }
 
 /// The ledger, newest first, optionally narrowed to one state.
 pub async fn list(
-    storage: &Storage,
+    pool: &SqlitePool,
     state: Option<TransactionState>,
     limit: i64,
 ) -> Result<Vec<Transaction>> {
@@ -380,7 +374,7 @@ pub async fn list(
             ))
             .bind(s.as_str())
             .bind(limit)
-            .fetch_all(&storage.pool())
+            .fetch_all(pool)
             .await?
         }
         None => {
@@ -388,7 +382,7 @@ pub async fn list(
                 "SELECT {TX_COLUMNS} FROM transactions ORDER BY created_at DESC LIMIT ?1"
             ))
             .bind(limit)
-            .fetch_all(&storage.pool())
+            .fetch_all(pool)
             .await?
         }
     };
@@ -398,7 +392,7 @@ pub async fn list(
 /// Moves a `pending` row to `approved`, guarded on `state = 'pending'` **in
 /// SQL**. Returns `false` when the guard matched nothing — which is what makes
 /// the approve door idempotent by refusal rather than by hope.
-pub async fn mark_approved(storage: &Storage, id: &str, approved_by: Option<&str>) -> Result<bool> {
+pub async fn mark_approved(pool: &SqlitePool, id: &str, approved_by: Option<&str>) -> Result<bool> {
     let now = ts(Utc::now());
     let r = sqlx::query(
         "UPDATE transactions SET state = 'approved', approved_by = ?2, approved_at = ?3, \
@@ -407,13 +401,13 @@ pub async fn mark_approved(storage: &Storage, id: &str, approved_by: Option<&str
     .bind(id)
     .bind(approved_by)
     .bind(&now)
-    .execute(&storage.pool())
+    .execute(pool)
     .await?;
     Ok(r.rows_affected() > 0)
 }
 
 /// Moves a `pending` row to `rejected`. Same SQL guard, same reason.
-pub async fn mark_rejected(storage: &Storage, id: &str, by: Option<&str>) -> Result<bool> {
+pub async fn mark_rejected(pool: &SqlitePool, id: &str, by: Option<&str>) -> Result<bool> {
     let now = ts(Utc::now());
     let r = sqlx::query(
         "UPDATE transactions SET state = 'rejected', approved_by = ?2, approved_at = ?3, \
@@ -422,7 +416,7 @@ pub async fn mark_rejected(storage: &Storage, id: &str, by: Option<&str>) -> Res
     .bind(id)
     .bind(by)
     .bind(&now)
-    .execute(&storage.pool())
+    .execute(pool)
     .await?;
     Ok(r.rows_affected() > 0)
 }
@@ -430,7 +424,7 @@ pub async fn mark_rejected(storage: &Storage, id: &str, by: Option<&str>) -> Res
 /// Stamps the terminal `submitted` state and its receipt, guarded on
 /// `state = 'approved'`: only a run that came through an approval can claim a
 /// submission, and only once.
-pub async fn mark_submitted(storage: &Storage, id: &str, receipt_path: &str) -> Result<bool> {
+pub async fn mark_submitted(pool: &SqlitePool, id: &str, receipt_path: &str) -> Result<bool> {
     let now = ts(Utc::now());
     let r = sqlx::query(
         "UPDATE transactions SET state = 'submitted', submitted_at = ?3, receipt_path = ?2, \
@@ -439,21 +433,30 @@ pub async fn mark_submitted(storage: &Storage, id: &str, receipt_path: &str) -> 
     .bind(id)
     .bind(receipt_path)
     .bind(&now)
-    .execute(&storage.pool())
+    .execute(pool)
     .await?;
     Ok(r.rows_affected() > 0)
 }
 
-/// Expires every `pending` row whose deadline has passed, returning how many.
-/// Rows with no deadline are never swept — "no TTL" means what it says.
-pub async fn expire_due(storage: &Storage) -> Result<u64> {
-    let now = ts(Utc::now());
+/// Expires every `pending` row older than `ttl_secs`, returning how many.
+///
+/// The deadline is **derived** (`created_at + ttl`) rather than stamped at
+/// staging time, so `[transact] approval_ttl_secs` is a live operator control:
+/// shortening it retires the stale mandates already sitting in the ledger, and
+/// lengthening it does not orphan rows behind a deadline nobody can move.
+/// `ttl_secs == 0` sweeps nothing — "no TTL" means what it says.
+pub async fn expire_stale(pool: &SqlitePool, ttl_secs: u64) -> Result<u64> {
+    if ttl_secs == 0 {
+        return Ok(0);
+    }
+    let cutoff = ts(Utc::now() - chrono::Duration::seconds(ttl_secs as i64));
     let r = sqlx::query(
-        "UPDATE transactions SET state = 'expired', updated_at = ?1 \
-         WHERE state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
+        "UPDATE transactions SET state = 'expired', updated_at = ?2 \
+         WHERE state = 'pending' AND created_at <= ?1",
     )
-    .bind(&now)
-    .execute(&storage.pool())
+    .bind(&cutoff)
+    .bind(ts(Utc::now()))
+    .execute(pool)
     .await?;
     Ok(r.rows_affected())
 }
@@ -462,7 +465,7 @@ pub async fn expire_due(storage: &Storage) -> Result<u64> {
 /// to the per-profile daily cap. A profile-less flow (`None`) is counted as its
 /// own bucket, not merged with every named identity.
 pub async fn submitted_since(
-    storage: &Storage,
+    pool: &SqlitePool,
     profile: Option<&str>,
     since: DateTime<Utc>,
 ) -> Result<i64> {
@@ -475,7 +478,7 @@ pub async fn submitted_since(
             )
             .bind(p)
             .bind(since)
-            .fetch_one(&storage.pool())
+            .fetch_one(pool)
             .await?
         }
         None => {
@@ -484,7 +487,7 @@ pub async fn submitted_since(
              AND profile IS NULL AND submitted_at >= ?1",
             )
             .bind(since)
-            .fetch_one(&storage.pool())
+            .fetch_one(pool)
             .await?
         }
     };
@@ -672,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn staging_a_key_that_already_submitted_does_not_reopen_it() {
         let store = crate::testing::TempStore::new("tx-stage").await;
-        let s = &store.storage;
+        let s = &store.storage.pool();
         let row = stage_pending(
             s,
             NewTransaction {
@@ -681,7 +684,6 @@ mod tests {
                 job_id: Some("job-1"),
                 profile: Some("portal"),
                 evidence_sha: "sha-a",
-                expires_at: None,
             },
         )
         .await
@@ -702,7 +704,6 @@ mod tests {
                 job_id: Some("job-2"),
                 profile: Some("portal"),
                 evidence_sha: "sha-b",
-                expires_at: None,
             },
         )
         .await
@@ -728,53 +729,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expiry_sweep_only_touches_pending_rows_with_a_deadline() {
+    async fn expiry_sweep_only_retires_pending_rows_and_only_with_a_ttl() {
         let store = crate::testing::TempStore::new("tx-expire").await;
-        let s = &store.storage;
-        let past = Utc::now() - chrono::Duration::seconds(60);
-        let due = stage_pending(
+        let s = &store.storage.pool();
+        let open = stage_pending(
             s,
             NewTransaction {
-                idempotency_key: "due",
+                idempotency_key: "open",
                 app: "transact",
                 job_id: None,
                 profile: None,
                 evidence_sha: "sha",
-                expires_at: Some(past),
             },
         )
         .await
         .unwrap();
-        let forever = stage_pending(
+        let decided = stage_pending(
             s,
             NewTransaction {
-                idempotency_key: "forever",
+                idempotency_key: "decided",
                 app: "transact",
                 job_id: None,
                 profile: None,
                 evidence_sha: "sha",
-                expires_at: None,
             },
         )
         .await
         .unwrap();
-        assert_eq!(expire_due(s).await.unwrap(), 1);
+        assert!(mark_rejected(s, &decided.id, None).await.unwrap());
+
+        // A TTL of zero is "no deadline": nothing is swept, ever.
+        assert_eq!(expire_stale(s, 0).await.unwrap(), 0);
         assert_eq!(
-            get(s, &due.id).await.unwrap().unwrap().state,
+            get(s, &open.id).await.unwrap().unwrap().state,
+            TransactionState::Pending
+        );
+        // A TTL longer than the row's age leaves it alone.
+        assert_eq!(expire_stale(s, 3600).await.unwrap(), 0);
+        // A TTL of 0.. wait, a one-second-in-the-past cutoff retires it — and
+        // touches ONLY the pending row: a rejected decision stays rejected.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(expire_stale(s, 1).await.unwrap(), 1);
+        assert_eq!(
+            get(s, &open.id).await.unwrap().unwrap().state,
             TransactionState::Expired
         );
         assert_eq!(
-            get(s, &forever.id).await.unwrap().unwrap().state,
-            TransactionState::Pending
+            get(s, &decided.id).await.unwrap().unwrap().state,
+            TransactionState::Rejected
         );
         // An expired row is terminal: it cannot be approved back to life.
-        assert!(!mark_approved(s, &due.id, None).await.unwrap());
+        assert!(!mark_approved(s, &open.id, None).await.unwrap());
         assert_eq!(
             list(s, Some(TransactionState::Pending), 10)
                 .await
                 .unwrap()
                 .len(),
-            1
+            0
         );
         assert_eq!(list(s, None, 10).await.unwrap().len(), 2);
     }

@@ -449,6 +449,18 @@ fn rows_per_statement(cols: usize, fixed: usize) -> usize {
 }
 
 impl Datasets {
+    /// The store handle behind this dataset writer.
+    ///
+    /// `Datasets` is the only store handle an [`crate::AppContext`] carries, so
+    /// this is how an app reaches a job-scoped table that is not a dataset —
+    /// today, the N01 transactions ledger, which a `transact` run must stage a
+    /// `pending` row into before it parks for approval. Symmetric with
+    /// [`crate::Storage::pool`], and a clone like it: a `SqlitePool` is a
+    /// handle, not a connection.
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
