@@ -167,11 +167,13 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    // The read-only tools are always offered —  and     // await a status and spend nothing. The actuating ones are not.  (N15)
-    // is always offered too and is NOT gated by : it creates no job,
-    // and its gate is the per-run job token pumper mints for its own Claude
-    // subprocess — an ordinary client that calls it gets an  tool
-    // error rather than a fetch (see ). It stays LAST.
+    // The read-only tools are always offered — `wait_job` and `wait_workflow`
+    // await a status and spend nothing. The actuating ones are not. `fetch`
+    // (N15) is always offered too and is NOT gated by `allow_enqueue`: it
+    // creates no job, and its gate is the per-run job token pumper mints for
+    // its own Claude subprocess — an ordinary client that calls it gets an
+    // `[unauthorized]` tool error rather than a fetch (see `e2e::mcp_fetch`).
+    // It stays LAST.
     assert_eq!(
         names,
         vec![
