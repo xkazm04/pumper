@@ -261,7 +261,7 @@ HTTP goes through the same engine every raw-HTTP caller in the process uses, so
 a plugin's traffic is spaced by the **per-host politeness governor**, sees the
 response cache, obeys the body cap and shows up on `GET /hosts` like any other
 request. Per call: a 20s timeout and a 2 MiB body cap. `kv` is a per-plugin
-namespace in the `plugin_kv` table (migration 0046) whose primary key starts
+namespace in the `plugin_kv` table (migration 0047) whose primary key starts
 with the plugin name — supplied by the host, never by the guest — so there is no
 call shape that reads another plugin's keys. Ceilings: 64 KiB per value, 1,000
 keys per plugin.
