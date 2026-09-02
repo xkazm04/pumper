@@ -123,11 +123,18 @@ impl Enricher for PluginEnricher {
     }
 
     async fn enrich(&self, input: &EnrichInput) -> Vec<Entity> {
-        let out = match self
-            .plugins
-            .run(&self.plugin, &input.text, &self.params)
-            .await
-        {
+        // The document's own clock rides in the params envelope: a wasm32 guest
+        // has no clock at all, so an enricher judging "is this deadline still
+        // upcoming" has nothing to judge against unless the host says when the
+        // document is from. Configured params (none yet) merge around it.
+        let mut params = self.params.clone();
+        match params.as_object_mut() {
+            Some(map) => {
+                map.insert("now".into(), Value::from(input.now));
+            }
+            None => params = serde_json::json!({ "now": input.now }),
+        }
+        let out = match self.plugins.run(&self.plugin, &input.text, &params).await {
             Ok(value) => value,
             Err(e) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
