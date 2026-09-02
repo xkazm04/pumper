@@ -43,18 +43,40 @@ The one deliberate difference: the tool returns `{query, total, count, hits, ind
 
 ### Entity-typed filters (`amount`, `event_date`)
 
-At index time, `crates/engine-search/src/enrich.rs` extracts two optional fields from each doc's title+body with conservative regex rules, and `GET /search` filters on them: `amount_gte`/`amount_lte` (whole US dollars) and `date_after`/`date_before` (unix seconds). **No match = no field**: a doc with nothing extracted is *absent* from the field, so it never matches any range filter — filtering by amount implies "has an amount", never "amount is 0".
+At index time, the built-in enricher (`crates/engine-search/src/enrich.rs`, behind the `Enricher` trait since N11) extracts two optional fields from each doc's title+body with conservative regex rules, and `GET /search` filters on them: `amount_gte`/`amount_lte` (whole US dollars) and `date_after`/`date_before` (unix seconds). **No match = no field**: a doc with nothing extracted is *absent* from the field, so it never matches any range filter — filtering by amount implies "has an amount", never "amount is 0".
 
 - **`amount`** — the largest amount carrying an explicit `$`/`usd` marker, whole dollars, scale suffixes (`k`/`m`/`mm`/`b`/`million`/`billion`) applied. Bare numbers are not money. Over $1T is treated as extraction noise and dropped. **Ambiguously formatted amounts are dropped, not guessed**: `$1.234,56` / `$1.234.567,89` / `$5.000.000` (European decimal or grouping) would be read as `$1` or `$5` by US-centric parsing, so the candidate is skipped entirely — other, unambiguous amounts in the same document still count.
 - **`event_date`** — the earliest *upcoming* deadline-like date (UTC midnight), where "deadline-like" requires a keyword (`deadline`, `due`, `clos…`, `expir…`, `apply`, `submit`, `respond`, `end_date`) within the preceding 120 bytes. A bare publication date is not a deadline. Accepted shapes: `YYYY-MM-DD` **including RFC3339 timestamps** (`2026-09-01T00:00:00Z`, offsets and fractional seconds), `M/D/YYYY`, and `Month D, YYYY`. Upcoming means within `[now − 1 day, now + 10 years]`; invalid calendar dates are dropped.
 
 Enrichment is computed **before** the index writer lock is taken (its own blocking task), so the locked section does index operations only, and both fields come from a single lowercased copy of the text rather than one per field.
 
-`GET /search/status` → `{enabled, doc_count, disk_bytes, segment_count}`. `doc_count` is the logical document count; `disk_bytes` is the index directory's on-disk size (sum of its files, best-effort — an unreadable entry counts 0) and `segment_count` the searchable segments the reader currently sees. The physical pair exists because `doc_count` hides growth on an upserting corpus: flat `doc_count` with climbing bytes/segments means ghosts or merges falling behind. Both are `0` when `[search] enabled = false` (`NoSearch` measures nothing rather than guessing).
+### Enrichers: adding an entity kind without wiping the index (N11)
+
+Entity extraction is a configured PIPELINE, not two compiled-in regexes. `[search] enrichers` is an ordered list (default `["builtin"]` — byte-for-byte the pre-N11 behaviour):
+
+```toml
+[search]
+enrichers = ["builtin", "plugin:enrich-money-date"]
+```
+
+- **`"builtin"`** — the two shipped regex rules above.
+- **`"plugin:<name>"`** — a core-module WASM plugin loaded by the ordinary plugin host, entered through an **`enrich`** export with the same `{doc, params}` envelope, fuel budget, memory cap and admission gate as every other plugin call. Output contract: `{"entities": {kind: scalar|array}}`. `params.now` carries the DOCUMENT's own timestamp, because a wasm guest has no clock (see [trigger-plugins.md § Plugin kinds](trigger-plugins.md)).
+- An **unknown or malformed entry** (`"builtins"`, a bare `"plugin:"`) is refused **by name at startup**, never silently skipped — a dropped enrichment pass looks exactly like a corpus with nothing to extract.
+- **Order decides collisions, first writer wins.** Appending a plugin can only ADD kinds; putting it before `"builtin"` is how an operator deliberately lets it own `amount`.
+
+Every entity lands in one **stored, unindexed `entities` JSON field** on the schema. That is the point: a new entity KIND (`currency`, `ico`, `region`, an array of per-item amounts) is a plugin install, **not a schema change**, so it never trips the schema-drift wipe below. `amount` and `event_date` remain native fast fields, promoted out of the entity map only when the value carries the right type — a plugin emitting `"amount": "lots"` gets it stored under `entities` and NOT into the range-filterable column. Reading entities back today is via the stored field (`TantivyIndex::stored_entities`); **there is no `entity=<kind>:<op>:<value>` query grammar yet** (see Known gaps).
+
+**Failure is per document and open.** An enricher that traps, times out, returns unreadable output, or names a plugin nobody installed yields no entities for that document, is counted, and never fails the batch — the index is a derived artifact, and losing a document because one optional field could not be computed is strictly worse than losing the field.
+
+`GET /search/status` → `{enabled, doc_count, disk_bytes, segment_count, enrichers}`. `enrichers` is one row per configured entry (`{name, docs, entities, failures}`): `docs` counts documents the pass was OFFERED, `entities` what it emitted before collision merging, and `failures` documents it could not run on. `failures > 0` is the only thing that tells a trapping plugin apart from an enricher that honestly finds nothing. `doc_count` is the logical document count; `disk_bytes` is the index directory's on-disk size (sum of its files, best-effort — an unreadable entry counts 0) and `segment_count` the searchable segments the reader currently sees. The physical pair exists because `doc_count` hides growth on an upserting corpus: flat `doc_count` with climbing bytes/segments means ghosts or merges falling behind. Both are `0` when `[search] enabled = false` (`NoSearch` measures nothing rather than guessing).
 
 ## Maintenance
 
-`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, index_stats, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
+`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, index_stats, enricher_stats, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
+
+### Re-running enrichment: `search-backfill --re-enrich`
+
+After installing, removing or reordering `[search] enrichers`, documents already in the index carry the OLD entity maps. `cargo run -p pumper-server --bin search-backfill -- --app grants --dataset unified --re-enrich` re-walks that scope and upserts each document under the same doc id with the current enrichers — **no schema rebuild, no wipe, no duplicates**, and the offline run builds the same plugin host the server uses so `plugin:` enrichers produce the same entities they would live. It is a MODIFIER: it never supplies a scope, and it refuses an **empty** index rather than reporting a first-time build as a re-enrichment. The run prints the per-enricher counters afterwards. As always, run it with the server **stopped** (the index writer lock is exclusive).
 
 ### Opening the index: four states, three recoveries
 
@@ -117,6 +139,8 @@ A scope is required so a broad rebuild is always deliberate. The backfill uses t
 - No semantic/hybrid search and no autocomplete (backlog). Facets are a top-1000 sample, not exact counts (`total` is exact); the MCP `search` tool returns no facets at all.
 - `offset` paging is capped at 10 000; there is no deep-paging cursor over search hits.
 - A wiped or quarantined index refills only as records change — recovery is the manual `search-backfill` bin, not an automatic rebuild. Nothing reclaims a `<dir>.corrupt.<n>` quarantine. **Detection is no longer query-path-only**: `GET /datasets/doctor` (`just doctor`) raises a `search_index_empty` finding when search is enabled, the index holds 0 documents, and the store holds live records — so an operator can find the state before a user reports missing results. See [datasets.md § `datasets doctor`](datasets.md#datasets-doctor--store-integrity-report) for why the check is zero-versus-nonzero rather than a ratio.
+- **No entity query grammar.** `/search` filters on `amount`/`event_date` only; an entity kind a plugin adds is stored and readable per document but not yet filterable (`entity=currency:eq:czk` is designed, not built). Faceting on arbitrary kinds and LLM/NER enrichers are likewise out.
+- **The `entities` field itself was one last schema bump.** Upgrading to a build carrying it wipes the existing index (the documented schema-drift recovery) and needs one `search-backfill`; every entity kind added AFTER it is free.
 - **`amount` is US-dollar only.** Extraction requires a `$`/`usd` marker, so `€`, `£`, `CZK`, and every other currency is invisible to `amount_gte`/`amount_lte` — and a non-USD figure is never converted, just skipped.
 - **Both entity fields are document-level, not per-item**: one `amount` (the largest in the doc) and one `event_date` (the earliest upcoming deadline) per document. A document listing several awards or several deadlines is filterable only by its maximum amount and its nearest date; the others are not queryable.
 - Materialized views carry the display fields above, not the source record's full payload — join back through `source.{app, dataset, key}` for that.

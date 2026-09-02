@@ -56,7 +56,34 @@ because the file stem is the name a trigger references.
 
 Hot swap without a restart: re-run `just plugins-install`, then
 `POST /plugins/reload`. `GET /plugins` lists what is loaded, with each module's
-`describe()` manifest (`kind: "predicate" | "transform" | "extractor"`).
+`describe()` manifest (`kind: "predicate" | "transform" | "extractor" | "sink" | "enricher"`).
+
+### Plugin kinds and their entry points
+
+`kind` is a convention the host reads for `GET /plugins?kind=`; the ABI is one
+family, entered through the export a module actually carries:
+
+| `kind` | entry export | input `doc` | output contract |
+| --- | --- | --- | --- |
+| `extractor` | `extract_v2` (legacy: `extract`) | the fetched document | the extracted object |
+| `predicate` | `extract_v2` | the `_trigger` delta, as a JSON string | `{"pass": bool, "reason"?}` |
+| `transform` | `extract_v2` | the `_trigger` object | the shaped object |
+| `sink` | `extract_v2` | the delivery envelope | the connector's result |
+| `enricher` (N11) | **`enrich`** | one document's title + body text | `{"entities": {kind: scalar or array}}` |
+
+An **enricher** is an index-time hook, not a trigger hook: it runs from the
+search index's pre-write enrichment pass, configured by `[search] enrichers`
+(see [search.md](search.md)), under this host's ordinary fuel budget, memory cap
+and admission gate. Two specifics:
+
+- Its `params` envelope carries **`now`**, the document's own timestamp. A
+  wasm32 guest has no clock, so a rule like "is this deadline still upcoming"
+  is unanswerable inside the sandbox without it — the reference plugin
+  (`plugins-src/enrich-money-date`) emits no `event_date` at all when it is
+  missing rather than assuming an epoch.
+- Failure is **fail-open per document**, like every trigger hook: a trap,
+  unreadable output or an uninstalled module costs that document's entities and
+  is counted on `GET /search/status`, never the document or the batch.
 
 ## Configuration
 
@@ -331,6 +358,8 @@ the type and a reworded message cannot silently reclassify stored rows. See
   by the idempotency key (`dedup`) or refused by the target's params schema
   never reaches it — correct, since there is no job to report, but it means the
   slot is not a "the trigger fired" notification.
+- An `enricher` gets no per-plugin `params` of its own yet: the host passes
+  `{now}` and nothing else, so a plugin that wants a knob compiles it in.
 - The `capabilities` vocabulary is `http` and `kv` and nothing else: no
   filesystem, no timers, no outbound sockets other than HTTP.
 - A capability manifest is **static**. A connector's hosts are fixed at build
