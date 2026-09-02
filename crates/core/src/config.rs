@@ -46,6 +46,8 @@ pub struct Config {
     pub peer: Vec<PeerConfig>,
     /// N01 Transact v2: the live-submission gate. Default OFF.
     pub transact: TransactConfig,
+    /// N05: the durable event log and its cursor subscriptions. On by default.
+    pub events: EventsConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -3280,5 +3282,55 @@ impl TransactConfig {
     /// `None` for "no cap".
     pub fn daily_cap(&self) -> Option<i64> {
         (self.max_submits_per_profile_per_day > 0).then_some(self.max_submits_per_profile_per_day)
+    }
+}
+
+/// N05: the durable event log and its cursor subscriptions.
+///
+/// The log is **on by default** and that is deliberate — unlike every other
+/// section added in this campaign, it changes no behaviour an operator has to
+/// opt into. Writing the bus to SQLite makes `Last-Event-ID` survive a restart
+/// and makes every event kind subscribable; turning it off restores exactly the
+/// old in-memory ring, `reset` events and all.
+///
+/// It lives in its own section rather than as `[storage]` keys because the log
+/// is a *feature* with a retention policy, a batch size and an outbox, not a
+/// property of the store — and because `[storage]` is a shared surface this
+/// campaign's parallel builders were told not to edit.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Master switch. `false` = the pre-N05 behaviour byte for byte: the bus
+    /// stays an in-memory ring, nothing is persisted, `GET /events/log` answers
+    /// an empty page and the outbox drain does nothing (so watches deliver
+    /// through the legacy in-line path).
+    pub log_enabled: bool,
+    /// How long a log row is kept. `0` = keep forever (the log then grows
+    /// without bound, which is a choice an operator may make deliberately).
+    ///
+    /// Seven days is the default because the log's job is *resume*, not
+    /// archive: a consumer that has been away a week has to resync anyway, and
+    /// the durable record of what a run produced lives in `records` /
+    /// `record_revisions`, not here.
+    pub log_retention_days: i64,
+    /// Events one outbox drain hands to one subscription per tick. A small
+    /// batch so a subscription that has been disabled for a week cannot
+    /// stampede its receiver (or the delivery pool) when it is re-enabled.
+    pub outbox_batch: i64,
+    /// Ceiling on events buffered in memory awaiting their log write. Reached
+    /// only when the store is unavailable or wedged; past it the OLDEST pending
+    /// events are dropped and counted, and the drop is logged — a bounded,
+    /// stated loss rather than unbounded RSS growth on a failing store.
+    pub pending_capacity: usize,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            log_enabled: true,
+            log_retention_days: 7,
+            outbox_batch: 200,
+            pending_capacity: 8192,
+        }
     }
 }

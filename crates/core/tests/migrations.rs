@@ -26,6 +26,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "datahub_govern_actions",
     "datahub_govern_levels",
     "derived",
+    // N05: the durable event log (0049).
+    "events",
     "doc_fingerprints",
     "extraction_profiles",
     "field_invariants",
@@ -51,6 +53,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "schedules",
     "source_runs",
     "sources",
+    // N05: cursor subscriptions over the event log (0049).
+    "subscriptions",
     "tier_memory",
     // N01: the approval ledger behind live browser submissions (0046).
     "transactions",
@@ -186,6 +190,12 @@ async fn replay_keeps_columns_added_by_later_migrations() {
             "api_recipes lost column `{col}`: {api_recipes:?}"
         );
     }
+
+    let watches = column_names(&pool, "watches").await;
+    assert!(
+        watches.contains("cursor_seq"), // 0049 durable event log
+        "watches lost column `cursor_seq`: {watches:?}"
+    );
 
     let triggers = column_names(&pool, "triggers").await;
     for col in [
