@@ -694,8 +694,14 @@ pub(crate) struct LatestRun {
 /// a scheduled run is queued/running it *is* the newest job, because the guard
 /// itself prevented anything newer — and drops the wedge, since a retried older
 /// job is by definition not the newest.
+///
+/// `waiting` (N02) is an active status here: a job parked on a human approval is
+/// mid-run — its checkpoint is live and it will continue the moment somebody
+/// answers — so stacking the next cron firing on top of it would run the same
+/// work twice, which is precisely the overlap this guard exists to prevent. It
+/// releases no worker permit, but it does hold its schedule's slot.
 pub(crate) fn run_holds_slot(status: Option<&str>) -> bool {
-    matches!(status, Some("queued") | Some("running"))
+    matches!(status, Some("queued") | Some("running") | Some("waiting"))
 }
 
 /// Reads a schedule's most recent firing and applies [`run_holds_slot`] to it.
@@ -1036,6 +1042,7 @@ mod tests {
         // exists for ("don't stack a second run on top of mine").
         assert!(run_holds_slot(Some("queued")));
         assert!(run_holds_slot(Some("running")));
+        assert!(run_holds_slot(Some("waiting")));
         // Newest run finished: the slot is free, whatever any OLDER job of the
         // same schedule was manually retried into.
         for terminal in ["succeeded", "failed", "cancelled"] {
@@ -1046,6 +1053,25 @@ mod tests {
         }
         // Never fired at all: nothing to overlap with.
         assert!(!run_holds_slot(None));
+    }
+
+    /// The N02 anti-pattern: `waiting` read as "not running, therefore done".
+    /// A parked run holds no worker permit, which makes it tempting to treat as
+    /// finished — but it is mid-work with a live checkpoint, so freeing its
+    /// schedule slot would fire the next cron run on top of it and do the same
+    /// work twice. Pinned against the terminal set so the two can never be
+    /// confused by a future edit.
+    #[test]
+    fn a_waiting_run_holds_its_slot_and_is_not_read_as_finished() {
+        assert!(
+            run_holds_slot(Some("waiting")),
+            "a job parked on external input is mid-run, not finished"
+        );
+        for terminal in ["succeeded", "failed", "cancelled"] {
+            assert!(!run_holds_slot(Some(terminal)));
+        }
+        // And the enum agrees: `waiting` is non-terminal at the one authority.
+        assert!(!pumper_core::JobStatus::Waiting.is_terminal());
     }
 
     /// The EXPECTED-diff guard for "one predicate, two readers": the overlap
@@ -1088,9 +1114,14 @@ mod tests {
         );
 
         // And only `run_holds_slot` itself decides what an active status is.
+        // Every spelling of the active set a second reader might hand-roll —
+        // including the `waiting` arm N02 added, which is the newest way for the
+        // two answers to drift apart.
         let matches_active = |body: &str| {
             body.contains(r#"Some("queued") | Some("running")"#)
                 || body.contains(r#"Some("running") | Some("queued")"#)
+                || body.contains(r#"Some("waiting")"#)
+                || body.contains(r#""queued" | "running""#)
         };
         assert!(
             !matches_active(&route),

@@ -135,7 +135,16 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
-        E::Storage(_)
+        //
+        // `AwaitingInput` is here on purpose. It is not a failure at all — it is
+        // the worker's park signal (N02), consumed by the outcome arm long
+        // before anything HTTP-shaped is involved, and no route runs an app
+        // synchronously. So it reaching this boundary means a seam raised it
+        // outside a job run, which is a bug; dressing that as a tidy 202 or 409
+        // would hide it forever, exactly as remapping `Storage(RowNotFound)` to
+        // 404 would. It stays a 500, which is what a bug is.
+        E::AwaitingInput(_)
+        | E::Storage(_)
         | E::Parse(_)
         | E::Config(_)
         | E::App(_)
