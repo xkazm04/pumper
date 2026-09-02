@@ -1065,6 +1065,32 @@ pub trait ScrapeApp: Send + Sync {
         AppManifest::default()
     }
 
+    /// N18: may this app's jobs run on an **outbound executor** — a separate
+    /// process that long-polls the coordinator, executes the whole job with its
+    /// own engines, and reports the result back?
+    ///
+    /// Default `false`, and that default is the safe one: an executor's
+    /// [`AppContext`] carries a **refusing** `datasets` handle (there is no RPC
+    /// dataset client in v1), so an app that upserts would run to completion out
+    /// there and lose every write it thinks it made. Declaring `true` is
+    /// therefore a claim about the app — *this app is result-only: it fetches,
+    /// researches, saves artifacts, reports progress and checkpoints, and
+    /// returns everything it produced in its result JSON* — and the server pins
+    /// that claim with an inventory test that reads the app's own source
+    /// (`crate::executors::executor_eligible_apps_are_result_only`), not with
+    /// this flag alone.
+    ///
+    /// It sits on the trait beside [`schedule`](Self::schedule) and
+    /// [`requires`](Self::requires) rather than inside [`AppManifest`] for the
+    /// same reason those do — it is a fact about *where and when this app may
+    /// run*, not part of the agent-facing params contract — and because a new
+    /// `AppManifest` field is not additive: every app that builds one as a
+    /// struct literal (35 files today) would stop compiling, which is a lot of
+    /// churn to buy nothing.
+    fn executor(&self) -> bool {
+        false
+    }
+
     /// Executes one job. The returned JSON is stored as the job result.
     async fn run(&self, ctx: AppContext) -> Result<Value>;
 }

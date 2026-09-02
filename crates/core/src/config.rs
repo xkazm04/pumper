@@ -55,6 +55,11 @@ pub struct Config {
     pub lineage: LineageConfig,
     /// N05: the durable event log and its cursor subscriptions. On by default.
     pub events: EventsConfig,
+    /// N18 elastic executor plane: the coordinator's executor-facing doors and
+    /// the outbound executor's own dial-out settings. Default OFF on both
+    /// sides — `/executors/*` answers 404 until `enabled`, and no process runs
+    /// in executor mode unless it is started with `--executor`.
+    pub executors: ExecutorsConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -1028,6 +1033,27 @@ impl Config {
                     rm.timeout_secs, rm.max_body_bytes
                 )));
             }
+        }
+
+        // N18 executor plane. Same pairing as `[remote]` above and for a
+        // stronger reason: an unauthenticated `/executors/claim` does not merely
+        // fetch on a caller's behalf, it HANDS OUT this node's queued work and
+        // then accepts whatever result comes back for it.
+        let ex = &self.executors;
+        if ex.enabled && ex.secret.trim().is_empty() {
+            return Err(Error::Config(
+                "[executors] secret must be set when the executor plane is enabled — \
+                 an unauthenticated /executors/claim hands out this node's jobs and \
+                 accepts their results from anyone"
+                    .into(),
+            ));
+        }
+        if ex.enabled && ex.claim_wait_secs == 0 {
+            return Err(Error::Config(
+                "[executors] claim_wait_secs must be > 0 — a zero-length long poll turns \
+                 every executor into a hot loop against the claim door"
+                    .into(),
+            ));
         }
 
         // Retention. Every knob is off by default, so these rules only bind on a
@@ -3538,3 +3564,97 @@ impl Default for EventsConfig {
         }
     }
 }
+
+/// N18: the elastic executor plane.
+///
+/// One section serves **both ends** of the same relationship, which is
+/// deliberate: a node is a coordinator, an executor, or (in a test) both, and
+/// splitting the keys into `[executors]` and `[executor]` would have made the
+/// two secrets two config surfaces that must be kept equal by hand — exactly
+/// the mistake `[remote]`'s single `secret` avoids for the fetch fabric.
+///
+/// Coordinator keys: `enabled`, `secret`, `claim_wait_secs`, `offline_after_secs`.
+/// Executor keys: `coordinator_url`, `executor_id`, `capabilities`,
+/// `poll_interval_secs`.
+///
+/// **Everything is off by default.** `enabled = false` makes every
+/// `/executors/*` and `/jobs/{id}/(heartbeat|checkpoint|progress|finish)` route
+/// answer 404 (they do not exist as far as a caller is concerned), so a node
+/// that never sets this key behaves byte-for-byte as it did before N18.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExecutorsConfig {
+    /// Coordinator side: serve the executor-facing doors at all.
+    ///
+    /// Paired with `secret` by [`Config::validate`] exactly as `[remote]` is:
+    /// an enabled plane with a blank secret would be an unauthenticated door
+    /// that hands out jobs and accepts their results, which is strictly worse
+    /// than a disabled one.
+    pub enabled: bool,
+    /// The shared secret both ends present in [`EXECUTOR_SECRET_HEADER`].
+    /// Compared as SHA-256 digests, like the remote fabric's, so the comparison
+    /// does not leak a prefix through its timing.
+    pub secret: String,
+    /// Coordinator side: how long `POST /executors/claim` holds an empty queue
+    /// open before answering `204`. The long poll IS the clock and the
+    /// backpressure boundary — an executor asks for work only when it has a
+    /// free slot — so this is a latency/idle-request trade, not a rate limit.
+    pub claim_wait_secs: u64,
+    /// Coordinator side: how long since an executor's last poll before
+    /// `GET /executors` calls it `offline`. Purely a *report*: reclaiming a dead
+    /// executor's jobs is the reaper's business, and it is driven by the job's
+    /// heartbeat, not by this.
+    pub offline_after_secs: u64,
+    /// Executor side: the coordinator to dial (`--coordinator <url>` overrides
+    /// it). Empty = no coordinator configured; `--executor` then refuses to
+    /// start rather than looping against nothing.
+    pub coordinator_url: String,
+    /// Executor side: this executor's stable identity. Empty = derive one from
+    /// the hostname plus the process id, which is honest but changes across
+    /// restarts; set it for a fleet you want to read a history for.
+    pub executor_id: String,
+    /// Executor side: the apps this process offers to run. Empty = "everything
+    /// the coordinator considers executor-eligible". The coordinator always
+    /// intersects this with its own eligibility list, so naming an app here can
+    /// never widen what this executor is allowed to claim.
+    pub capabilities: Vec<String>,
+    /// Executor side: how long to wait after an empty claim (a `204`) or a
+    /// transport failure before asking again.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ExecutorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: String::new(),
+            claim_wait_secs: 30,
+            offline_after_secs: 120,
+            coordinator_url: String::new(),
+            executor_id: String::new(),
+            capabilities: Vec::new(),
+            poll_interval_secs: 2,
+        }
+    }
+}
+
+impl ExecutorsConfig {
+    /// Whether the coordinator's executor doors are actually servable: enabled
+    /// AND holding a secret.
+    ///
+    /// The anti-pattern this is named for: `enabled` alone read as "serve it".
+    /// `Config::validate` refuses that pairing at boot for a real config, but a
+    /// hand-assembled state (a test, an embedder) can still carry it, and the
+    /// failure mode of getting it wrong is an open door that hands out jobs.
+    pub fn servable(&self) -> bool {
+        self.enabled && !self.secret.trim().is_empty()
+    }
+}
+
+/// The header both ends of the executor plane carry the shared secret in.
+///
+/// Deliberately NOT `Authorization`: `[auth] mode = "keys"` already owns that
+/// header for principal resolution, and an executor presents *two* credentials
+/// (the plane secret and, in keys mode, an `admin` key). One header per
+/// credential keeps "wrong secret" and "wrong key" two distinguishable 401s.
+pub const EXECUTOR_SECRET_HEADER: &str = "x-pumper-executor-secret";

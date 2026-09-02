@@ -19,7 +19,8 @@ use crate::{Error, Result};
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
                            result, error, input_request, waiting_since, waiting_expires_at, \
-                           resumed_input, created_at, available_at, started_at, finished_at";
+                           resumed_input, executor_id, created_at, available_at, started_at, \
+                           finished_at";
 
 /// Rows one recovery sweep will verdict before stopping. The sweep runs inside
 /// boot, so it is bounded rather than proportional to how bad the last crash
@@ -477,6 +478,198 @@ impl Storage {
             })
             .await?;
         row.map(Job::try_from).transpose()
+    }
+
+    /// The executor-plane claim (N18): like [`Storage::claim_next`], but it
+    /// restricts the candidate set to `eligible` apps and **stamps the claiming
+    /// executor onto the row**.
+    ///
+    /// Two differences from the local claim, both load-bearing:
+    /// - `eligible` is an allow-list, not the local path's block-list. An
+    ///   executor may only ever run apps the *coordinator* decided are
+    ///   executor-eligible (`AppManifest::executor` + result-only), intersected
+    ///   with what the executor said it can do. An empty list claims nothing —
+    ///   the honest answer for a node with no eligible apps, and never "claim
+    ///   anything".
+    /// - `executor_id` is written in the SAME statement that flips the row to
+    ///   `running`, so there is no window in which a job is running under an
+    ///   executor the row does not name.
+    ///
+    /// `blocked` is the cluster-wide per-app cap, computed from the DB by the
+    /// coordinator rather than from an in-process map (which cannot see other
+    /// processes' work).
+    pub async fn claim_next_for_executor(
+        &self,
+        executor_id: &str,
+        eligible: &[String],
+        blocked: &[String],
+        aging_coeff: f64,
+    ) -> Result<Option<Job>> {
+        if eligible.is_empty() {
+            return Ok(None);
+        }
+        // Bind slots: ?1 = now, ?2 = executor id, then the eligible list, then
+        // the blocked list. Numbered by position so neither list can collide.
+        let mut next = 3usize;
+        let mut marks = Vec::with_capacity(eligible.len());
+        for _ in eligible {
+            marks.push(format!("?{next}"));
+            next += 1;
+        }
+        let inclusion = format!(" AND app IN ({})", marks.join(", "));
+        let exclusion = if blocked.is_empty() {
+            String::new()
+        } else {
+            let mut marks = Vec::with_capacity(blocked.len());
+            for _ in blocked {
+                marks.push(format!("?{next}"));
+                next += 1;
+            }
+            format!(" AND app NOT IN ({})", marks.join(", "))
+        };
+        let order = if aging_coeff > 0.0 {
+            format!(
+                "(priority + (julianday(?1) - julianday(created_at)) * 86400.0 / {aging_coeff}) \
+                 DESC, created_at"
+            )
+        } else {
+            "priority DESC, created_at".to_string()
+        };
+        let sql = format!(
+            "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1, \
+             heartbeat_at = ?1, executor_id = ?2 \
+             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1\
+             {inclusion}{exclusion} ORDER BY {order} LIMIT 1) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        let row = self
+            .metered(StoreOp::JobClaim, |mut conn| async move {
+                let mut query = sqlx::query_as::<_, JobRow>(&sql)
+                    .bind(now())
+                    .bind(executor_id.to_string());
+                for app in eligible {
+                    query = query.bind(app);
+                }
+                for app in blocked {
+                    query = query.bind(app);
+                }
+                let row = query.fetch_optional(&mut *conn).await?;
+                let rows = row.is_some() as u64;
+                Ok((row, rows))
+            })
+            .await?;
+        row.map(Job::try_from).transpose()
+    }
+
+    /// Whether `executor_id` still holds this attempt's lease — the fence every
+    /// executor-facing route applies before it acts.
+    ///
+    /// The anti-pattern it closes: an executor that was reaped (its lease went
+    /// stale, the job re-queued and re-claimed elsewhere) reporting a result for
+    /// "its" job. The `(status='running', attempts)` fence on `complete`/`fail`
+    /// already discards that *write*; this makes the refusal explicit and early,
+    /// so the door answers `409` instead of silently accepting a report it is
+    /// about to throw away — and so a checkpoint or a progress snapshot cannot
+    /// be written by a process that no longer owns the job.
+    pub async fn job_claimed_by(&self, id: Uuid, attempt: i64, executor_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM jobs WHERE id = ?1 AND status = 'running' AND attempts = ?2 \
+             AND executor_id = ?3",
+        )
+        .bind(id.to_string())
+        .bind(attempt)
+        .bind(executor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// [`Storage::heartbeat`], additionally fenced on the executor that holds
+    /// the lease: a beat from a process the row does not name refreshes nothing,
+    /// so a partitioned executor cannot keep alive a job another executor has
+    /// already been handed.
+    pub async fn heartbeat_from(&self, id: Uuid, attempt: i64, executor_id: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE jobs SET heartbeat_at = ?2 \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3 AND executor_id = ?4",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .bind(attempt)
+        .bind(executor_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records that an executor polled, upserting its declared capabilities and
+    /// its last-poll instant. Called on every claim attempt — including the ones
+    /// that return no job, which is exactly what makes "idle but alive"
+    /// distinguishable from "gone".
+    pub async fn record_executor_poll(
+        &self,
+        id: &str,
+        capabilities: &[String],
+        claimed: bool,
+    ) -> Result<()> {
+        let caps = serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO executors (id, capabilities, first_seen_at, last_poll_at, claimed_total) \
+             VALUES (?1, ?2, ?3, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET capabilities = ?2, last_poll_at = ?3, \
+             claimed_total = claimed_total + ?4",
+        )
+        .bind(id)
+        .bind(caps)
+        .bind(now())
+        .bind(claimed as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every executor the coordinator has ever seen, newest poll first, with the
+    /// number of jobs each is currently running.
+    pub async fn list_executors(&self) -> Result<Vec<ExecutorRow>> {
+        let rows: Vec<(String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT e.id, e.capabilities, e.first_seen_at, e.last_poll_at, e.claimed_total, \
+             (SELECT COUNT(*) FROM jobs j WHERE j.executor_id = e.id AND j.status = 'running') \
+             FROM executors e ORDER BY e.last_poll_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, capabilities, first_seen_at, last_poll_at, claimed_total, running)| {
+                    ExecutorRow {
+                        id,
+                        capabilities: serde_json::from_str(&capabilities).unwrap_or_default(),
+                        first_seen_at,
+                        last_poll_at,
+                        claimed_total,
+                        running,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Per-app counts of jobs currently running **on executors**, cluster-wide.
+    ///
+    /// This is the number the in-process `HashMap` cannot produce: it lives in
+    /// one process and therefore counts one process's work. The coordinator's
+    /// per-app cap for the executor claim path is computed from this instead.
+    /// Locally-claimed jobs (`executor_id IS NULL`) are deliberately excluded —
+    /// the local path keeps its own in-memory accounting, unchanged.
+    pub async fn executor_running_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT app, COUNT(*) FROM jobs WHERE status = 'running' \
+             AND executor_id IS NOT NULL GROUP BY app",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Marks a running job succeeded. Guarded on `(status, attempts)`: only the
@@ -3622,6 +3815,29 @@ fn wal_sidecar_bytes(db: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// One row of `GET /executors` (N18): an outbound executor process the
+/// coordinator has seen, and what it is doing right now.
+///
+/// `last_poll_at` is kept as the stored string rather than a parsed instant for
+/// the same reason the keyset pages are: it is rendered, compared to a cutoff,
+/// and never arithmetic'd. The liveness *verdict* is computed by
+/// `crate::executors::executor_state` on the server side, from this and the
+/// configured window, so the store keeps facts and the policy stays in one
+/// tested function.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutorRow {
+    pub id: String,
+    /// The app names this executor declared. Advisory — the coordinator
+    /// intersects them with its own eligibility list on every claim.
+    pub capabilities: Vec<String>,
+    pub first_seen_at: String,
+    pub last_poll_at: String,
+    /// Jobs handed to this executor since it was first seen.
+    pub claimed_total: i64,
+    /// Jobs it is running right now (`status='running' AND executor_id = id`).
+    pub running: i64,
+}
+
 #[derive(sqlx::FromRow)]
 struct JobRow {
     id: String,
@@ -3642,6 +3858,7 @@ struct JobRow {
     waiting_since: Option<String>,
     waiting_expires_at: Option<String>,
     resumed_input: Option<String>,
+    executor_id: Option<String>,
     created_at: String,
     available_at: String,
     started_at: Option<String>,
@@ -3675,6 +3892,7 @@ impl TryFrom<JobRow> for Job {
             waiting_since: r.waiting_since.as_deref().map(parse_ts).transpose()?,
             waiting_expires_at: r.waiting_expires_at.as_deref().map(parse_ts).transpose()?,
             resumed_input: parse_json_column(r.resumed_input.as_deref()),
+            executor_id: r.executor_id,
             created_at: parse_ts(&r.created_at)?,
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,

@@ -97,6 +97,14 @@ pub struct Job {
     /// read on a default install.
     #[serde(skip_serializing)]
     pub resumed_input: Option<Value>,
+    /// Which outbound executor holds (or held) this attempt's lease — `None`
+    /// for every job the coordinator claimed on its own worker, which is the
+    /// default and the honest answer for a single-process install (N18).
+    ///
+    /// Stamped by the claim, never cleared: a finished job still says where it
+    /// ran, which is what makes `receipt.job.executor_id` and "the share of
+    /// jobs executed remotely" answerable after the fact.
+    pub executor_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
