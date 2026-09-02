@@ -10,7 +10,7 @@ edition.workspace = true
 # (e.g. Personas) depend with `default-features = false` to drop sqlx entirely
 # (avoids a duplicate libsqlite3 link against a bundled rusqlite).
 default = ["storage"]
-storage = ["dep:sqlx", "dep:ring", "dep:hex"]
+storage = ["dep:sqlx", "dep:ring", "dep:hex", "dep:cron"]
 # Shared test harness (`pumper_core::testing`): TempStore RAII fixture, Dead
 # engines, AppContext builder. Enable from [dev-dependencies] ONLY.
 test-support = ["storage", "dep:tempfile"]
@@ -40,6 +40,10 @@ skyscraper = "0.7"
 tempfile = { version = "3", optional = true }
 # N16 mesh envelopes: ed25519 verification + the hex wire encodings. Optional so
 # a `default-features = false` embedder (engines + Fetcher only) never links them.
+# App-declared schedules (P.4): the cron a run asks for is PARSED before the
+# row is written, so an unreadable expression is refused instead of stored as a
+# schedule that never fires.
+cron = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 

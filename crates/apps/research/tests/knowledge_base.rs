@@ -385,7 +385,7 @@ async fn the_source_cap_bites_and_says_so_instead_of_silently_dropping() {
     assert_eq!(
         out["watch_requests"],
         json!([{ "app": "watch", "cron": "0 0 7 * * *", "params": { "url": ONE } }]),
-        "one ready-to-POST /schedules body per capped source"
+        "one /schedules body per capped source"
     );
     // The cap governs every per-source action, so the second URL has no record
     // either — one meaning for `sources_truncated`.
@@ -395,6 +395,75 @@ async fn the_source_cap_bites_and_says_so_instead_of_silently_dropping() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn watch_sources_asks_the_runtime_for_real_schedules_not_a_list_to_replay_by_hand() {
+    // THE REFUTED BEHAVIOR: `watch_sources: true` produced `watch_requests[]`
+    // — ready-to-POST bodies a human was supposed to notice — and created
+    // nothing. The app now asks the runtime, whose post-run fan-out writes the
+    // `app:research` rows.
+    let store = TempStore::new("research-kb-requests").await;
+    let watching = ctx(
+        &store,
+        json!({"query": "Czech VAT thresholds", "watch_sources": true}),
+        scripted(report_json(&["threshold is 2M CZK"])),
+    );
+    let requests = watching.schedule_requests.clone();
+    let out = Research::default().run(watching).await.unwrap();
+
+    let asked = requests.lock().expect("not poisoned").clone();
+    assert_eq!(asked.len(), 2, "one per cited source: {asked:#?}");
+    assert_eq!(asked[0]["app"], "watch");
+    assert_eq!(asked[0]["params"]["url"], ONE);
+    assert_eq!(
+        out["watch_requests"],
+        json!(asked),
+        "the result echoes exactly what was requested, no more"
+    );
+    assert_eq!(out["watch_requests_truncated"], json!(false));
+
+    // …and a run with no `watch_sources` asks for nothing at all.
+    let quiet_ctx = ctx(
+        &store,
+        json!({"query": "Czech VAT thresholds"}),
+        scripted(report_json(&["threshold is 2M CZK"])),
+    );
+    let quiet = quiet_ctx.schedule_requests.clone();
+    Research::default().run(quiet_ctx).await.unwrap();
+    assert!(quiet.lock().expect("not poisoned").is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_schedule_is_reported_not_echoed_as_created() {
+    // The runtime's ceiling, not the app's: `watch_requests` must never claim a
+    // schedule the runtime refused.
+    let store = TempStore::new("research-kb-ceiling").await;
+    let capped = TestContext::new(&store.storage, "research")
+        .params(json!({"query": "Czech VAT thresholds", "watch_sources": true}))
+        .engines(engines_with(
+            Arc::new(Dead),
+            Arc::new(Dead),
+            scripted(report_json(&["threshold is 2M CZK"])),
+        ))
+        .max_schedule_requests(1)
+        .build();
+    let requests = capped.schedule_requests.clone();
+    let out = Research::default().run(capped).await.unwrap();
+
+    assert_eq!(requests.lock().expect("not poisoned").len(), 1);
+    assert_eq!(
+        out["watch_requests"].as_array().map(Vec::len),
+        Some(1),
+        "only the request the runtime accepted: {out:#}"
+    );
+    assert_eq!(
+        out["watch_requests_truncated"],
+        json!(true),
+        "the surplus is a stated cut, not a silent drop"
+    );
+    // The SOURCE cap is a different fact and must not be moved by this one.
+    assert_eq!(out["sources_truncated"], json!(false));
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

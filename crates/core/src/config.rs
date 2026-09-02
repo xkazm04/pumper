@@ -1285,6 +1285,13 @@ pub struct WorkerConfig {
     /// runs inline on its worker permit instead — slower, but never dropped: a
     /// dropped fan-out is a webhook that silently never arrives.
     pub fanout_max_queued: usize,
+    /// Ceiling on the schedules ONE run may ask the runtime to create
+    /// (`AppContext::request_schedule`, applied by the post-run fan-out as
+    /// `managed_by = "app:<name>"` rows). A schedule is a standing commitment,
+    /// so a single job must not be able to mint an unbounded number of them;
+    /// a run that asks for more is told `false` at the seam and reports the
+    /// cut. `0` refuses every app-declared schedule.
+    pub max_app_schedules_per_run: usize,
 }
 
 impl Default for WorkerConfig {
@@ -1296,6 +1303,7 @@ impl Default for WorkerConfig {
             default_app_concurrency: 0,
             app_concurrency: HashMap::new(),
             schedule_tick_secs: 15,
+            max_app_schedules_per_run: 20,
             shutdown_drain_secs: 25,
             // Heartbeat every 30s; reap after 120s (4 missed beats) so a slow but
             // alive job is never mistaken for a hung one, while a wedged task is

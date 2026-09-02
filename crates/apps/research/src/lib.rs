@@ -339,7 +339,8 @@ impl ScrapeApp for Research {
          record per cited URL, both provenance-stamped (`persist`, default true). \
          `snapshot_sources` archives each cited URL through the metered tiered \
          fetcher and stamps `artifact_sha` so the citation is re-derivable; \
-         `watch_sources` proposes a `POST /schedules` body per cited URL."
+         `watch_sources` creates one `watch` schedule per cited URL, tagged \
+         managed_by app:research and capped by [worker] max_app_schedules_per_run."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -391,7 +392,7 @@ impl ScrapeApp for Research {
                     },
                     "watch_sources": {
                         "type": "boolean",
-                        "description": "Emit one ready-to-POST /schedules body per cited URL in watch_requests. This app creates no schedules itself. Default false."
+                        "description": "Create one `watch` schedule per cited URL (managed_by app:research), capped by [worker] max_app_schedules_per_run. The created bodies are echoed in watch_requests; a refused surplus sets watch_requests_truncated. Default false."
                     },
                     "watch_cron": {
                         "type": "string",
@@ -439,7 +440,7 @@ impl ScrapeApp for Research {
                  resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, \
                  stop_reason, datasets: {persisted, findings, sources, findings_new, \
                  findings_changed, sources_new, sources_changed, error}, snapshots: {attempted, \
-                 saved, failed}, watch_requests[], sources_truncated, index_datasets[]} — the research report is NESTED under `report`, and only when \
+                 saved, failed}, watch_requests[], watch_requests_truncated, sources_truncated, index_datasets[]} — the research report is NESTED under `report`, and only when \
                  `structured` is true; when it is false `report` is the agent's raw answer as a \
                  bare string, so `summary`/`key_findings`/`sources` are never top-level keys. \
                  `session_id` is resumable — pass it back as the `session_id` param to drill \
@@ -460,8 +461,10 @@ impl ScrapeApp for Research {
                  failure that was reported rather than allowed to discard a paid-for report. \
                  `snapshots` counts `snapshot_sources` fetches (attempted/saved/failed - a \
                  failed snapshot is recorded on the source record, never fatal). \
-                 `watch_requests` are ready-to-POST `/schedules` bodies the run PROPOSES for \
-                 the cited URLs (`watch_sources`); this app creates no schedules itself. \
+                 `watch_requests` are the `/schedules` bodies the run ASKED the runtime to \
+                 create for the cited URLs (`watch_sources`); the post-run fan-out writes \
+                 them as app:research-managed rows, and `watch_requests_truncated` \
+                 says the runtime per-run ceiling refused a surplus. \
                  `sources_truncated` says the per-run source cap bit.",
             ),
             cost_class: CostClass::Claude,
@@ -708,6 +711,7 @@ impl ScrapeApp for Research {
             "datasets": kb.datasets,
             "snapshots": kb.snapshots,
             "watch_requests": kb.watch_requests,
+            "watch_requests_truncated": kb.watch_requests_truncated,
             "sources_truncated": kb.sources_truncated,
             // Routes this run's `research/findings` + `research/sources`
             // revisions into the search index and the saved-search alerts, the
@@ -1156,6 +1160,11 @@ struct Knowledge {
     datasets: Value,
     snapshots: Value,
     watch_requests: Vec<Value>,
+    /// The runtime refused at least one requested schedule (`[worker]
+    /// max_app_schedules_per_run`). Its own flag, kept apart from
+    /// `sources_truncated`: one says the CITATION list was cut, the other says
+    /// the standing commitments were.
+    watch_requests_truncated: bool,
     sources_truncated: bool,
 }
 
@@ -1177,6 +1186,7 @@ impl Knowledge {
             }),
             snapshots: json!({ "attempted": 0, "saved": 0, "failed": 0 }),
             watch_requests: Vec::new(),
+            watch_requests_truncated: false,
             sources_truncated: false,
         }
     }
@@ -1276,18 +1286,29 @@ async fn build_knowledge(
         snapshots.push(snap);
     }
 
-    let watch_requests = if opts.watch {
-        capped
-            .iter()
-            .map(|c| watch_request(&c.url, &opts.watch_cron))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // P.4: the app ASKS the runtime for these schedules; the worker's post-run
+    // fan-out creates them as `managed_by = "app:research"` rows. They used to
+    // be proposals only — a list of ready-to-POST bodies a human was supposed
+    // to notice and replay by hand, so `watch_sources: true` produced a list
+    // and no watches. A request the runtime refuses (the per-run ceiling) is
+    // NOT reported as requested.
+    let mut watch_requests = Vec::new();
+    let mut watch_requests_truncated = false;
+    if opts.watch {
+        for c in capped.iter() {
+            let body = watch_request(&c.url, &opts.watch_cron);
+            if ctx.request_schedule(body.clone()) {
+                watch_requests.push(body);
+            } else {
+                watch_requests_truncated = true;
+            }
+        }
+    }
 
     let mut out = Knowledge {
         snapshots: json!({ "attempted": attempted, "saved": saved, "failed": failed }),
         watch_requests,
+        watch_requests_truncated,
         sources_truncated,
         ..Knowledge::empty()
     };

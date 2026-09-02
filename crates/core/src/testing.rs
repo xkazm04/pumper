@@ -348,6 +348,7 @@ pub fn engines_with(
 /// default-config `Resilience`, no budget, `NoPlugins`/`NoProgress`, artifacts
 /// under `<storage.artifacts_dir>/<app>/job`.
 pub struct TestContext<'a> {
+    max_schedule_requests: usize,
     storage: &'a Storage,
     app: String,
     params: Value,
@@ -377,6 +378,7 @@ impl<'a> TestContext<'a> {
             resumed_input: None,
             checkpoints: None,
             vcr: crate::vcr::Vcr::Off,
+            max_schedule_requests: crate::config::WorkerConfig::default().max_app_schedules_per_run,
         }
     }
 
@@ -427,6 +429,13 @@ impl<'a> TestContext<'a> {
         self
     }
 
+    /// Per-run ceiling on `AppContext::request_schedule`
+    /// (`[worker] max_app_schedules_per_run`). Defaults to the shipped 20.
+    pub fn max_schedule_requests(mut self, max: usize) -> Self {
+        self.max_schedule_requests = max;
+        self
+    }
+
     pub fn engines(mut self, engines: Arc<EngineSet>) -> Self {
         self.engines = Some(engines);
         self
@@ -467,6 +476,8 @@ impl<'a> TestContext<'a> {
             checkpoints: self
                 .checkpoints
                 .unwrap_or_else(|| Arc::new(NoCheckpoints) as Arc<dyn CheckpointSink>),
+            schedule_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            max_schedule_requests: self.max_schedule_requests,
             restored: self.restored,
             resumed_input: self.resumed_input,
             vcr: self.vcr,
