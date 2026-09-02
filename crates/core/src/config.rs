@@ -1788,6 +1788,10 @@ impl AuthConfig {
             AUTH_MODE_KEYS
         } else {
             AUTH_MODE_OPEN
+        }
+    }
+}
+
 /// `[waiting]` — the deadline policy for jobs parked on external input (N02).
 ///
 /// A job enters [`crate::JobStatus::Waiting`] when its app calls
