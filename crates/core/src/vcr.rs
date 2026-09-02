@@ -289,6 +289,11 @@ pub const REPLAY_BYPASS_APPS: &[(&str, ReplayFidelity, &str)] = &[
          the migration is banked rather than done (see the raw-engine inventory)",
     ),
     (
+        "mpsv-ciselniky",
+        ReplayFidelity::Unreplayable,
+        "the four MPSV codebook documents: raw JSON, and the app's whole payload",
+    ),
+    (
         "mpsv-ispv",
         ReplayFidelity::Unreplayable,
         "the ISPV wage API: raw JSON, and the app's whole payload",

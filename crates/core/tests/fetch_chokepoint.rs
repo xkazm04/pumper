@@ -69,6 +69,12 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // migration (with provenance stamping) is banked in the vault
     // (hackernews-teaches-current-idioms, r11). Reviewed, not endorsed.
     ("crates/apps/hackernews/src/lib.rs::ctx.engines.http", 1),
+    // Four small key-free codebook JSON documents, one GET each — the same
+    // one-fetch verbatim-rows shape as mpsv-ispv below, and cloned from it on
+    // purpose (N36). Nothing here is a rendered page: there is no thin-content
+    // escalation to make, and the run is judged all-or-nothing before any
+    // write, so the tiered ladder has nothing to contribute.
+    ("crates/apps/mpsv-ciselniky/src/lib.rs::ctx.engines.http", 1),
     ("crates/apps/mpsv-ispv/src/lib.rs::ctx.engines.http", 1),
     // ~188 MB bulk feed: `no_cache` + a per-request 300s timeout, plus an ARES
     // company lookup. Both are APIs.

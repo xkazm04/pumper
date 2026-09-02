@@ -51,6 +51,7 @@ app-ca-grants = { path = "crates/apps/ca-grants" }
 app-eu-sedia = { path = "crates/apps/eu-sedia" }
 app-mpsv-vpm = { path = "crates/apps/mpsv-vpm" }
 app-mpsv-ispv = { path = "crates/apps/mpsv-ispv" }
+app-mpsv-ciselniky = { path = "crates/apps/mpsv-ciselniky" }
 app-extractor = { path = "crates/apps/extractor" }
 app-plugin = { path = "crates/apps/plugin" }
 app-smlouvy-dump-watch = { path = "crates/apps/smlouvy-dump-watch" }

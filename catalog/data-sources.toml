@@ -490,6 +490,123 @@ sfera = "string"
 medianMzda = { min = 1000.0, max = 5000000.0 }
 mzdaPrumer = { min = 1000.0, max = 5000000.0 }
 
+# ── MPSV číselníky (codebooks) — the LABEL side of the labour datasets ───────
+# One row per mirrored codebook, all served by the `mpsv-ciselniky` app. Keyed
+# by the SAME codebook URI the vacancy feed publishes, which is what lets
+# mpsv-vpm resolve `Dovednost/…` / `Vzdelani/…` / `Kraj/116` to a readable name
+# by an exact key lookup instead of a substring match.
+#
+# STATUS IS `planned`, DELIBERATELY. The app is implemented and tested, but the
+# `/od/soubory` distribution slugs below are ASSUMED, not verified live (built
+# without network access; the same guess that 404'd for `mpsv-vpm-prirustky`).
+# `catalog.live()` drives both the cron cross-check and `Catalog::reconcile`, so
+# a `planned` row keeps a quarterly job that would only 404 off the scheduler
+# until someone confirms the URL. FIRST LIVE RUN: `POST /apps/mpsv-ciselniky/jobs`
+# with `{"codebooks":["kraj"]}`; on a 404 re-run with `params.urls.kraj` set to
+# the real distribution and move that URL into `CODEBOOKS` in
+# `crates/apps/mpsv-ciselniky/src/lib.rs`, then flip these four rows to
+# `status = "live"` (the cron already matches the app's `schedule()`).
+
+[[source]]
+id = "mpsv-ciselnik-dovednost"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Dovednost (skills codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-dovednost/ciselnik-dovednost.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "dovednost"
+notes = "URL ASSUMED (doubled-slug pattern of the two verified MPSV feeds), NOT verified live. {polozky:[]}, keyed by the `Dovednost/…` URI the vacancy feed publishes. Row floor 100 — below it the run refuses as a collapsed codebook. Resolves skill_demand.skillLabel."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-vzdelani"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Vzdělání (education-level codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-vzdelani/ciselnik-vzdelani.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "vzdelani"
+notes = "URL ASSUMED, NOT verified live. Education-level scale keyed by the `Vzdelani/…` URI. Row floor 5. Resolves education_agg.educationLabel."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-kraj"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Kraj (region codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-kraj/ciselnik-kraj.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "kraj"
+notes = "URL ASSUMED, NOT verified live. The 14 kraje keyed by the `Kraj/…` URI. Row floor 10. Turns every `kraj Kraj/108` title in mpsv-vpm into `Jihomoravský kraj`."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-typ-mzdy"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Typ mzdy (wage-type codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-typ-mzdy/ciselnik-typ-mzdy.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "typ_mzdy"
+notes = "URL ASSUMED, NOT verified live. Wage-type enumeration keyed by the `TypMzdy/…` URI — the dimension whose unresolved URI once silently discarded every posted salary in mpsv-vpm. Row floor 2. Mirrored for completeness; no mpsv-vpm field stamps it in v1."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
 [[source]]
 id = "mpsv-vpm-prirustky"
 app = ""

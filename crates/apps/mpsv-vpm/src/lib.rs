@@ -65,7 +65,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
     ScrapeApp,
@@ -92,6 +92,23 @@ const MIN_PLAUSIBLE_POSTINGS: usize = 1_000;
 /// Official ISPV salary statistics — read cross-app from the store.
 const ISPV_APP: &str = "mpsv-ispv";
 const ISPV_DATASET: &str = "wages";
+/// Codebook mirror — the label side of this app's opaque URI dimensions, read
+/// cross-app from the store exactly the way the ISPV anchor above is.
+///
+/// Named by LITERAL, never by importing `app-mpsv-ciselniky`: the dependency
+/// rule is that an app depends only on `core`, so the coupling between these
+/// two apps is a `(app, dataset)` pair in the store, not a crate edge — the
+/// same posture `ISPV_APP`/`ISPV_DATASET` already take.
+const CODEBOOK_APP: &str = "mpsv-ciselniky";
+const CODEBOOK_SKILL: &str = "dovednost";
+const CODEBOOK_EDUCATION: &str = "vzdelani";
+const CODEBOOK_KRAJ: &str = "kraj";
+/// Read cap per codebook. The skills codebook is the big one (thousands of
+/// entries); 50 000 is far above any of them, and a hit is logged because a
+/// silently truncated codebook would un-label a slice of the output with no
+/// other signal.
+const CODEBOOK_READ_LIMIT: i64 = 50_000;
+
 /// Virtual shared namespace for the posted-vs-official join (grants-common
 /// pattern: cross-source products live in a namespace no single app owns).
 const GAP_APP: &str = "cz-labour";
@@ -173,9 +190,20 @@ pub const CZ_LABOUR_NAMESPACE: &str = GAP_APP;
 /// * `role_region_agg` is OUT: occupation × kraj × org type is the
 ///   highest-cardinality table here (tens of thousands of cells, nearly all of
 ///   which change daily), and it is already addressable by key.
-/// * `skill_demand`, `education_agg` are OUT: same daily-churn cross product,
-///   and their identity is an opaque codebook URI (`Dovednost/…`) — there is no
-///   searchable TEXT in them, only codes a query would have to already know.
+/// * `skill_demand_weekly`, `education_agg_weekly` — the WEEKLY ROLLUPS of the
+///   two codebook-keyed tables, and the reason the daily tables below stay out.
+///   Since N36 every skill/education row carries a resolved `skillLabel` /
+///   `educationLabel` and a sentence `title`, so there IS searchable text in
+///   them now — but the daily tables still churn every day, and indexing them
+///   would cost one document per cell per day (~365× the same cell a year).
+///   The rollups carry the same labelled row under the same key with the ISO
+///   week it was published for, and are written at most ONCE per cell per week
+///   (see [`weekly_rollup_items`]), so the index sees ~52 revisions a year
+///   instead of ~365 and a saved search on a skill name still finds the cell.
+/// * `skill_demand`, `education_agg` (the DAILY tables) are OUT: the labels
+///   fixed the "no searchable TEXT" half of the old rationale, not the
+///   daily-churn half. They stay addressable by key and are the rollups'
+///   source.
 /// * `role_trends` is OUT: derived counts recomputed daily from
 ///   `role_region_agg`'s history — indexing it indexes the same churn twice.
 /// * `vacancy_samples` and `employers` are OUT together, and deliberately as a
@@ -189,7 +217,18 @@ pub const INDEXED_DATASETS: &[(&str, &str)] = &[
     (GAP_APP, NOWCAST_DATASET),
     (GAP_APP, LIFECYCLE_DATASET),
     ("mpsv-vpm", "region_agg"),
+    ("mpsv-vpm", SKILL_WEEKLY_DATASET),
+    ("mpsv-vpm", EDUCATION_WEEKLY_DATASET),
 ];
+
+/// Weekly rollups of the two codebook-keyed tables — see [`INDEXED_DATASETS`]
+/// and [`weekly_rollup_items`]. Same key as the daily table; the row is the
+/// daily row plus the ISO week it was published for.
+const SKILL_WEEKLY_DATASET: &str = "skill_demand_weekly";
+const EDUCATION_WEEKLY_DATASET: &str = "education_agg_weekly";
+/// Read cap for the rollup's "already published this week?" probe. Sized like
+/// the codebook read: the rollups have exactly one row per daily cell.
+const WEEKLY_ROLLUP_READ_LIMIT: i64 = 50_000;
 
 /// [`INDEXED_DATASETS`] rendered as the result's `index_datasets` value — the
 /// exact shape `worker::index_dataset_specs` parses.
@@ -467,6 +506,10 @@ impl ScrapeApp for MpsvVpm {
             .take(considered)
             .filter_map(|p| p.changed_date())
             .max();
+        // The run's calendar day: the feed's own reference date when it has one
+        // (so a replayed fixture rolls up into the week it describes, not the
+        // week it was replayed in), else today.
+        let run_date: NaiveDate = ref_date.unwrap_or_else(|| Utc::now().date_naive());
         let posted_cutoff: Option<NaiveDate> = match (max_posted_age_days > 0, ref_date) {
             (true, Some(rd)) => Some(rd - Duration::days(max_posted_age_days)),
             _ => None,
@@ -609,6 +652,12 @@ impl ScrapeApp for MpsvVpm {
         // existing `drop(resp)` — extended to the larger, longer-lived parsed side.)
         drop(postings);
 
+        // Load the codebook mirror ONCE per run (three small store reads), then
+        // stamp every skill / education / region row from it. Loaded here, after
+        // the corpus is freed and before the first row is built, so no write
+        // path can be reached with a half-loaded label map.
+        let books = Codebooks::load(&ctx).await?;
+
         // aggregate cells that clear the min-count threshold (statistically usable)
         let mut agg_items: Vec<(String, Value)> = Vec::new();
         for ((czisco, kraj, org), cell) in &cells {
@@ -627,7 +676,10 @@ impl ScrapeApp for MpsvVpm {
             if cell.count < min_count {
                 continue;
             }
-            region_items.push((format!("{kraj}|{org}"), cell.to_region_value(kraj, org)));
+            region_items.push((
+                format!("{kraj}|{org}"),
+                cell.to_region_value(kraj, org, &books),
+            ));
         }
 
         // keep the richest N samples per group
@@ -709,7 +761,7 @@ impl ScrapeApp for MpsvVpm {
             let group_total = group_all.get(ug).map(|c| c.count).unwrap_or(0);
             skill_items.push((
                 format!("{ug}|{skill_id}"),
-                cell.to_skill_value(ug, skill_id, group_total),
+                cell.to_skill_value(ug, skill_id, group_total, &books),
             ));
         }
         let mut education_items: Vec<(String, Value)> = Vec::new();
@@ -720,7 +772,7 @@ impl ScrapeApp for MpsvVpm {
             let group_median = group_all.get(ug).and_then(Cell::median);
             education_items.push((
                 format!("{ug}|{edu_id}"),
-                cell.to_education_value(ug, edu_id, group_median),
+                cell.to_education_value(ug, edu_id, group_median, &books),
             ));
         }
         let skill = ctx
@@ -729,6 +781,41 @@ impl ScrapeApp for MpsvVpm {
         let education = ctx
             .upsert_many_with_provenance("education_agg", &education_items, feed_prov())
             .await?;
+
+        // Weekly rollups — the indexed half of the two codebook-keyed tables.
+        // The daily tables move every day; these are written at most once per
+        // cell per ISO week, so the search index sees ~52 revisions a year per
+        // cell instead of ~365. See `weekly_rollup_items` and INDEXED_DATASETS.
+        let week = iso_week(run_date);
+        let mut weekly_out = serde_json::Map::new();
+        let mut weekly_written = 0usize;
+        for (daily_ds, weekly_ds, items) in [
+            ("skill_demand", SKILL_WEEKLY_DATASET, &skill_items),
+            ("education_agg", EDUCATION_WEEKLY_DATASET, &education_items),
+        ] {
+            let stored = ctx
+                .datasets
+                .list(&ctx.app, weekly_ds, WEEKLY_ROLLUP_READ_LIMIT)
+                .await?;
+            let published = published_weeks(&stored);
+            let rollup = weekly_rollup_items(&week, &published, items);
+            let summary = ctx
+                .upsert_many_with_provenance(weekly_ds, &rollup, feed_prov())
+                .await?;
+            weekly_written += rollup.len();
+            weekly_out.insert(
+                weekly_ds.to_string(),
+                json!({
+                    "from": daily_ds,
+                    "isoWeek": week,
+                    "cells": items.len(),
+                    "written": rollup.len(),
+                    "skippedAlreadyThisWeek": items.len().saturating_sub(rollup.len()),
+                    "new": summary.new.len(),
+                    "changed": summary.changed.len(),
+                }),
+            );
+        }
 
         // Trending vs fading roles: national posting-count trajectories from
         // role_region_agg's revision history (the change-intelligence
@@ -1117,7 +1204,7 @@ impl ScrapeApp for MpsvVpm {
             .and_then(Value::as_i64)
             .unwrap_or(REPOST_WINDOW_DAYS_DEFAULT)
             .max(1);
-        let ledger_date = ref_date.unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let ledger_date = run_date;
         let prior_ledger: Option<Ledger> = match ctx
             .datasets
             .get(&ctx.app, LEDGER_DATASET, "current")
@@ -1171,6 +1258,7 @@ impl ScrapeApp for MpsvVpm {
             &live_counts,
             min_count,
             repost_window_days,
+            &books,
         );
         let lifecycle = ctx
             .datasets
@@ -1238,6 +1326,17 @@ impl ScrapeApp for MpsvVpm {
             "educationCells": education_items.len(),
             "educationNew": education.new.len(),
             "educationChanged": education.changed.len(),
+            // How readable this run's output actually is: the share of rows
+            // whose codebook URI resolved to a name. `null` labels are kept
+            // rows, so a low share is an un-mirrored codebook, never lost data.
+            "labelledShare": {
+                "skill_demand": labelled_share(&skill_items, "skillLabel"),
+                "education_agg": labelled_share(&education_items, "educationLabel"),
+                "region_agg": labelled_share(&region_items, "krajName"),
+            },
+            "codebooks": books.sizes(),
+            "weeklyRollups": Value::Object(weekly_out),
+            "weeklyRollupRows": weekly_written,
             "trendCells": trend_items.len(),
             "trendsChanged": trends.new.len() + trends.changed.len(),
             "trendingTop": trending_top,
@@ -1260,6 +1359,172 @@ impl ScrapeApp for MpsvVpm {
     }
 }
 
+// ── codebook label resolution ───────────────────────────────────────────────
+//
+// The skills, education and region dimensions of this app are keyed on the
+// opaque codebook URIs the vacancy feed publishes (`Dovednost/…`, `Vzdelani/…`,
+// `Kraj/116`). `mpsv-ciselniky` mirrors MPSV's codebooks keyed by those SAME
+// URIs, so resolution here is an exact key lookup — never a substring match,
+// which is the rule the aggregation loop has always followed.
+//
+// HONEST ABSENCE IS THE WHOLE CONTRACT: an id the codebook does not carry keeps
+// its URI and gets `label: null`. It is never dropped (that would claim the
+// demand does not exist), never guessed, and never rendered as a prettified
+// version of the code.
+
+/// The resolved codebooks for one run — three URI→label maps, loaded once.
+#[derive(Default)]
+pub struct Codebooks {
+    skill: HashMap<String, String>,
+    education: HashMap<String, String>,
+    kraj: HashMap<String, String>,
+}
+
+impl Codebooks {
+    /// Load the three codebooks this app stamps from. A codebook that has never
+    /// been mirrored (fresh install, or `mpsv-ciselniky` still refusing its
+    /// ASSUMED URL) reads back empty, and every id it would have resolved gets
+    /// `label: null` — the run is NEVER failed for a missing label, because a
+    /// day of unlabelled labour aggregates is strictly better than no labour
+    /// aggregates.
+    async fn load(ctx: &AppContext) -> Result<Self> {
+        let mut books = Codebooks::default();
+        for (dataset, slot) in [
+            (CODEBOOK_SKILL, &mut books.skill),
+            (CODEBOOK_EDUCATION, &mut books.education),
+            (CODEBOOK_KRAJ, &mut books.kraj),
+        ] {
+            let rows = ctx
+                .datasets
+                .list(CODEBOOK_APP, dataset, CODEBOOK_READ_LIMIT)
+                .await?;
+            if rows.len() as i64 >= CODEBOOK_READ_LIMIT {
+                tracing::warn!(
+                    dataset,
+                    scanned = rows.len(),
+                    "mpsv-vpm: codebook read hit the cap — some ids will be left unlabelled"
+                );
+            }
+            *slot = codebook_map(&rows);
+        }
+        Ok(books)
+    }
+
+    fn skill(&self, uri: &str) -> Option<&str> {
+        self.skill.get(uri).map(String::as_str)
+    }
+
+    fn education(&self, uri: &str) -> Option<&str> {
+        self.education.get(uri).map(String::as_str)
+    }
+
+    fn kraj(&self, uri: &str) -> Option<&str> {
+        self.kraj.get(uri).map(String::as_str)
+    }
+
+    /// How many labels each codebook contributed — reported per run so a
+    /// codebook that quietly stopped being mirrored is visible before the
+    /// labelled share drops.
+    fn sizes(&self) -> Value {
+        json!({
+            CODEBOOK_SKILL: self.skill.len(),
+            CODEBOOK_EDUCATION: self.education.len(),
+            CODEBOOK_KRAJ: self.kraj.len(),
+        })
+    }
+}
+
+/// URI → label from a mirrored codebook dataset.
+///
+/// The Czech label is the product's label; `label_en` is the fallback for a
+/// codebook that only publishes English. A row carrying NEITHER contributes no
+/// entry at all — mapping it to its own id would turn "this id has no name"
+/// into "this id is named `Dovednost/1234`", which is exactly the fabricated
+/// label this whole item exists to remove.
+fn codebook_map(rows: &[pumper_core::datasets::Record]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for r in rows {
+        let label = r
+            .data
+            .get("label_cs")
+            .and_then(Value::as_str)
+            .or_else(|| r.data.get("label_en").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(label) = label {
+            map.insert(r.key.clone(), label.to_string());
+        }
+    }
+    map
+}
+
+/// Share of `items` whose `field` carries a resolved (non-null) label, one
+/// decimal — the run's own answer to "is this product readable yet?".
+///
+/// An empty dataset is 100.0, not 0.0: "no rows" is not "no labels", and a
+/// zero here would page an operator every time a min-count gate emptied a cell
+/// set.
+fn labelled_share(items: &[(String, Value)], field: &str) -> f64 {
+    if items.is_empty() {
+        return 100.0;
+    }
+    let labelled = items
+        .iter()
+        .filter(|(_, v)| v.get(field).and_then(Value::as_str).is_some())
+        .count();
+    (labelled as f64 / items.len() as f64 * 1000.0).round() / 10.0
+}
+
+// ── weekly rollups ──────────────────────────────────────────────────────────
+
+/// ISO-8601 week label, `2026-W36` — the identity of a rollup vintage.
+fn iso_week(date: NaiveDate) -> String {
+    let w = date.iso_week();
+    format!("{}-W{:02}", w.year(), w.week())
+}
+
+/// The rollup rows to write this run: every daily cell whose rollup row is not
+/// ALREADY stamped with `week`.
+///
+/// This is the whole reason `skill_demand`/`education_agg` can be searchable
+/// without costing one index document per cell per DAY. The daily tables churn
+/// (a posting count moves every day), so indexing them directly would write
+/// ~365 revisions per cell per year. The rollup carries the same labelled row
+/// under the same key, published at most once per cell per week, so the index
+/// sees ~52.
+///
+/// `published` maps rollup key → the `isoWeek` already stored there. A cell
+/// seen for the first time is written; a cell already published for this week
+/// is skipped (NOT re-upserted with today's numbers, which would restore the
+/// daily churn under a weekly name).
+fn weekly_rollup_items(
+    week: &str,
+    published: &HashMap<String, String>,
+    daily: &[(String, Value)],
+) -> Vec<(String, Value)> {
+    daily
+        .iter()
+        .filter(|(key, _)| published.get(key).map(String::as_str) != Some(week))
+        .map(|(key, value)| {
+            let mut row = value.clone();
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("isoWeek".to_string(), json!(week));
+            }
+            (key.clone(), row)
+        })
+        .collect()
+}
+
+/// Rollup key → the ISO week already published there, read off the store.
+fn published_weeks(rows: &[pumper_core::datasets::Record]) -> HashMap<String, String> {
+    rows.iter()
+        .filter_map(|r| {
+            let w = r.data.get("isoWeek").and_then(Value::as_str)?;
+            Some((r.key.clone(), w.to_string()))
+        })
+        .collect()
+}
+
 // ── search-document titles ──────────────────────────────────────────────────
 //
 // `SearchDoc::from_dataset_record` builds a document's TITLE from the record's
@@ -1270,12 +1535,62 @@ impl ScrapeApp for MpsvVpm {
 // looking for. Kept ASCII-digit (`45000 CZK`, not `45 000`) so the number is one
 // searchable token.
 
-/// Region label for a title: `ALL` is the national roll-up, not a kraj id.
-fn kraj_label(kraj: &str) -> String {
+/// Region label for a title: the codebook NAME when the mirror resolves the id
+/// (`Kraj/116` → `Jihomoravský kraj`), the national roll-up for `ALL`, and the
+/// raw id otherwise.
+///
+/// The unresolved fallback is deliberately the OLD rendering (`kraj Kraj/108`),
+/// not a prettified guess: a title that reads `kraj Kraj/108` says plainly that
+/// the codebook did not carry this id, while "Kraj 108" would read like a name
+/// the source published. Every regional title in this app goes through here, so
+/// this one function is what turns the whole locality surface readable the
+/// moment `mpsv-ciselniky` has run once.
+fn kraj_label(kraj: &str, books: &Codebooks) -> String {
     if kraj == "ALL" {
-        "Czechia (all regions)".to_string()
-    } else {
-        format!("kraj {kraj}")
+        return "Czechia (all regions)".to_string();
+    }
+    match books.kraj(kraj) {
+        Some(name) => name.to_string(),
+        None => format!("kraj {kraj}"),
+    }
+}
+
+/// A skill-demand row's title: the readable sentence a search hit renders as.
+/// An unresolved skill keeps its URI in the title — the row is still findable
+/// by the occupation and the number, and the URI is the thing an operator would
+/// paste into a codebook lookup.
+fn skill_title(
+    unit_group: &str,
+    skill_id: &str,
+    label: Option<&str>,
+    count: usize,
+    share: Option<f64>,
+) -> String {
+    let what = label.unwrap_or(skill_id);
+    match share {
+        Some(pct) => {
+            format!("CZ-ISCO {unit_group} — {what}: {count} postings ({pct:.0}% of the group)")
+        }
+        None => format!("CZ-ISCO {unit_group} — {what}: {count} postings"),
+    }
+}
+
+/// An education-level row's title. The premium is signed on purpose ("below the
+/// group median" is the finding as often as "above").
+fn education_title(
+    unit_group: &str,
+    education_id: &str,
+    label: Option<&str>,
+    median: Option<i64>,
+    premium: Option<i64>,
+) -> String {
+    let what = label.unwrap_or(education_id);
+    match (median, premium) {
+        (Some(m), Some(p)) => {
+            format!("CZ-ISCO {unit_group} — {what}: median {m} CZK ({p:+} CZK vs the group)")
+        }
+        (Some(m), None) => format!("CZ-ISCO {unit_group} — {what}: median {m} CZK"),
+        _ => format!("CZ-ISCO {unit_group} — {what}: no posted salaries"),
     }
 }
 
@@ -1317,21 +1632,33 @@ fn nowcast_title(
     }
 }
 
-fn lifecycle_title(group: &str, kraj: &str, median_days: i64, closures: usize) -> String {
+fn lifecycle_title(
+    group: &str,
+    kraj: &str,
+    median_days: i64,
+    closures: usize,
+    books: &Codebooks,
+) -> String {
     format!(
         "CZ-ISCO {group} {} — median {median_days} days to close, {closures} closures",
-        kraj_label(kraj)
+        kraj_label(kraj, books)
     )
 }
 
-fn region_title(kraj: &str, org: &str, count: usize, median: Option<i64>) -> String {
+fn region_title(
+    kraj: &str,
+    org: &str,
+    count: usize,
+    median: Option<i64>,
+    books: &Codebooks,
+) -> String {
     let salary = match median {
         Some(m) => format!("median salary {m} CZK"),
         None => "no posted salaries".to_string(),
     };
     format!(
         "{}, {} — {count} postings, {salary}",
-        kraj_label(kraj),
+        kraj_label(kraj, books),
         org_label(org)
     )
 }
@@ -2247,6 +2574,7 @@ fn aggregate_lifecycle(
     live_counts: &HashMap<(String, String), usize>,
     min_count: usize,
     window_days: i64,
+    books: &Codebooks,
 ) -> Vec<(String, Value)> {
     #[derive(Default)]
     struct LifeCell {
@@ -2283,7 +2611,7 @@ fn aggregate_lifecycle(
             json!({
                 // The full-text index reads `title` off the record — see the
                 // search-document titles section.
-                "title": lifecycle_title(&ug, &kraj, pct(0.5), n),
+                "title": lifecycle_title(&ug, &kraj, pct(0.5), n, books),
                 "czIscoGroup": ug,
                 "krajId": kraj,
                 // Time from first observation to disappearance from the feed.
@@ -2564,15 +2892,29 @@ impl Cell {
     /// A skill-demand row: how many postings in `unit_group` demand `skill_id`,
     /// its share of the group's postings, and the salary distribution for those
     /// postings.
-    fn to_skill_value(&self, unit_group: &str, skill_id: &str, group_total: usize) -> Value {
+    fn to_skill_value(
+        &self,
+        unit_group: &str,
+        skill_id: &str,
+        group_total: usize,
+        books: &Codebooks,
+    ) -> Value {
         let (s, pct) = self.stats();
+        let share =
+            (group_total > 0).then(|| (self.count as f64 / group_total as f64 * 100.0).round());
+        // Honest absence: an id the codebook does not carry keeps its URI in
+        // `skillId` and gets `skillLabel: null`. Never dropped, never guessed.
+        let label = books.skill(skill_id);
         json!({
+            // The full-text index reads `title` off the record — see the
+            // search-document titles section.
+            "title": skill_title(unit_group, skill_id, label, self.count, share),
             "unitGroup": unit_group,
             "skillId": skill_id,
+            "skillLabel": label,
             "count": self.count,
             "groupPostings": group_total,
-            "sharePct": (group_total > 0)
-                .then(|| (self.count as f64 / group_total as f64 * 100.0).round()),
+            "sharePct": share,
             "salaryCount": s.len(),
             "salaryMedian": pct(0.5),
             "salaryP25": pct(0.25),
@@ -2589,6 +2931,7 @@ impl Cell {
         unit_group: &str,
         education_id: &str,
         group_median: Option<i64>,
+        books: &Codebooks,
     ) -> Value {
         let (s, pct) = self.stats();
         let median = pct(0.5);
@@ -2596,9 +2939,12 @@ impl Cell {
             (Some(m), Some(g)) => Some(m - g),
             _ => None,
         };
+        let label = books.education(education_id);
         json!({
+            "title": education_title(unit_group, education_id, label, median, premium),
             "unitGroup": unit_group,
             "educationId": education_id,
+            "educationLabel": label,
             "count": self.count,
             "salaryCount": s.len(),
             "salaryMedian": median,
@@ -2607,13 +2953,18 @@ impl Cell {
         })
     }
 
-    fn to_region_value(&self, kraj: &str, org: &str) -> Value {
+    fn to_region_value(&self, kraj: &str, org: &str, books: &Codebooks) -> Value {
         let (s, pct) = self.stats();
         json!({
             // The full-text index reads `title` off the record — see the
             // search-document titles section.
-            "title": region_title(kraj, org, self.count, pct(0.5)),
+            "title": region_title(kraj, org, self.count, pct(0.5), books),
             "krajId": kraj,
+            // The codebook name, or Null when the mirror does not carry this id
+            // (and on the `ALL` roll-up, which is not a kraj at all). The title
+            // still renders, so a null here is a missing NAME, never a missing
+            // row.
+            "krajName": books.kraj(kraj),
             "orgType": org,
             "count": self.count,
             "salaryCount": s.len(),
@@ -2720,11 +3071,49 @@ mod tests {
         c
     }
 
+    /// A stored dataset record, the way `Datasets::list` hands one back.
+    fn codebook_record(key: &str, data: Value) -> pumper_core::datasets::Record {
+        pumper_core::datasets::Record {
+            key: key.to_string(),
+            data,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            updated_at: Utc::now(),
+            removed_at: None,
+            trust: "stable".to_string(),
+        }
+    }
+
+    /// No codebook mirrored yet — the fresh-install state, and the state every
+    /// pre-N36 assertion in this file was written against.
+    fn no_books() -> Codebooks {
+        Codebooks::default()
+    }
+
+    /// A mirrored codebook, the way `mpsv-ciselniky` leaves it in the store.
+    fn books_with(
+        skill: &[(&str, &str)],
+        education: &[(&str, &str)],
+        kraj: &[(&str, &str)],
+    ) -> Codebooks {
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        Codebooks {
+            skill: map(skill),
+            education: map(education),
+            kraj: map(kraj),
+        }
+    }
+
     #[test]
     fn skill_value_reports_count_share_and_salary() {
         // 3 postings demand this skill out of a 12-posting group → 25% share.
         let c = cell(&[40_000.0, 50_000.0, 60_000.0]);
-        let v = c.to_skill_value("2512", "Dovednost/rust", 12);
+        let v = c.to_skill_value("2512", "Dovednost/rust", 12, &no_books());
         assert_eq!(v["unitGroup"], "2512");
         assert_eq!(v["skillId"], "Dovednost/rust");
         assert_eq!(v["count"], 3);
@@ -2737,12 +3126,12 @@ mod tests {
     fn education_value_premium_is_median_vs_median_never_fabricated() {
         // A degree-required cell median 60k against the group median 45k → +15k.
         let c = cell(&[55_000.0, 60_000.0, 65_000.0]);
-        let v = c.to_education_value("2512", "Vzdelani/vs", Some(45_000));
+        let v = c.to_education_value("2512", "Vzdelani/vs", Some(45_000), &no_books());
         assert_eq!(v["salaryMedian"], 60_000);
         assert_eq!(v["groupMedian"], 45_000);
         assert_eq!(v["premiumVsGroup"], 15_000);
         // No group median → no fabricated premium.
-        let v2 = c.to_education_value("2512", "Vzdelani/vs", None);
+        let v2 = c.to_education_value("2512", "Vzdelani/vs", None, &no_books());
         assert!(v2["premiumVsGroup"].is_null());
     }
 
@@ -2814,6 +3203,8 @@ mod tests {
             ("cz-labour", "salary_nowcast"),
             ("cz-labour", "vacancy_lifecycle"),
             ("mpsv-vpm", "region_agg"),
+            ("mpsv-vpm", "skill_demand_weekly"),
+            ("mpsv-vpm", "education_agg_weekly"),
         ];
         assert_eq!(
             INDEXED_DATASETS, EXPECTED,
@@ -2874,18 +3265,20 @@ mod tests {
         );
 
         assert_eq!(
-            lifecycle_title("5223", "Kraj/108", 14, 30),
+            lifecycle_title("5223", "Kraj/108", 14, 30, &no_books()),
             "CZ-ISCO 5223 kraj Kraj/108 — median 14 days to close, 30 closures"
         );
         // The `ALL` roll-up is national, not a kraj called "ALL".
-        assert!(lifecycle_title("5223", "ALL", 21, 900).contains("Czechia (all regions)"));
+        assert!(
+            lifecycle_title("5223", "ALL", 21, 900, &no_books()).contains("Czechia (all regions)")
+        );
 
         assert_eq!(
-            region_title("Kraj/108", "private", 1_234, Some(45_000)),
+            region_title("Kraj/108", "private", 1_234, Some(45_000), &no_books()),
             "kraj Kraj/108, private employers — 1234 postings, median salary 45000 CZK"
         );
         assert_eq!(
-            region_title("ALL", "all", 300_000, None),
+            region_title("ALL", "all", 300_000, None, &no_books()),
             "Czechia (all regions), all employers — 300000 postings, no posted salaries"
         );
     }
@@ -2914,7 +3307,8 @@ mod tests {
             .expect("title")
             .contains("nowcast official-grade median 40000 CZK"));
         // region_agg
-        let region = cell(&[40_000.0, 50_000.0]).to_region_value("Kraj/108", "private");
+        let region =
+            cell(&[40_000.0, 50_000.0]).to_region_value("Kraj/108", "private", &no_books());
         assert!(region["title"]
             .as_str()
             .expect("title")
@@ -3034,6 +3428,306 @@ mod tests {
             p["profeseCzIsco"] = json!({ "id": cz });
         }
         p
+    }
+
+    // -- N36: codebook-resolved labels ---------------------------------------
+
+    /// The gate. Every regional title in this app runs through `kraj_label`,
+    /// which used to print the raw codebook id - `kraj Kraj/108` - in the one
+    /// line a search hit shows a human.
+    #[test]
+    fn kraj_label_renders_the_codebook_name_not_the_raw_id() {
+        let books = books_with(&[], &[], &[("Kraj/116", "Jihomoravský kraj")]);
+        assert_eq!(kraj_label("Kraj/116", &books), "Jihomoravský kraj");
+        // An id the mirror does not carry keeps the OLD rendering, which says
+        // plainly that this is a code and not a name.
+        assert_eq!(kraj_label("Kraj/999", &books), "kraj Kraj/999");
+        // `ALL` is the national roll-up, not a kraj - before and after mirroring.
+        assert_eq!(kraj_label("ALL", &books), "Czechia (all regions)");
+        assert_eq!(kraj_label("ALL", &no_books()), "Czechia (all regions)");
+        // And the whole title surface follows it.
+        assert_eq!(
+            region_title("Kraj/116", "private", 1_234, Some(45_000), &books),
+            "Jihomoravský kraj, private employers — 1234 postings, median salary 45000 CZK"
+        );
+        assert!(lifecycle_title("5223", "Kraj/116", 14, 30, &books)
+            .contains("CZ-ISCO 5223 Jihomoravský kraj"));
+    }
+
+    /// The other half of the gate: a URI the codebook is missing keeps its URI
+    /// and gets a NULL label. Dropping it would claim the demand does not
+    /// exist; guessing a label would be the fabrication this item removes.
+    #[test]
+    fn an_unmirrored_id_keeps_its_uri_with_a_null_label_never_dropped() {
+        let books = books_with(
+            &[("Dovednost/java", "Programování v jazyce Java")],
+            &[("Vzdelani/vs", "Vysokoškolské")],
+            &[],
+        );
+        let c = cell(&[40_000.0, 50_000.0, 60_000.0]);
+
+        let known = c.to_skill_value("2512", "Dovednost/java", 12, &books);
+        assert_eq!(known["skillLabel"], "Programování v jazyce Java");
+        assert_eq!(known["skillId"], "Dovednost/java");
+        assert_eq!(
+            known["title"],
+            "CZ-ISCO 2512 — Programování v jazyce Java: 3 postings (25% of the group)"
+        );
+
+        let unknown = c.to_skill_value("2512", "Dovednost/rust", 12, &books);
+        assert!(unknown["skillLabel"].is_null(), "{unknown}");
+        assert_eq!(
+            unknown["skillId"], "Dovednost/rust",
+            "the row is kept under its URI - the demand is real, only the name is missing"
+        );
+        assert!(unknown["title"]
+            .as_str()
+            .expect("title")
+            .contains("Dovednost/rust"));
+        assert_eq!(
+            unknown["count"], 3,
+            "the numbers are untouched by labelling"
+        );
+
+        let edu = c.to_education_value("2512", "Vzdelani/vs", Some(45_000), &books);
+        assert_eq!(edu["educationLabel"], "Vysokoškolské");
+        assert_eq!(
+            edu["title"],
+            "CZ-ISCO 2512 — Vysokoškolské: median 50000 CZK (+5000 CZK vs the group)"
+        );
+        let edu_unknown = c.to_education_value("2512", "Vzdelani/zzz", Some(45_000), &books);
+        assert!(edu_unknown["educationLabel"].is_null());
+        assert_eq!(edu_unknown["educationId"], "Vzdelani/zzz");
+
+        // A region with no mirrored codebook: Null NAME, never a missing row.
+        let region = c.to_region_value("Kraj/108", "private", &books);
+        assert!(region["krajName"].is_null());
+        assert_eq!(region["krajId"], "Kraj/108");
+        // `ALL` is not a kraj, so it has no name either - the title carries it.
+        let national = c.to_region_value("ALL", "all", &books);
+        assert!(national["krajName"].is_null());
+        assert!(national["title"]
+            .as_str()
+            .expect("title")
+            .starts_with("Czechia (all regions)"));
+    }
+
+    /// A codebook row with no readable name contributes NO entry - mapping an
+    /// id to itself would turn "this id has no name" into "this id is named
+    /// `Dovednost/1234`", which is the fabricated label the whole item removes.
+    #[test]
+    fn codebook_map_skips_unlabelled_rows_rather_than_naming_them_after_their_id() {
+        let rows = vec![
+            codebook_record("Kraj/116", json!({ "label_cs": "Jihomoravský kraj" })),
+            // English-only codebook: better than nothing, and stated as such.
+            codebook_record(
+                "Kraj/117",
+                json!({ "label_cs": null, "label_en": "Zlín Region" }),
+            ),
+            codebook_record("Kraj/118", json!({ "label_cs": "   " })),
+            codebook_record("Kraj/119", json!({ "id": "Kraj/119" })),
+        ];
+        let map = codebook_map(&rows);
+        assert_eq!(
+            map.get("Kraj/116").map(String::as_str),
+            Some("Jihomoravský kraj")
+        );
+        assert_eq!(map.get("Kraj/117").map(String::as_str), Some("Zlín Region"));
+        assert!(
+            !map.contains_key("Kraj/118"),
+            "blank is absence, not a label"
+        );
+        assert!(!map.contains_key("Kraj/119"));
+    }
+
+    #[test]
+    fn labelled_share_reports_resolution_and_an_empty_dataset_is_not_a_zero() {
+        let row = |label: Option<&str>| json!({ "skillLabel": label });
+        let items: Vec<(String, Value)> = vec![
+            ("a".into(), row(Some("Java"))),
+            ("b".into(), row(Some("Rust"))),
+            ("c".into(), row(Some("Go"))),
+            ("d".into(), row(None)),
+        ];
+        assert_eq!(labelled_share(&items, "skillLabel"), 75.0);
+        // "No rows" is not "no labels" - a 0.0 here would page an operator every
+        // time a min-count gate emptied a cell set.
+        assert_eq!(labelled_share(&[], "skillLabel"), 100.0);
+    }
+
+    // -- N36: weekly rollups -------------------------------------------------
+
+    #[test]
+    fn iso_week_labels_the_vintage_and_crosses_the_year_boundary_the_iso_way() {
+        assert_eq!(
+            iso_week(NaiveDate::from_ymd_opt(2026, 9, 2).unwrap()),
+            "2026-W36"
+        );
+        // 2027-01-01 is a Friday, which ISO puts in the LAST week of 2026 -
+        // the reason the year comes off `iso_week()` and not off the date.
+        assert_eq!(
+            iso_week(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
+            "2026-W53"
+        );
+    }
+
+    /// The reason `skill_demand` can be searchable at all: the daily table
+    /// churns every day, so the rollup must write a cell ONCE per ISO week -
+    /// re-upserting today's numbers under a weekly name would restore the exact
+    /// 365-documents-per-cell-per-year cost the rollup exists to avoid.
+    #[test]
+    fn weekly_rollup_skips_a_cell_already_published_this_week_not_reupserting_it() {
+        let daily: Vec<(String, Value)> = vec![
+            ("2512|Dovednost/java".into(), json!({ "count": 30 })),
+            ("2512|Dovednost/rust".into(), json!({ "count": 4 })),
+        ];
+        let mut published = HashMap::new();
+        published.insert("2512|Dovednost/java".to_string(), "2026-W36".to_string());
+
+        // Same week: only the cell that has not been published yet is written.
+        let items = weekly_rollup_items("2026-W36", &published, &daily);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "2512|Dovednost/rust");
+        assert_eq!(items[0].1["isoWeek"], "2026-W36");
+        assert_eq!(
+            items[0].1["count"], 4,
+            "the labelled daily row is carried whole"
+        );
+
+        // A new week republishes every cell - one revision per cell per week.
+        let next = weekly_rollup_items("2026-W37", &published, &daily);
+        assert_eq!(next.len(), 2);
+        assert!(next.iter().all(|(_, v)| v["isoWeek"] == "2026-W37"));
+
+        // A rollup row that predates the `isoWeek` field is treated as never
+        // published - it is republished once and then behaves normally.
+        let stale: HashMap<String, String> = HashMap::new();
+        assert_eq!(weekly_rollup_items("2026-W36", &stale, &daily).len(), 2);
+    }
+
+    #[test]
+    fn published_weeks_reads_the_stamp_and_ignores_a_row_without_one() {
+        let rows = vec![
+            codebook_record("a", json!({ "isoWeek": "2026-W36" })),
+            codebook_record("b", json!({ "count": 3 })),
+        ];
+        let map = published_weeks(&rows);
+        assert_eq!(map.get("a").map(String::as_str), Some("2026-W36"));
+        assert!(!map.contains_key("b"));
+    }
+
+    /// N36 end to end: with the codebooks mirrored, a run stamps readable
+    /// labels on every codebook-keyed row, keeps an unmirrored id under its URI
+    /// with a null label, and publishes the weekly rollups the index reads.
+    #[tokio::test]
+    async fn run_stamps_codebook_labels_and_publishes_the_weekly_rollups_once() {
+        let store = TempStore::new("mpsv-vpm-labels").await;
+        // What `mpsv-ciselniky` leaves in the store. `Dovednost/rust` is
+        // deliberately NOT mirrored.
+        for (dataset, key, label) in [
+            ("dovednost", "Dovednost/java", "Programování v jazyce Java"),
+            ("vzdelani", "Vzdelani/vs", "Vysokoškolské"),
+            ("kraj", "Kraj/116", "Jihomoravský kraj"),
+        ] {
+            store
+                .datasets()
+                .upsert(
+                    "mpsv-ciselniky",
+                    dataset,
+                    key,
+                    &json!({ "id": key, "codebook": dataset, "label_cs": label }),
+                )
+                .await
+                .expect("mirror the codebook");
+        }
+
+        let mut rows: Vec<Value> = Vec::new();
+        for i in 0..3 {
+            let mut p = posting(i, Some("CzIsco/25120"), "Kraj/116", 50_000.0);
+            p["pozadovanaDovednost"] =
+                json!([{ "id": "Dovednost/java" }, { "id": "Dovednost/rust" }]);
+            p["minPozadovaneVzdelani"] = json!({ "id": "Vzdelani/vs" });
+            rows.push(p);
+        }
+        let body = json!({ "polozky": rows }).to_string();
+        let params = json!({
+            "url": "https://example.test/mirror.json",
+            "minCount": 1,
+            "aresMaxLookups": 0,
+        });
+        let out = MpsvVpm
+            .run(vpm_ctx(&store, body, params.clone()))
+            .await
+            .expect("run");
+
+        // Half the skill ids resolve; the run says so rather than leaving it to
+        // be discovered downstream.
+        assert_eq!(out["labelledShare"]["skill_demand"], 50.0);
+        assert_eq!(out["labelledShare"]["education_agg"], 100.0);
+        assert_eq!(out["labelledShare"]["region_agg"], 50.0); // Kraj/116 rows named, ALL not
+        assert_eq!(out["codebooks"]["kraj"], 1);
+
+        let skills = store
+            .datasets()
+            .list("mpsv-vpm", "skill_demand", 100)
+            .await
+            .expect("read back");
+        let java = skills
+            .iter()
+            .find(|r| r.key == "2512|Dovednost/java")
+            .expect("mirrored skill");
+        assert_eq!(java.data["skillLabel"], "Programování v jazyce Java");
+        let rust = skills
+            .iter()
+            .find(|r| r.key == "2512|Dovednost/rust")
+            .expect("unmirrored skill is KEPT, under its URI");
+        assert!(rust.data["skillLabel"].is_null());
+
+        let regions = store
+            .datasets()
+            .list("mpsv-vpm", "region_agg", 100)
+            .await
+            .expect("read back");
+        let jm = regions
+            .iter()
+            .find(|r| r.key == "Kraj/116|all")
+            .expect("the kraj cell");
+        assert_eq!(jm.data["krajName"], "Jihomoravský kraj");
+        assert!(jm.data["title"]
+            .as_str()
+            .expect("title")
+            .starts_with("Jihomoravský kraj, all employers"));
+
+        // The rollup carries the labelled row, stamped with the feed's own ISO
+        // week (the reference date is `datumZmeny`, 2026-08-10).
+        let weekly = store
+            .datasets()
+            .list("mpsv-vpm", "skill_demand_weekly", 100)
+            .await
+            .expect("read back");
+        assert_eq!(weekly.len(), 2);
+        assert!(weekly.iter().all(|r| r.data["isoWeek"] == "2026-W33"));
+        assert_eq!(out["weeklyRollups"]["skill_demand_weekly"]["written"], 2);
+
+        // A SECOND run in the same week writes no rollup rows at all — that is
+        // the whole point: the daily table churns, the indexed rollup does not.
+        let body2 = json!({ "polozky": (0..3)
+            .map(|i| {
+                let mut p = posting(i, Some("CzIsco/25120"), "Kraj/116", 60_000.0);
+                p["pozadovanaDovednost"] = json!([{ "id": "Dovednost/java" }]);
+                p
+            })
+            .collect::<Vec<Value>>() })
+        .to_string();
+        let out2 = MpsvVpm
+            .run(vpm_ctx(&store, body2, params))
+            .await
+            .expect("second run");
+        assert_eq!(out2["weeklyRollups"]["skill_demand_weekly"]["written"], 0);
+        assert_eq!(
+            out2["weeklyRollups"]["skill_demand_weekly"]["skippedAlreadyThisWeek"],
+            1
+        );
     }
 
     /// The bughunt bug, proven at run level: with three unclassified postings in
@@ -3933,7 +4627,7 @@ mod tests {
         let mut live = HashMap::new();
         live.insert(("5223".to_string(), "Kraj/108".to_string()), 30usize);
         live.insert(("5223".to_string(), "ALL".to_string()), 40usize);
-        let items = aggregate_lifecycle(&closed, &live, 3, 30);
+        let items = aggregate_lifecycle(&closed, &live, 3, 30, &no_books());
         // Kraj/116 (1 closure) suppressed; Kraj/108 + ALL survive, sorted.
         let keys: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["5223|ALL", "5223|Kraj/108"]);
@@ -3950,7 +4644,7 @@ mod tests {
         assert_eq!(all["closedCount"], 4); // Kraj/116 closure still counts here
         assert_eq!(all["churnPct"], 10.0); // 4 vs 40
                                            // Unknown live cell → no fabricated churn.
-        let no_live = aggregate_lifecycle(&closed, &HashMap::new(), 3, 30);
+        let no_live = aggregate_lifecycle(&closed, &HashMap::new(), 3, 30, &no_books());
         assert!(no_live[0].1["churnPct"].is_null());
         assert!(no_live[0].1["liveCount"].is_null());
     }
