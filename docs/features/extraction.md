@@ -81,10 +81,20 @@ The `extractor` app has **four** modes, each declared by its own params root:
 
 | mode | roots | writes records? |
 | --- | --- | --- |
-| urls | `rules` + `urls` | yes |
-| source | `rules` + `source` | yes |
+| urls | (`rules` \| `profile`) + `urls` | yes |
+| source | (`rules` \| `profile`) + `source` | yes |
 | replay | `replay` | no (report + artifact) |
 | induce | `induce` | no (report + artifact) |
+
+A write mode names its rule set **one** of two ways, never both: inline
+`rules: {…}`, or `profile: "<name>"` — a named, versioned entity in the
+extraction-profile registry, whose ACTIVE version the run executes. `profile` is
+a mode root like `rules` is, so `{profile, replay}` is the same refused
+confusion, and `{profile, rules}` is refused rather than resolved by precedence.
+A **blank** `profile` string reads as absent at both layers (a params template
+with an unfilled variable falls through to the inline answer instead of asking
+the registry for `""`). See
+[resilient-extraction.md §4](resilient-extraction.md).
 
 **Any other combination is refused**, at two layers that must agree:
 
@@ -115,6 +125,7 @@ Both modes share the extraction + quality-report path and report aggregate quali
 - urls mode: `requested`, `fetched`, `skipped`, `failed` (skipped URLs).
 - source mode: `source {app, dataset}`, `requested`, `limit`, `truncated`, `loaded`, `missing`, `missing_keys` (`[{key, reason}]`).
 - every write mode: `dataset` — **the dataset the records actually landed in**. Normally the requested name; the shadow `<dataset>@q` when `[resilience] enforce = true` diverted a quarantined source (see [resilient-extraction.md](resilient-extraction.md)). Without it a diverted run looked identical to a normal one and the reader went looking in the wrong table. `null` on a backfill that wrote no batch.
+- every write mode: `repairable` — whether a repair loop could ever write back to this run's rule set, plus `repair_reason` when it could not. A `profile` run is `repairable: true` and also reports `profile` and the `profile_version` it actually executed (that number is stamped onto the run's `source_runs` row, so a later repair is judged against the rules that ran rather than whatever is active by the time anyone looks). An inline run is `repairable: false, repair_reason: "inline rules"` — nothing refuses it; the run just says what the system cannot do for it.
 - every write mode: `rules_hash` — the content-addressed pin registered for this run's rule set and stamped on every revision it wrote, or **`null` plus `rules_registration_error`** when the registry write failed. Registration is best-effort by design (provenance is additive and must never fail a working scrape), but unstamped revisions are permanently non-replayable, and that used to be visible only as a log line.
 - both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first. Two row scopes:
   - **document scope** (top-level fields): `{field, misses, errors, miss_rate}` — a miss is an `empty` or `error` status, never `container_empty`; `miss_rate` is misses ÷ docs.
