@@ -121,7 +121,7 @@ calls a stuck source "an acceptable terminal state", and that is what it is.
 
 ### The profile registry (§4) — BUILT, store-side (N12 step 1)
 
-`0041_extraction_profiles.sql` ships `extraction_profiles` + immutable
+`0044_extraction_profiles.sql` ships `extraction_profiles` + immutable
 `profile_versions` + `source_runs.profile_version`, with the append-only
 promotion/rollback semantics (`Datasets::add_profile_version` never moves the
 active pointer; `set_active_profile_version` does, and refuses a version nobody

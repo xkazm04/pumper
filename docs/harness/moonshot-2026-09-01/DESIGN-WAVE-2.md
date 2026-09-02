@@ -119,6 +119,22 @@ budget beyond the job's.
 config file written with the token; the `fetch` tool refuses a missing/expired token (401 via the
 error map); a fetch through the tool is metered on the job's ledger.
 
+## Carry-forward from wave 1 (assigned; see FIXES-WAVE-1.md §Carry-forward)
+
+- **G (N03)** also lands: `routes/jobs.rs::enqueue_job` reads the `CallerPrincipal` extension and
+  calls `Storage::enqueue_dedup_as` so `jobs.principal_id` / `cost_events.principal_id` are stamped;
+  workflow step enqueues carry the run's principal. Add `principal=` to `GET /costs` and a
+  `by_principal` block on `/economics` (core `summary_by_principal` exists). G's scope gains
+  `routes/jobs.rs` and `routes/economics.rs`.
+- **J (N15)** also lands: `AppContext::fetch`'s router consultation in `crates/core/src/app.rs`
+  honours a learned `api_recipe` pin (today it branches only on `browser`). J's scope gains that
+  one function.
+- **Migrations**: master is at **0045**. Take 0046+ and expect the coordinator to renumber on
+  collision — four of five wave-1 builders took 0041.
+- **Config sections**: append at the very end of `Config` and of the file, after `WasmAppsConfig`
+  / `RepairConfig`; the wave-1 merges conflicted in `config.rs` every time and were resolved by
+  keeping both sides.
+
 ## Merge order (coordinator)
 
 J (N15) → I (N10) → H (N16) → G (N03) → F (N01). `cargo check --workspace` after each; `just ci`

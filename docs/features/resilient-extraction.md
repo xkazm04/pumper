@@ -599,7 +599,7 @@ otherwise would be the dishonest part of the design.
 
 ## 4. Where rules live: the profile registry (prerequisite for everything in §6)
 
-> **Built (N12 step 1), store-side.** Migration `0041_extraction_profiles.sql`
+> **Built (N12 step 1), store-side.** Migration `0044_extraction_profiles.sql`
 > adds `extraction_profiles` + immutable `profile_versions` and the
 > `source_runs.profile_version` column. The store API is
 > `Datasets::ensure_profile` / `add_profile_version` /
@@ -824,7 +824,7 @@ test asserting the equivalence.
 > | brittle lint | `induce::lint_selector`, `lint_selector_breadth` | built |
 > | the seven gates | `resilience::repair::{gate_*, judge}` | built |
 > | promotion / rollback machine | `resilience::repair::{decide_promotion, probation_outcome}` | built |
-> | candidate + verdict persistence | `repair_attempts`, `repair_candidates` (migration 0042) | built |
+> | candidate + verdict persistence | `repair_attempts`, `repair_candidates` (migration 0045) | built |
 > | Tier-1 Claude candidates | — | **not built** |
 > | golden documents (§6.4.4) | `GoldenDoc` type only; no `data/golden/` store | **not built** — and gate 4 therefore REJECTS rather than skips |
 >
