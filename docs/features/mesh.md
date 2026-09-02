@@ -323,7 +323,12 @@ which is what selects `{items, next_cursor}` paging) at the origin's default
     "origin_provenance_kept": 120, "origin_artifact_sha_dropped": 118,
     "tombstones_applied": 2, "tombstones_deferred": 0,
     "capped": false, "walk_resumed": false, "walk_completed": true,
-    "since": "2026-08-10T09:00:00.000000Z", "note": null
+    "since": "2026-08-10T09:00:00.000000Z", "note": null,
+    "reconcile": {
+      "reconciled": true, "in_sync": false,
+      "local_digest": "4f2a…", "origin_digest": "9c81…",
+      "ghosts_removed": 1, "ghost_keys": ["43112233"]
+    }
   }],
   "index_datasets": [{ "app": "peer_hackernews", "dataset": "stories" }],
   "tombstones": "applied from the feed's 'removed' revisions"
