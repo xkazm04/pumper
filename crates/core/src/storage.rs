@@ -1560,8 +1560,8 @@ impl Storage {
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
              on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
-             filters, plugin_hooks) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
+             filters, plugin_hooks, bind, each_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(&id)
         .bind(t.name)
