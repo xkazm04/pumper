@@ -5,7 +5,7 @@ raised_by: intake intake-portkey-0902 (peer comparison)
 source: librarian/sources/2026-09-02-portkey-gateway.md
 stage: the tier escalation ladder in crates/core/src/fetcher.rs and the job retry decision in crates/server/src/worker.rs
 size: 3 files / ~80 lines / S
-status: proposed
+status: accepted
 ---
 
 ## Why the scope implies it
