@@ -80,14 +80,14 @@ fn ladder(http: Arc<Counting>, browser: Arc<Counting>, claude: Arc<Counting>) ->
 }
 
 fn config_error() -> Error {
-    Error::Config("missing [claude] api key".into())
+    Error::config("missing [claude] api key")
 }
 
 #[tokio::test]
 async fn router_failure_stops_the_ladder_at_one_engine_invocation() {
     let (http, browser, claude) = (
         Counting::new(config_error),
-        Counting::new(|| Error::Browser("chrome died".into())),
+        Counting::new(|| Error::browser("chrome died")),
         Counting::new(|| Error::App("research failed".into())),
     );
     let fetcher = ladder(http.clone(), browser.clone(), claude.clone());
@@ -99,7 +99,7 @@ async fn router_failure_stops_the_ladder_at_one_engine_invocation() {
     // The mark is one carrier — the variant itself — and it survives to the
     // caller, so the job row names the origin instead of the ladder's prose.
     assert!(
-        matches!(err, Error::Config(_)),
+        matches!(err, Error::Config { .. }),
         "a router failure must reach the caller as itself, got: {err}"
     );
     assert_eq!(http.count(), 1, "the failing tier runs exactly once");
@@ -114,7 +114,7 @@ async fn router_failure_stops_the_ladder_at_one_engine_invocation() {
 async fn candidate_failure_still_climbs_every_tier() {
     let (http, browser, claude) = (
         Counting::new(|| Error::http("connection reset")),
-        Counting::new(|| Error::Browser("chrome died".into())),
+        Counting::new(|| Error::browser("chrome died")),
         Counting::new(|| Error::App("research failed".into())),
     );
     let fetcher = ladder(http.clone(), browser.clone(), claude.clone());
@@ -149,14 +149,14 @@ async fn router_failure_at_the_browser_never_un_skips_the_http_tier() {
         .fetch(req)
         .await
         .expect_err("the browser tier fails");
-    assert!(matches!(err, Error::Config(_)), "got: {err}");
+    assert!(matches!(err, Error::Config { .. }), "got: {err}");
     assert_eq!(browser.count(), 1);
     assert_eq!(http.count(), 0, "the router's skip stands");
 
     // Candidate-caused: the un-skip is exactly right, and still fires.
     let (http, browser) = (
         Counting::new(|| Error::http("connection reset")),
-        Counting::new(|| Error::Browser("chrome died".into())),
+        Counting::new(|| Error::browser("chrome died")),
     );
     let fetcher = ladder(http.clone(), browser.clone(), Counting::new(config_error));
     let mut req = FetchRequest::new(URL);

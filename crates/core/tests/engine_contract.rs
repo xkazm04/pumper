@@ -21,7 +21,7 @@ struct NoFlows;
 #[async_trait]
 impl Browser for NoFlows {
     async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
-        Err(Error::Browser("not under test".into()))
+        Err(Error::browser("not under test"))
     }
 }
 
@@ -81,7 +81,7 @@ fn the_flow_refusal_has_one_producer_and_it_is_terminal() {
 /// retries that make a flaky render survivable.
 #[test]
 fn a_failure_during_a_flow_is_still_retryable() {
-    assert!(!Error::Browser("chrome died mid-flow".into()).is_terminal_for_job());
+    assert!(!Error::browser("chrome died mid-flow").is_terminal_for_job());
 }
 
 /// `Dead`'s contract is that **any** engine call is a test bug. `transact` was

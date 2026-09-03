@@ -18,8 +18,8 @@ use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
-                           target_key, result, error, requeue_reason, created_at, available_at, \
-                           started_at, finished_at";
+                           target_key, result, error, requeue_reason, cause_kind, created_at, \
+                           available_at, started_at, finished_at";
 
 /// The claim's in-flight exclusion by target: a job whose `target_key` is
 /// already held by a `running` row is not the row this claim picks.
@@ -684,6 +684,9 @@ impl Storage {
         }
         let error = reason.text();
         let error = error.as_ref();
+        // The type the failure was built from, when it kept one — the column an
+        // operator can group a week of failures by, which the sentence cannot be.
+        let cause_kind = reason.error().and_then(Error::cause_kind);
         // A producer with no typed error (a panic payload, the wall-clock
         // timeout, a recovery sweep) gets the default arm, which is what those
         // three always got.
@@ -702,7 +705,7 @@ impl Storage {
             // has become a smarter system nobody can predict.
             Requeue::Never { reason } => {
                 let ok = self
-                    .fail_permanently_because(id, attempt, error, Some(reason))
+                    .fail_permanently_because(id, attempt, error, Some(reason), cause_kind)
                     .await?;
                 return Ok(ok.then_some(JobStatus::Failed));
             }
@@ -731,7 +734,7 @@ impl Storage {
                 .metered(StoreOp::JobVerdict, |mut conn| async move {
                     let r = sqlx::query(
                         "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3, \
-                         requeue_reason = ?5 \
+                         requeue_reason = ?5, cause_kind = ?6 \
                          WHERE id = ?1 AND status = 'running' AND attempts = ?4",
                     )
                     .bind(id.to_string())
@@ -739,6 +742,7 @@ impl Storage {
                     .bind(ts(available))
                     .bind(attempt)
                     .bind(why)
+                    .bind(cause_kind)
                     .execute(&mut *conn)
                     .await?;
                     let rows = r.rows_affected();
@@ -755,7 +759,7 @@ impl Storage {
     /// Marks a running job permanently failed, guarded on `(status, attempts)`.
     /// Returns whether the write landed (`false` = stale, discarded).
     pub async fn fail_permanently(&self, id: Uuid, attempt: i64, error: &str) -> Result<bool> {
-        self.fail_permanently_because(id, attempt, error, None)
+        self.fail_permanently_because(id, attempt, error, None, None)
             .await
     }
 
@@ -769,13 +773,15 @@ impl Storage {
         attempt: i64,
         error: &str,
         why: Option<&str>,
+        cause_kind: Option<&'static str>,
     ) -> Result<bool> {
         let why = why.map(str::to_string);
         let rows = self
             .metered(StoreOp::JobVerdict, |mut conn| async move {
                 let r = sqlx::query(
                     "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3, \
-                     requeue_reason = COALESCE(?5, requeue_reason) \
+                     requeue_reason = COALESCE(?5, requeue_reason), \
+                     cause_kind = COALESCE(?6, cause_kind) \
                      WHERE id = ?1 AND status = 'running' AND attempts = ?4",
                 )
                 .bind(id.to_string())
@@ -783,6 +789,7 @@ impl Storage {
                 .bind(now())
                 .bind(attempt)
                 .bind(why)
+                .bind(cause_kind)
                 .execute(&mut *conn)
                 .await?;
                 let rows = r.rows_affected();
@@ -883,7 +890,7 @@ impl Storage {
             .map(|(id, app)| {
                 Uuid::parse_str(&id)
                     .map(|id| (id, app))
-                    .map_err(|e| Error::Parse(format!("job id: {e}")))
+                    .map_err(|e| Error::parse_from(format!("job id: {e}"), e))
             })
             .collect()
     }
@@ -3342,6 +3349,7 @@ struct JobRow {
     result: Option<String>,
     error: Option<String>,
     requeue_reason: Option<String>,
+    cause_kind: Option<String>,
     created_at: String,
     available_at: String,
     started_at: Option<String>,
@@ -3353,11 +3361,11 @@ impl TryFrom<JobRow> for Job {
 
     fn try_from(r: JobRow) -> Result<Job> {
         Ok(Job {
-            id: Uuid::parse_str(&r.id).map_err(|e| Error::Parse(format!("job id: {e}")))?,
+            id: Uuid::parse_str(&r.id).map_err(|e| Error::parse_from(format!("job id: {e}"), e))?,
             app: r.app,
             params: serde_json::from_str(&r.params).unwrap_or(Value::Null),
             status: JobStatus::parse(&r.status)
-                .ok_or_else(|| Error::Parse(format!("unknown job status '{}'", r.status)))?,
+                .ok_or_else(|| Error::parse(format!("unknown job status '{}'", r.status)))?,
             attempts: r.attempts,
             max_attempts: r.max_attempts,
             priority: r.priority,
@@ -3373,6 +3381,7 @@ impl TryFrom<JobRow> for Job {
                 .and_then(|s| serde_json::from_str(s).ok()),
             error: r.error,
             requeue_reason: r.requeue_reason,
+            cause_kind: r.cause_kind,
             created_at: parse_ts(&r.created_at)?,
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
@@ -4130,7 +4139,7 @@ fn cutoff(days: u64) -> DateTime<Utc> {
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+        .map_err(|e| Error::parse_from(format!("bad timestamp '{s}': {e}"), e))
 }
 
 #[cfg(test)]
@@ -4210,10 +4219,10 @@ mod requeue_policy_tests {
     fn opinionless() -> Vec<Error> {
         vec![
             Error::http("connection reset"),
-            Error::Browser("chrome died".into()),
+            Error::browser("chrome died"),
             Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
             Error::Profile("jar unreadable".into()),
-            Error::Parse("bad html".into()),
+            Error::parse("bad html"),
             Error::App("the source returned nonsense".into()),
             Error::plugin(PluginFailure::Trap, "delta-slim", "all fuel consumed"),
             Error::SourceDrift("hitCount>0 but 0 rows parsed".into()),
@@ -4291,7 +4300,7 @@ mod requeue_policy_tests {
     #[test]
     fn an_ours_error_does_not_ride_the_ladder_at_the_job_level_either() {
         for e in [
-            Error::Config("missing key".into()),
+            Error::config("missing key"),
             Error::Transact("submit: true refused".into()),
             Error::ReplayMiss("no recorded response".into()),
             Error::plugin(PluginFailure::Unknown, "delta-slim", "not installed"),

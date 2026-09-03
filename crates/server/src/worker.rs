@@ -2735,6 +2735,7 @@ mod fanout_fence_tests {
             trigger_id: None,
             target_key: None,
             requeue_reason: None,
+            cause_kind: None,
             result: None,
             error: None,
             created_at: chrono::Utc::now(),

@@ -1,0 +1,16 @@
+-- What a job's failure was CAUSED by, as a type rather than a sentence.
+--
+-- `jobs.error` holds the rendered message, which is right for a human and
+-- useless for a query: every producer interpolated its cause into prose at the
+-- raise site, so "how many of this week's failures were the origin refusing us,
+-- and how many were our own client failing to build a request" could only be
+-- answered by matching substrings of sentences anybody is free to reword — the
+-- anti-pattern `PluginFailure` and `SourceDrift` each exist to kill, one layer
+-- down.
+--
+-- The four cause-carrying variants (`Http`, `Browser`, `Parse`, `Config`) now
+-- keep the value they were built from, and this column records its TYPE — the
+-- part that is stable and groupable. NULL means the failure carried no typed
+-- cause (most of them: a refusal raised from a condition, a panic, a timeout, a
+-- recovery sweep), never that the cause was uninteresting.
+ALTER TABLE jobs ADD COLUMN cause_kind TEXT;

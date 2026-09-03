@@ -335,7 +335,7 @@ impl pumper_core::Browser for DownBrowser {
         &self,
         _req: pumper_core::RenderRequest,
     ) -> pumper_core::Result<pumper_core::RenderedPage> {
-        Err(pumper_core::Error::Browser("chrome is not running".into()))
+        Err(pumper_core::Error::browser("chrome is not running"))
     }
 }
 

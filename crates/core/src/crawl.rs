@@ -349,8 +349,9 @@ impl UrlFilter {
             patterns
                 .iter()
                 .map(|p| {
-                    regex::Regex::new(p)
-                        .map_err(|e| crate::Error::Parse(format!("bad url pattern '{p}': {e}")))
+                    regex::Regex::new(p).map_err(|e| {
+                        crate::Error::parse_from(format!("bad url pattern '{p}': {e}"), e)
+                    })
                 })
                 .collect()
         };

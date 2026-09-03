@@ -292,7 +292,7 @@ struct NoFlows;
 #[async_trait::async_trait]
 impl Browser for NoFlows {
     async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
-        Err(Error::Browser("no rendering in this test".into()))
+        Err(Error::browser("no rendering in this test"))
     }
 }
 

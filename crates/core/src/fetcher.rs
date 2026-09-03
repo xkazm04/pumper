@@ -2216,7 +2216,7 @@ mod tests {
     #[async_trait]
     impl Browser for DownBrowser {
         async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
-            Err(Error::Browser("chrome launch failed: no such file".into()))
+            Err(Error::browser("chrome launch failed: no such file"))
         }
     }
 
@@ -2328,7 +2328,7 @@ mod tests {
         req.strategy = FetchStrategy::Browser;
         let err = fetcher.fetch(req).await.expect_err("must not fall back");
         assert!(
-            matches!(err, Error::Browser(_)),
+            matches!(err, Error::Browser { .. }),
             "the browser engine error surfaces as-is: {err}"
         );
     }

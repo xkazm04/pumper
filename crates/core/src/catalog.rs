@@ -327,7 +327,7 @@ impl Catalog {
             return Ok(Catalog::default());
         }
         let raw = std::fs::read_to_string(&path)?;
-        Self::parse(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+        Self::parse(&raw).map_err(|e| Error::config_from(format!("{}: {e}", path.display()), e))
     }
 
     /// Parses catalog TOML from a string (the testable core of [`load`]).
@@ -341,10 +341,11 @@ impl Catalog {
     /// connector-catalog/catalog-as-data, "declarations rot without a consumer
     /// that checks them").
     pub fn parse(raw: &str) -> Result<Catalog> {
-        let catalog: Catalog = toml::from_str(raw).map_err(|e| Error::Config(e.to_string()))?;
+        let catalog: Catalog =
+            toml::from_str(raw).map_err(|e| Error::config_from(e.to_string(), e))?;
         let findings = catalog.vocabulary_findings();
         if !findings.is_empty() {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "catalog vocabulary: {}",
                 findings.join("; ")
             )));

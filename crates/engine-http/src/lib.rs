@@ -417,10 +417,12 @@ fn build_client(
         // `Proxy::all` covers http/https/socks5 and honors `user:pass@` auth in
         // the URL. socks5 support comes from reqwest's `socks` feature.
         let p = reqwest::Proxy::all(url)
-            .map_err(|e| Error::http(format!("invalid proxy '{url}': {e}")))?;
+            .map_err(|e| Error::http_from(format!("invalid proxy '{url}': {e}"), e))?;
         builder = builder.proxy(p);
     }
-    builder.build().map_err(|e| Error::http(e.to_string()))
+    builder
+        .build()
+        .map_err(|e| Error::http_from(e.to_string(), e))
 }
 
 impl HttpEngine {
@@ -722,7 +724,7 @@ async fn read_bytes_capped(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| Error::http(e.to_string()))?
+        .map_err(|e| Error::http_from(e.to_string(), e))?
     {
         if would_exceed_cap(buf.len() as u64, chunk.len() as u64, cap) {
             return Err(Error::http(format!(
@@ -884,6 +886,22 @@ fn transport_is_deterministic(p: TransportPredicates) -> bool {
 /// terminal, and is already the 400 this is at the request boundary — the same
 /// lever `require_safe_profile_name` took for a typo'd profile. Widening
 /// `Error::Http` would have swept up every connect blip and body error with it.
+/// The **one** mapping from a `reqwest` failure to a pumper error: the
+/// deterministic classification above when it applies, otherwise a retryable
+/// `Error::Http` that **keeps the `reqwest::Error` itself**.
+///
+/// Keeping it is what makes [`TransportPredicates`]' five classes answerable
+/// downstream. Before, the enum could not hold them, so the block of reasoning
+/// above this function was a comment about what a *message* probably meant; now
+/// a consumer downcasts the cause and asks reqwest the same questions this file
+/// asks — a classification the compiler checks.
+fn transport_error(url: &str, e: reqwest::Error) -> Error {
+    match deterministic_transport_error(url, &e) {
+        Some(terminal) => terminal,
+        None => Error::http_from(e.to_string(), e),
+    }
+}
+
 fn deterministic_transport_error(url: &str, e: &reqwest::Error) -> Option<Error> {
     transport_is_deterministic(TransportPredicates::of(e)).then(|| {
         Error::BadRequest(format!(
@@ -1154,10 +1172,7 @@ impl HttpClient for HttpEngine {
             // Same classification as `send`: this method makes a single attempt,
             // so there is no ladder to save here — but the JOB's ladder is real,
             // and a URL that cannot be requested at all must not ride it.
-            .map_err(|e| {
-                deterministic_transport_error(&req.url, &e)
-                    .unwrap_or_else(|| Error::http(e.to_string()))
-            })?;
+            .map_err(|e| transport_error(&req.url, e))?;
         if let Some(jar) = &jar {
             jar.touch();
         }
@@ -1517,6 +1532,44 @@ mod tests {
             assert!(matches!(mapped, Error::BadRequest(_)), "{mapped:?}");
             assert!(mapped.to_string().contains(url));
         }
+    }
+
+    /// The classification that becomes possible once the cause survives.
+    ///
+    /// This file documents five reqwest failure classes and their retry verdicts
+    /// in a comment above `transport_is_deterministic`, because the enum could
+    /// not hold them: one `format!` at the raise site and the only thing left
+    /// was a sentence, so anything downstream that wanted to know "was this a
+    /// timeout or a refused connection" had to match substrings of reqwest's
+    /// prose — the anti-pattern `PluginFailure` exists to kill, one layer down.
+    ///
+    /// Now the retryable arm keeps the `reqwest::Error`, so the questions are
+    /// answered by asking reqwest, and **no string appears in the assertion**.
+    #[test]
+    fn a_retryable_transport_failure_keeps_the_reqwest_error_itself() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Port 1 on loopback: refused immediately, no network, no listener.
+        let raw = rt
+            .block_on(reqwest::Client::new().get("http://127.0.0.1:1/").send())
+            .expect_err("a refused connection");
+        assert!(raw.is_connect(), "fixture must be a connect error: {raw:?}");
+
+        let mapped = transport_error("http://127.0.0.1:1/", raw);
+        // Retryable, exactly as before — the cause changes what can be ASKED,
+        // never what is classified. `is_terminal_for_job` and
+        // `is_router_failure` still match on the variant alone.
+        assert!(!mapped.is_terminal_for_job());
+        let cause = mapped
+            .cause()
+            .expect("the retryable arm must keep its cause")
+            .downcast_ref::<reqwest::Error>()
+            .expect("and keep it as a reqwest::Error");
+        assert!(cause.is_connect());
+        assert!(!cause.is_timeout());
+        assert!(!cause.is_decode());
     }
 
     #[test]

@@ -2165,8 +2165,9 @@ impl Datasets {
                 .fetch_optional(&self.pool)
                 .await?;
         raw.map(|s| {
-            serde_json::from_str(&s)
-                .map_err(|e| Error::Parse(format!("stored rules for '{hash}' unparseable: {e}")))
+            serde_json::from_str(&s).map_err(|e| {
+                Error::parse_from(format!("stored rules for '{hash}' unparseable: {e}"), e)
+            })
         })
         .transpose()
     }
@@ -3544,10 +3545,13 @@ pub fn parse_stored_join(
     match serde_json::from_str::<StoredJoin>(raw) {
         Ok(StoredJoin::Lookup(l)) => Ok((Some(l), None)),
         Ok(StoredJoin::Group(g)) => Ok((None, Some(g))),
-        Err(e) => Err(Error::Parse(format!(
-            "derived spec's stored lookup/group column is unparseable ({e}); \
+        Err(e) => Err(Error::parse_from(
+            format!(
+                "derived spec's stored lookup/group column is unparseable ({e}); \
              refusing to run it as a passthrough"
-        ))),
+            ),
+            e,
+        )),
     }
 }
 
@@ -4316,7 +4320,7 @@ pub fn ts(dt: DateTime<Utc>) -> String {
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+        .map_err(|e| Error::parse_from(format!("bad timestamp '{s}': {e}"), e))
 }
 
 #[cfg(test)]

@@ -86,6 +86,14 @@ pub struct Job {
     /// a system that is smarter about *when* to retry and cannot say *why* has
     /// traded a predictable runtime for an opaque one.
     pub requeue_reason: Option<String>,
+    /// The TYPE of the failure's cause — `toml::de::Error`, `reqwest::Error` —
+    /// when the error kept one. `None` = the failure carried no typed cause,
+    /// which is most of them.
+    ///
+    /// The queryable half of a failure: `jobs.error` is the sentence a human
+    /// reads, and grouping a week of failures by *what caused them* used to mean
+    /// matching substrings of prose anybody was free to reword.
+    pub cause_kind: Option<String>,
     pub created_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,

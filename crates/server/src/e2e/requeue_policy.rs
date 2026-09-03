@@ -85,7 +85,7 @@ fn rate_limited() -> Error {
 /// A configuration failure — pumper's own, identical on every attempt, and
 /// already the thing that stops the tier ladder.
 fn ours() -> Error {
-    Error::Config("missing api key for origin.test".into())
+    Error::config("missing api key for origin.test")
 }
 
 async fn state_for(
