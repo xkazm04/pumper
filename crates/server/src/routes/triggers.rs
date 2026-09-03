@@ -477,8 +477,11 @@ pub(crate) async fn test_trigger(
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
     // No idempotency key so tests are repeatable.
+    let target_key =
+        crate::mcp::target_key_for(&state.registry, &trigger.target_app, &resolved_params);
     let opts = EnqueueOptions {
         params: resolved_params,
+        target_key,
         max_attempts: trigger.max_attempts,
         priority: trigger.priority,
         budget_usd: trigger.budget_usd,

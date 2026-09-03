@@ -397,11 +397,13 @@ pub(crate) async fn reconcile_one(
     let max_attempts = schedule
         .max_attempts
         .unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
+    let target_key = crate::mcp::target_key_for(&state.registry, &schedule.app, &params);
     let opts = EnqueueOptions {
         params,
         max_attempts,
         priority: schedule.priority,
         schedule_id: Some(schedule.id.clone()),
+        target_key,
         // The schedule's own ceiling, off the live row — see `firing_budget`.
         // This field is why the fire path may not build its options from
         // `Default`: `budget_usd: None` is "no ceiling", so every scheduled run

@@ -952,6 +952,32 @@ pub trait ScrapeApp: Send + Sync {
         AppManifest::default()
     }
 
+    /// **What a job with these params acts on**, as a short string — the unit
+    /// two runs must not write at the same time. `None` (the default) means this
+    /// app names no target, and its jobs are excluded from the exclusion.
+    ///
+    /// The store refuses to claim a job whose key is already held by a
+    /// `running` row (`Storage::claim_next`), so an app that can answer this
+    /// gets in-flight mutual exclusion without taking a lock anywhere: a
+    /// scheduled run and a manual re-run of the same source, or two trigger hops
+    /// onto one target, queue normally and run one after the other.
+    ///
+    /// **Not a hash of `params`**, which is the wrong granularity in both
+    /// directions: two jobs with different pagination params act on one dataset,
+    /// and two jobs with identical params under different `budget_usd` do not
+    /// conflict. It is what the app *declares*, which is why it is an override
+    /// that refuses by default — the same way `fetch_bytes` and `transact` opt
+    /// in on the engine traits.
+    ///
+    /// **The granularity is the app's decision and the failure direction is
+    /// asymmetric.** An over-broad key (one that names a dataset written by many
+    /// jobs by page, on purpose) serialises a legitimate parallel shape and
+    /// costs throughput silently and continuously; an absent key costs a rare
+    /// double-write. Return `None` rather than a key you are not sure about.
+    fn target_key(&self, _params: &Value) -> Option<String> {
+        None
+    }
+
     /// Executes one job. The returned JSON is stored as the job result.
     async fn run(&self, ctx: AppContext) -> Result<Value>;
 }

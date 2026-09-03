@@ -47,6 +47,14 @@ impl ScrapeApp for CaGrants {
         json!({ "status": "active", "limit": 1000, "maxPages": 25 })
     }
 
+    /// One `opportunities` writer at a time, for the same reason as
+    /// `grants-gov`: a run upserts the whole listing into one dataset keyed by
+    /// PortalID, and its `maxPages` walk is internal to the job. A scheduled run
+    /// overlapping a manual re-run is a double-write, not extra throughput.
+    fn target_key(&self, _params: &Value) -> Option<String> {
+        Some("ca-grants:opportunities".to_string())
+    }
+
     fn manifest(&self) -> AppManifest {
         AppManifest {
             params_schema: Some(json!({

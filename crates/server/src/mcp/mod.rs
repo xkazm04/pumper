@@ -526,6 +526,7 @@ async fn enqueue_app(
     };
     let params = crate::routes::merge_params(app.default_params(), over);
     validate_app_params(&state.registry, name, &params)?;
+    let target_key = target_key_for(&state.registry, name, &params);
     let opts = pumper_core::EnqueueOptions {
         params,
         max_attempts: 1,
@@ -539,6 +540,7 @@ async fn enqueue_app(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        target_key,
     };
     let (job, created) = state
         .storage
@@ -645,6 +647,22 @@ pub(crate) fn validate_app_params(
         return Ok(());
     };
     validate_params(schema, params)
+}
+
+/// **What a job of this app, with these params, acts on** — asked of the app
+/// ([`pumper_core::ScrapeApp::target_key`]) by every door that creates work, so
+/// the exclusion key is derived identically no matter which door made the row.
+///
+/// A sibling of [`validate_app_params`] and for the same reason: a rule each
+/// door re-decides is a rule the doors disagree about. Unknown app is `None` —
+/// the caller owns the "unknown app" answer, and a row nobody can name a target
+/// for is a row that names no target.
+pub(crate) fn target_key_for(
+    registry: &std::collections::HashMap<String, std::sync::Arc<dyn pumper_core::ScrapeApp>>,
+    app: &str,
+    params: &Value,
+) -> Option<String> {
+    registry.get(app)?.target_key(params)
 }
 
 /// Validates a params object against an app's declared JSON Schema. `Err` is a

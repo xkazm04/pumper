@@ -466,6 +466,7 @@ mod tests {
             budget_usd: None,
             schedule_id: None,
             trigger_id: None,
+            target_key: None,
             result: None,
             error: None,
             created_at: now,

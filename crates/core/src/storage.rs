@@ -18,7 +18,26 @@ use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
-                           result, error, created_at, available_at, started_at, finished_at";
+                           target_key, result, error, created_at, available_at, started_at, \
+                           finished_at";
+
+/// The claim's in-flight exclusion by target: a job whose `target_key` is
+/// already held by a `running` row is not the row this claim picks.
+///
+/// Written once, here, because the same predicate has to appear in the claim
+/// (which enforces it) and in [`Storage::held_by_target`] (which reports it),
+/// and two spellings of one rule is how a guard and its gauge come to disagree.
+/// A `NULL` key is never held and never holds: an app that has not overridden
+/// [`crate::ScrapeApp::target_key`] behaves exactly as it did before the column
+/// existed.
+///
+/// Non-starvation is a property of the claim, not of a queue: a held job is
+/// simply not the row picked this tick, and the worker already wakes on every
+/// finish (`notify_one`, "a finished job may unblock a previously-capped app"),
+/// which is the same tick that releases the target.
+const TARGET_EXCLUSION: &str = " AND (target_key IS NULL OR target_key NOT IN \
+                                 (SELECT target_key FROM jobs \
+                                  WHERE status = 'running' AND target_key IS NOT NULL))";
 
 /// Rows one recovery sweep will verdict before stopping. The sweep runs inside
 /// boot, so it is bounded rather than proportional to how bad the last crash
@@ -89,6 +108,21 @@ pub struct EnqueueOptions {
     /// complement of `trigger_id` (which trigger) and what makes "the hops this
     /// run caused" an index seek rather than a scan of the jobs table.
     pub source_job_id: Option<String>,
+    /// **What this job acts on**, as the app declares it
+    /// ([`crate::ScrapeApp::target_key`]). Two jobs carrying the same key never
+    /// run at the same time — the claim refuses the second while the first is
+    /// `running`.
+    ///
+    /// The complement of `idempotency_key`, not a variant of it: that one
+    /// answers *should this request create work at all* and refuses an enqueue;
+    /// this one says nothing about creating the row and everything about when it
+    /// may run. A trigger redelivery is deduped and never becomes a row, while a
+    /// scheduled run and a manual re-run are both legitimate rows that must not
+    /// overlap.
+    ///
+    /// `None` (the default, and every app that has not overridden
+    /// `target_key`) opts out completely: the job is neither held nor holding.
+    pub target_key: Option<String>,
 }
 
 /// A standing subscription: deliver a `dataset.changed` event whenever a job
@@ -327,13 +361,14 @@ impl Storage {
         let sched = opts.schedule_id.as_deref();
         let trig = opts.trigger_id.as_deref();
         let src = opts.source_job_id.as_deref();
+        let target = opts.target_key.as_deref();
         let insert = self
             .metered(StoreOp::JobEnqueue, |mut conn| async move {
                 let r = sqlx::query(
                     "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
                      callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-                     trigger_id, source_job_id, created_at, available_at) \
-                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     trigger_id, source_job_id, target_key, created_at, available_at) \
+                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )
                 .bind(id.to_string())
                 .bind(app)
@@ -347,6 +382,7 @@ impl Storage {
                 .bind(sched)
                 .bind(trig)
                 .bind(src)
+                .bind(target)
                 .bind(ts(created))
                 .bind(ts(available))
                 .execute(&mut *conn)
@@ -384,6 +420,17 @@ impl Storage {
     /// Apps listed in `blocked` are skipped, which is how the worker enforces
     /// per-app concurrency limits (fairness across many apps' queues).
     ///
+    /// **Two exclusions, two different questions.** `blocked` is fairness and is
+    /// the worker's list; [`TARGET_EXCLUSION`] is mutual exclusion and is the
+    /// store's own, because a target already `running` is a fact about the table
+    /// rather than about this process. Keeping it inside the claim's `SELECT` is
+    /// load-bearing: the whole guard then lives in the one atomic
+    /// `UPDATE … WHERE id = (SELECT …) RETURNING` that already makes a claim
+    /// exclusive, so there is no window between the check and the claim, no way
+    /// for two workers to disagree, and a second `pumper` process inherits the
+    /// guarantee for free. A worker-side check would inherit nothing and be
+    /// advisory.
+    ///
     /// `aging_coeff` is the priority-aging starvation guard (`WorkerConfig::
     /// priority_aging_coefficient_secs`): the claim orders by *effective*
     /// priority = `priority + waited_secs / aging_coeff`, so a long-waiting
@@ -411,7 +458,8 @@ impl Storage {
         let sql = format!(
             "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1, \
              heartbeat_at = ?1 \
-             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1{exclusion} \
+             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1\
+                         {exclusion}{TARGET_EXCLUSION} \
                          ORDER BY {order} LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -786,6 +834,32 @@ impl Storage {
             .fetch_one(&mut *conn)
             .await?;
             Ok((ages, 1))
+        })
+        .await
+    }
+
+    /// How many due-but-unclaimed jobs are waiting on a **target another job is
+    /// already running**, rather than on the worker.
+    ///
+    /// The operator's half of the target exclusion. Before it, one number
+    /// ("queued and due") meant "the worker is behind", and a capacity finding
+    /// was the only reading available. It separates into *behind* and *held*,
+    /// and only the first is a capacity finding — a held job needs no worker, it
+    /// needs the run in front of it to finish.
+    ///
+    /// Counted with the claim's own predicate ([`TARGET_EXCLUSION`], negated) so
+    /// the gauge cannot drift from the guard it reports on.
+    pub async fn held_by_target(&self) -> Result<i64> {
+        self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
+            let (n,): (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM jobs \
+                 WHERE status = 'queued' AND available_at <= ?1 \
+                   AND NOT (1 = 1{TARGET_EXCLUSION})"
+            ))
+            .bind(now())
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok((n, 1))
         })
         .await
     }
@@ -3052,6 +3126,7 @@ struct JobRow {
     budget_usd: Option<f64>,
     schedule_id: Option<String>,
     trigger_id: Option<String>,
+    target_key: Option<String>,
     result: Option<String>,
     error: Option<String>,
     created_at: String,
@@ -3078,6 +3153,7 @@ impl TryFrom<JobRow> for Job {
             budget_usd: r.budget_usd,
             schedule_id: r.schedule_id,
             trigger_id: r.trigger_id,
+            target_key: r.target_key,
             result: r
                 .result
                 .as_deref()

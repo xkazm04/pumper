@@ -67,6 +67,14 @@ pub struct Job {
     pub schedule_id: Option<String>,
     /// The trigger that fired this job, when it was a reactive-pipeline hop.
     pub trigger_id: Option<String>,
+    /// What this job acts on, as its app declares it (`ScrapeApp::target_key`).
+    /// Two jobs carrying the same key never run at the same time — the claim
+    /// holds the second back until the first leaves `running`. `None` = the app
+    /// names no target, and the job is neither held nor holding.
+    ///
+    /// Serialized on `GET /jobs`, which is where a queued job that is *held*
+    /// becomes distinguishable from one the worker is merely behind on.
+    pub target_key: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,

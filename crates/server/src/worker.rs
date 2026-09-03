@@ -2728,6 +2728,7 @@ mod fanout_fence_tests {
             budget_usd: None,
             schedule_id: None,
             trigger_id: None,
+            target_key: None,
             result: None,
             error: None,
             created_at: chrono::Utc::now(),

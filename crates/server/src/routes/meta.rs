@@ -167,6 +167,9 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     let instrument = state.storage.instrument();
     out.push_str(&store_op_metrics(&instrument.snapshot()));
     out.push_str(&queue_age_metrics(&state.storage.queue_ages().await?));
+    out.push_str(&held_by_target_metric(
+        state.storage.held_by_target().await?,
+    ));
     out.push_str(&store_size_metrics(&state.storage.size_facts().await?));
     out.push_str(&maintenance_metrics(&pass_counts(&instrument)));
     out.push_str(&activity_metrics(
@@ -458,6 +461,24 @@ fn queue_age_metrics(ages: &pumper_core::QueueAges) -> String {
         ages.oldest_running_secs
     ));
     out
+}
+
+/// Due jobs waiting on a **target another job is running**, as Prometheus text.
+///
+/// The split `pumper_jobs{status="queued"}` alone cannot make. A due-but-
+/// unclaimed job used to mean one thing — the worker is behind — and that
+/// reading is a capacity finding. A job held by the target exclusion is not
+/// waiting for a worker at all; it is waiting for the run in front of it, and
+/// adding capacity does nothing for it. Alerting on the depth without
+/// subtracting this number therefore pages for a queue that is working exactly
+/// as designed.
+fn held_by_target_metric(held: i64) -> String {
+    format!(
+        "# HELP pumper_jobs_held_by_target Due queued jobs whose target_key is already held by a          running job. Subtract from pumper_jobs{{status=\"queued\"}} before reading the rest as          worker backlog: these are waiting on the run in front of them, not on capacity
+         # TYPE pumper_jobs_held_by_target gauge
+         pumper_jobs_held_by_target {held}
+"
+    )
 }
 
 /// What the store costs on disk, as Prometheus text.

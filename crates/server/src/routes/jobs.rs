@@ -151,6 +151,7 @@ pub(crate) async fn enqueue_job(
     // to `None` (= unlimited). See `validate_budget_usd`.
     let budget_usd = validate_budget_usd(body.budget_usd)
         .map_err(|msg| ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+    let target_key = crate::mcp::target_key_for(&state.registry, &name, &params);
     let opts = EnqueueOptions {
         params,
         max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
@@ -163,6 +164,7 @@ pub(crate) async fn enqueue_job(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        target_key,
     };
     let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
     if created {

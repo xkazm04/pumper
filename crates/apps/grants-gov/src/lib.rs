@@ -150,6 +150,18 @@ impl ScrapeApp for GrantsGov {
         })
     }
 
+    /// **One `opportunities` writer at a time.** Every run of this app upserts
+    /// the whole listing into the one dataset, keyed by opportunity id, and the
+    /// pagination that could justify parallel writers happens *inside* a single
+    /// job (`maxPages`), never across jobs — so two overlapping runs are never a
+    /// throughput shape, only a double-write. The params are deliberately not
+    /// part of the key: `oppStatuses`/`keyword` change which rows a run touches,
+    /// but two runs with different filters still write the same rows of the same
+    /// dataset, which is exactly the collision.
+    fn target_key(&self, _params: &Value) -> Option<String> {
+        Some(format!("grants-gov:{OPPORTUNITIES_DATASET}"))
+    }
+
     fn manifest(&self) -> AppManifest {
         AppManifest {
             params_schema: Some(json!({
