@@ -114,7 +114,7 @@ impl ArchiveEngine {
         for (name, bound) in [("from", from), ("to", to)] {
             if let Some(b) = bound {
                 if !valid_cdx_bound(b) {
-                    return Err(Error::Http(format!(
+                    return Err(Error::http(format!(
                         "bad archive '{name}' bound '{b}': want 4-14 digits (YYYY[MMDDhhmmss])"
                     )));
                 }
@@ -124,7 +124,7 @@ impl ArchiveEngine {
         let req = HttpRequest::get(cdx_range_query_url(&self.base_url, url, from, to, max + 1));
         let resp = self.inner.fetch(req).await?;
         if !resp.is_success() {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "archive CDX range query for {url} failed: status {}",
                 resp.status
             )));
@@ -297,9 +297,7 @@ impl HttpClient for ArchiveEngine {
     /// "fall through to the live ladder".
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
         if req.method != HttpMethod::Get || req.body.is_some() {
-            return Err(Error::Http(
-                "archive engine serves only bodyless GETs".into(),
-            ));
+            return Err(Error::http("archive engine serves only bodyless GETs"));
         }
 
         // 1) Newest capture from the CDX index. The caller's cache preferences
@@ -310,15 +308,15 @@ impl HttpClient for ArchiveEngine {
         cdx_req.timeout_secs = req.timeout_secs;
         let cdx_resp = self.inner.fetch(cdx_req).await?;
         if !cdx_resp.is_success() {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "archive CDX query for {} failed: status {}",
                 req.url, cdx_resp.status
             )));
         }
         let snap = parse_cdx_first_line(&cdx_resp.body)
-            .ok_or_else(|| Error::Http(format!("no archive snapshot recorded for {}", req.url)))?;
+            .ok_or_else(|| Error::http(format!("no archive snapshot recorded for {}", req.url)))?;
         let captured = snapshot_datetime(&snap.timestamp).ok_or_else(|| {
-            Error::Http(format!(
+            Error::http(format!(
                 "unparseable archive capture timestamp '{}' for {}",
                 snap.timestamp, req.url
             ))
@@ -326,7 +324,7 @@ impl HttpClient for ArchiveEngine {
 
         // 2) Freshness window.
         if !within_window(captured, Utc::now(), req.archive_max_age) {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "newest archive snapshot of {} was captured {} — outside the {}s freshness window",
                 req.url,
                 captured.to_rfc3339(),
@@ -378,7 +376,7 @@ impl HttpClient for ArchiveEngine {
     /// deliberate refusal read identically. This one names the archive and the
     /// reason, and points at the surface that *does* enumerate captures.
     async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
-        Err(Error::Http(format!(
+        Err(Error::http(format!(
             "the archive engine deliberately does not serve binary bodies ({}): \
              a snapshot is a point in time, and which capture a byte fetch means \
              is unspecified. Enumerate captures with `ArchiveEngine::list_snapshots` \
@@ -733,7 +731,7 @@ mod tests {
         let mut req = HttpRequest::get("https://example.com/");
         req.archive_max_age = Some(3600);
         let err = engine.fetch(req).await.unwrap_err();
-        assert!(matches!(err, Error::Http(_)));
+        assert!(matches!(err, Error::Http { .. }));
         assert!(err.to_string().contains("freshness window"), "{err}");
         // The snapshot body was never fetched — only the index was consulted.
         assert_eq!(inner.seen.lock().unwrap().len(), 1);
@@ -832,10 +830,10 @@ mod tests {
                 .get(&req.url)
                 .send()
                 .await
-                .map_err(|e| Error::Http(e.to_string()))?;
+                .map_err(|e| Error::http(e.to_string()))?;
             let status = resp.status().as_u16();
             let final_url = resp.url().to_string();
-            let body = resp.text().await.map_err(|e| Error::Http(e.to_string()))?;
+            let body = resp.text().await.map_err(|e| Error::http(e.to_string()))?;
             Ok(HttpResponse {
                 status,
                 headers: HashMap::new(),

@@ -113,7 +113,7 @@ async fn router_failure_stops_the_ladder_at_one_engine_invocation() {
 #[tokio::test]
 async fn candidate_failure_still_climbs_every_tier() {
     let (http, browser, claude) = (
-        Counting::new(|| Error::Http("connection reset".into())),
+        Counting::new(|| Error::http("connection reset")),
         Counting::new(|| Error::Browser("chrome died".into())),
         Counting::new(|| Error::App("research failed".into())),
     );
@@ -139,20 +139,23 @@ async fn router_failure_at_the_browser_never_un_skips_the_http_tier() {
     // Router-caused: the un-skip would overturn a correct routing decision on
     // evidence that says nothing about the http tier.
     let (http, browser) = (
-        Counting::new(|| Error::Http("connection reset".into())),
+        Counting::new(|| Error::http("connection reset")),
         Counting::new(config_error),
     );
     let fetcher = ladder(http.clone(), browser.clone(), Counting::new(config_error));
     let mut req = FetchRequest::new(URL);
     req.skip_http = true;
-    let err = fetcher.fetch(req).await.expect_err("the browser tier fails");
+    let err = fetcher
+        .fetch(req)
+        .await
+        .expect_err("the browser tier fails");
     assert!(matches!(err, Error::Config(_)), "got: {err}");
     assert_eq!(browser.count(), 1);
     assert_eq!(http.count(), 0, "the router's skip stands");
 
     // Candidate-caused: the un-skip is exactly right, and still fires.
     let (http, browser) = (
-        Counting::new(|| Error::Http("connection reset".into())),
+        Counting::new(|| Error::http("connection reset")),
         Counting::new(|| Error::Browser("chrome died".into())),
     );
     let fetcher = ladder(http.clone(), browser.clone(), Counting::new(config_error));

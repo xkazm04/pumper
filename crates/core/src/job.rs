@@ -77,6 +77,15 @@ pub struct Job {
     pub target_key: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// Which arm of the requeue policy set this row's `available_at` — or, on a
+    /// permanently failed row, why the ladder stopped early. `None` = the plain
+    /// attempt ladder on a row that predates the policy, or an attempt budget
+    /// that simply ran out (which `attempts` already says).
+    ///
+    /// Recorded because the delay stopped being one formula anyone can compute:
+    /// a system that is smarter about *when* to retry and cannot say *why* has
+    /// traded a predictable runtime for an opaque one.
+    pub requeue_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,

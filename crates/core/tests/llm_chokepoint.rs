@@ -323,7 +323,7 @@ impl pumper_core::HttpClient for DownHttp {
         &self,
         _req: pumper_core::HttpRequest,
     ) -> pumper_core::Result<pumper_core::HttpResponse> {
-        Err(pumper_core::Error::Http("dns error: no such host".into()))
+        Err(pumper_core::Error::http("dns error: no such host"))
     }
 }
 

@@ -36,6 +36,7 @@ mod peer_mirror;
 mod provisioner_lifecycle;
 mod quiet_window;
 mod request_panics;
+mod requeue_policy;
 mod router;
 mod schedule_budget;
 mod schedule_misfire;

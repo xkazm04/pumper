@@ -121,6 +121,18 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
         "crates/server/src/routes/runtime.rs::state.engines.fetch",
         1,
     ),
+    // ── Fixtures that must reproduce a raw-HTTP app's failure ────────────────
+    // The requeue-policy measurable stages what an API-shaped app raises: a
+    // transport error propagated with `?` from `ctx.engines.http`, which is
+    // exactly the shape of the eleven raw-HTTP app rows above. Routing the
+    // fixture through `ctx.fetch` would measure a different thing — the tiered
+    // ladder flattens a tier failure into `Error::App("all fetch tiers
+    // exhausted…")`, which is precisely the boundary the policy's carrier does
+    // NOT cross, so the test would silently assert the default arm.
+    (
+        "crates/server/src/e2e/requeue_policy.rs::ctx.engines.http",
+        1,
+    ),
 ];
 
 /// Workspace root — `crates/core/../..`.

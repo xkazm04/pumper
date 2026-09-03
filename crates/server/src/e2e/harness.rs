@@ -38,7 +38,7 @@ pub async fn test_state_indexed(
     search: Arc<dyn pumper_core::Search>,
     tweak: impl FnOnce(&mut Config),
 ) -> (AppState, TempStore) {
-    test_state_parts(apps, search, Arc::new(NoPlugins), tweak).await
+    test_state_parts(apps, search, Arc::new(NoPlugins), dead_engines(), tweak).await
 }
 
 /// [`test_state`] with a REAL plugin host — the seam the trigger-hook tests
@@ -48,7 +48,24 @@ pub async fn test_state_with_plugins(
     apps: Vec<Arc<dyn ScrapeApp>>,
     plugins: Arc<dyn pumper_core::Plugins>,
 ) -> (AppState, TempStore) {
-    test_state_parts(apps, Arc::new(NoSearch), plugins, |_| {}).await
+    test_state_parts(apps, Arc::new(NoSearch), plugins, dead_engines(), |_| {}).await
+}
+
+/// [`test_state`] with the engine set supplied by the caller — the seam for a
+/// scripted `HttpClient`, which is how an app-level transport failure is staged
+/// without a network.
+pub async fn test_state_engines(
+    apps: Vec<Arc<dyn ScrapeApp>>,
+    engines: Arc<pumper_core::EngineSet>,
+) -> (AppState, TempStore) {
+    test_state_parts(
+        apps,
+        Arc::new(NoSearch),
+        Arc::new(NoPlugins),
+        engines,
+        |_| {},
+    )
+    .await
 }
 
 /// The one assembly path; every `test_state*` helper is a preset over it.
@@ -56,6 +73,7 @@ async fn test_state_parts(
     apps: Vec<Arc<dyn ScrapeApp>>,
     search: Arc<dyn pumper_core::Search>,
     plugins: Arc<dyn pumper_core::Plugins>,
+    engines: Arc<pumper_core::EngineSet>,
     tweak: impl FnOnce(&mut Config),
 ) -> (AppState, TempStore) {
     let store = TempStore::new("server-e2e").await;
@@ -77,7 +95,7 @@ async fn test_state_parts(
         config,
         storage: Arc::new(store.storage.clone()),
         governor: Arc::new(Governor::new(&GovernorConfig::default())),
-        engines: dead_engines(),
+        engines,
         plugins,
         search,
         registry,

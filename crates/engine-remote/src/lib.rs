@@ -422,7 +422,7 @@ impl RemoteEngine {
         let budget = std::time::Duration::from_secs(self.timeout_secs);
         match tokio::time::timeout(budget, self.try_node(node, req)).await {
             Ok(result) => result,
-            Err(_) => Err(Error::Http(format!(
+            Err(_) => Err(Error::http(format!(
                 "node {node} did not answer {FETCH_PROXY_PATH} within the {}s end-to-end \
                  [remote] timeout_secs budget",
                 self.timeout_secs
@@ -434,7 +434,7 @@ impl RemoteEngine {
     /// caller turns into the next node, then into a local fallback.
     async fn try_node(&self, node: &str, req: &HttpRequest) -> Result<HttpResponse> {
         let payload = serde_json::to_string(req)
-            .map_err(|e| Error::Http(format!("serialize proxied request: {e}")))?;
+            .map_err(|e| Error::http(format!("serialize proxied request: {e}")))?;
         let mut proxy = HttpRequest::get(format!("{node}{FETCH_PROXY_PATH}"));
         proxy.method = HttpMethod::Post;
         proxy.body = Some(payload);
@@ -455,19 +455,19 @@ impl RemoteEngine {
         );
         let resp = self.transport.fetch(proxy).await?;
         if !resp.is_success() {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "node {node} answered /fetch-proxy with status {}",
                 resp.status
             )));
         }
         let parsed: ProxyResponse = serde_json::from_str(&resp.body)
-            .map_err(|e| Error::Http(format!("node {node} sent an unparseable envelope: {e}")))?;
+            .map_err(|e| Error::http(format!("node {node} sent an unparseable envelope: {e}")))?;
         if let Some(reason) = body_over_cap(parsed.body.len(), self.max_body_bytes) {
-            return Err(Error::Http(format!("node {node} {reason}")));
+            return Err(Error::http(format!("node {node} {reason}")));
         }
         let mut resp: HttpResponse = parsed.into();
         if let Some(reason) = envelope_mismatch(&req.url, &resp.headers) {
-            return Err(Error::Http(format!("node {node} {reason}")));
+            return Err(Error::http(format!("node {node} {reason}")));
         }
         stamp_egress(&mut resp.headers, node);
         Ok(resp)
@@ -711,7 +711,7 @@ mod tests {
                 script[0]
                     .as_ref()
                     .map(|ok| ok.clone())
-                    .map_err(|e| Error::Http(e.to_string()))
+                    .map_err(|e| Error::http(e.to_string()))
             };
             let (status, body) = entry?;
             Ok(HttpResponse {
@@ -968,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_error_falls_back_to_local() {
-        let transport = Scripted::new(vec![Err(Error::Http("connection refused".into()))]);
+        let transport = Scripted::new(vec![Err(Error::http("connection refused"))]);
         let engine = RemoteEngine::with_transport(
             &cfg(&["http://dead-node:9"]),
             transport,
@@ -1088,7 +1088,7 @@ mod tests {
                         let key = format!("{node}{FETCH_PROXY_PATH}");
                         let value = match r {
                             Ok(ok) => Ok(ok.clone()),
-                            Err(e) => Err(Error::Http(e.to_string())),
+                            Err(e) => Err(Error::http(e.to_string())),
                         };
                         (key, value)
                     })
@@ -1107,7 +1107,7 @@ mod tests {
             self.seen.lock().unwrap().push(req.url.clone());
             let (status, body) = match self.answers.get(&req.url) {
                 Some(Ok(ok)) => ok.clone(),
-                Some(Err(e)) => return Err(Error::Http(e.to_string())),
+                Some(Err(e)) => return Err(Error::http(e.to_string())),
                 None => panic!("unscripted node {}", req.url),
             };
             Ok(HttpResponse {
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     fn dead() -> Result<(u16, String)> {
-        Err(Error::Http("connection refused".into()))
+        Err(Error::http("connection refused"))
     }
 
     /// The anti-pattern: **failover to the thing the feature exists to avoid**.

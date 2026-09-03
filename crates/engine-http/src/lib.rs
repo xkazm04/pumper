@@ -417,10 +417,10 @@ fn build_client(
         // `Proxy::all` covers http/https/socks5 and honors `user:pass@` auth in
         // the URL. socks5 support comes from reqwest's `socks` feature.
         let p = reqwest::Proxy::all(url)
-            .map_err(|e| Error::Http(format!("invalid proxy '{url}': {e}")))?;
+            .map_err(|e| Error::http(format!("invalid proxy '{url}': {e}")))?;
         builder = builder.proxy(p);
     }
-    builder.build().map_err(|e| Error::Http(e.to_string()))
+    builder.build().map_err(|e| Error::http(e.to_string()))
 }
 
 impl HttpEngine {
@@ -574,6 +574,7 @@ impl HttpEngine {
                         attempt,
                         budget,
                         &last_error,
+                        last_retry_after,
                     ));
                 };
                 debug!(url = %req.url, attempt, "retrying in {delay:?} ({last_error})");
@@ -593,6 +594,7 @@ impl HttpEngine {
                     attempt,
                     budget,
                     &last_error,
+                    last_retry_after,
                 ));
             };
             // Captured BEFORE the request goes out: a login response's own
@@ -685,7 +687,7 @@ impl HttpEngine {
                 }
             }
         }
-        Err(Error::Http(format!(
+        Err(Error::http(format!(
             "{} failed after {} attempts: {last_error}",
             req.url,
             retries + 1
@@ -720,10 +722,10 @@ async fn read_bytes_capped(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| Error::Http(e.to_string()))?
+        .map_err(|e| Error::http(e.to_string()))?
     {
         if would_exceed_cap(buf.len() as u64, chunk.len() as u64, cap) {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "response body from {url} exceeds max_body_bytes cap of {cap} bytes"
             )));
         }
@@ -947,12 +949,22 @@ fn attempt_timeout(per_attempt: Duration, remaining: Option<Duration>) -> Option
 /// Stays **retryable** (`Error::Http`), like `[browser] render_budget_secs`
 /// exhaustion: "this host was slow *this time*" is a fact about a live site, not
 /// a pure function of the request, so a job may legitimately try again later.
+///
+/// **It carries the wait the server stated**, when there was one. This is the
+/// one site that reads a `Retry-After`, respects it as a floor, and then refuses
+/// to sleep it because it will not fit the budget ([`capped_retry_sleep`]) — so
+/// it is the only site that knows a stated delay was learned and then abandoned.
+/// Rendered into prose, that number was gone: the job ladder re-queued in 10
+/// seconds and ran the whole fetch back into the rate limit the origin had asked
+/// us to wait ten minutes for. One carrier, never two — the field, never a
+/// sentinel in the message.
 fn budget_exhausted(
     url: &str,
     elapsed: Duration,
     attempts: u32,
     budget: Option<Duration>,
     last_error: &str,
+    stated: Option<Duration>,
 ) -> Error {
     let budget_secs = budget.map(|b| b.as_secs()).unwrap_or_default();
     let why = if last_error.is_empty() {
@@ -960,11 +972,15 @@ fn budget_exhausted(
     } else {
         format!("last error: {last_error}")
     };
-    Error::Http(format!(
+    let message = format!(
         "{url} exhausted its end-to-end fetch budget ([http] total_budget_secs = {budget_secs}s) \
          after {:.1}s and {attempts} attempt(s) — {why}",
         elapsed.as_secs_f64()
-    ))
+    );
+    match stated {
+        Some(wait) => Error::http_after(message, wait),
+        None => Error::http(message),
+    }
 }
 
 /// Deterministic per-retry jitter seed from the URL and attempt number — same
@@ -1140,7 +1156,7 @@ impl HttpClient for HttpEngine {
             // and a URL that cannot be requested at all must not ride it.
             .map_err(|e| {
                 deterministic_transport_error(&req.url, &e)
-                    .unwrap_or_else(|| Error::Http(e.to_string()))
+                    .unwrap_or_else(|| Error::http(e.to_string()))
             })?;
         if let Some(jar) = &jar {
             jar.touch();
@@ -1155,7 +1171,7 @@ impl HttpClient for HttpEngine {
             }
         }
         if !(200..300).contains(&status) {
-            return Err(Error::Http(format!(
+            return Err(Error::http(format!(
                 "{} returned status {status} (fetch_bytes requires a 2xx body)",
                 req.url
             )));
@@ -1409,6 +1425,7 @@ mod tests {
             2,
             Some(Duration::from_secs(300)),
             "status 429",
+            None,
         );
         let shown = err.to_string();
         for needle in [
@@ -1423,7 +1440,7 @@ mod tests {
         // Retryable: a slow site is a fact about the site, not about the request.
         assert!(!err.is_terminal_for_job());
         // A budget spent before any attempt reported anything still reads.
-        let none = budget_exhausted("https://x/", Duration::from_secs(1), 0, None, "");
+        let none = budget_exhausted("https://x/", Duration::from_secs(1), 0, None, "", None);
         assert!(none.to_string().contains("no attempt completed"));
     }
 
@@ -1533,7 +1550,7 @@ mod tests {
         let cfg = HttpConfig::default();
         // A syntactically invalid proxy URL surfaces a typed Http error.
         let err = build_client(&cfg, Some("::not a url::"), None).unwrap_err();
-        assert!(matches!(err, Error::Http(_)));
+        assert!(matches!(err, Error::Http { .. }));
     }
 
     #[test]

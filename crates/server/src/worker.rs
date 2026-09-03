@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pumper_core::storage::FailReason;
 use pumper_core::{AppContext, Job, JobStatus, SearchDoc};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
@@ -1022,7 +1023,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             warn!(job = %job.id, error = %e, "job failed");
             match state
                 .storage
-                .fail(job.id, job.attempts, &e.to_string())
+                .fail(job.id, job.attempts, FailReason::Typed(&e))
                 .await
             {
                 Ok(Some(JobStatus::Queued)) => {
@@ -1041,7 +1042,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // backoff and retry semantics are identical; only the error text
             // (and its `panicked: ` marker) differs.
             error!(job = %job.id, %error, "job panicked");
-            match state.storage.fail(job.id, job.attempts, &error).await {
+            match state
+                .storage
+                .fail(job.id, job.attempts, FailReason::Text(&error))
+                .await
+            {
                 Ok(Some(JobStatus::Queued)) => {
                     state.notify.notify_one();
                     return;
@@ -1059,7 +1064,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 .fail(
                     job.id,
                     job.attempts,
-                    &format!("timed out after {}s", timeout.as_secs()),
+                    FailReason::Text(&format!("timed out after {}s", timeout.as_secs())),
                 )
                 .await
             {
@@ -2729,6 +2734,7 @@ mod fanout_fence_tests {
             schedule_id: None,
             trigger_id: None,
             target_key: None,
+            requeue_reason: None,
             result: None,
             error: None,
             created_at: chrono::Utc::now(),

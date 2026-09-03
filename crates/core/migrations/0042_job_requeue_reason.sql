@@ -1,0 +1,15 @@
+-- Why a failed job got the next-attempt time it got.
+--
+-- Before the requeue policy, the answer to "when will this retry" was one
+-- formula anyone could compute: 10 * 2^attempts, capped at an hour, plus
+-- deterministic jitter. After it, the delay is a function of the ERROR — a
+-- server-stated wait outranks the ladder, an ours-class failure stops it, a busy
+-- store waits a moment instead of a rung — and a smarter system whose answer
+-- nobody can predict is a bad trade for a service one person operates.
+--
+-- So the row says which arm ran, in the same spirit as the RECOVERY_REASON_*
+-- stamps: `attempt ladder` (the default and the great majority),
+-- `server-stated wait`, `store contention`, `ours-class failure`. NULL means the
+-- row predates the column, or its verdict predates the policy — never that the
+-- reason was unremarkable.
+ALTER TABLE jobs ADD COLUMN requeue_reason TEXT;

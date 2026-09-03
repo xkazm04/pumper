@@ -467,6 +467,7 @@ mod tests {
             schedule_id: None,
             trigger_id: None,
             target_key: None,
+            requeue_reason: None,
             result: None,
             error: None,
             created_at: now,

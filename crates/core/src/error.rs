@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// How a Claude-engine call failed, and **what it had already spent when it
 /// did**.
 ///
@@ -152,8 +154,27 @@ impl PluginFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("http engine: {0}")]
-    Http(String),
+    /// An HTTP-engine failure, and **the wait the server asked for on its way
+    /// out**.
+    ///
+    /// The struct variant exists to carry `retry_after`, for the same reason
+    /// [`Error::Claude`] is one: a fact the failure knows and no consumer can
+    /// re-derive. `engine-http` reads `Retry-After` properly, honours both RFC
+    /// 7231 forms, treats it as a floor rather than a replacement — and then
+    /// gives up when the stated wait will not fit the fetch budget
+    /// (`capped_retry_sleep`), at which point the number it learned used to go
+    /// into prose. The job ladder then re-queued in 10 seconds and ran the whole
+    /// fetch back into the rate limit the server had asked us to wait ten
+    /// minutes for. Build it with [`Error::http`] / [`Error::http_after`].
+    #[error("http engine: {message}")]
+    Http {
+        message: String,
+        /// A server-stated delay this failure could not honour, if there was
+        /// one. `None` means the server asked for nothing (not "asked for
+        /// zero"), which is why the requeue policy reads it as an override
+        /// rather than as a value.
+        retry_after: Option<Duration>,
+    },
     #[error("browser engine: {0}")]
     Browser(String),
     /// A Claude-engine failure. The struct variant exists to carry
@@ -270,6 +291,38 @@ pub enum Error {
 }
 
 impl Error {
+    /// An HTTP-engine failure the server asked nothing about — today's shape,
+    /// and what every site that has no stated wait to carry should build.
+    pub fn http(message: impl Into<String>) -> Self {
+        Error::Http {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// An HTTP-engine failure carrying **the delay the server stated and this
+    /// fetch could not honour** — the whole point of the struct variant.
+    ///
+    /// One carrier, never two: this is minted where the wait is learned and
+    /// discarded (`engine-http`'s budget-exhausted arm), so the job ladder can
+    /// honour it without a second mechanism disagreeing about what the server
+    /// said.
+    pub fn http_after(message: impl Into<String>, retry_after: Duration) -> Self {
+        Error::Http {
+            message: message.into(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    /// The wait the origin asked for, if this failure carries one. Read by
+    /// [`crate::storage::requeue_after`], which lets it outrank the ladder.
+    pub fn stated_retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// A Claude-engine failure that spent nothing, or whose spend is unknown.
     pub fn claude(class: ClaudeFailure, message: impl Into<String>) -> Self {
         Error::Claude {
@@ -475,7 +528,7 @@ impl Error {
             // `BudgetExhausted` is our clamp, not a fact about any tier, and
             // `BadRequest` is the caller's input. Both are already terminal for
             // the job, which is the axis that actually stops them.
-            Error::Http(_)
+            Error::Http { .. }
             | Error::Browser(_)
             | Error::Claude { .. }
             | Error::Profile(_)
@@ -625,9 +678,7 @@ mod tests {
         assert!(Error::App("plugin trapped, allegedly".into())
             .plugin_failure()
             .is_none());
-        assert!(Error::Http("connection reset".into())
-            .plugin_failure()
-            .is_none());
+        assert!(Error::http("connection reset").plugin_failure().is_none());
     }
 
     /// A plugin trap is the sandbox WORKING. Retrying it may well succeed
@@ -707,9 +758,7 @@ mod tests {
     /// invent one.
     #[test]
     fn other_failures_report_no_spend() {
-        assert!(Error::Http("connection reset".into())
-            .claude_spend()
-            .is_none());
+        assert!(Error::http("connection reset").claude_spend().is_none());
         assert!(Error::App("nonsense".into()).claude_spend().is_none());
     }
 
@@ -781,7 +830,7 @@ mod tests {
     #[test]
     fn transient_failures_stay_retryable_not_terminal() {
         for e in [
-            Error::Http("connection reset".into()),
+            Error::http("connection reset"),
             Error::Browser("chrome died".into()),
             Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
             Error::App("the source returned nonsense".into()),
@@ -844,7 +893,7 @@ mod tests {
         );
         // The lookalike keeps its ladder: a source that is *down* fails in the
         // fetch chokepoint, and that one really can succeed next time.
-        assert!(!Error::Http("connect grants.gov: timed out".into()).is_terminal_for_job());
+        assert!(!Error::http("connect grants.gov: timed out").is_terminal_for_job());
         assert!(!Error::App("partial harvest".into()).is_terminal_for_job());
     }
 
@@ -855,7 +904,7 @@ mod tests {
     #[test]
     fn a_drift_refusal_does_not_read_like_the_source_being_down() {
         let drift = Error::SourceDrift("result.records missing or not an array".into());
-        let outage = Error::Http("connect https://data.ca.gov: timed out".into());
+        let outage = Error::http("connect https://data.ca.gov: timed out");
         assert!(drift.to_string().starts_with("source drift:"), "{drift}");
         assert!(!outage.to_string().starts_with("source drift:"), "{outage}");
         assert_ne!(drift.is_terminal_for_job(), outage.is_terminal_for_job());
@@ -883,7 +932,7 @@ mod tests {
             | Error::ReplayMiss(_)
             | Error::SourceDrift(_) => true,
             // Everything else can genuinely succeed on the next attempt.
-            Error::Http(_)
+            Error::Http { .. }
             | Error::Browser(_)
             | Error::Claude { .. }
             | Error::Profile(_)
@@ -904,7 +953,7 @@ mod tests {
     #[test]
     fn every_error_variant_has_a_decided_retry_classification() {
         let all = vec![
-            Error::Http("reset".into()),
+            Error::http("reset"),
             Error::Browser("chrome died".into()),
             Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
             Error::Profile("jar unreadable".into()),
@@ -1023,6 +1072,6 @@ mod tests {
         // And nothing outside the storage variant may answer this at all, or a
         // `match` on the outcome silently swallows unrelated failures.
         assert!(!Error::App("database is locked, allegedly".into()).is_store_contention());
-        assert!(!Error::Http("connection reset".into()).is_store_contention());
+        assert!(!Error::http("connection reset").is_store_contention());
     }
 }

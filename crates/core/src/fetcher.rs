@@ -1612,7 +1612,7 @@ mod tests {
     #[async_trait]
     impl HttpClient for MissArchive {
         async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
-            Err(Error::Http("no archive snapshot within window".into()))
+            Err(Error::http("no archive snapshot within window"))
         }
     }
 
@@ -2389,7 +2389,7 @@ mod tests {
         #[async_trait]
         impl HttpClient for DownHttp {
             async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
-                Err(Error::Http("dns error: no such host".into()))
+                Err(Error::http("dns error: no such host"))
             }
         }
         let fetcher = Fetcher::new(
@@ -2708,7 +2708,7 @@ mod tests {
         impl HttpClient for ApiFailsHttp {
             async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
                 if req.url == API_URL {
-                    return Err(Error::Http("connection refused".into()));
+                    return Err(Error::http("connection refused"));
                 }
                 Ok(HttpResponse {
                     status: 200,

@@ -89,7 +89,7 @@ async fn fetch_bytes_returns_raw_bytes_caps_bodies_and_rejects_non_2xx() {
     let mut capped = HttpRequest::get(format!("{base}/big"));
     capped.max_body_bytes = Some(1024);
     let err = engine.fetch_bytes(capped).await.unwrap_err();
-    assert!(matches!(err, Error::Http(_)));
+    assert!(matches!(err, Error::Http { .. }));
     assert!(
         err.to_string().contains("max_body_bytes cap of 1024"),
         "error names the cap: {err}"
@@ -124,6 +124,6 @@ async fn fetch_bytes_default_impl_is_a_loud_unsupported_error() {
         .fetch_bytes(HttpRequest::get("https://example.com/a.zip"))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Http(_)));
+    assert!(matches!(err, Error::Http { .. }));
     assert!(err.to_string().contains("fetch_bytes"), "{err}");
 }
