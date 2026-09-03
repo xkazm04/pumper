@@ -710,10 +710,10 @@ impl Config {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
             let mut cfg: Config = toml::from_str(&raw)
-                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+                .map_err(|e| Error::config_from(format!("{}: {e}", path.display()), e))?;
             cfg.normalize();
             cfg.validate()
-                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+                .map_err(|e| Error::config_from(format!("{}: {e}", path.display()), e))?;
             Ok(cfg)
         } else {
             tracing::warn!("config file {} not found, using defaults", path.display());
@@ -748,7 +748,7 @@ impl Config {
         // until `max_attempts` is exhausted. No job ever completes.
         if w.heartbeat_secs > 0 && w.stale_after_secs > 0 && w.stale_after_secs <= w.heartbeat_secs
         {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[worker] stale_after_secs ({}) must exceed heartbeat_secs ({}) — \
                  otherwise every healthy job is reaped as hung",
                 w.stale_after_secs, w.heartbeat_secs
@@ -762,7 +762,7 @@ impl Config {
             && w.job_timeout_secs > 0
             && w.job_timeout_secs <= w.stale_after_secs
         {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[worker] job_timeout_secs ({}) must exceed stale_after_secs ({}) — \
                  otherwise the reaper races the job timeout",
                 w.job_timeout_secs, w.stale_after_secs
@@ -772,8 +772,8 @@ impl Config {
         // A worker with no concurrency claims nothing: the queue fills and drains
         // never, with no error anywhere.
         if w.concurrency == 0 {
-            return Err(Error::Config(
-                "[worker] concurrency must be > 0 — a worker with 0 slots claims no jobs".into(),
+            return Err(Error::config(
+                "[worker] concurrency must be > 0 — a worker with 0 slots claims no jobs",
             ));
         }
 
@@ -786,7 +786,7 @@ impl Config {
             // every tripped run is also severe: the whole hysteresis ladder
             // collapses and one bad run walks a source to quarantine.
             if r.degrade_score >= r.quarantine_score {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[resilience] degrade_score ({}) must be < quarantine_score ({}) — \
                      otherwise every tripped run is severe and the hysteresis ladder collapses",
                     r.degrade_score, r.quarantine_score
@@ -795,7 +795,7 @@ impl Config {
             // A floor outside (0,1] either gates nothing (<=0) or gates every run
             // (>1), and the second silently disables detection entirely.
             if !(r.fetch_ok_floor > 0.0 && r.fetch_ok_floor <= 1.0) {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[resilience] fetch_ok_floor ({}) must be in (0, 1] — \
                      above 1 every run is inconclusive and nothing is ever judged",
                     r.fetch_ok_floor
@@ -804,7 +804,7 @@ impl Config {
             // Below 5 documents no proportion test has the power to separate a
             // broken run from noise, so the cohort floor would be decorative.
             if r.min_cohort_docs < 5 {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[resilience] min_cohort_docs ({}) must be >= 5 — \
                      no rate test can separate signal from noise below that",
                     r.min_cohort_docs
@@ -812,16 +812,15 @@ impl Config {
             }
             // An empty baseline window means every run is judged against nothing.
             if r.window_runs == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[resilience] window_runs must be > 0 — a zero-run baseline \
-                     leaves every run with nothing to be compared against"
-                        .into(),
+                     leaves every run with nothing to be compared against",
                 ));
             }
             // Drift bands that cross make the divergence table unreadable: a
             // drift could be simultaneously "unchanged" and "moved".
             if r.drift_low >= r.drift_high {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[resilience] drift_low ({}) must be < drift_high ({})",
                     r.drift_low, r.drift_high
                 )));
@@ -830,16 +829,15 @@ impl Config {
             // itself on the first run that merely failed to trip — which is the
             // exact behaviour quarantine exists to prevent.
             if r.recovery_runs == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[resilience] recovery_runs must be > 0 — a source would otherwise \
-                     un-quarantine itself on the first run that happened not to trip"
-                        .into(),
+                     un-quarantine itself on the first run that happened not to trip",
                 ));
             }
             // Sketches are the baseline substrate; keeping fewer than the window
             // means the baseline read silently sees a short window.
             if r.sketch_retention_runs < r.window_runs {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[resilience] sketch_retention_runs ({}) must be >= window_runs ({}) — \
                      otherwise retention prunes the baseline the detector reads",
                     r.sketch_retention_runs, r.window_runs
@@ -857,12 +855,11 @@ impl Config {
         // two, and guessing which silently is how a total outage or an unbounded
         // body gets shipped.
         if self.http.max_body_bytes == 0 {
-            return Err(Error::Config(
+            return Err(Error::config(
                 "[http] max_body_bytes must be > 0 — a zero cap rejects every non-empty \
                  response body, i.e. every fetch. (Note `[browser] max_html_bytes = 0` \
                  means the opposite: it DISABLES that tier's cap. There is no \
-                 disable value for this one; set a large number instead.)"
-                    .into(),
+                 disable value for this one; set a large number instead.)",
             ));
         }
 
@@ -876,7 +873,7 @@ impl Config {
                 Ok("http") | Ok("https")
             )
         {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[archive] base_url ('{}') must be an absolute http(s) URL",
                 a.base_url
             )));
@@ -889,10 +886,9 @@ impl Config {
         let rm = &self.remote;
         if rm.enabled {
             if rm.secret.trim().is_empty() {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[remote] secret must be set when the fetch fabric is enabled — \
-                     an unauthenticated /fetch-proxy is an open proxy"
-                        .into(),
+                     an unauthenticated /fetch-proxy is an open proxy",
                 ));
             }
             for node in &rm.nodes {
@@ -900,13 +896,13 @@ impl Config {
                     url::Url::parse(node).as_ref().map(|u| u.scheme()),
                     Ok("http") | Ok("https")
                 ) {
-                    return Err(Error::Config(format!(
+                    return Err(Error::config(format!(
                         "[remote] node ('{node}') must be an absolute http(s) URL"
                     )));
                 }
             }
             if rm.timeout_secs == 0 || rm.max_body_bytes == 0 {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[remote] timeout_secs ({}) and max_body_bytes ({}) must be > 0 \
                      when the fetch fabric is enabled",
                     rm.timeout_secs, rm.max_body_bytes
@@ -920,7 +916,7 @@ impl Config {
         // operator can see from the file.
         let st = &self.storage;
         if st.revision_retention_days > 0 && st.revision_retention_keep_min < 1 {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[storage] revision_retention_keep_min ({}) must be >= 1 when \
                  revision_retention_days is set — keeping zero revisions per record deletes the \
                  whole history of every record past the cutoff, not just its tail",
@@ -928,11 +924,10 @@ impl Config {
             )));
         }
         if st.artifact_retention_include_cassettes && st.artifact_retention_days == 0 {
-            return Err(Error::Config(
+            return Err(Error::config(
                 "[storage] artifact_retention_include_cassettes is set while \
                  artifact_retention_days is 0 — the flag reads as 'cassettes are unprotected' \
-                 but nothing reclaims artifacts at all, so it does nothing"
-                    .into(),
+                 but nothing reclaims artifacts at all, so it does nothing",
             ));
         }
         // Artifact retention keeps a body alive while a REPLAYABLE revision points
@@ -944,7 +939,7 @@ impl Config {
             && st.revision_retention_days > 0
             && st.revision_retention_days < st.artifact_retention_days
         {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[storage] revision_retention_days ({}) must be >= artifact_retention_days ({}) \
                  — artifact pins are held by replayable revisions, so pruning history first \
                  un-pins bodies before their own window is up",
@@ -956,10 +951,9 @@ impl Config {
         // failure ever recorded — before any success could reset the counter —
         // making auto-validation a one-shot coin flip. Catch it at boot.
         if self.recipes.max_failures == 0 {
-            return Err(Error::Config(
+            return Err(Error::config(
                 "[recipes] max_failures must be >= 1 — a validated recipe needs at \
-                 least one consecutive failure before it is un-validated"
-                    .into(),
+                 least one consecutive failure before it is un-validated",
             ));
         }
 
@@ -970,17 +964,15 @@ impl Config {
         let i = &self.ingress;
         if i.enabled {
             if i.max_body_bytes == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[ingress] max_body_bytes must be > 0 when ingress is enabled — \
-                     a zero cap rejects every inbound event"
-                        .into(),
+                     a zero cap rejects every inbound event",
                 ));
             }
             if i.rate_limit_per_min == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[ingress] rate_limit_per_min must be > 0 when ingress is enabled — \
-                     a zero bucket admits no events"
-                        .into(),
+                     a zero bucket admits no events",
                 ));
             }
         }
@@ -994,7 +986,7 @@ impl Config {
                 Some(std::cmp::Ordering::Less) | None
             )
         {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[mcp] max_job_budget_usd ({}) must be >= 0 when mcp is enabled",
                 self.mcp.max_job_budget_usd
             )));
@@ -1007,17 +999,16 @@ impl Config {
         let rf = &self.refresher;
         if rf.enabled {
             if rf.global_per_tick == 0 || rf.per_host_per_tick == 0 {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[refresher] global_per_tick ({}) and per_host_per_tick ({}) must be > 0 \
                      when the refresher is enabled — zero budgets refresh nothing",
                     rf.global_per_tick, rf.per_host_per_tick
                 )));
             }
             if rf.horizon_secs == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[refresher] horizon_secs must be > 0 when the refresher is enabled — \
-                     a zero window never finds a near-due key"
-                        .into(),
+                     a zero window never finds a near-due key",
                 ));
             }
         }
@@ -1026,7 +1017,7 @@ impl Config {
         // the cap silently stops being a cap.
         let g = &self.governor;
         if g.enabled && g.penalty_base_secs > g.penalty_cap_secs {
-            return Err(Error::Config(format!(
+            return Err(Error::config(format!(
                 "[governor] penalty_cap_secs ({}) must be >= penalty_base_secs ({}) — \
                  otherwise the cap never applies",
                 g.penalty_cap_secs, g.penalty_base_secs
@@ -1043,7 +1034,7 @@ impl Config {
             // means the interval is not the interval — the real cadence is the
             // tick, and every stated bound below it is fiction.
             if m.tick_secs == 0 || m.tick_secs > m.min_interval_secs {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[maintenance] tick_secs ({}) must be > 0 and <= min_interval_secs ({}) — \
                      the gate cannot honour an interval it is consulted less often than",
                     m.tick_secs, m.min_interval_secs
@@ -1053,7 +1044,7 @@ impl Config {
             // quiet rung ever could, so "prefer true quiet" would never be the
             // preference — the ladder would start on its second rung.
             if m.staleness_secs < m.min_interval_secs {
-                return Err(Error::Config(format!(
+                return Err(Error::config(format!(
                     "[maintenance] staleness_secs ({}) must be >= min_interval_secs ({}) — \
                      otherwise the reduced-chunk rung fires before the quiet rung can",
                     m.staleness_secs, m.min_interval_secs
@@ -1063,19 +1054,17 @@ impl Config {
             // activity", which is the wall-clock timer with extra steps and no
             // gate at all.
             if m.wal_harm_bytes == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[maintenance] wal_harm_bytes must be > 0 — a zero harm bound makes every \
-                     pass an emergency, which is the ungated timer this gate replaces"
-                        .into(),
+                     pass an emergency, which is the ungated timer this gate replaces",
                 ));
             }
             // Zero rounds is a pass that checkpoints nothing and still reports
             // `ran` — a maintenance log that would read healthy forever.
             if m.checkpoint_rounds == 0 {
-                return Err(Error::Config(
+                return Err(Error::config(
                     "[maintenance] checkpoint_rounds must be >= 1 — a pass with no rounds \
-                     reports `ran` having done nothing"
-                        .into(),
+                     reports `ran` having done nothing",
                 ));
             }
         }

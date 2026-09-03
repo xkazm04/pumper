@@ -178,7 +178,7 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
             html,
         } => {
             let sel = Selector::parse(selector)
-                .map_err(|e| Error::Parse(format!("bad css selector '{selector}': {e:?}")))?;
+                .map_err(|e| Error::parse(format!("bad css selector '{selector}': {e:?}")))?;
             CompiledRule::Css {
                 selector: sel,
                 attr: attr.clone(),
@@ -188,7 +188,7 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
         }
         Rule::Regex { pattern, group } => {
             let re = Regex::new(pattern)
-                .map_err(|e| Error::Parse(format!("bad regex '{pattern}': {e}")))?;
+                .map_err(|e| Error::parse_from(format!("bad regex '{pattern}': {e}"), e))?;
             CompiledRule::Regex { re, group: *group }
         }
         Rule::Json { pointer } if !scoped => {
@@ -197,7 +197,7 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
             // an Error at compile time, not an indistinguishable Empty miss
             // at extract time (which defeats the DocReport/FieldStatus signal).
             if !pointer.is_empty() && !pointer.starts_with('/') {
-                return Err(Error::Parse(format!(
+                return Err(Error::parse(format!(
                     "bad json pointer '{pointer}': must be empty or start with '/'"
                 )));
             }
@@ -207,17 +207,16 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
         }
         Rule::Xpath { xpath, all } if !scoped => {
             let parsed = skyscraper::xpath::parse(xpath)
-                .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
+                .map_err(|e| Error::parse_from(format!("bad xpath '{xpath}': {e}"), e))?;
             CompiledRule::Xpath {
                 xpath: parsed,
                 all: *all,
             }
         }
         Rule::Json { .. } | Rule::Xpath { .. } => {
-            return Err(Error::Parse(
+            return Err(Error::parse(
                 "'json'/'xpath' rules are not supported inside an 'each' container \
-                 (use 'css'/'regex'/'const' or a nested 'each')"
-                    .into(),
+                 (use 'css'/'regex'/'const' or a nested 'each')",
             ))
         }
         Rule::Const { value } => CompiledRule::Const {
@@ -229,13 +228,13 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
             container,
         } => {
             let sel = Selector::parse(selector).map_err(|e| {
-                Error::Parse(format!("bad css selector '{selector}' in 'each': {e:?}"))
+                Error::parse(format!("bad css selector '{selector}' in 'each': {e:?}"))
             })?;
             let container = container
                 .as_deref()
                 .map(|c| {
                     Selector::parse(c).map_err(|e| {
-                        Error::Parse(format!("bad container selector '{c}' in 'each': {e:?}"))
+                        Error::parse(format!("bad container selector '{c}' in 'each': {e:?}"))
                     })
                 })
                 .transpose()?;
@@ -304,8 +303,9 @@ impl CompiledTransform {
                 pattern,
                 replacement,
             } => Self::RegexReplace {
-                re: Regex::new(&pattern)
-                    .map_err(|e| Error::Parse(format!("bad transform regex '{pattern}': {e}")))?,
+                re: Regex::new(&pattern).map_err(|e| {
+                    Error::parse_from(format!("bad transform regex '{pattern}': {e}"), e)
+                })?,
                 replacement,
             },
             Transform::Split { sep, index } => Self::Split { sep, index },

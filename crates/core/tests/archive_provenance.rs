@@ -76,7 +76,7 @@ struct NoLive;
 #[async_trait]
 impl HttpClient for NoLive {
     async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
-        Err(Error::Http("the live tier must not be reached".into()))
+        Err(Error::http("the live tier must not be reached"))
     }
 }
 

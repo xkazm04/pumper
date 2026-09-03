@@ -323,7 +323,7 @@ impl pumper_core::HttpClient for DownHttp {
         &self,
         _req: pumper_core::HttpRequest,
     ) -> pumper_core::Result<pumper_core::HttpResponse> {
-        Err(pumper_core::Error::Http("dns error: no such host".into()))
+        Err(pumper_core::Error::http("dns error: no such host"))
     }
 }
 
@@ -335,7 +335,7 @@ impl pumper_core::Browser for DownBrowser {
         &self,
         _req: pumper_core::RenderRequest,
     ) -> pumper_core::Result<pumper_core::RenderedPage> {
-        Err(pumper_core::Error::Browser("chrome is not running".into()))
+        Err(pumper_core::Error::browser("chrome is not running"))
     }
 }
 

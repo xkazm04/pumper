@@ -1247,8 +1247,10 @@ pub async fn fire_external_triggers(
             continue;
         }
         let key = idempotency_key(&trigger.id, event_id);
+        let target_key = crate::mcp::target_key_for(&state.registry, &trigger.target_app, &params);
         let opts = EnqueueOptions {
             params,
+            target_key,
             max_attempts: trigger.max_attempts,
             priority: trigger.priority,
             budget_usd: trigger.budget_usd,
@@ -1379,8 +1381,10 @@ async fn enqueue_hop(
     if !hop_params_pass_target_schema(state, trigger, &params, ctx).await {
         return 0;
     }
+    let target_key = crate::mcp::target_key_for(&state.registry, &trigger.target_app, &params);
     let opts = EnqueueOptions {
         params,
+        target_key,
         max_attempts: trigger.max_attempts,
         priority: trigger.priority,
         budget_usd: trigger.budget_usd,

@@ -67,8 +67,33 @@ pub struct Job {
     pub schedule_id: Option<String>,
     /// The trigger that fired this job, when it was a reactive-pipeline hop.
     pub trigger_id: Option<String>,
+    /// What this job acts on, as its app declares it (`ScrapeApp::target_key`).
+    /// Two jobs carrying the same key never run at the same time — the claim
+    /// holds the second back until the first leaves `running`. `None` = the app
+    /// names no target, and the job is neither held nor holding.
+    ///
+    /// Serialized on `GET /jobs`, which is where a queued job that is *held*
+    /// becomes distinguishable from one the worker is merely behind on.
+    pub target_key: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// Which arm of the requeue policy set this row's `available_at` — or, on a
+    /// permanently failed row, why the ladder stopped early. `None` = the plain
+    /// attempt ladder on a row that predates the policy, or an attempt budget
+    /// that simply ran out (which `attempts` already says).
+    ///
+    /// Recorded because the delay stopped being one formula anyone can compute:
+    /// a system that is smarter about *when* to retry and cannot say *why* has
+    /// traded a predictable runtime for an opaque one.
+    pub requeue_reason: Option<String>,
+    /// The TYPE of the failure's cause — `toml::de::Error`, `reqwest::Error` —
+    /// when the error kept one. `None` = the failure carried no typed cause,
+    /// which is most of them.
+    ///
+    /// The queryable half of a failure: `jobs.error` is the sentence a human
+    /// reads, and grouping a week of failures by *what caused them* used to mean
+    /// matching substrings of prose anybody was free to reword.
+    pub cause_kind: Option<String>,
     pub created_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,

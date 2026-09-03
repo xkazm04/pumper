@@ -224,7 +224,7 @@ fn clamp_wait_ms(requested_ms: u64, remaining: Option<Duration>) -> (u64, bool) 
 /// request, "this page was too slow *this time*" is a fact about a live remote
 /// site, and the next attempt may well be fast.
 fn budget_exhausted(stage: &str, url: &str, budget_secs: u64) -> Error {
-    Error::Browser(format!(
+    Error::browser(format!(
         "render budget exhausted after {budget_secs}s while {stage} ({url}): one render may hold \
          its tab and one of the [browser] max_concurrent_renders slots for at most \
          [browser] render_budget_secs. Raise that key for genuinely slow pages, or narrow the \
@@ -520,12 +520,12 @@ impl BrowserEngine {
         if !self.cfg.headless {
             builder = builder.with_head();
         }
-        let config = builder.build().map_err(Error::Browser)?;
+        let config = builder.build().map_err(Error::browser)?;
 
         info!(user_data_dir = %user_data_dir.display(), "launching chrome");
         let (browser, mut handler) = ChromeBrowser::launch(config)
             .await
-            .map_err(|e| Error::Browser(format!("launch: {e}")))?;
+            .map_err(|e| Error::browser(format!("launch: {e}")))?;
 
         let alive = Arc::new(AtomicBool::new(true));
         let alive_flag = alive.clone();
@@ -604,7 +604,7 @@ impl BrowserEngine {
         {
             Ok(res) => res?,
             Err(_) => {
-                return Err(Error::Browser(format!(
+                return Err(Error::browser(format!(
                     "chrome launch timed out after {LAUNCH_TIMEOUT_SECS}s (profile '{key}')"
                 )))
             }
@@ -660,7 +660,7 @@ impl Browser for BrowserEngine {
                 sem.clone()
                     .acquire_owned()
                     .await
-                    .map_err(|e| Error::Browser(format!("render semaphore closed: {e}")))?,
+                    .map_err(|e| Error::browser(format!("render semaphore closed: {e}")))?,
             ),
             None => None,
         };
@@ -678,7 +678,7 @@ impl Browser for BrowserEngine {
         let page = budget
             .require("opening a tab", &req.url, browser.new_page("about:blank"))
             .await?
-            .map_err(|e| Error::Browser(format!("new_page: {e}")))?;
+            .map_err(|e| Error::browser(format!("new_page: {e}")))?;
         // From here to the return, EVERY exit path — including the ones that are
         // not exits at all (a cancelled or timed-out job drops this future
         // mid-await) — releases the tab and its tasks through this guard.
@@ -698,7 +698,7 @@ impl Browser for BrowserEngine {
                     page.event_listener::<EventRequestPaused>(),
                 )
                 .await?
-                .map_err(|e| Error::Browser(format!("intercept listener: {e}")))?;
+                .map_err(|e| Error::browser(format!("intercept listener: {e}")))?;
             scope.watch(tokio::spawn(async move {
                 while let Some(ev) = paused.next().await {
                     let drop_it = block_heavy
@@ -752,7 +752,7 @@ impl Browser for BrowserEngine {
                     page.event_listener::<EventRequestWillBeSent>(),
                 )
                 .await?
-                .map_err(|e| Error::Browser(format!("capture listener (request): {e}")))?;
+                .map_err(|e| Error::browser(format!("capture listener (request): {e}")))?;
             let mut received = budget
                 .require(
                     "attaching the capture listener",
@@ -760,7 +760,7 @@ impl Browser for BrowserEngine {
                     page.event_listener::<EventResponseReceived>(),
                 )
                 .await?
-                .map_err(|e| Error::Browser(format!("capture listener (response): {e}")))?;
+                .map_err(|e| Error::browser(format!("capture listener (response): {e}")))?;
             let sink = candidates.clone();
             scope.watch(tokio::spawn(async move {
                 // request-id → method, from the request side of the pair.
@@ -812,7 +812,7 @@ impl Browser for BrowserEngine {
         {
             // No cleanup here on purpose: `scope` releases the tab and both
             // tasks as it drops out of this early return.
-            return Err(Error::Browser(format!("goto {}: {e}", req.url)));
+            return Err(Error::browser(format!("goto {}: {e}", req.url)));
         }
 
         let mut nav_timed_out = false;
@@ -936,7 +936,7 @@ impl Browser for BrowserEngine {
             .and_then(|u| u.ok())
             .flatten();
         scope.release().await;
-        let html = content?.map_err(|e| Error::Browser(format!("content: {e}")))?;
+        let html = content?.map_err(|e| Error::browser(format!("content: {e}")))?;
 
         // Cap the captured HTML like the HTTP tier caps its body, so a pathological
         // JS-built DOM can't balloon memory on the expensive tier — a typed error
@@ -952,7 +952,7 @@ impl Browser for BrowserEngine {
         // about the next attempt could differ; that is not this.
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
         if over_html_cap(html.len() as u64, cap) {
-            return Err(Error::Browser(format!(
+            return Err(Error::browser(format!(
                 "rendered HTML from {} ({} bytes) exceeds max_html_bytes cap of {cap} bytes",
                 req.url,
                 html.len()

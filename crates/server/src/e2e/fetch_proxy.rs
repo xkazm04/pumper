@@ -343,7 +343,7 @@ async fn a_failed_proxied_fetch_is_not_answered_with_a_retryable_status() {
     #[async_trait::async_trait]
     impl HttpClient for FailingHttp {
         async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
-            Err(Error::Http("connect timeout".into()))
+            Err(Error::http("connect timeout"))
         }
     }
     let (state, _store) = proxy_state(Arc::new(FailingHttp), enabled_remote()).await;
@@ -384,10 +384,10 @@ impl HttpClient for PlainClient {
         let resp = builder
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::http(e.to_string()))?;
         let status = resp.status().as_u16();
         let final_url = resp.url().to_string();
-        let body = resp.text().await.map_err(|e| Error::Http(e.to_string()))?;
+        let body = resp.text().await.map_err(|e| Error::http(e.to_string()))?;
         Ok(HttpResponse {
             status,
             headers: HashMap::new(),

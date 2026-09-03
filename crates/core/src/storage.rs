@@ -18,7 +18,175 @@ use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
-                           result, error, created_at, available_at, started_at, finished_at";
+                           target_key, result, error, requeue_reason, cause_kind, created_at, \
+                           available_at, started_at, finished_at";
+
+/// The claim's in-flight exclusion by target: a job whose `target_key` is
+/// already held by a `running` row is not the row this claim picks.
+///
+/// Written once, here, because the same predicate has to appear in the claim
+/// (which enforces it) and in [`Storage::held_by_target`] (which reports it),
+/// and two spellings of one rule is how a guard and its gauge come to disagree.
+/// A `NULL` key is never held and never holds: an app that has not overridden
+/// [`crate::ScrapeApp::target_key`] behaves exactly as it did before the column
+/// existed.
+///
+/// Non-starvation is a property of the claim, not of a queue: a held job is
+/// simply not the row picked this tick, and the worker already wakes on every
+/// finish (`notify_one`, "a finished job may unblock a previously-capped app"),
+/// which is the same tick that releases the target.
+const TARGET_EXCLUSION: &str = " AND (target_key IS NULL OR target_key NOT IN \
+                                 (SELECT target_key FROM jobs \
+                                  WHERE status = 'running' AND target_key IS NOT NULL))";
+
+/// What a failure tells [`Storage::fail`]: the typed error when the producer
+/// has one, a rendered sentence when it genuinely does not.
+///
+/// The enum exists so the two cannot drift. `fail` needs a string for the row
+/// and a type for the policy, and a signature taking both invites a call site
+/// that renders one failure and classifies another. The three `Text` producers
+/// are the ones with no `Error` to give: a caught panic payload, the wall-clock
+/// timeout, and the recovery sweep's own reason for a row whose executor is
+/// gone.
+#[derive(Debug, Clone, Copy)]
+pub enum FailReason<'a> {
+    /// A failure the runtime typed. The policy reads it; the row's text is its
+    /// `Display`.
+    Typed(&'a Error),
+    /// A failure only a sentence describes. Takes the default ladder, which is
+    /// what these producers always got.
+    Text(&'a str),
+}
+
+impl<'a> FailReason<'a> {
+    /// What the row records.
+    fn text(&self) -> std::borrow::Cow<'a, str> {
+        match self {
+            FailReason::Typed(e) => std::borrow::Cow::Owned(e.to_string()),
+            FailReason::Text(s) => std::borrow::Cow::Borrowed(s),
+        }
+    }
+
+    /// What the policy decides with, when there is anything to decide with.
+    fn error(&self) -> Option<&'a Error> {
+        match self {
+            FailReason::Typed(e) => Some(e),
+            FailReason::Text(_) => None,
+        }
+    }
+}
+
+impl<'a> From<&'a Error> for FailReason<'a> {
+    fn from(e: &'a Error) -> Self {
+        FailReason::Typed(e)
+    }
+}
+
+impl<'a> From<&'a str> for FailReason<'a> {
+    fn from(s: &'a str) -> Self {
+        FailReason::Text(s)
+    }
+}
+
+/// The job ladder's base delay: `10 * 2^attempts`, capped at an hour.
+///
+/// Extracted so [`requeue_after`]'s default arm and every test that asserts the
+/// ladder did not move read the same expression. Jitter is deliberately NOT here
+/// — it is a property of the write (it needs the job id), not of the policy.
+pub fn ladder_delay(attempts: i64) -> Duration {
+    Duration::from_secs(
+        10u64
+            .saturating_mul(2u64.saturating_pow(attempts.max(0) as u32))
+            .min(3600),
+    )
+}
+
+/// What the store should do with a failed job, once. Returned by
+/// [`requeue_after`] and obeyed by [`Storage::fail`].
+///
+/// Deliberately **not** kube's shape, which returns an `Action` from user code:
+/// the queue here is durable and the store owns the write, so the policy is a
+/// pure function the store calls, never a callback an app supplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requeue {
+    /// Try again after this delay (before the write's jitter), for the stated
+    /// reason.
+    After {
+        delay: Duration,
+        reason: &'static str,
+    },
+    /// Do not try again: route to `fail_permanently`, recording the reason.
+    Never { reason: &'static str },
+}
+
+/// The default arm's reason: nothing about this failure earned an opinion, so it
+/// rode `10 * 2^attempts`.
+pub const REQUEUE_REASON_LADDER: &str = "attempt ladder";
+/// The origin asked for a wait and this delay honours it.
+pub const REQUEUE_REASON_STATED: &str = "server-stated wait";
+/// The store was busy, not broken — a short bounded wait, not the engine ladder.
+pub const REQUEUE_REASON_CONTENTION: &str = "store contention";
+/// pumper's own failure: identical on every attempt, so there is no next one.
+pub const REQUEUE_REASON_OURS: &str = "ours-class failure (no attempt can differ)";
+
+/// What a busy store is worth waiting. Lock waits resolve in milliseconds, so
+/// the engine ladder's 10 seconds is two orders of magnitude of dead time for a
+/// remedy that is not even the same remedy.
+const CONTENTION_DELAY: Duration = Duration::from_secs(1);
+
+/// **When** a failed job should run again — the decision the ladder used to make
+/// with nothing but an attempt number.
+///
+/// A pure function of its arguments (`now`-free, jitter-free, no config handle),
+/// so it is testable against a table the way `scheduler::decide` is. It answers
+/// only *when*; **whether** stays [`Error::is_terminal_for_job`]'s question at
+/// the worker, and collapsing the two would lose the cell that matters —
+/// `Error::Config` is retryable-in-principle and pointless-to-retry-here, which
+/// is two facts, not one.
+///
+/// Three opinions, and no more:
+///
+/// - **A stated wait outranks the ladder.** `max(ladder, stated)` — the same
+///   floor rule `engine-http`'s `retry_delay` applies inside one fetch, lifted
+///   one layer so the job honours what the fetch already learned. Never a
+///   replacement: honouring a server's request must not become a mechanism for
+///   retrying *sooner* than the ladder would have.
+/// - **An ours-error does not ride the ladder.** [`Error::is_router_failure`]
+///   already decides this for the tier ladder (`fetcher.rs` stops on it); the
+///   job ladder was still spending three attempts and two backoffs producing the
+///   identical sentence. Same predicate, same amplification, one layer up.
+/// - **Store contention is not an engine failure.**
+///   [`Error::is_store_contention`] separates a lock wait from a defect, and a
+///   lock wait's remedy is a moment, not a ladder.
+///
+/// Everything else takes the default arm and is byte-identical to what the
+/// ladder did before this function existed.
+pub fn requeue_after(error: &Error, attempts: i64, stated: Option<Duration>) -> Requeue {
+    let ladder = ladder_delay(attempts);
+    if error.is_router_failure() {
+        return Requeue::Never {
+            reason: REQUEUE_REASON_OURS,
+        };
+    }
+    if let Some(stated) = stated {
+        if stated > ladder {
+            return Requeue::After {
+                delay: stated,
+                reason: REQUEUE_REASON_STATED,
+            };
+        }
+    }
+    if error.is_store_contention() {
+        return Requeue::After {
+            delay: CONTENTION_DELAY,
+            reason: REQUEUE_REASON_CONTENTION,
+        };
+    }
+    Requeue::After {
+        delay: ladder,
+        reason: REQUEUE_REASON_LADDER,
+    }
+}
 
 /// Rows one recovery sweep will verdict before stopping. The sweep runs inside
 /// boot, so it is bounded rather than proportional to how bad the last crash
@@ -89,6 +257,21 @@ pub struct EnqueueOptions {
     /// complement of `trigger_id` (which trigger) and what makes "the hops this
     /// run caused" an index seek rather than a scan of the jobs table.
     pub source_job_id: Option<String>,
+    /// **What this job acts on**, as the app declares it
+    /// ([`crate::ScrapeApp::target_key`]). Two jobs carrying the same key never
+    /// run at the same time — the claim refuses the second while the first is
+    /// `running`.
+    ///
+    /// The complement of `idempotency_key`, not a variant of it: that one
+    /// answers *should this request create work at all* and refuses an enqueue;
+    /// this one says nothing about creating the row and everything about when it
+    /// may run. A trigger redelivery is deduped and never becomes a row, while a
+    /// scheduled run and a manual re-run are both legitimate rows that must not
+    /// overlap.
+    ///
+    /// `None` (the default, and every app that has not overridden
+    /// `target_key`) opts out completely: the job is neither held nor holding.
+    pub target_key: Option<String>,
 }
 
 /// A standing subscription: deliver a `dataset.changed` event whenever a job
@@ -327,13 +510,14 @@ impl Storage {
         let sched = opts.schedule_id.as_deref();
         let trig = opts.trigger_id.as_deref();
         let src = opts.source_job_id.as_deref();
+        let target = opts.target_key.as_deref();
         let insert = self
             .metered(StoreOp::JobEnqueue, |mut conn| async move {
                 let r = sqlx::query(
                     "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
                      callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-                     trigger_id, source_job_id, created_at, available_at) \
-                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     trigger_id, source_job_id, target_key, created_at, available_at) \
+                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )
                 .bind(id.to_string())
                 .bind(app)
@@ -347,6 +531,7 @@ impl Storage {
                 .bind(sched)
                 .bind(trig)
                 .bind(src)
+                .bind(target)
                 .bind(ts(created))
                 .bind(ts(available))
                 .execute(&mut *conn)
@@ -384,6 +569,17 @@ impl Storage {
     /// Apps listed in `blocked` are skipped, which is how the worker enforces
     /// per-app concurrency limits (fairness across many apps' queues).
     ///
+    /// **Two exclusions, two different questions.** `blocked` is fairness and is
+    /// the worker's list; [`TARGET_EXCLUSION`] is mutual exclusion and is the
+    /// store's own, because a target already `running` is a fact about the table
+    /// rather than about this process. Keeping it inside the claim's `SELECT` is
+    /// load-bearing: the whole guard then lives in the one atomic
+    /// `UPDATE … WHERE id = (SELECT …) RETURNING` that already makes a claim
+    /// exclusive, so there is no window between the check and the claim, no way
+    /// for two workers to disagree, and a second `pumper` process inherits the
+    /// guarantee for free. A worker-side check would inherit nothing and be
+    /// advisory.
+    ///
     /// `aging_coeff` is the priority-aging starvation guard (`WorkerConfig::
     /// priority_aging_coefficient_secs`): the claim orders by *effective*
     /// priority = `priority + waited_secs / aging_coeff`, so a long-waiting
@@ -411,7 +607,8 @@ impl Storage {
         let sql = format!(
             "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1, \
              heartbeat_at = ?1 \
-             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1{exclusion} \
+             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1\
+                         {exclusion}{TARGET_EXCLUSION} \
                          ORDER BY {order} LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -459,11 +656,25 @@ impl Storage {
     }
 
     /// Records a running job's failure, guarded on `(status, attempts)` like
-    /// `complete`. Re-queues with exponential backoff **plus jitter** while
-    /// attempts remain, else fails permanently. Returns the resulting status, or
-    /// `None` when the write was discarded as stale (the job had already moved
-    /// on).
-    pub async fn fail(&self, id: Uuid, attempt: i64, error: &str) -> Result<Option<JobStatus>> {
+    /// `complete`. Re-queues while attempts remain — after the delay
+    /// [`requeue_after`] decides, plus jitter — else fails permanently. Returns
+    /// the resulting status, or `None` when the write was discarded as stale
+    /// (the job had already moved on).
+    ///
+    /// The failure arrives as a [`FailReason`] rather than a rendered string so
+    /// the policy has something to decide with: a producer that HAS a typed
+    /// error passes it, and the row's text is derived from it here rather than
+    /// at the call site, which is what keeps the sentence and the type from
+    /// describing different failures.
+    ///
+    /// The `(status, attempts)` fence, the stale-write discard and the
+    /// `attempts < max_attempts` threshold are exactly as they were.
+    pub async fn fail(
+        &self,
+        id: Uuid,
+        attempt: i64,
+        reason: FailReason<'_>,
+    ) -> Result<Option<JobStatus>> {
         let Some(job) = self.get(id).await? else {
             return Ok(None);
         };
@@ -471,10 +682,36 @@ impl Storage {
         if job.status != JobStatus::Running || job.attempts != attempt {
             return Ok(None);
         }
+        let error = reason.text();
+        let error = error.as_ref();
+        // The type the failure was built from, when it kept one — the column an
+        // operator can group a week of failures by, which the sentence cannot be.
+        let cause_kind = reason.error().and_then(Error::cause_kind);
+        // A producer with no typed error (a panic payload, the wall-clock
+        // timeout, a recovery sweep) gets the default arm, which is what those
+        // three always got.
+        let verdict = match reason.error() {
+            Some(e) => requeue_after(e, job.attempts, e.stated_retry_after()),
+            None => Requeue::After {
+                delay: ladder_delay(job.attempts),
+                reason: REQUEUE_REASON_LADDER,
+            },
+        };
+        let (delay, why) = match verdict {
+            Requeue::After { delay, reason } => (delay, reason),
+            // The policy gave up. It routes through the same permanent-failure
+            // door as an exhausted attempt budget, carrying its reason: a job
+            // that stopped being retried must say why on the row, or the ladder
+            // has become a smarter system nobody can predict.
+            Requeue::Never { reason } => {
+                let ok = self
+                    .fail_permanently_because(id, attempt, error, Some(reason), cause_kind)
+                    .await?;
+                return Ok(ok.then_some(JobStatus::Failed));
+            }
+        };
         if job.attempts < job.max_attempts {
-            let backoff_secs = 10u64
-                .saturating_mul(2u64.saturating_pow(job.attempts.max(0) as u32))
-                .min(3600);
+            let backoff_secs = delay.as_secs();
             // Jitter up to +25%, exactly as `fail_delivery` already does for the
             // webhook ladder. Without it the ladder is a pure function of the
             // attempt number, so the whole fleet fails together during one outage
@@ -482,6 +719,9 @@ impl Storage {
             // turns a recovering dependency back into a failing one, and does it
             // harder on each rung. Deterministic seed (job id bytes + attempt), no
             // wall-clock RNG: a resumed or replayed run picks the same delay.
+            //
+            // Applied to whatever the policy returned, and only ever upward, so a
+            // server-stated wait is never shortened by the spread.
             let seed = id
                 .as_bytes()
                 .iter()
@@ -493,13 +733,16 @@ impl Storage {
             let rows = self
                 .metered(StoreOp::JobVerdict, |mut conn| async move {
                     let r = sqlx::query(
-                        "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 \
+                        "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3, \
+                         requeue_reason = ?5, cause_kind = ?6 \
                          WHERE id = ?1 AND status = 'running' AND attempts = ?4",
                     )
                     .bind(id.to_string())
                     .bind(error)
                     .bind(ts(available))
                     .bind(attempt)
+                    .bind(why)
+                    .bind(cause_kind)
                     .execute(&mut *conn)
                     .await?;
                     let rows = r.rows_affected();
@@ -516,16 +759,37 @@ impl Storage {
     /// Marks a running job permanently failed, guarded on `(status, attempts)`.
     /// Returns whether the write landed (`false` = stale, discarded).
     pub async fn fail_permanently(&self, id: Uuid, attempt: i64, error: &str) -> Result<bool> {
+        self.fail_permanently_because(id, attempt, error, None, None)
+            .await
+    }
+
+    /// [`fail_permanently`](Self::fail_permanently), recording **why the ladder
+    /// stopped** when a policy rather than an exhausted attempt budget stopped
+    /// it. `None` = the attempt budget ran out, which the row's `attempts`
+    /// already says.
+    async fn fail_permanently_because(
+        &self,
+        id: Uuid,
+        attempt: i64,
+        error: &str,
+        why: Option<&str>,
+        cause_kind: Option<&'static str>,
+    ) -> Result<bool> {
+        let why = why.map(str::to_string);
         let rows = self
             .metered(StoreOp::JobVerdict, |mut conn| async move {
                 let r = sqlx::query(
-                    "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3 \
+                    "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3, \
+                     requeue_reason = COALESCE(?5, requeue_reason), \
+                     cause_kind = COALESCE(?6, cause_kind) \
                      WHERE id = ?1 AND status = 'running' AND attempts = ?4",
                 )
                 .bind(id.to_string())
                 .bind(error)
                 .bind(now())
                 .bind(attempt)
+                .bind(why)
+                .bind(cause_kind)
                 .execute(&mut *conn)
                 .await?;
                 let rows = r.rows_affected();
@@ -626,7 +890,7 @@ impl Storage {
             .map(|(id, app)| {
                 Uuid::parse_str(&id)
                     .map(|id| (id, app))
-                    .map_err(|e| Error::Parse(format!("job id: {e}")))
+                    .map_err(|e| Error::parse_from(format!("job id: {e}"), e))
             })
             .collect()
     }
@@ -786,6 +1050,32 @@ impl Storage {
             .fetch_one(&mut *conn)
             .await?;
             Ok((ages, 1))
+        })
+        .await
+    }
+
+    /// How many due-but-unclaimed jobs are waiting on a **target another job is
+    /// already running**, rather than on the worker.
+    ///
+    /// The operator's half of the target exclusion. Before it, one number
+    /// ("queued and due") meant "the worker is behind", and a capacity finding
+    /// was the only reading available. It separates into *behind* and *held*,
+    /// and only the first is a capacity finding — a held job needs no worker, it
+    /// needs the run in front of it to finish.
+    ///
+    /// Counted with the claim's own predicate ([`TARGET_EXCLUSION`], negated) so
+    /// the gauge cannot drift from the guard it reports on.
+    pub async fn held_by_target(&self) -> Result<i64> {
+        self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
+            let (n,): (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM jobs \
+                 WHERE status = 'queued' AND available_at <= ?1 \
+                   AND NOT (1 = 1{TARGET_EXCLUSION})"
+            ))
+            .bind(now())
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok((n, 1))
         })
         .await
     }
@@ -994,7 +1284,10 @@ impl Storage {
                 break;
             }
             let job = Job::try_from(row)?;
-            match self.fail(job.id, job.attempts, reason).await? {
+            match self
+                .fail(job.id, job.attempts, FailReason::Text(reason))
+                .await?
+            {
                 Some(status) => {
                     match status {
                         JobStatus::Failed => sweep.failed += 1,
@@ -3052,8 +3345,11 @@ struct JobRow {
     budget_usd: Option<f64>,
     schedule_id: Option<String>,
     trigger_id: Option<String>,
+    target_key: Option<String>,
     result: Option<String>,
     error: Option<String>,
+    requeue_reason: Option<String>,
+    cause_kind: Option<String>,
     created_at: String,
     available_at: String,
     started_at: Option<String>,
@@ -3065,11 +3361,11 @@ impl TryFrom<JobRow> for Job {
 
     fn try_from(r: JobRow) -> Result<Job> {
         Ok(Job {
-            id: Uuid::parse_str(&r.id).map_err(|e| Error::Parse(format!("job id: {e}")))?,
+            id: Uuid::parse_str(&r.id).map_err(|e| Error::parse_from(format!("job id: {e}"), e))?,
             app: r.app,
             params: serde_json::from_str(&r.params).unwrap_or(Value::Null),
             status: JobStatus::parse(&r.status)
-                .ok_or_else(|| Error::Parse(format!("unknown job status '{}'", r.status)))?,
+                .ok_or_else(|| Error::parse(format!("unknown job status '{}'", r.status)))?,
             attempts: r.attempts,
             max_attempts: r.max_attempts,
             priority: r.priority,
@@ -3078,11 +3374,14 @@ impl TryFrom<JobRow> for Job {
             budget_usd: r.budget_usd,
             schedule_id: r.schedule_id,
             trigger_id: r.trigger_id,
+            target_key: r.target_key,
             result: r
                 .result
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
             error: r.error,
+            requeue_reason: r.requeue_reason,
+            cause_kind: r.cause_kind,
             created_at: parse_ts(&r.created_at)?,
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
@@ -3840,7 +4139,7 @@ fn cutoff(days: u64) -> DateTime<Utc> {
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+        .map_err(|e| Error::parse_from(format!("bad timestamp '{s}': {e}"), e))
 }
 
 #[cfg(test)]
@@ -3900,6 +4199,166 @@ mod latest_job_tiebreaker_tests {
             id, high_id,
             "a created_at tie must resolve to the greatest id (house keyset), not \
              an arbitrary row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod requeue_policy_tests {
+    use super::{
+        ladder_delay, requeue_after, Requeue, REQUEUE_REASON_CONTENTION, REQUEUE_REASON_LADDER,
+        REQUEUE_REASON_OURS, REQUEUE_REASON_STATED,
+    };
+    use crate::error::{ClaudeFailure, PluginFailure};
+    use crate::Error;
+    use std::time::Duration;
+
+    /// One instance of every variant the policy is expected to have NO opinion
+    /// about — i.e. everything that is neither ours, nor contention, nor
+    /// carrying a stated wait.
+    fn opinionless() -> Vec<Error> {
+        vec![
+            Error::http("connection reset"),
+            Error::browser("chrome died"),
+            Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
+            Error::Profile("jar unreadable".into()),
+            Error::parse("bad html"),
+            Error::App("the source returned nonsense".into()),
+            Error::plugin(PluginFailure::Trap, "delta-slim", "all fuel consumed"),
+            Error::SourceDrift("hitCount>0 but 0 rows parsed".into()),
+            Error::Io(std::io::Error::other("disk hiccup")),
+            Error::Other(anyhow::anyhow!("something else")),
+        ]
+    }
+
+    /// The load-bearing negative: extracting the ladder into a policy must not
+    /// have moved the ladder. Every failure the policy has nothing to say about
+    /// gets `10 * 2^attempts` capped at an hour — the same expression, on the
+    /// same rungs, for the same reason (jitter is applied by the write, and is
+    /// pinned separately in `tests/jobs.rs`).
+    ///
+    /// If this test is hard to write, the policy has absorbed the ladder instead
+    /// of wrapping it.
+    #[test]
+    fn the_default_arm_is_the_ladder_that_was_there_before() {
+        for attempts in [0i64, 1, 2, 3, 7, 8, 9, 20] {
+            let expected = 10u64
+                .saturating_mul(2u64.saturating_pow(attempts as u32))
+                .min(3600);
+            assert_eq!(ladder_delay(attempts), Duration::from_secs(expected));
+            for e in opinionless() {
+                assert_eq!(
+                    requeue_after(&e, attempts, None),
+                    Requeue::After {
+                        delay: Duration::from_secs(expected),
+                        reason: REQUEUE_REASON_LADDER,
+                    },
+                    "{e} on attempt {attempts} must ride the unchanged ladder"
+                );
+            }
+        }
+    }
+
+    /// THE case the axis exists for: the fetch read `Retry-After: 600`, honoured
+    /// it as a floor, could not fit it in its budget, and gave up. The job ladder
+    /// then re-queued in 10 seconds and ran the whole fetch back into the same
+    /// rate limit. The stated wait outranks the rung.
+    #[test]
+    fn a_server_stated_wait_outranks_the_rung() {
+        let e = Error::http_after("429 rate limited", Duration::from_secs(600));
+        assert_eq!(e.stated_retry_after(), Some(Duration::from_secs(600)));
+        assert_eq!(
+            requeue_after(&e, 0, e.stated_retry_after()),
+            Requeue::After {
+                delay: Duration::from_secs(600),
+                reason: REQUEUE_REASON_STATED,
+            }
+        );
+    }
+
+    /// And the direction that must never reverse: a stated wait is a floor, not
+    /// a replacement. A server asking for 5 seconds on rung 3 (80s) does not buy
+    /// a retry 75 seconds earlier than the ladder promised — honouring a
+    /// request must not become a mechanism for retrying sooner.
+    #[test]
+    fn a_stated_wait_can_only_lengthen_the_delay_never_shorten_it() {
+        let e = Error::http_after("429 briefly", Duration::from_secs(5));
+        assert_eq!(
+            requeue_after(&e, 3, e.stated_retry_after()),
+            Requeue::After {
+                delay: ladder_delay(3),
+                reason: REQUEUE_REASON_LADDER,
+            }
+        );
+    }
+
+    /// The amplification the router-failure axis was introduced to end, ended at
+    /// the job ladder too: an ours-error reproduces identically on every attempt
+    /// for the same reason it reproduces on every tier — pumper was the variable,
+    /// not the origin — so the ladder can only produce the same sentence three
+    /// times and bill for the backoff in between.
+    #[test]
+    fn an_ours_error_does_not_ride_the_ladder_at_the_job_level_either() {
+        for e in [
+            Error::config("missing key"),
+            Error::Transact("submit: true refused".into()),
+            Error::ReplayMiss("no recorded response".into()),
+            Error::plugin(PluginFailure::Unknown, "delta-slim", "not installed"),
+        ] {
+            assert!(e.is_router_failure(), "fixture must be an ours-error: {e}");
+            assert_eq!(
+                requeue_after(&e, 0, None),
+                Requeue::Never {
+                    reason: REQUEUE_REASON_OURS
+                },
+                "{e} must not be re-queued"
+            );
+        }
+    }
+
+    /// The mirror risk, and the more dangerous one: `Never` on something
+    /// transient loses a job silently. The predicate is `is_router_failure`
+    /// itself — exhaustive, defaulting to *theirs* — so a theirs-error keeps
+    /// every retry it had.
+    #[test]
+    fn a_theirs_error_keeps_its_retries() {
+        for e in opinionless() {
+            assert!(
+                matches!(requeue_after(&e, 0, None), Requeue::After { .. }),
+                "{e} must keep its ladder"
+            );
+        }
+    }
+
+    /// A busy store is contention, not a defect, and its remedy is a moment
+    /// rather than a rung: the lock the writer is waiting on is typically gone
+    /// in milliseconds, so 10 seconds of engine ladder is dead time bought for
+    /// nothing.
+    #[cfg(feature = "storage")]
+    #[test]
+    fn store_contention_waits_a_moment_not_a_rung() {
+        let busy = Error::Storage(sqlx::Error::PoolTimedOut);
+        assert!(busy.is_store_contention());
+        match requeue_after(&busy, 3, None) {
+            Requeue::After { delay, reason } => {
+                assert_eq!(reason, REQUEUE_REASON_CONTENTION);
+                assert!(
+                    delay < ladder_delay(3),
+                    "{delay:?} is not shorter than the rung"
+                );
+            }
+            other => panic!("a busy store must still be retried: {other:?}"),
+        }
+        // A real defect is NOT contention and stays on the ladder — the
+        // over-classification direction, which would give a broken query a
+        // one-second retry loop.
+        let defect = Error::Storage(sqlx::Error::RowNotFound);
+        assert_eq!(
+            requeue_after(&defect, 3, None),
+            Requeue::After {
+                delay: ladder_delay(3),
+                reason: REQUEUE_REASON_LADDER,
+            }
         );
     }
 }

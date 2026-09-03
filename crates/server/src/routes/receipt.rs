@@ -225,6 +225,13 @@ pub(crate) async fn job_receipt(
             "schedule_id": job.schedule_id,
             "trigger_id": job.trigger_id,
             "error": job.error,
+            // The one place a human deliberately READS a failure rather than a
+            // machine classifying it, so it is where a lost cause type costs
+            // most: `error` is the sentence, `cause_kind` is what produced it
+            // (`toml::de::Error`, `reqwest::Error`). `null` = the failure
+            // carried no typed cause, which is most of them.
+            "cause_kind": job.cause_kind,
+            "requeue_reason": job.requeue_reason,
         },
         "stages": stages,
         "cost": cost,
@@ -466,6 +473,9 @@ mod tests {
             budget_usd: None,
             schedule_id: None,
             trigger_id: None,
+            target_key: None,
+            requeue_reason: None,
+            cause_kind: None,
             result: None,
             error: None,
             created_at: now,

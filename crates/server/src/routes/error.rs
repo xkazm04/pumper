@@ -121,7 +121,7 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         // rarely (it is raised inside an app's `run()`, so its home is the job
         // row), which is precisely why the mapping was free to make honest: no
         // route runs an app synchronously today, so nothing observable changed.
-        E::Http(_) | E::Browser(_) | E::Claude { .. } | E::SourceDrift(_) => {
+        E::Http { .. } | E::Browser { .. } | E::Claude { .. } | E::SourceDrift(_) => {
             (StatusCode::BAD_GATEWAY, UPSTREAM_MESSAGE.into())
         }
         // Deliberately NOT a 502: a WASM plugin runs *inside this process*, so
@@ -136,8 +136,8 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
         E::Storage(_)
-        | E::Parse(_)
-        | E::Config(_)
+        | E::Parse { .. }
+        | E::Config { .. }
         | E::App(_)
         | E::Io(_)
         | E::Json(_)
@@ -473,7 +473,7 @@ mod contract_tests {
                 "GET https://api.vendor.example/v2/x?api_key=s3cret failed"
             )),
             pumper_core::Error::Storage(sqlx::Error::RowNotFound),
-            pumper_core::Error::Config("missing key in /etc/pumper/config.toml".into()),
+            pumper_core::Error::config("missing key in /etc/pumper/config.toml"),
         ];
         for e in leaky {
             let raw = e.to_string();
@@ -499,8 +499,8 @@ mod contract_tests {
     #[test]
     fn upstream_engine_failures_are_502_not_500() {
         for e in [
-            pumper_core::Error::Http("connect https://slow.example/a?k=v: timed out".into()),
-            pumper_core::Error::Browser("chrome crashed rendering https://x.example".into()),
+            pumper_core::Error::http("connect https://slow.example/a?k=v: timed out"),
+            pumper_core::Error::browser("chrome crashed rendering https://x.example"),
             pumper_core::Error::claude(
                 pumper_core::error::ClaudeFailure::NonZeroExit,
                 "cli exited 1",

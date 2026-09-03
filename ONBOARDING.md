@@ -229,12 +229,13 @@ pub trait ScrapeApp: Send + Sync {
     fn requires(&self) -> &'static [Requirement] { &[] }  // preconditions (e.g. an API-key env var)
     fn default_params(&self) -> Value { Value::Object(Default::default()) } // scheduled + body-less runs
     fn manifest(&self) -> AppManifest { AppManifest::default() }            // agent-facing contract
+    fn target_key(&self, params: &Value) -> Option<String> { None }         // what this job acts on
     async fn run(&self, ctx: AppContext) -> Result<Value>;// returns JSON stored as the job result
 }
 ```
 
-`run()` is the only required method; the other six have defaults. Two are worth
-overriding on purpose:
+`run()` is the only required method; the other seven have defaults. Three are
+worth overriding on purpose:
 
 - **`manifest()`** — `AppManifest { params_schema, examples, output_shape,
   cost_class }`. Declaring `params_schema` (JSON Schema draft 2020-12) makes
@@ -246,6 +247,14 @@ overriding on purpose:
 - **`requires()`** — `&[Requirement]`, surfaced by `GET /apps` as a resolved
   `ready` flag, so a credential-gated app is distinguishable from a working one
   *before* its first failed job.
+- **`target_key()`** — a short string naming **what a job with these params acts
+  on**. Two jobs carrying the same key never run at the same time: the claim
+  holds the second back until the first leaves `running`, so a scheduled run and
+  a manual re-run of the same source cannot double-write. `None` (the default)
+  opts out entirely. It is not a hash of `params` — that is the wrong
+  granularity in both directions — and an over-broad key silently serialises a
+  legitimately parallel shape, so return `None` rather than a key you are not
+  sure about.
 
 Minimal implementation:
 

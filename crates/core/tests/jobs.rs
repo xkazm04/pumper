@@ -4,6 +4,7 @@
 //! deterministic (no sleeping).
 
 use chrono::{Duration, SecondsFormat, Utc};
+use pumper_core::storage::FailReason;
 use pumper_core::{EnqueueOptions, JobStatus};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -438,7 +439,10 @@ async fn the_retry_ladder_is_jittered_so_a_fleet_wide_outage_does_not_re_queue_i
     for _ in 0..20 {
         let id = insert_running(&pool, "a", 3, 5, 0).await;
         assert_eq!(
-            storage.fail(id, 3, "dependency down").await.unwrap(),
+            storage
+                .fail(id, 3, FailReason::Text("dependency down"))
+                .await
+                .unwrap(),
             Some(JobStatus::Queued)
         );
         let job = storage.get(id).await.unwrap().unwrap();

@@ -299,7 +299,7 @@ fn ts(dt: DateTime<Utc>) -> String {
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+        .map_err(|e| Error::parse_from(format!("bad timestamp '{s}': {e}"), e))
 }
 
 #[cfg(test)]

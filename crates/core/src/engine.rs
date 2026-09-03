@@ -1189,7 +1189,7 @@ pub trait HttpClient: Send + Sync {
     /// (currently `pumper-engine-http`) carry binary fetching; wrappers/mocks
     /// keep compiling and fail loudly if a binary fetch reaches them.
     async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
-        Err(Error::Http(format!(
+        Err(Error::http(format!(
             "this engine does not support binary fetch_bytes ({})",
             req.url
         )))

@@ -1836,8 +1836,10 @@ async fn govern_poll(state: AppState) {
                 // Hour-bucketed idempotency: a persistently failing assertion
                 // enqueues at most one sync per hour, not one per poll.
                 let key = govern_sync_key(app, dataset, chrono::Utc::now());
+                let target_key = crate::mcp::target_key_for(&state.registry, app, &params);
                 let opts = EnqueueOptions {
                     params,
+                    target_key,
                     max_attempts: 2,
                     idempotency_key: Some(key.clone()),
                     ..Default::default()

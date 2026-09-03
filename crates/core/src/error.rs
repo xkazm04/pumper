@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// How a Claude-engine call failed, and **what it had already spent when it
 /// did**.
 ///
@@ -150,12 +152,87 @@ impl PluginFailure {
     }
 }
 
+/// The typed cause a failure was built from, when the raise site had one.
+///
+/// `None` is honest and common: plenty of failures are raised from a condition
+/// rather than from another error. What is not honest is the shape this
+/// replaces — `.map_err(|e| Error::Config(format!("{}: {e}", path.display())))`
+/// — where at the moment the cause is most structured (a `toml::de::Error` with
+/// a span, line and column; a `reqwest::Error` that can answer `is_timeout()`)
+/// it is consumed into prose, and every consumer downstream has the same prose
+/// and no way back.
+///
+/// Boxed because `Error` is returned from every fallible function in the
+/// workspace and four variants must not grow the enum by an unbounded payload;
+/// `Send + Sync` because errors cross `tokio::spawn` everywhere. `Error` does
+/// not derive `Clone`, which is what makes a plain `Box` (rather than an `Arc`)
+/// the right shape.
+///
+/// **A chain is not a classification.** [`Error::is_terminal_for_job`] and
+/// [`Error::is_router_failure`] match on the *variant*, exhaustively, and must
+/// never consult a source: a decision that depends on a cause whose depth and
+/// content no signature constrains is the drift both predicates exist to end.
+/// The chain is for the human reading a receipt and for a classifier that wants
+/// a typed *sibling* fact (`reqwest::Error::is_timeout`), never for the two
+/// axes above.
+#[derive(Debug)]
+pub struct CauseValue {
+    /// The concrete type the cause was at the raise site —
+    /// `"toml::de::Error"`, `"reqwest::Error"`. Captured there because a
+    /// `Box<dyn Error>` cannot be asked its type afterwards, and because the
+    /// *type* is the part an operator can group a week of failures by. The
+    /// message is already in the sentence.
+    kind: &'static str,
+    error: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// The optional cause a failure carries.
+pub type Cause = Option<CauseValue>;
+
+impl CauseValue {
+    /// Captures a cause **with its type name**, which is only knowable here:
+    /// the generic parameter is the concrete type, and one line later it is a
+    /// `dyn Error` that cannot be asked.
+    fn of<E: std::error::Error + Send + Sync + 'static>(error: E) -> Self {
+        Self {
+            // The full path, not a trimmed one: `toml::de::Error` and
+            // `serde_json::Error` are already short, and trimming to a tail
+            // makes two crates' `de::Error` the same label — which is exactly
+            // the collision the column exists to avoid.
+            kind: std::any::type_name::<E>(),
+            error: Box::new(error),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("http engine: {0}")]
-    Http(String),
-    #[error("browser engine: {0}")]
-    Browser(String),
+    /// An HTTP-engine failure, and **the wait the server asked for on its way
+    /// out**.
+    ///
+    /// The struct variant exists to carry `retry_after`, for the same reason
+    /// [`Error::Claude`] is one: a fact the failure knows and no consumer can
+    /// re-derive. `engine-http` reads `Retry-After` properly, honours both RFC
+    /// 7231 forms, treats it as a floor rather than a replacement — and then
+    /// gives up when the stated wait will not fit the fetch budget
+    /// (`capped_retry_sleep`), at which point the number it learned used to go
+    /// into prose. The job ladder then re-queued in 10 seconds and ran the whole
+    /// fetch back into the rate limit the server had asked us to wait ten
+    /// minutes for. Build it with [`Error::http`] / [`Error::http_after`].
+    #[error("http engine: {message}")]
+    Http {
+        message: String,
+        /// A server-stated delay this failure could not honour, if there was
+        /// one. `None` means the server asked for nothing (not "asked for
+        /// zero"), which is why the requeue policy reads it as an override
+        /// rather than as a value.
+        retry_after: Option<Duration>,
+        /// The `reqwest::Error` this failure was built from. See [`Cause`].
+        cause: Cause,
+    },
+    /// A browser-engine failure and its driver-level cause. See [`Cause`].
+    #[error("browser engine: {message}")]
+    Browser { message: String, cause: Cause },
     /// A Claude-engine failure. The struct variant exists to carry
     /// [`ClaudeSpend`]: money the CLI reports on its way out is real money, and
     /// a `String`-only variant had nowhere to put it. Build it with
@@ -176,10 +253,15 @@ pub enum Error {
     /// Typed so "we refused to act" is never confused with "the browser broke".
     #[error("transact: {0}")]
     Transact(String),
-    #[error("parse: {0}")]
-    Parse(String),
-    #[error("config: {0}")]
-    Config(String),
+    /// A decode failure and the decoder's own error. See [`Cause`]: a
+    /// `serde_json::Error` knows the line and column it failed at, and one
+    /// `format!` away that is prose.
+    #[error("parse: {message}")]
+    Parse { message: String, cause: Cause },
+    /// A configuration failure and the parser's own error. See [`Cause`]: a
+    /// `toml::de::Error` carries a span into the file the operator has to edit.
+    #[error("config: {message}")]
+    Config { message: String, cause: Cause },
     #[error("app: {0}")]
     App(String),
     /// A sandboxed WASM plugin call failed. The struct variant exists to carry
@@ -270,6 +352,168 @@ pub enum Error {
 }
 
 impl Error {
+    /// An HTTP-engine failure the server asked nothing about — today's shape,
+    /// and what every site that has no stated wait to carry should build.
+    pub fn http(message: impl Into<String>) -> Self {
+        Error::Http {
+            message: message.into(),
+            retry_after: None,
+            cause: None,
+        }
+    }
+
+    /// An HTTP-engine failure that keeps the error it was built from — the
+    /// `reqwest::Error` that knows whether it was a connect, a timeout or a
+    /// decode, which the sentence can only describe.
+    pub fn http_from(
+        message: impl Into<String>,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Http {
+            message: message.into(),
+            retry_after: None,
+            cause: Some(CauseValue::of(cause)),
+        }
+    }
+
+    /// A browser-engine failure with no typed cause to keep.
+    pub fn browser(message: impl Into<String>) -> Self {
+        Error::Browser {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// A browser-engine failure keeping the driver's own error.
+    pub fn browser_from(
+        message: impl Into<String>,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Browser {
+            message: message.into(),
+            cause: Some(CauseValue::of(cause)),
+        }
+    }
+
+    /// A decode failure raised from a condition rather than from a decoder.
+    pub fn parse(message: impl Into<String>) -> Self {
+        Error::Parse {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// A decode failure keeping the decoder's error — the span, line and column
+    /// a `serde_json::Error` or a `scraper` failure carries.
+    pub fn parse_from(
+        message: impl Into<String>,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Parse {
+            message: message.into(),
+            cause: Some(CauseValue::of(cause)),
+        }
+    }
+
+    /// A configuration failure raised from a condition rather than a parser.
+    pub fn config(message: impl Into<String>) -> Self {
+        Error::Config {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// A configuration failure keeping the parser's error — the `toml::de::Error`
+    /// span that names the line of the file the operator has to edit.
+    pub fn config_from(
+        message: impl Into<String>,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Config {
+            message: message.into(),
+            cause: Some(CauseValue::of(cause)),
+        }
+    }
+
+    /// The typed cause this failure was built from, if it kept one.
+    ///
+    /// **The machine half of the chain.** A consumer that wants to act on the
+    /// cause downcasts it — `e.cause().and_then(|c|
+    /// c.downcast_ref::<reqwest::Error>()).is_some_and(|r| r.is_timeout())` —
+    /// which is a classification the compiler checks, unlike the substring
+    /// matching the same question used to require.
+    ///
+    /// Not exposed as [`std::error::Error::source`]: `thiserror`'s `#[source]`
+    /// cannot take an `Option<Box<dyn Error>>`, and the alternative (a
+    /// non-optional wrapper) would make every causeless failure report a source
+    /// that renders as nothing — a chain that lies about having a link is worse
+    /// than no chain. If `#[source]` learns optional fields, this becomes the
+    /// derive and the method stays as the named accessor.
+    pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        Some(&*self.cause_value()?.error)
+    }
+
+    /// The cause's own type, as it was at the raise site — `"toml::de::Error"`.
+    ///
+    /// The operator answer: the two failures anyone has to tell apart (*the
+    /// origin refused* vs *our own client could not build a request*) become
+    /// distinguishable in a query, the way `is_terminal_for_job` made *terminal*
+    /// queryable. A label, never a classification: a decision that has to act on
+    /// the cause downcasts it.
+    pub fn cause_kind(&self) -> Option<&'static str> {
+        Some(self.cause_value()?.kind)
+    }
+
+    fn cause_value(&self) -> Option<&CauseValue> {
+        match self {
+            Error::Http { cause, .. }
+            | Error::Browser { cause, .. }
+            | Error::Parse { cause, .. }
+            | Error::Config { cause, .. } => cause.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The cause chain under this failure, rendered one level per segment —
+    /// `None` when there is nothing under it.
+    ///
+    /// The **human** half, for the one place a person deliberately reads an
+    /// error rather than a machine classifying it (`GET /jobs/{id}/receipt`),
+    /// and the place where a lost span/line/column costs most.
+    pub fn cause_chain(&self) -> Option<String> {
+        let mut cause: &(dyn std::error::Error + 'static) = self.cause()?;
+        let mut out = vec![cause.to_string()];
+        while let Some(next) = cause.source() {
+            out.push(next.to_string());
+            cause = next;
+        }
+        Some(out.join(": "))
+    }
+
+    /// An HTTP-engine failure carrying **the delay the server stated and this
+    /// fetch could not honour** — the whole point of the struct variant.
+    ///
+    /// One carrier, never two: this is minted where the wait is learned and
+    /// discarded (`engine-http`'s budget-exhausted arm), so the job ladder can
+    /// honour it without a second mechanism disagreeing about what the server
+    /// said.
+    pub fn http_after(message: impl Into<String>, retry_after: Duration) -> Self {
+        Error::Http {
+            message: message.into(),
+            retry_after: Some(retry_after),
+            cause: None,
+        }
+    }
+
+    /// The wait the origin asked for, if this failure carries one. Read by
+    /// [`crate::storage::requeue_after`], which lets it outrank the ladder.
+    pub fn stated_retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// A Claude-engine failure that spent nothing, or whose spend is unknown.
     pub fn claude(class: ClaudeFailure, message: impl Into<String>) -> Self {
         Error::Claude {
@@ -455,7 +699,7 @@ impl Error {
             // Our own configuration, identical on every tier. `validate()`
             // catches 29 of these at boot; the ones that reach a running ladder
             // are the ones it cannot.
-            Error::Config(_) => true,
+            Error::Config { .. } => true,
             // Pre-flight refusals — pumper declining to act before any engine is
             // touched. `Transact` is this exact fix already made in one
             // capability (`engine::Browser::transact`'s default); `ReplayMiss`
@@ -475,11 +719,11 @@ impl Error {
             // `BudgetExhausted` is our clamp, not a fact about any tier, and
             // `BadRequest` is the caller's input. Both are already terminal for
             // the job, which is the axis that actually stops them.
-            Error::Http(_)
-            | Error::Browser(_)
+            Error::Http { .. }
+            | Error::Browser { .. }
             | Error::Claude { .. }
             | Error::Profile(_)
-            | Error::Parse(_)
+            | Error::Parse { .. }
             | Error::App(_)
             | Error::SourceDrift(_)
             | Error::BudgetExhausted(_)
@@ -625,9 +869,7 @@ mod tests {
         assert!(Error::App("plugin trapped, allegedly".into())
             .plugin_failure()
             .is_none());
-        assert!(Error::Http("connection reset".into())
-            .plugin_failure()
-            .is_none());
+        assert!(Error::http("connection reset").plugin_failure().is_none());
     }
 
     /// A plugin trap is the sandbox WORKING. Retrying it may well succeed
@@ -707,9 +949,7 @@ mod tests {
     /// invent one.
     #[test]
     fn other_failures_report_no_spend() {
-        assert!(Error::Http("connection reset".into())
-            .claude_spend()
-            .is_none());
+        assert!(Error::http("connection reset").claude_spend().is_none());
         assert!(Error::App("nonsense".into()).claude_spend().is_none());
     }
 
@@ -738,7 +978,7 @@ mod tests {
     /// refusal is typed `Transact`.
     #[test]
     fn a_flow_that_broke_is_not_a_refusal() {
-        assert!(!Error::Browser("chrome died mid-flow".into()).is_terminal_for_job());
+        assert!(!Error::browser("chrome died mid-flow").is_terminal_for_job());
         assert!(!Error::Profile("cookie jar unreadable".into()).is_terminal_for_job());
     }
 
@@ -781,12 +1021,12 @@ mod tests {
     #[test]
     fn transient_failures_stay_retryable_not_terminal() {
         for e in [
-            Error::Http("connection reset".into()),
-            Error::Browser("chrome died".into()),
+            Error::http("connection reset"),
+            Error::browser("chrome died"),
             Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
             Error::App("the source returned nonsense".into()),
-            Error::Parse("bad html".into()),
-            Error::Config("missing key".into()),
+            Error::parse("bad html"),
+            Error::config("missing key"),
             // NOT `ReplayMiss`: see `a_replay_miss_does_not_ride_the_retry_ladder`.
             // It sat here as if transient, while the load-time miss was already
             // being failed permanently by the worker — same feature, same
@@ -844,7 +1084,7 @@ mod tests {
         );
         // The lookalike keeps its ladder: a source that is *down* fails in the
         // fetch chokepoint, and that one really can succeed next time.
-        assert!(!Error::Http("connect grants.gov: timed out".into()).is_terminal_for_job());
+        assert!(!Error::http("connect grants.gov: timed out").is_terminal_for_job());
         assert!(!Error::App("partial harvest".into()).is_terminal_for_job());
     }
 
@@ -855,7 +1095,7 @@ mod tests {
     #[test]
     fn a_drift_refusal_does_not_read_like_the_source_being_down() {
         let drift = Error::SourceDrift("result.records missing or not an array".into());
-        let outage = Error::Http("connect https://data.ca.gov: timed out".into());
+        let outage = Error::http("connect https://data.ca.gov: timed out");
         assert!(drift.to_string().starts_with("source drift:"), "{drift}");
         assert!(!outage.to_string().starts_with("source drift:"), "{outage}");
         assert_ne!(drift.is_terminal_for_job(), outage.is_terminal_for_job());
@@ -883,12 +1123,12 @@ mod tests {
             | Error::ReplayMiss(_)
             | Error::SourceDrift(_) => true,
             // Everything else can genuinely succeed on the next attempt.
-            Error::Http(_)
-            | Error::Browser(_)
+            Error::Http { .. }
+            | Error::Browser { .. }
             | Error::Claude { .. }
             | Error::Profile(_)
-            | Error::Parse(_)
-            | Error::Config(_)
+            | Error::Parse { .. }
+            | Error::Config { .. }
             | Error::App(_)
             | Error::Plugin { .. }
             | Error::Io(_)
@@ -904,13 +1144,13 @@ mod tests {
     #[test]
     fn every_error_variant_has_a_decided_retry_classification() {
         let all = vec![
-            Error::Http("reset".into()),
-            Error::Browser("chrome died".into()),
+            Error::http("reset"),
+            Error::browser("chrome died"),
             Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
             Error::Profile("jar unreadable".into()),
             Error::Transact("submit: true refused".into()),
-            Error::Parse("bad html".into()),
-            Error::Config("missing key".into()),
+            Error::parse("bad html"),
+            Error::config("missing key"),
             Error::App("source returned nonsense".into()),
             Error::plugin(PluginFailure::Trap, "delta-slim", "all fuel consumed"),
             Error::BudgetExhausted("no headroom".into()),
@@ -1023,6 +1263,6 @@ mod tests {
         // And nothing outside the storage variant may answer this at all, or a
         // `match` on the outcome silently swallows unrelated failures.
         assert!(!Error::App("database is locked, allegedly".into()).is_store_contention());
-        assert!(!Error::Http("connection reset".into()).is_store_contention());
+        assert!(!Error::http("connection reset").is_store_contention());
     }
 }
