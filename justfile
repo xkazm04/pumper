@@ -30,9 +30,15 @@ dev:
 
 # --- build / verify ----------------------------------------------------------
 
+# The ONE recipe that re-enables incremental. [profile.dev] in Cargo.toml turns
+# it off workspace-wide because `cargo test --workspace` had grown 134.5 GB of
+# session dirs in a month; the edit loop is the case where it actually pays, and
+# `cargo check` units carry their own fingerprints, so turning it back on here
+# can never invalidate the build/test artifacts.
+#
 # Fast type-check of the whole workspace.
 check:
-    cargo check --workspace
+    CARGO_INCREMENTAL=1 cargo check --workspace
 
 # Build the binaries (debug); append `--release` yourself for an optimized build.
 build:
@@ -133,6 +139,7 @@ flake-report:
 harness-test:
     node --test scripts/ci/flake-check.test.mjs
     node --test scripts/ci/lane-certify.test.mjs
+    node --test scripts/ci/disk-check.test.mjs
 
 # Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
 # through the recorder (so the --ignored set finally accumulates history), then
@@ -190,7 +197,7 @@ lane-health:
 # a minutes-long run off the pre-push habit is how the habit stops happening.
 #
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test
+ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:
@@ -209,6 +216,76 @@ doc-sync:
     node --test scripts/docs/check-doc-sync.test.mjs
 
 # --- maintenance -------------------------------------------------------------
+
+# Reports, deletes nothing. `target/` is the only directory in this repo that
+# grows without bound — cargo garbage-collects it NEVER, so every dep bump and
+# feature flip leaves its old hash-suffixed artifact behind forever. Measured
+# 2026-08-26 it was 280.8 GB against 0.28 GB of actual scraped data, so "the
+# scraper is eating the disk" is a diagnosis worth being able to REFUTE in one
+# command rather than assume.
+#
+# Node, not `du`: `du -sh target` on the 314k-file tree this grew to did not
+# return in ten minutes under Git Bash. An instrument nobody can afford to run
+# is one nobody runs.
+#
+# Where the disk actually went: target/ vs data/ vs .git.
+disk:
+    node scripts/ci/disk-check.mjs --report
+
+# The gate, in `just ci`. A habit ("remember to clean sometimes") is exactly what
+# was in place while target/ grew to 280.8 GB in one month, so the ceiling is
+# declared and enforced instead: 0 within budget / 2 findings / 3 cannot check,
+# the same three outcomes as `flake-check`.
+#
+# Fail if the build cache is over its declared ceiling.
+disk-check:
+    node scripts/ci/disk-check.mjs
+
+# Safe by construction, and the answer `disk-check` points at. Deletes only
+# (a) incremental session dirs untouched for a week — pure cache, a delete can
+# cost a recompile and nothing else — and (b) artifact generations that a NEWER
+# hash of the same target has superseded AND that are themselves a week old, so
+# a build running right now can never have an artifact pulled from under it.
+# Add `--dry-run` to list without deleting.
+#
+# Prune superseded build artifacts. Keeps every live one.
+disk-prune *args:
+    node scripts/ci/disk-check.mjs --prune {{args}}
+
+# Registers a WEEKLY Windows scheduled task, and is the one recipe in this file
+# that writes state OUTSIDE the checkout — run it deliberately, once.
+# `disk-check` already self-heals, but it only runs when somebody runs `just ci`;
+# this covers the sessions that build fifty times and never reach a gate, which
+# is exactly how 280.8 GB accumulated. Per-user, no elevation needed.
+# PowerShell 7 (`pwsh`) required. `just disk-schedule -At 5:00am` to move it.
+#
+# Schedule the prune weekly (Sunday 03:00). Machine state — opt in.
+disk-schedule *args:
+    pwsh -NoProfile -File scripts/disk-schedule.ps1 {{args}}
+
+# Remove the weekly prune task.
+disk-unschedule:
+    pwsh -NoProfile -File scripts/disk-schedule.ps1 -Remove
+
+# Destructive and deliberate: this is a full rebuild, not a cache trim, because
+# cargo has no target-dir GC to ask for something gentler (`cargo clean -p` only
+# reaches named packages, and the mass here is spread across ~200 test binaries).
+# Prefer trimming just the incremental half when you can afford to keep the
+# rlibs — that is `clean-incremental`, and it costs minutes rather than a cold
+# rebuild of ~700 crates.
+#
+# Delete the whole build cache. Next build is COLD.
+clean-target:
+    cargo clean
+
+# The cheap half of `clean-target`: drops the compiler session dirs and keeps
+# every rlib, so nothing third-party recompiles. Safe to run at any time — the
+# only cost is that the next build of a workspace crate is non-incremental,
+# which under this repo's [profile.dev] it already was.
+#
+# Delete only the incremental cache, keeping compiled dependencies.
+clean-incremental:
+    rm -rf target/debug/incremental target/release/incremental
 
 # Recompute every record's SimHash. Run with the server STOPPED.
 reindex:

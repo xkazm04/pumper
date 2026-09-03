@@ -130,3 +130,34 @@ cron = "0.17"
 
 [profile.release]
 lto = "thin"
+
+# Disk economy on Windows MSVC. Measured 2026-08-26: target/ had reached 280.8 GB
+# in ONE month. Two halves, both structural rather than accidental.
+#
+# 105.9 GB of it was PDBs. This workspace links ~200 separate test binaries (63
+# integration-test files plus per-crate unit tests), each of which statically
+# links the whole workspace and so carried its own 120-800 MB full-debuginfo PDB
+# — in 7-16 stale hash-variant copies apiece, because cargo garbage-collects
+# `target/` never. `line-tables-only` keeps file:line in panic backtraces, which
+# is what actually makes a test failure readable, and drops the variable/type
+# tables that are the bulk. Third-party deps get nothing at all: nobody steps
+# through wasmtime, tantivy or chromiumoxide, and they are most of the mass.
+# (`package."*"` matches dependencies only, never workspace members.)
+#
+# The other 134.5 GB was incremental state, 2,806 compiler session dirs. The
+# dominant loop in this repo is `cargo test --workspace` — `just test`, `just ci`
+# — where incremental buys nearly nothing and pays for it in disk, so it is off
+# by default. The edit loop keeps it: `just check` sets CARGO_INCREMENTAL=1, and
+# `cargo check` units carry their own fingerprints, so re-enabling it there can
+# never thrash against build/test units. Flip `incremental` back to `true` here
+# if a session is doing heavy `just build`/`just dev` iteration instead.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+# Build scripts and proc macros are never debugged from a backtrace here.
+[profile.dev.build-override]
+debug = 0

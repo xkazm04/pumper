@@ -27,7 +27,7 @@ Other durable references live outside `.perfect/`:
 
 ## Invariants and gotchas
 
-Five things this repo does that are **not** derivable from a skim, and that prose
+Six things this repo does that are **not** derivable from a skim, and that prose
 elsewhere gets wrong.
 
 1. **CORS is OFF by default — README.md and ONBOARDING.md §2 say the opposite.**
@@ -75,6 +75,21 @@ elsewhere gets wrong.
    `./config.toml`). Also worth knowing: storage is a **single SQLite file in WAL mode**
    with `max_connections = 8` and a 5s `busy_timeout` — writers serialize, so a
    long-running write transaction is a workspace-wide stall, not a local one.
+
+6. **`target/` grows without bound, and `data/` never does.** Cargo garbage-collects
+   `target/` **never**: every dep bump and feature flip mints a fresh hash-suffixed
+   artifact and the old one stays forever. Measured 2026-08-26 it had reached
+   **280.8 GB in one month** — against **0.28 GB** of actual scraped data — with 7-16
+   stale generations per target and 105.9 GB of it PDBs, because ~200 test binaries
+   each statically link the whole workspace. So when disk is the complaint, `data/`
+   is almost certainly not the answer: run `just disk` before theorising about
+   dataset compression or retention. `[profile.dev]` in the root `Cargo.toml` now
+   caps the per-build cost (`line-tables-only`, deps at `debug = 0`, incremental off —
+   `just check` is the ONE recipe that re-enables incremental, and it may stay that way
+   only because `cargo check` units carry their own fingerprints), and `just disk-check`
+   is a self-healing rung of `just ci`. Do not simplify `line-tables-only` to
+   `debug = 0`: backtrace frames stop resolving to source, which is verified by a
+   planted-panic probe, not assumed.
 
 ## How to extend this file
 

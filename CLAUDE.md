@@ -15,7 +15,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 
 | `just` | raw cargo |
 | --- | --- |
-| `just check` | `cargo check --workspace` |
+| `just check` | `CARGO_INCREMENTAL=1 cargo check --workspace` — the one recipe that re-enables incremental; `[profile.dev]` turns it off workspace-wide |
 | `just test` | `cargo test --workspace` — what CI runs |
 | `just test-ignored` | `cargo test --workspace -- --ignored` — env-dependent (real Chrome, built wasm, timing) |
 | `just test-recorded` | `just test` through the flake recorder, so the run lands in the retained history detection queries over |
@@ -23,13 +23,18 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just fmt` / `just fmt-check` | `cargo fmt` / `cargo fmt --check` — CI gate |
 | `just flake-check` | the quarantine register as a gate — expiry, ceiling, and both reconciliation directions; 0 clean / 2 findings / **3 cannot check** |
 | `just flake-report` | register size **with its trend**, age of the oldest entry, and the labelled set with its full predicate |
-| `just harness-test` | the fixture suites that prove `flake-check` and `lane-certify` can still go red |
+| `just harness-test` | the fixture suites that prove `flake-check`, `lane-certify` and `disk-check` can still go red |
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
-| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |
+| `just disk` | where the disk actually went — `target/` vs `data/` vs `.git`, node not `du` (`du` on this tree does not return) |
+| `just disk-check` | the build cache as a gate: `target/` against a declared ceiling. **Self-healing** — it prunes and re-measures first, and goes red only when pruning could not fix it. 0 within budget / 2 findings / **3 cannot check**; `--no-prune` for the pure verdict |
+| `just disk-prune` | delete superseded artifact generations and week-old incremental sessions; keeps every live one. `--dry-run` to look first |
+| `just disk-schedule` / `just disk-unschedule` | register/remove a weekly prune as a Windows scheduled task — covers the sessions that never reach a gate. The one recipe that writes state **outside the checkout**; opt in deliberately |
+| `just clean-target` / `just clean-incremental` | `cargo clean` (next build is COLD) / drop only the incremental cache, keeping every compiled dependency |
 | `just reindex` | `cargo run -p pumper-server --bin reindex` |
 | `just search-backfill <scope>` | `cargo run -p pumper-server --bin search-backfill -- <scope>` |
 | `just plugin <crate>` | builds `plugins-src/<crate>` for `wasm32-unknown-unknown` (build only — does **not** install) |
