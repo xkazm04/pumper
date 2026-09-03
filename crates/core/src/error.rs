@@ -420,6 +420,78 @@ impl Error {
         )
     }
 
+    /// Whether this failure originated in **pumper itself** — its config, its
+    /// routing, its own refusals before an engine was reached — rather than in
+    /// the upstream an engine was talking to. The question is *"would every
+    /// engine produce this?"*.
+    ///
+    /// A **second, independent** axis from [`Error::is_terminal_for_job`], not a
+    /// re-partition of it: terminality asks *is this worth trying again*, origin
+    /// asks *is there anywhere else to try it*. `SourceDrift` is terminal and
+    /// theirs; `Http` is transient and theirs; `Transact` is terminal and ours —
+    /// the cells that prove the two are different questions.
+    ///
+    /// **One carrier, never two.** This predicate is the only mark. pumper is
+    /// one process with one typed error enum, so the classification is a
+    /// property of the variant and nothing has to survive a boundary; a second
+    /// mechanism (a header, a sentinel in the message) is the drift that lets
+    /// the two spellings disagree.
+    ///
+    /// Read by the fetch ladder ([`crate::fetcher::Fetcher::fetch`]), which
+    /// stops on it: a router failure reproduces identically on every remaining
+    /// tier because the tier was never the variable, so continuing spends one
+    /// engine invocation per tier to re-derive the same sentence — and the
+    /// browser tier's http un-skip overturns a correct routing decision on
+    /// evidence that says nothing about the http tier.
+    ///
+    /// **Exhaustive on purpose, and the default is theirs.** A new variant stops
+    /// this compiling until someone decides whose failure it is; a `_ =>` arm
+    /// would let "ours" be reached by accident, and the two directions do not
+    /// cost the same — a theirs-error misfiled as ours loses a document the
+    /// ladder would have fetched, while an ours-error misfiled as theirs costs
+    /// only what happens today.
+    pub fn is_router_failure(&self) -> bool {
+        match self {
+            // Our own configuration, identical on every tier. `validate()`
+            // catches 29 of these at boot; the ones that reach a running ladder
+            // are the ones it cannot.
+            Error::Config(_) => true,
+            // Pre-flight refusals — pumper declining to act before any engine is
+            // touched. `Transact` is this exact fix already made in one
+            // capability (`engine::Browser::transact`'s default); `ReplayMiss`
+            // is our cassette, not an origin's answer.
+            Error::Transact(_) | Error::ReplayMiss(_) => true,
+            // Plugins split by kind, and only the load side is ours: an unknown
+            // module, a disabled subsystem, a missing export are facts about our
+            // own artifacts. A trap, malformed output or a host error happened
+            // while the plugin ran over a body an engine fetched, so a different
+            // body really can come out differently.
+            Error::Plugin { kind, .. } => matches!(
+                kind,
+                PluginFailure::Unknown | PluginFailure::Disabled | PluginFailure::MissingExport
+            ),
+            // Theirs — engine transport, the upstream's answer, the store. Plus
+            // the two that are neither and must not be folded into either side:
+            // `BudgetExhausted` is our clamp, not a fact about any tier, and
+            // `BadRequest` is the caller's input. Both are already terminal for
+            // the job, which is the axis that actually stops them.
+            Error::Http(_)
+            | Error::Browser(_)
+            | Error::Claude { .. }
+            | Error::Profile(_)
+            | Error::Parse(_)
+            | Error::App(_)
+            | Error::SourceDrift(_)
+            | Error::BudgetExhausted(_)
+            | Error::BadRequest(_)
+            | Error::Io(_)
+            | Error::Json(_)
+            | Error::Other(_) => false,
+            #[cfg(feature = "storage")]
+            Error::Storage(_) => false,
+        }
+    }
+
     /// Whether this failure is the store reporting **contention** rather than a
     /// defect: SQLite answering `SQLITE_BUSY` / `SQLITE_LOCKED`, or the
     /// connection pool timing out before a connection came free.
