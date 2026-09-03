@@ -614,9 +614,9 @@ impl Fetcher {
                         &mut trace,
                         FetchTier::Archive,
                         "archive",
-                        &e,
+                        e,
                         started,
-                    ),
+                    )?,
                 }
             }
         }
@@ -742,9 +742,9 @@ impl Fetcher {
                         &mut trace,
                         FetchTier::Browser,
                         "browser",
-                        &e,
+                        e,
                         started,
-                    );
+                    )?;
                     // A dead browser must not take the whole ladder down with
                     // it — least of all on the hosts the learned router pinned
                     // to the browser, which is exactly where traffic is
@@ -822,9 +822,9 @@ impl Fetcher {
                         &mut trace,
                         FetchTier::Claude,
                         "claude",
-                        &e,
+                        e,
                         started,
-                    );
+                    )?;
                 }
             }
         }
@@ -996,7 +996,7 @@ impl Fetcher {
             }
             Err(e) if req.strategy == FetchStrategy::Http => Err(e),
             Err(e) => {
-                trace_tier_error(escalations, trace, FetchTier::Http, "http", &e, started);
+                trace_tier_error(escalations, trace, FetchTier::Http, "http", e, started)?;
                 Ok(None)
             }
         }
@@ -1116,12 +1116,16 @@ impl Fetcher {
                 let _ = source
                     .record_failure(&recipe.id, self.recipes_max_failures)
                     .await;
-                trace_tier_error(
+                // The one tier that does NOT take the break arm: a recipe is a
+                // learned artifact, and its failure un-validates it (the strike
+                // above) instead of indicting the ladder. `Option` here is the
+                // contract — this tier can only fall through.
+                let _ = trace_tier_error(
                     escalations,
                     trace,
                     FetchTier::ApiRecipe,
                     "api_recipe",
-                    &e,
+                    e,
                     started,
                 );
                 None
@@ -1139,14 +1143,23 @@ impl Fetcher {
 /// criteria genuinely differ (HTTP weighs status + bot-wall, the browser weighs
 /// challenge markers, and the return-early condition differs per strategy), and
 /// that per-tier judgement is the whole point of a tiered fetcher.
+///
+/// **`Err` is the ladder's second break arm.** A tier that failed for a reason
+/// that is *ours* ([`Error::is_router_failure`] — a broken `[section]`, a
+/// pre-flight refusal, an unloadable plugin) reproduces identically on every
+/// remaining tier, so this returns it instead of escalating: one tier tried, one
+/// failure reported, and the job row names the origin (`config: …`) rather than
+/// the ladder's exhaustion prose. It also keeps the browser tier's http un-skip
+/// from overturning a correct routing decision on evidence about pumper.
+/// `Ok(())` is a candidate failure and escalates exactly as it always has.
 fn trace_tier_error(
     escalations: &mut Vec<String>,
     trace: &mut Vec<TierTrace>,
     tier: FetchTier,
     name: &str,
-    err: &Error,
+    err: Error,
     started: Instant,
-) {
+) -> Result<()> {
     escalations.push(format!("{name} tier failed: {err}"));
     trace.push(TierTrace {
         tier,
@@ -1158,6 +1171,10 @@ fn trace_tier_error(
         cost_usd: None,
         detail: Some(err.to_string()),
     });
+    if err.is_router_failure() {
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
