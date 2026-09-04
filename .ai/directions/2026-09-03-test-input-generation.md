@@ -5,7 +5,7 @@ raised_by: intake intake-boa-0903
 source: librarian/sources/2026-09-03-boa.md
 stage: the trigger hook pipeline in crates/server/src/triggers.rs (predicate -> transform -> record) and the only harness that drives it through the real wasm host, crates/server/src/e2e/trigger_plugins.rs
 size: 2 files / ~150 lines / S
-status: proposed
+status: accepted
 ---
 
 ## Why the scope implies it
