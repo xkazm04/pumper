@@ -697,6 +697,59 @@ mod contract_tests {
         );
     }
 
+    /// The shipped lines of one module: every `#[cfg(test)]` block removed by
+    /// span (attribute line through the next column-0 `}`), comments dropped,
+    /// each line trimmed.
+    ///
+    /// Extracted and pure so the span logic is a tested fact rather than an
+    /// inline `take_while`. A guard that silently stops looking part-way through
+    /// a file reports a clean codebase in a voice indistinguishable from
+    /// success, which is exactly what the truncating version did.
+    fn production_lines(source: &str) -> Vec<&str> {
+        let mut in_test = false;
+        source
+            .lines()
+            .filter(|line| {
+                if line.trim_end() == "#[cfg(test)]" {
+                    in_test = true;
+                    return false;
+                }
+                if in_test {
+                    // rustfmt puts a module's closing brace at column 0.
+                    if *line == "}" {
+                        in_test = false;
+                    }
+                    return false;
+                }
+                !line.trim_start().starts_with("//")
+            })
+            .map(str::trim)
+            .collect()
+    }
+
+    /// The anti-pattern, in miniature: production code AFTER a test block must
+    /// survive the filter, or the guard below stops policing the rest of the
+    /// file the day someone adds a small test module near the top.
+    #[test]
+    fn production_lines_keeps_what_follows_a_test_block() {
+        let source = "fn before() {}\n#[cfg(test)]\nmod t {\n    fn helper() { x.lock().unwrap(); }\n}\nfn after() { y.lock().unwrap(); }\n";
+        let body = production_lines(source);
+        assert!(body.contains(&"fn before() {}"));
+        assert!(
+            body.contains(&"fn after() { y.lock().unwrap(); }"),
+            "code after a test block is shipped code: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|l| l.contains("fn helper")),
+            "the test block itself is still excluded: {body:?}"
+        );
+        // A file whose test block IS last behaves exactly as before.
+        assert_eq!(
+            production_lines("fn a() {}\n#[cfg(test)]\nmod t {\n    fn b() {}\n}\n"),
+            vec!["fn a() {}"]
+        );
+    }
+
     fn scan_for_lock_unwraps(dir: &Path, offenders: &mut Vec<String>, scanned: &mut usize) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
@@ -713,15 +766,18 @@ mod contract_tests {
             // Production code only. The rule is about the REQUEST PATH, and a
             // `#[cfg(test)]` block is not on it — this very file's poison
             // fixture has to lock-and-unwrap to create the poisoned state.
-            // Every module in this tree puts its test block last (checked: no
-            // route file defines a function after its first one), so truncating
-            // at the first column-0 marker keeps all shipped code.
-            let body: Vec<&str> = source
-                .lines()
-                .take_while(|l| *l != "#[cfg(test)]")
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .map(str::trim)
-                .collect();
+            //
+            // Test blocks are removed by SPAN, not by truncating at the first
+            // one. The truncating version carried the claim "every module in
+            // this tree puts its test block last (checked: no route file
+            // defines a function after its first one)" — and that was false for
+            // three files: `routes/meta.rs` (test block at line 58 of 1365),
+            // `routes/query.rs` (346 of 1334) and `mcp/mod.rs` (1504 of 1957).
+            // Roughly 2,750 lines of shipped request-path code sat outside a
+            // guard that reported itself as covering the surface, and any module
+            // that puts a small test block near the top blinds the rest of
+            // itself the moment the block lands.
+            let body: Vec<&str> = production_lines(&source);
             if body.is_empty() {
                 continue;
             }
