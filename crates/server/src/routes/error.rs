@@ -375,42 +375,66 @@ mod contract_tests {
         ("SERVICE_UNAVAILABLE", 503, Some("unavailable")),
     ];
 
-    /// Collects the status constants named in every `.rs` file under the HTTP
-    /// surface. Rooted at `CARGO_MANIFEST_DIR` (a compile-time absolute path)
-    /// rather than the CWD, and walking the directories rather than an
-    /// `include_str!` list, so a NEW route module is covered the moment it
-    /// exists instead of when someone remembers to add it here.
+    /// The one directory of `.rs` files this scan skips: `#[cfg(test)] mod e2e`.
+    /// Those files ASSERT statuses rather than emit them, so counting them would
+    /// let a test fixture keep a stale entry alive after the last handler that
+    /// produced it was deleted (the `stale` half of the diff below).
+    const NOT_A_HANDLER_SURFACE: &str = "e2e";
+
+    /// Collects the status constants named in every `.rs` file this crate ships,
+    /// with the files it read.
+    ///
+    /// Rooted at `CARGO_MANIFEST_DIR` (a compile-time absolute path) rather than
+    /// the CWD, and walking the tree rather than an `include_str!` list, so a NEW
+    /// module is covered the moment it exists instead of when someone remembers
+    /// to add it here.
+    ///
+    /// **It walks `src`, not a hand-listed `["routes", "mcp"]`.** That list was
+    /// the bug: `crate::auth` — the N20 identity layer — builds the SAME
+    /// `{error, code}` envelope through the `error_code`/`INTERNAL_MESSAGE` this
+    /// very module re-exports to it, and emits 401/403/429/402/500 from
+    /// middleware that runs in front of every route. It was outside the scan
+    /// entirely, so the contract this test exists to enforce did not reach the
+    /// one surface that refuses a caller before a handler ever sees them. The
+    /// denominator has to come from the tree, not from a list somebody maintains.
     ///
     /// Comment lines are skipped: prose that merely *mentions* a status is not
     /// a handler emitting one, and without this the test fails on its own
     /// documentation (it did).
-    fn statuses_in_use() -> BTreeSet<String> {
+    fn statuses_in_use() -> (BTreeSet<String>, BTreeSet<String>) {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found = BTreeSet::new();
-        for area in ["routes", "mcp"] {
-            scan(&src.join(area), &mut found);
-        }
+        let mut files = BTreeSet::new();
+        scan(&src, &src, &mut found, &mut files);
         assert!(
             found.len() > 5,
             "the scan found almost nothing — it is looking in the wrong place, and a test that \
              cannot see the handlers cannot police them"
         );
-        found
+        (found, files)
     }
 
-    fn scan(dir: &Path, found: &mut BTreeSet<String>) {
+    fn scan(root: &Path, dir: &Path, found: &mut BTreeSet<String>, files: &mut BTreeSet<String>) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
-                scan(&path, found);
+                if path.file_name().and_then(|n| n.to_str()) != Some(NOT_A_HANDLER_SURFACE) {
+                    scan(root, &path, found, files);
+                }
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source");
+            files.insert(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
             for line in source.lines().filter(|l| !l.trim_start().starts_with("//")) {
                 for (at, marker) in line.match_indices("StatusCode::") {
                     let name: String = line[at + marker.len()..]
@@ -432,7 +456,26 @@ mod contract_tests {
             .iter()
             .map(|(name, ..)| name.to_string())
             .collect();
-        let in_use = statuses_in_use();
+        let (in_use, files) = statuses_in_use();
+
+        // The anti-pattern this scan was carrying: the areas were a hand-listed
+        // `["routes", "mcp"]`, so the identity middleware — which refuses a
+        // caller with 401/403/429/402 BEFORE any handler runs, using this
+        // module's own `error_code` — was outside the contract entirely. The
+        // surface is now derived from the tree, and these are the files that
+        // would have been missed.
+        for must_cover in ["auth.rs", "activity.rs", "executor_main.rs"] {
+            assert!(
+                files.contains(must_cover),
+                "{must_cover} is not in the scanned surface — a module that builds the error \
+                 envelope is outside the contract that polices it. Scanned: {files:?}"
+            );
+        }
+        assert!(
+            !files.iter().any(|f| f.starts_with("e2e/")),
+            "the e2e fixtures ASSERT statuses rather than emit them; counting them would keep a \
+             stale EXPECTED entry alive after its last producer was deleted"
+        );
 
         let unlisted: Vec<_> = in_use.difference(&listed).collect();
         assert!(
