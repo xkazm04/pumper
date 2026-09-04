@@ -56,6 +56,24 @@ const DEFAULT_CHUNK_TURNS: u32 = 8;
 /// Hard cap on research steps per job — the loop's unconditional bound.
 const MAX_STEPS: u32 = 12;
 
+/// The largest `max_turns` this loop can actually spend: [`MAX_STEPS`] steps,
+/// each launched with at most `turns_per_step` (default
+/// [`DEFAULT_CHUNK_TURNS`]) turns.
+///
+/// **Why this has to be computed rather than assumed.** The loop carries two
+/// independent bounds — [`MAX_STEPS`], a literal here, and `max_turns`, a
+/// request parameter documented as "total CLI turns for the whole run" — and
+/// nothing derived either from the other. Above `MAX_STEPS * turns_per_step`
+/// the caller's total was simply unreachable: the run exited `step_cap` having
+/// charged the reachable figure, the surplus was never spendable, and the
+/// result said nothing, so raising `max_turns` past the ceiling looked exactly
+/// like raising it below one. The two numbers now travel together, and the
+/// surplus is REPORTED rather than dropped — the convention this app already
+/// applies to `sources_truncated` and `watch_requests_truncated`.
+fn reachable_turn_budget(per_step: Option<u32>) -> u64 {
+    u64::from(MAX_STEPS) * u64::from(per_step.unwrap_or(DEFAULT_CHUNK_TURNS).max(1))
+}
+
 /// Max chars of raw model text carried in a checkpoint as partial findings.
 const PARTIAL_CAP_CHARS: usize = 4000;
 
@@ -357,7 +375,7 @@ impl ScrapeApp for Research {
                     "max_turns": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Total CLI turns for the whole run, spread across the checkpointed steps — not a per-step limit."
+                        "description": "Total CLI turns for the whole run, spread across the checkpointed steps — not a per-step limit. Bounded above by 12 (the step cap) x turns_per_step: a larger value is unreachable, and the result reports turns_budget_reachable with turns_budget_clamped: true."
                     },
                     "turns_per_step": {
                         "type": "integer",
@@ -440,7 +458,7 @@ impl ScrapeApp for Research {
                  resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, \
                  stop_reason, datasets: {persisted, findings, sources, findings_new, \
                  findings_changed, sources_new, sources_changed, error}, snapshots: {attempted, \
-                 saved, failed}, watch_requests[], watch_requests_truncated, sources_truncated, index_datasets[]} — the research report is NESTED under `report`, and only when \
+                 saved, failed}, watch_requests[], watch_requests_truncated, sources_truncated, \n                 turns_budget_reachable, turns_budget_clamped, index_datasets[]} — the research report is NESTED under `report`, and only when \
                  `structured` is true; when it is false `report` is the agent's raw answer as a \
                  bare string, so `summary`/`key_findings`/`sources` are never top-level keys. \
                  `session_id` is resumable — pass it back as the `session_id` param to drill \
@@ -465,7 +483,7 @@ impl ScrapeApp for Research {
                  create for the cited URLs (`watch_sources`); the post-run fan-out writes \
                  them as app:research-managed rows, and `watch_requests_truncated` \
                  says the runtime per-run ceiling refused a surplus. \
-                 `sources_truncated` says the per-run source cap bit.",
+                 `sources_truncated` says the per-run source cap bit.                  `turns_budget_reachable` is the largest `max_turns` this run's chunk size                  could actually spend (the step cap times `turns_per_step`), and                  `turns_budget_clamped` says the caller asked for more than that — the                  surplus was never spendable, which `stop_reason: step_cap` alone does not                  distinguish from a run that simply never shaped a report.",
             ),
             cost_class: CostClass::Claude,
         }
@@ -555,6 +573,11 @@ impl ScrapeApp for Research {
         // The step-cap check below is the loop's own initial value, so no
         // branch leaves `stop_reason` unset.
         let mut stop_reason = StopReason::StepCap;
+
+        // Two bounds govern this loop; report where the caller's turn budget
+        // lands against the one it did not name. See `reachable_turn_budget`.
+        let turns_budget_reachable = reachable_turn_budget(turns_per_step);
+        let turns_budget_clamped = max_turns.is_some_and(|t| u64::from(t) > turns_budget_reachable);
 
         loop {
             if state.steps_done >= MAX_STEPS {
@@ -708,6 +731,11 @@ impl ScrapeApp for Research {
             "num_turns": state.turns_used,
             "session_id": state.session_id,
             "stop_reason": stop_reason.as_str(),
+            // The reachable turn total for this run's chunk size, and whether
+            // the caller asked for more than it. A bare boolean would say the
+            // budget was cut without saying what it was cut to.
+            "turns_budget_reachable": turns_budget_reachable,
+            "turns_budget_clamped": turns_budget_clamped,
             "datasets": kb.datasets,
             "snapshots": kb.snapshots,
             "watch_requests": kb.watch_requests,
@@ -2198,6 +2226,44 @@ mod tests {
             assert_eq!(result["structured"], json!(false));
             assert_eq!(result["steps"], json!(MAX_STEPS));
             assert_eq!(researcher.call_count(), MAX_STEPS as usize);
+        }
+
+        #[test]
+        fn reachable_turn_budget_is_derived_from_the_step_cap() {
+            // Default chunk: 12 steps x 8 turns.
+            assert_eq!(reachable_turn_budget(None), 96);
+            assert_eq!(reachable_turn_budget(Some(1)), 12);
+            assert_eq!(reachable_turn_budget(Some(25)), 300);
+            // A zero chunk is floored at one by the loop, so the ceiling is too.
+            assert_eq!(reachable_turn_budget(Some(0)), 12);
+        }
+
+        #[tokio::test]
+        async fn a_turn_budget_above_the_reachable_maximum_is_reported_not_swallowed() {
+            // `max_turns` is documented as "total CLI turns for the whole run",
+            // but the loop is also bounded by MAX_STEPS, so the largest total
+            // it can actually spend is MAX_STEPS * turns_per_step. Ask for more
+            // than that and the run must SAY the budget was unreachable, the
+            // way this app already says `sources_truncated`.
+            let store = TempStore::new("research-turnclamp").await;
+            let mut out = research_output("still thinking, not json");
+            out.session_id = Some("sess-forever".into());
+            out.num_turns = Some(8);
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "max_turns": 200}),
+                researcher.clone(),
+            )
+            .await;
+            let result = Research::default().run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("step_cap"));
+            assert_eq!(result["steps"], json!(MAX_STEPS));
+            // 12 steps x 8 turns: the 200 the caller asked for was never
+            // reachable, and 104 of them were never spendable.
+            assert_eq!(result["num_turns"], json!(96));
+            assert_eq!(result["turns_budget_reachable"], json!(96));
+            assert_eq!(result["turns_budget_clamped"], json!(true));
         }
 
         /// A researcher that bills like the CLI does under `--max-budget-usd`:
