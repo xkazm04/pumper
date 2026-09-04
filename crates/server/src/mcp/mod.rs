@@ -319,9 +319,14 @@ fn server_tools(state: &AppState) -> Vec<Value> {
     tools
 }
 
-/// `tools/call`: runs a tool and wraps the outcome per MCP — a *tool* failure
-/// is a `result` with `isError: true` (the agent can read and react), while an
-/// unknown tool or unusable arguments are protocol errors.
+/// `tools/call`: runs a tool and wraps the outcome per MCP.
+///
+/// The channel is chosen by **who can act on the answer**, not by whether the
+/// call "really happened". An unknown tool is a protocol error: no rewording of
+/// the arguments fixes it, and the caller must re-list. Everything the model
+/// could fix on the next turn — a tool failure, and every argument that fails
+/// the tool's published schema — is a `result` with `isError: true`, which is
+/// what the agent can actually read and react to.
 async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tools/call needs a 'name'");
@@ -330,6 +335,29 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // ONE DOOR for the schema we publish. Every tool advertises
+    // `additionalProperties: false` plus its own required/range/enum
+    // constraints, and until this check existed none of that was enforced
+    // against a call: a model's misspelled key was dropped and the tool
+    // answered confidently without it. Handlers still hold the rules a schema
+    // cannot express; this holds the ones it can, identically for every tool,
+    // so the two cannot drift apart per handler.
+    if let Some(schema) = server_tools(state)
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|t| t.get("inputSchema"))
+    {
+        if let Err(message) = validate_tool_args(schema, &args) {
+            return rpc_result(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": message }],
+                    "isError": true,
+                }),
+            );
+        }
+    }
     let outcome = match name {
         "list_apps" => Ok(tool_list_apps(state)),
         "query_dataset" => tool_query_dataset(state, &args).await,
@@ -672,6 +700,46 @@ pub(crate) fn target_key_for(
 /// A schema that itself fails to compile is a manifest bug, not the caller's —
 /// it is warn-logged and validation is skipped, so a bad schema can never brick
 /// enqueue (the registry test keeps this path theoretical).
+/// The tool door's half of the rule [`validate_params`] enforces for app params:
+/// arguments are judged against the schema THIS server published for that tool,
+/// at the one door every call passes through.
+///
+/// Per-handler checking is what this replaces, and not for tidiness — the
+/// handlers already disagreed about which advertised constraints they check.
+/// `search` refuses a bad `sort` by hand; nothing on any tool refused an
+/// unknown key, so a caller's typo was silently dropped and the tool answered
+/// without it. A schema published and unenforced is not a contract.
+///
+/// The refusal is in-band rather than a protocol error, and the message names
+/// every violation by JSON pointer and tells the caller to re-read the schema:
+/// a misspelled or out-of-range argument is exactly the class the caller fixes
+/// on its next turn when it is told what was wrong, and the caller is a model.
+///
+/// An `inputSchema` that will not compile is our bug, not the caller's — it is
+/// warn-logged and skipped, so a bad schema can never brick the tool surface.
+pub(crate) fn validate_tool_args(schema: &Value, args: &Value) -> Result<(), String> {
+    let validator = match jsonschema::validator_for(schema) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("unusable tool inputSchema (skipping validation): {e}");
+            return Ok(());
+        }
+    };
+    let errors: Vec<String> = validator
+        .iter_errors(args)
+        .map(|e| format!("arguments{}: {e}", e.instance_path))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "arguments failed this tool's published inputSchema: {}. \
+             Re-read the schema with tools/list before retrying.",
+            errors.join("; ")
+        ))
+    }
+}
+
 pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), String> {
     let validator = match jsonschema::validator_for(schema) {
         Ok(v) => v,

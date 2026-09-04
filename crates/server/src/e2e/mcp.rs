@@ -430,6 +430,45 @@ async fn search_tool_rejects_a_bad_sort_and_a_blank_query_like_the_http_route() 
     );
 }
 
+/// Every tool publishes `additionalProperties: false`, so an argument key the
+/// schema does not name is a violation of a contract WE advertised — and the
+/// caller is a model that guesses key names. Unenforced, a typo is silently
+/// dropped and the tool answers confidently with the argument missing, which is
+/// the worst available outcome: a plausible wrong answer with no signal.
+///
+/// Enforced at the door rather than per handler, because the handlers already
+/// disagree about which advertised constraints they check by hand. The refusal
+/// is in-band (`isError: true`), not a protocol error: a misspelled key is
+/// exactly the class a model can fix on the next turn if it is told.
+#[tokio::test]
+async fn tool_args_are_validated_against_the_schema_the_tool_publishes() {
+    let (state, _store, search) = mcp_state_recording(false).await;
+
+    // A typo'd key on a tool whose schema closes the object.
+    let resp = handle_rpc(&state, &call("search", json!({ "q": "x", "srot": "newest" })))
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["isError"], true, "typo'd key was accepted");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("srot"), "the message must name the bad key: {text}");
+    assert!(
+        search.last.lock().unwrap().is_none(),
+        "a refused request never reaches the index"
+    );
+
+    // A required property the schema names and the handler does not check.
+    let resp = handle_rpc(&state, &call("query_dataset", json!({ "app": "schematic" })))
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["isError"], true, "missing required arg was accepted");
+
+    // The valid call still works — the gate refuses violations, not traffic.
+    let resp = handle_rpc(&state, &call("search", json!({ "q": "x" })))
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["isError"], false);
+}
+
 #[tokio::test]
 async fn resources_serve_catalog_and_app_manifests() {
     let (state, _store) = mcp_state(false).await;
