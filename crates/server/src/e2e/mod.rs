@@ -50,6 +50,7 @@ mod sink_delivery;
 mod store_reports;
 mod target_exclusion;
 mod trigger_cache;
+mod trigger_hook_stages;
 mod trigger_hops;
 mod trigger_ledger;
 mod trigger_plugins;
