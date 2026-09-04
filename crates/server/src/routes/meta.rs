@@ -9,16 +9,103 @@ use serde_json::{json, Value};
 use crate::routes::error::ApiError;
 use crate::state::AppState;
 
+/// The generated OpenAPI 3.1 document, rendered **once** for the process.
+///
+/// The anti-pattern this replaces: the handler was
+/// `Json(super::openapi_router().split_for_parts().1)`, which on **every
+/// request** re-registered all ~140 route groups, re-collected every component
+/// schema, and re-serialized the result: measured at **29.6 ms for 277 kB** of
+/// compact JSON per call (debug build, `report_one_full_render_cost` below; the
+/// committed `clients/openapi.json` is the same document pretty-printed, 480 kB).
+/// The route is also in `auth::PUBLIC_PATHS`, so that work is reachable without
+/// a key even when the operator has turned identity on, which makes an amplifier
+/// out of a self-description endpoint.
+///
+/// The document is a pure function of the compiled-in router — no state, no
+/// config, nothing that can change while the process runs — so rendering it
+/// more than once cannot produce a different answer. The bytes are byte-identical
+/// to what `Json` produced: `serde_json::to_string` is the same compact encoder,
+/// and the content type is the same `application/json`.
+fn openapi_document() -> &'static str {
+    static DOCUMENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DOCUMENT.get_or_init(|| {
+        serde_json::to_string(&super::openapi_router().split_for_parts().1)
+            .expect("the OpenAPI document serializes (the spec-snapshot test proves it)")
+    })
+}
+
 /// Serves the generated OpenAPI 3.1 document. The spec is rebuilt from the same
 /// route registration used by `router`, so it always matches what is served.
+// Rendered ONCE per process now — see `openapi_document`. Deliberately a `//`
+// comment rather than a line added to the doc comment above: utoipa lifts that
+// text into the operation's `summary`, so every word of it is part of
+// `clients/openapi.json` and of every client generated from it. Re-wording a doc
+// comment here is a consumer-contract diff, which is not what this change is.
 #[utoipa::path(
     get,
     path = "/openapi.json",
     tag = "meta",
     responses((status = 200, description = "OpenAPI 3.1 document for this API"))
 )]
-pub(crate) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(super::openapi_router().split_for_parts().1)
+pub(crate) async fn openapi_json() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        openapi_document(),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod openapi_document_tests {
+    use super::openapi_document;
+
+    /// The anti-pattern: the handler rebuilt the whole `OpenApiRouter` and
+    /// re-serialized a 480 kB document on every request, on an unauthenticated
+    /// path. The document cannot change while the process runs, so the render
+    /// must happen once — and the bytes must still be exactly the router's own,
+    /// or `/openapi.json` and `clients/openapi.json` would describe different
+    /// APIs.
+    #[test]
+    fn the_document_is_rendered_once_and_is_still_the_routers_own() {
+        let first = openapi_document();
+        let second = openapi_document();
+        assert!(
+            std::ptr::eq(first, second),
+            "a second call re-rendered instead of reusing the cached document"
+        );
+        let fresh =
+            serde_json::to_string(&crate::routes::openapi_router().split_for_parts().1).unwrap();
+        assert_eq!(first, fresh, "the cached bytes drifted from the router");
+        assert!(first.starts_with("{\"openapi\":\"3."), "{}", &first[..32]);
+    }
+
+    /// A quick sanity bound on the thing that made this worth caching: the
+    /// document really is large enough that re-rendering it per request is not
+    /// free. Deliberately loose — it is a floor, not a snapshot.
+    #[test]
+    fn the_document_is_large_enough_that_per_request_rendering_was_not_free() {
+        assert!(
+            openapi_document().len() > 100_000,
+            "{} bytes",
+            openapi_document().len()
+        );
+    }
+
+    /// The measurement behind the change, kept runnable rather than quoted:
+    /// how long ONE full build+serialize takes — which is what the old handler
+    /// did per request, and what the new one does once.
+    #[test]
+    #[ignore = "timing probe, not a gate"]
+    fn report_one_full_render_cost() {
+        let start = std::time::Instant::now();
+        let bytes = serde_json::to_string(&crate::routes::openapi_router().split_for_parts().1)
+            .unwrap()
+            .len();
+        println!(
+            "one full openapi build+serialize: {:?} for {bytes} bytes",
+            start.elapsed()
+        );
+    }
 }
 
 #[utoipa::path(
@@ -664,6 +751,7 @@ fn activity_metrics(reading: u64, pool_saturated: bool) -> String {
 /// `"pumper_x 150\n"` is a substring of `"         pumper_x 150\n"` — every
 /// existing test in this file passed against the malformed body. So the check
 /// has to be about the LINE, not about a substring of it.
+#[cfg(test)]
 fn malformed_exposition_lines(body: &str) -> Vec<String> {
     let mut bad = Vec::new();
     for line in body.lines().filter(|l| !l.is_empty()) {
