@@ -314,10 +314,11 @@ fn checkpoint_metrics(failures: crate::progress::CheckpointFailures) -> String {
 /// series are different answers.
 fn claim_failure_metrics(total: u64) -> String {
     format!(
-        "# HELP pumper_worker_claim_failures_total Job-claim attempts that failed (store          unreachable or erroring). Process-lifetime, reset on restart. The matching log lines are          rate-limited; this count is not
-         # TYPE pumper_worker_claim_failures_total counter
-         pumper_worker_claim_failures_total {total}
-"
+        "# HELP pumper_worker_claim_failures_total Job-claim attempts that failed (store \
+         unreachable or erroring). Process-lifetime, reset on restart. The matching log lines \
+         are rate-limited; this count is not\n\
+         # TYPE pumper_worker_claim_failures_total counter\n\
+         pumper_worker_claim_failures_total {total}\n"
     )
 }
 
@@ -622,25 +623,58 @@ fn maintenance_metrics(
 fn activity_metrics(reading: u64, pool_saturated: bool) -> String {
     let mut out = String::new();
     out.push_str(
-        "# HELP pumper_store_activity_gauge In-flight foreground work: HTTP requests being          handled plus jobs currently running. The input to the quiet-window maintenance gate          — a pass runs only when this reads 0 and the minimum interval has elapsed
-         # TYPE pumper_store_activity_gauge gauge
-",
+        "# HELP pumper_store_activity_gauge In-flight foreground work: HTTP requests being \
+         handled plus jobs currently running. The input to the quiet-window maintenance gate \
+         — a pass runs only when this reads 0 and the minimum interval has elapsed\n\
+         # TYPE pumper_store_activity_gauge gauge\n",
     );
-    out.push_str(&format!(
-        "pumper_store_activity_gauge {reading}
-"
-    ));
+    out.push_str(&format!("pumper_store_activity_gauge {reading}\n"));
     out.push_str(
-        "# HELP pumper_store_pool_saturated 1 when the most recent connection acquisition on          any measured family waited past its slow line. Counts as busy for the maintenance          gate: a saturated pool is demand for the machine that the activity gauge cannot          see
-         # TYPE pumper_store_pool_saturated gauge
-",
+        "# HELP pumper_store_pool_saturated 1 when the most recent connection acquisition on \
+         any measured family waited past its slow line. Counts as busy for the maintenance \
+         gate: a saturated pool is demand for the machine that the activity gauge cannot see\n\
+         # TYPE pumper_store_pool_saturated gauge\n",
     );
     out.push_str(&format!(
-        "pumper_store_pool_saturated {}
-",
+        "pumper_store_pool_saturated {}\n",
         pool_saturated as u8
     ));
     out
+}
+
+/// Every line of a rendered exposition block that is malformed, with the reason.
+///
+/// Two shapes, and both come from the SAME authoring mistake: a `\`
+/// line-continuation dropped from a multi-line string literal. Rust then keeps
+/// the newline and the source indentation, so the block ships as
+///
+/// ```text
+/// # HELP pumper_x ... (store          unreachable ...
+///          # TYPE pumper_x counter
+///          pumper_x 150
+/// ```
+///
+/// — a HELP sentence with a ten-space hole in the middle of it (that string is
+/// served to every scraper and rendered verbatim in metric-metadata views), and
+/// `# TYPE`/sample lines carrying nine leading spaces. Prometheus's own text
+/// parser skips leading blanks, so nothing ever went red; an OpenMetrics-strict
+/// reader does not, and the HELP text is simply wrong either way.
+///
+/// The reason a `contains(..)` assertion cannot catch this is that
+/// `"pumper_x 150\n"` is a substring of `"         pumper_x 150\n"` — every
+/// existing test in this file passed against the malformed body. So the check
+/// has to be about the LINE, not about a substring of it.
+fn malformed_exposition_lines(body: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for line in body.lines().filter(|l| !l.is_empty()) {
+        if line.starts_with([' ', '\t']) {
+            bad.push(format!("leading whitespace: {line:?}"));
+        }
+        if line.trim_start().contains("  ") {
+            bad.push(format!("interior double space: {line:?}"));
+        }
+    }
+    bad
 }
 
 /// Renders the webhook-delivery block of `/metrics` from one health snapshot.
@@ -1020,6 +1054,118 @@ mod webhook_metric_tests {
             pumper_core::MaintenanceTask::ALL.len() * pumper_core::PassOutcome::ALL.len()
         );
         assert_eq!(body.matches("# HELP ").count(), 1);
+    }
+
+    /// The anti-pattern: three blocks lost the `\` line-continuation from their
+    /// multi-line literal, so `/metrics` shipped HELP sentences with ten-space
+    /// holes in them (`(store          unreachable or erroring)`) and `# TYPE` /
+    /// sample lines indented by nine spaces. Every `contains(..)` assertion in
+    /// this file passed the whole time, because the malformed line CONTAINS the
+    /// well-formed substring.
+    ///
+    /// Covers every pure renderer in this module. The blocks still inlined in
+    /// [`metrics`] itself are covered by the source guard below, which is what
+    /// catches a new one authored the same way.
+    #[test]
+    fn rendered_metric_lines_have_no_lost_line_continuations() {
+        let mut body = String::new();
+        body.push_str(&webhook_metrics(&DeliveryHealth::default(), at(0)));
+        body.push_str(&egress_metrics(
+            &pumper_core::fetcher::EgressCounters::default(),
+        ));
+        body.push_str(&checkpoint_metrics(
+            crate::progress::CheckpointFailures::default(),
+        ));
+        body.push_str(&claim_failure_metrics(150));
+        body.push_str(&store_op_metrics(&instrument_with_traffic().snapshot()));
+        body.push_str(&queue_age_metrics(&pumper_core::QueueAges::default()));
+        body.push_str(&store_size_metrics(&pumper_core::StoreSize::default()));
+        body.push_str(&maintenance_metrics(&pass_counts(
+            &pumper_core::StoreInstrument::new(),
+        )));
+        body.push_str(&activity_metrics(3, true));
+        assert!(
+            super::malformed_exposition_lines(&body).is_empty(),
+            "{:#?}",
+            super::malformed_exposition_lines(&body)
+        );
+        // The checker really does bite — a body carrying the exact defect it was
+        // written for is reported on BOTH of its shapes, and the well-formed
+        // substring a `contains(..)` would have matched is present throughout.
+        let seeded = "# HELP pumper_x a sentence with          a hole\n         # TYPE pumper_x counter\n         pumper_x 1\n";
+        assert!(
+            seeded.contains("pumper_x 1\n"),
+            "a contains() assertion is blind to this"
+        );
+        let bad = super::malformed_exposition_lines(seeded);
+        assert_eq!(bad.len(), 3, "{bad:#?}");
+        assert_eq!(
+            bad.iter()
+                .filter(|b| b.starts_with("leading whitespace"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            bad.iter()
+                .filter(|b| b.starts_with("interior double space"))
+                .count(),
+            1
+        );
+    }
+
+    /// The blocks `metrics` pushes inline never pass through a renderer, so the
+    /// only thing that can police them is their source. Restricted to lines that
+    /// actually carry exposition text (`# HELP` / `# TYPE` / a `pumper_` series)
+    /// so ordinary code and alignment cannot false-positive, and rooted at
+    /// `CARGO_MANIFEST_DIR` like this crate's other source guards.
+    ///
+    /// Leading indentation is stripped first: inside a correctly `\`-continued
+    /// literal the SOURCE line is indented and the OUTPUT line is not, so only
+    /// an interior run of spaces is evidence of a lost continuation.
+    ///
+    /// Test modules are skipped by SPAN (`#[cfg(test)]` to the next column-0
+    /// `}`), not by truncating at the first one: this module puts `list_apps`
+    /// *after* its test block, so a truncating scan would silently stop covering
+    /// the second half of the file.
+    #[test]
+    fn no_metric_literal_in_this_module_has_lost_its_continuation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/meta.rs");
+        let source = std::fs::read_to_string(&path).expect("read this module");
+        let mut in_test = false;
+        let production: Vec<&str> = source
+            .lines()
+            .filter(|l| {
+                if *l == "#[cfg(test)]" {
+                    in_test = true;
+                    return false;
+                }
+                if in_test {
+                    if *l == "}" {
+                        in_test = false;
+                    }
+                    return false;
+                }
+                !l.trim_start().starts_with("//")
+            })
+            .collect();
+        assert!(
+            production.len() > 100,
+            "the truncation ate the module this guard is supposed to police"
+        );
+        let offenders: Vec<&str> = production
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                (t.contains("# HELP") || t.contains("# TYPE") || t.contains("pumper_"))
+                    && t.contains("  ")
+            })
+            .copied()
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a metric literal carries an interior double space — a `\\` line-continuation was \
+             dropped, and the served HELP/TYPE text is malformed: {offenders:#?}"
+        );
     }
 
     /// Clock skew (a row stamped in the future) must not render a negative age,

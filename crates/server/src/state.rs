@@ -431,7 +431,8 @@ impl AppState {
                     );
                 }
                 Err(e) => tracing::warn!(
-                    "event log: could not read MAX(seq) ({e}); the sequence RESTARTS at 0 and                      resuming clients will be told to reset"
+                    "event log: could not read MAX(seq) ({e}); the sequence RESTARTS at 0 and \
+                     resuming clients will be told to reset"
                 ),
             }
         }
