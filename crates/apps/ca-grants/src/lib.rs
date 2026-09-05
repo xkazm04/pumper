@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use grants_common::{append_warning, sweep_warning, walk_end, SweepEnd, SweepVocab};
 use pumper_core::datasets::JsonFilter;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
@@ -25,6 +26,15 @@ pub struct CaGrants;
 const CKAN_URL: &str = "https://data.ca.gov/api/3/action/datastore_search";
 // California Grants Portal dataset on data.ca.gov (verified 2026-07-03).
 const RESOURCE_ID: &str = "111c8c88-21f6-453c-ae2c-b4785a0624f5";
+// CKAN's dialect for `grants_common::sweep_warning` — the page-size param this
+// app's manifest actually publishes, the upstream's name, and the field the
+// total is read from. This struct is all that used to justify a private fork of
+// the whole warning function.
+const SWEEP_VOCAB: SweepVocab = SweepVocab {
+    page_size_param: "limit",
+    source: "CKAN",
+    total_field: "result.total",
+};
 
 #[async_trait]
 impl ScrapeApp for CaGrants {
@@ -139,7 +149,7 @@ impl ScrapeApp for CaGrants {
         // assigns it from `walk_end`, so the compiler proves the reported arm and
         // the actual stop can never disagree. A default here would be a second,
         // silent opinion about how the walk ended.
-        let end;
+        let end: SweepEnd;
 
         loop {
             let mut body = json!({
@@ -225,8 +235,8 @@ impl ScrapeApp for CaGrants {
         // (`pages >= max_pages && offset < total`), so a short page and a
         // renamed/dropped `result.total` each returned Ok identically to a full
         // sweep — and the latter capped California at one page indefinitely.
-        // See [`SweepEnd`].
-        let truncated = end != SweepEnd::Complete;
+        // See `grants_common::SweepEnd`.
+        let truncated = end.truncated();
 
         // A listing that reports nothing at all while grants are already stored
         // is drift, not a clean sweep: `result.total` AND `result.records` both
@@ -319,7 +329,7 @@ impl ScrapeApp for CaGrants {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-            // How the walk ended, named — see [`SweepEnd`]. `truncated` is its
+            // How the walk ended, named — see `grants_common::SweepEnd`. `truncated` is its
             // boolean projection ("anything but complete"), kept because it is
             // the key consumers already read.
             "sweep": end.as_str(),
@@ -332,162 +342,30 @@ impl ScrapeApp for CaGrants {
             append_warning(&mut out, msg);
         }
         // Pushed after the merge, which appended the drift warnings.
-        if let Some(msg) = sweep_warning(end, pages, max_pages, limit, total, records.len()) {
+        if let Some(msg) = sweep_warning(
+            end,
+            pages,
+            max_pages,
+            limit,
+            total,
+            records.len(),
+            SWEEP_VOCAB,
+        ) {
             append_warning(&mut out, msg);
         }
         Ok(out)
     }
 }
 
-/// How the CKAN walk ended. Four endings, and **only one proves the corpus was
-/// covered** — the single `truncated` boolean collapsed them into one claim and
-/// three of them read as a complete corpus.
-///
-/// This is grants-gov's vocabulary — same four names, same meanings, same
-/// ordering — deliberately reused rather than re-invented, because a second
-/// dialect of "how much did this sweep prove" across two grant sources would be
-/// worse than the bug. (grants-gov in turn took `Complete`/`Capped`/`ShortPage`
-/// from cordis and added `UnknownTotal`.) It lives here rather than in
-/// `grants-common` only because apps may not depend on apps and the shared crate
-/// was out of this change's write set; lifting all three copies into
-/// `grants_common` is the follow-up.
-///
-/// The arm this app was missing entirely is [`SweepEnd::UnknownTotal`], and the
-/// ledger records what it was worth on the federal side: *the renamed-`hitCount`
-/// case capped the corpus at one page indefinitely*. `ca-grants` read
-/// `result.total` once, from page 1, with `unwrap_or(0)`, and then broke the walk
-/// on `offset >= total` — so `1000 >= 0` after page 1. California capped at one
-/// page, green, with `truncated: false` and a drift guard (gated on `total > 0`)
-/// that could never fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepEnd {
-    /// The records actually COLLECTED reach CKAN's own reported `result.total`.
-    /// The only ending that reads as complete.
-    Complete,
-    /// Stopped at `maxPages` with records left to walk.
-    Capped,
-    /// A page came back shorter than `limit` while the reported `total` says more
-    /// remains. A transient truncation (a rate-limited or partially-served page),
-    /// NOT the end of the corpus.
-    ShortPage,
-    /// Records served under a `result.total` of 0 — absent, renamed, or moved.
-    /// The total is unusable, so no arithmetic can prove the end; the walk runs
-    /// on until a short page or the cap and reports coverage as unproven.
-    UnknownTotal,
-}
-
-impl SweepEnd {
-    fn as_str(self) -> &'static str {
-        match self {
-            SweepEnd::Complete => "complete",
-            SweepEnd::Capped => "capped",
-            SweepEnd::ShortPage => "short_page",
-            SweepEnd::UnknownTotal => "unknown_total",
-        }
-    }
-}
-
-/// How the walk ends after fetching the 1-based `page`, or `None` to keep going.
-///
-/// `collected` is every record gathered so far **including this page**, and it —
-/// not offset arithmetic — is what proves coverage. The old break asked
-/// `offset >= total`, which counts the rows *requested*: a page that asked for
-/// 1000 and delivered 100 still advanced the offset by 1000, so on the second
-/// page of a 1366-record corpus that test read `2000 >= 1366` and called 1100
-/// records a complete sweep. Counting what actually arrived is the only proof
-/// that survives a partially-served page.
-///
-/// The ordering is load-bearing and mirrors grants-gov's: proof of coverage
-/// first, then the per-run cap, then the short page — because a short page is
-/// **evidence of nothing** (a rate-limited upstream produces exactly the same
-/// shape as a genuine tail) and must never outrank the proof.
-///
-/// Termination: every path either returns `Some` or leaves `page < max_pages`,
-/// so `maxPages` still bounds the walk — including on an `unknown_total` feed,
-/// where there is no total left to bound it.
-fn walk_end(
-    page: u64,
-    limit: u64,
-    total: u64,
-    got: u64,
-    collected: u64,
-    max_pages: u64,
-) -> Option<SweepEnd> {
-    if total == 0 {
-        // No usable total. Two sub-cases, told apart by what the SAME response
-        // served — which is the only evidence available here.
-        if got == 0 {
-            // Self-consistent: no total, no records. An honestly empty result
-            // set (a `Status` filter matching nothing) IS fully swept. This is
-            // the boundary that must not be reported as drift.
-            return Some(SweepEnd::Complete);
-        }
-        // Self-contradictory: records served under a zero total. Keep walking —
-        // a short page or the cap is the only end signal left — but never report
-        // complete.
-        return (got < limit || page >= max_pages).then_some(SweepEnd::UnknownTotal);
-    }
-    if collected >= total {
-        return Some(SweepEnd::Complete);
-    }
-    if page >= max_pages {
-        return Some(SweepEnd::Capped);
-    }
-    if got < limit {
-        return Some(SweepEnd::ShortPage);
-    }
-    None
-}
-
-/// The human-readable warning for a walk that did not prove its coverage, or
-/// `None` for a complete sweep.
-///
-/// Every non-complete arm reaches the caller through `warnings[]` as well as
-/// through `sweep`/`truncated`, because a consumer reading only the warnings
-/// channel is exactly the consumer who would otherwise never learn that the
-/// California corpus is short.
-fn sweep_warning(
-    end: SweepEnd,
-    pages: u64,
-    max_pages: u64,
-    limit: u64,
-    total: u64,
-    fetched: usize,
-) -> Option<String> {
-    match end {
-        SweepEnd::Complete => None,
-        SweepEnd::Capped => Some(format!(
-            "coverage truncated: stopped at maxPages={max_pages} after {fetched} of \
-             {total} records — raise limit/maxPages to cover the full corpus"
-        )),
-        SweepEnd::ShortPage => Some(format!(
-            "coverage truncated: page {pages} returned fewer than limit={limit} while \
-             CKAN reports {total} total, so the walk stopped at {fetched} records — \
-             treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
-             partially-served page looks exactly like a genuine tail)"
-        )),
-        SweepEnd::UnknownTotal => Some(format!(
-            "coverage unproven: CKAN served {fetched} records over {pages} page(s) while \
-             reporting result.total:0 — the total is missing or renamed, so nothing can \
-             prove the corpus was covered. The walk ran to a short page or \
-             maxPages={max_pages} instead of trusting the total"
-        )),
-    }
-}
-
-/// Appends a warning to a result's `warnings` array (creating it if absent).
-/// `UnifiedOutcome::merge_into` extends `warnings` rather than replacing it, so any
-/// coverage warning survives whichever side of the merge pushes it.
-fn append_warning(out: &mut Value, msg: String) {
-    if let Value::Object(map) = out {
-        match map.get_mut("warnings") {
-            Some(Value::Array(w)) => w.push(json!(msg)),
-            _ => {
-                map.insert("warnings".into(), json!([msg]));
-            }
-        }
-    }
-}
+// `SweepEnd`, `walk_end`, `sweep_warning` and `append_warning` are
+// `grants_common`'s. This app forked all four privately, and its own doc comment
+// named the fix: *"lifting all three copies into `grants_common` is the
+// follow-up"*. This is that follow-up. The only genuinely Californian part was
+// the wording — `limit`, `CKAN`, `result.total` — which now travels as
+// `SWEEP_VOCAB` above, so the emitted warnings are byte-identical while the walk
+// arithmetic and the extend-not-clobber rule have ONE definition each. The
+// federal `unknown_total` bug that cost this app a one-page corpus can no longer
+// be fixed on one side of the fleet only.
 
 /// Stable key for a portal record: PortalID, then GrantID, then a fallback that
 /// is never the raw `_id` (which renumbers on reload).
@@ -629,15 +507,18 @@ mod tests {
 
     #[test]
     fn sweep_warnings_name_the_arm_they_came_from() {
-        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366).is_none());
-        let capped = sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000).unwrap();
+        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366, SWEEP_VOCAB).is_none());
+        let capped =
+            sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000, SWEEP_VOCAB).unwrap();
         assert!(capped.contains("maxPages=25"), "{capped}");
-        let short = sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100).unwrap();
+        let short =
+            sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100, SWEEP_VOCAB).unwrap();
         assert!(
             short.contains("limit=1000") && short.contains("1366"),
             "{short}"
         );
-        let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400).unwrap();
+        let unproven =
+            sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400, SWEEP_VOCAB).unwrap();
         assert!(
             unproven.contains("coverage unproven") && unproven.contains("result.total:0"),
             "{unproven}"
@@ -655,9 +536,9 @@ mod tests {
             (SweepEnd::UnknownTotal, "unknown_total", true),
         ] {
             assert_eq!(end.as_str(), name);
-            assert_eq!(end != SweepEnd::Complete, truncated, "{name}");
+            assert_eq!(end.truncated(), truncated, "{name}");
             assert_eq!(
-                sweep_warning(end, 1, 25, 1000, 10, 5).is_some(),
+                sweep_warning(end, 1, 25, 1000, 10, 5, SWEEP_VOCAB).is_some(),
                 truncated,
                 "every non-complete arm also warns: {name}"
             );

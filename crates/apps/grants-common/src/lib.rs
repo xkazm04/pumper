@@ -293,6 +293,21 @@ fn merge_warnings(map: &mut serde_json::Map<String, Value>, warnings: &[String])
     }
 }
 
+/// Appends one warning to a result object's `warnings` array, creating it when
+/// absent and keeping whatever a caller put there first.
+///
+/// The extend-not-clobber rule has exactly one implementation ([`merge_warnings`])
+/// and this is its single-message door. Three source apps carried byte-identical
+/// private copies of this function and eu-sedia carried the same `match` inline;
+/// a fix to the rule (the `insert`-clobbers-preexisting-warnings bug that
+/// `merge_into_extends_preexisting_warnings_not_clobbers_them` records) had to be
+/// mirrored by hand into each. Now it cannot be.
+pub fn append_warning(out: &mut Value, msg: String) {
+    if let Value::Object(map) = out {
+        merge_warnings(map, std::slice::from_ref(&msg));
+    }
+}
+
 /// Horizon topic-family key: the identifier with its call-year segment removed,
 /// so successor topics across work programmes collapse onto one lineage key
 /// (`HORIZON-CL4-2026-DATA-01` and `HORIZON-CL4-2024-DATA-01` →
@@ -2066,13 +2081,12 @@ fn norm_status(s: Option<&str>) -> Value {
 /// parser.
 ///
 /// This is `grants-gov`'s and `ca-grants`' vocabulary — same four names, same
-/// meanings, same ordering — lifted here rather than forked a third time.
-/// `ca-grants` (`src/lib.rs`) nominated `grants_common` as its home in a
-/// comment: *"It lives here rather than in `grants-common` only because apps may
-/// not depend on apps and the shared crate was out of this change's write set."*
-/// This IS that home. The two existing copies are deliberately left in place —
-/// re-pointing ~45 references is churn, not a fix — so for now this is the
-/// canonical definition for **new** adopters, of which `eu-sedia` is the first.
+/// meanings, same ordering. Both apps forked it privately (`ca-grants` nominated
+/// `grants_common` as its home in a comment: *"lifting all three copies into
+/// `grants_common` is the follow-up"*), and this IS that home: the forks are
+/// gone, every grant-source app names the four endings through this one enum,
+/// and the per-source wording that used to justify a fork now travels as
+/// [`SweepVocab`] instead.
 ///
 /// The arm apps keep missing is [`SweepEnd::UnknownTotal`], and the ledger
 /// records what it has cost three times: `grants-gov`'s renamed `hitCount`,
@@ -2167,15 +2181,35 @@ pub fn walk_end(
     None
 }
 
+/// The three per-source words a coverage warning needs so that ONE message
+/// template can speak every grant source's own dialect.
+///
+/// These names are the entire reason `grants-gov` and `ca-grants` each kept a
+/// private `sweep_warning`: the *logic* was byte-identical, only the nouns
+/// differed ("rows" vs "limit" vs "pageSize", "search2" vs "CKAN", "hitCount" vs
+/// "result.total"). A message that says `pageSize` to an operator whose manifest
+/// param is `rows` is not actionable, so the nouns are load-bearing — but they
+/// are DATA, not a reason to fork a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepVocab {
+    /// The page-size parameter as the operator sets it in `params` (`rows`,
+    /// `limit`, `pageSize`) — what the "raise X/maxPages" remedy must name.
+    pub page_size_param: &'static str,
+    /// How to name the upstream in prose (`search2`, `CKAN`, `the source`).
+    pub source: &'static str,
+    /// The upstream field the total was read from (`hitCount`, `result.total`,
+    /// `totalResults`), because "the total is missing" is only actionable if the
+    /// message says WHICH field to go looking for.
+    pub total_field: &'static str,
+}
+
 /// The human-readable warning for a walk that did not prove its coverage, or
 /// `None` for a complete sweep.
 ///
 /// Every non-complete arm reaches the caller through `warnings[]` as well as
 /// through `sweep`/`truncated`, because a consumer reading only the warnings
 /// channel is exactly the consumer who would otherwise never learn the corpus is
-/// short. `total_field` is the upstream field name the total was read from
-/// (`totalResults`, `hitCount`, `result.total`), because "the total is missing"
-/// is only actionable if the message says WHICH field to go looking for.
+/// short. The per-source nouns come from `vocab` — see [`SweepVocab`].
 pub fn sweep_warning(
     end: SweepEnd,
     pages: u64,
@@ -2183,23 +2217,28 @@ pub fn sweep_warning(
     page_size: u64,
     total: u64,
     fetched: usize,
-    total_field: &str,
+    vocab: SweepVocab,
 ) -> Option<String> {
+    let SweepVocab {
+        page_size_param,
+        source,
+        total_field,
+    } = vocab;
     match end {
         SweepEnd::Complete => None,
         SweepEnd::Capped => Some(format!(
             "coverage truncated: stopped at maxPages={max_pages} after {fetched} of {total} \
-             records — raise pageSize/maxPages to cover the full corpus"
+             records — raise {page_size_param}/maxPages to cover the full corpus"
         )),
         SweepEnd::ShortPage => Some(format!(
-            "coverage truncated: page {pages} returned fewer than pageSize={page_size} while \
-             the source reports {total} total, so the walk stopped at {fetched} records — \
+            "coverage truncated: page {pages} returned fewer than {page_size_param}={page_size} \
+             while {source} reports {total} total, so the walk stopped at {fetched} records — \
              treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
              partially-served page looks exactly like a genuine tail)"
         )),
         SweepEnd::UnknownTotal => Some(format!(
-            "coverage unproven: the source served {fetched} records over {pages} page(s) while \
-             reporting `{total_field}`:0 — the total is missing or renamed, so nothing can \
+            "coverage unproven: {source} served {fetched} records over {pages} page(s) while \
+             reporting {total_field}:0 — the total is missing or renamed, so nothing can \
              prove the corpus was covered. The walk ran to a short page or maxPages={max_pages} \
              instead of trusting the total"
         )),
@@ -2403,17 +2442,102 @@ mod tests {
             assert_eq!(end.as_str(), name);
             assert_eq!(end.truncated(), truncated, "{name}");
             assert_eq!(
-                sweep_warning(end, 1, 50, 100, 10, 5, "totalResults").is_some(),
+                sweep_warning(end, 1, 50, 100, 10, 5, SEDIA).is_some(),
                 truncated,
                 "{name}: every non-complete arm must reach warnings[] too"
             );
         }
-        let unproven =
-            sweep_warning(SweepEnd::UnknownTotal, 3, 50, 100, 0, 240, "totalResults").unwrap();
+        let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 50, 100, 0, 240, SEDIA).unwrap();
         assert!(
             unproven.contains("totalResults"),
             "the warning must name the field to go looking for: {unproven}"
         );
+    }
+
+    // The three dialects the source apps speak, as their own crates declare
+    // them. Duplicated here ON PURPOSE: the test below is the guard that the
+    // shared template still renders each app's exact wording, so it must not
+    // read the constants it is checking.
+    const SEDIA: SweepVocab = SweepVocab {
+        page_size_param: "pageSize",
+        source: "the source",
+        total_field: "totalResults",
+    };
+    const SEARCH2: SweepVocab = SweepVocab {
+        page_size_param: "rows",
+        source: "search2",
+        total_field: "hitCount",
+    };
+    const CKAN: SweepVocab = SweepVocab {
+        page_size_param: "limit",
+        source: "CKAN",
+        total_field: "result.total",
+    };
+
+    /// THE ANTI-PATTERN: three apps forked `sweep_warning` because one template
+    /// spoke only one source's nouns — a message telling a grants.gov operator to
+    /// "raise pageSize" names a param their manifest does not have. Unifying the
+    /// function is only safe if the nouns still arrive, so this asserts the
+    /// remedy, the upstream's name and the drifted field name for every dialect
+    /// and every unproven arm. A regression here is a warning that sends an
+    /// operator looking for the wrong knob.
+    #[test]
+    fn one_template_still_speaks_each_sources_own_nouns() {
+        for (vocab, param, source, field) in [
+            (SEARCH2, "rows", "search2", "hitCount"),
+            (CKAN, "limit", "CKAN", "result.total"),
+            (SEDIA, "pageSize", "the source", "totalResults"),
+        ] {
+            let capped = sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000, vocab)
+                .expect("capped warns");
+            assert!(
+                capped.contains(&format!("raise {param}/maxPages")),
+                "the remedy must name the caller's own page-size param: {capped}"
+            );
+            let short = sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100, vocab)
+                .expect("short page warns");
+            assert!(
+                short.contains(&format!("fewer than {param}=1000"))
+                    && short.contains(&format!("while {source} reports 1366 total"))
+                    && short.contains("TRUNCATED page"),
+                "{short}"
+            );
+            let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400, vocab)
+                .expect("unknown total warns");
+            assert!(
+                unproven.contains("coverage unproven")
+                    && unproven.contains(&format!("{source} served 2400 records"))
+                    && unproven.contains(&format!("reporting {field}:0")),
+                "{unproven}"
+            );
+        }
+    }
+
+    /// THE REFUTED BEHAVIOR: `append_warning`'s three private copies were each
+    /// one `map.insert` away from dropping a warning an app had already pushed —
+    /// the same bug `merge_into` shipped. One door, one rule.
+    #[test]
+    fn append_warning_extends_a_preexisting_array_and_leaves_non_objects_alone() {
+        let mut out = json!({ "warnings": ["drift: 60% null titles"] });
+        append_warning(&mut out, "coverage truncated".to_string());
+        assert_eq!(
+            out["warnings"],
+            json!(["drift: 60% null titles", "coverage truncated"])
+        );
+
+        let mut fresh = json!({ "fetched": 3 });
+        append_warning(&mut fresh, "w".to_string());
+        assert_eq!(fresh["warnings"], json!(["w"]));
+
+        // A foreign `warnings` shape is replaced, never appended into.
+        let mut foreign = json!({ "warnings": "one string" });
+        append_warning(&mut foreign, "w".to_string());
+        assert_eq!(foreign["warnings"], json!(["w"]));
+
+        // Not an object: nothing to append to, and no panic.
+        let mut arr = json!([1, 2]);
+        append_warning(&mut arr, "w".to_string());
+        assert_eq!(arr, json!([1, 2]));
     }
 
     /// THE REFUTED BEHAVIOR: the shipped guard is `total > 0 && got == 0`, gated

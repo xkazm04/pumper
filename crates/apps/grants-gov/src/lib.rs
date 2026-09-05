@@ -92,6 +92,9 @@
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
+use grants_common::{
+    append_warning, empty_page_is_drift, sweep_warning, walk_end, SweepEnd, SweepVocab,
+};
 use pumper_core::{
     AppContext, AppManifest, CostClass, DerivedPaths, Error, HttpMethod, HttpRequest,
     ManifestExample, Provenance, Result, ScrapeApp,
@@ -101,6 +104,15 @@ use serde_json::{json, Value};
 pub struct GrantsGov;
 
 const SEARCH2_URL: &str = "https://api.grants.gov/v1/api/search2";
+// search2's dialect for `grants_common::sweep_warning` — the page-size param
+// this app's manifest actually publishes (`rows`, NOT `pageSize`), the
+// upstream's name, and the field the total is read from. This struct is all that
+// used to justify a private fork of the whole warning function.
+const SWEEP_VOCAB: SweepVocab = SweepVocab {
+    page_size_param: "rows",
+    source: "search2",
+    total_field: "hitCount",
+};
 
 #[async_trait]
 impl ScrapeApp for GrantsGov {
@@ -403,8 +415,8 @@ impl ScrapeApp for GrantsGov {
         // (`pages >= max_pages && start < hit_count`) above a comment claiming
         // this whole class was closed, so a short page, a mid-sweep drop and a
         // renamed `hitCount` each returned Ok identically to a genuine full
-        // sweep. See [`SweepEnd`].
-        let truncated = end != SweepEnd::Complete;
+        // sweep. See `grants_common::SweepEnd`.
+        let truncated = end.truncated();
 
         // Dedup + change detection: key each opportunity by its stable id (falling
         // back to the opportunity number, then row index). A scheduled run reports
@@ -664,7 +676,7 @@ impl ScrapeApp for GrantsGov {
             // is non-fatal to the listing, so this is the ONLY place a caller
             // learns the enrichment degraded — it is never allowed to be absent.
             "detailsFailed": details_failed,
-            // How the walk ended, named — see [`SweepEnd`]. `truncated` is its
+            // How the walk ended, named — see `grants_common::SweepEnd`. `truncated` is its
             // boolean projection ("anything but complete"), kept because it is
             // the key consumers already read.
             "sweep": end.as_str(),
@@ -682,7 +694,15 @@ impl ScrapeApp for GrantsGov {
         for msg in degradation_warnings {
             append_warning(&mut out, msg);
         }
-        if let Some(msg) = sweep_warning(end, pages, max_pages, rows, hit_count, hits.len()) {
+        if let Some(msg) = sweep_warning(
+            end,
+            pages,
+            max_pages,
+            rows,
+            hit_count,
+            hits.len(),
+            SWEEP_VOCAB,
+        ) {
             append_warning(&mut out, msg);
         }
         Ok(out)
@@ -693,116 +713,14 @@ impl ScrapeApp for GrantsGov {
 /// cannot drift apart — the drift guard counts the corpus this write produced.
 const OPPORTUNITIES_DATASET: &str = "opportunities";
 
-/// How the Search2 walk ended.
-///
-/// The single `truncated` boolean collapsed four different endings into one
-/// claim, and three of them read as a complete corpus. This is cordis's
-/// [`SweepEnd`](../../cordis/src/lib.rs) vocabulary — `Complete` / `Capped` /
-/// `ShortPage`, same names, same meanings — deliberately reused rather than
-/// re-invented.
-///
-/// **The one divergence**: cordis's listing always publishes a usable total, so
-/// it has no equivalent of [`SweepEnd::UnknownTotal`]. grants.gov's `hitCount`
-/// is read with `unwrap_or(0)`, so a rename of that one field yields
-/// `hit_count = 0`, and `start >= hit_count` (`1000 >= 0`) then broke the walk
-/// after page 1 while the drift guard — gated on `hit_count > 0` — stayed
-/// silent. The corpus capped at one page, green, indefinitely. That arm needs a
-/// name of its own because the remedy is different: nothing is wrong with the
-/// walk, the *proof* is missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepEnd {
-    /// The records actually COLLECTED reach the listing's own reported
-    /// `hitCount`. The only ending that reads as complete.
-    Complete,
-    /// Stopped at `maxPages` with records left to walk.
-    Capped,
-    /// A page came back shorter than `rows` while the reported `hitCount` says
-    /// more remains. A transient truncation (a rate-limited or partially-served
-    /// page), NOT the end of the corpus.
-    ShortPage,
-    /// The response served hits under a `hitCount` of 0 — absent, renamed, or
-    /// zero. The total is unusable, so no arithmetic can prove the end; the walk
-    /// runs on until a short page or the cap and reports coverage as unproven.
-    UnknownTotal,
-}
-
-impl SweepEnd {
-    fn as_str(self) -> &'static str {
-        match self {
-            SweepEnd::Complete => "complete",
-            SweepEnd::Capped => "capped",
-            SweepEnd::ShortPage => "short_page",
-            SweepEnd::UnknownTotal => "unknown_total",
-        }
-    }
-}
-
-/// How the walk ends after fetching the 1-based `page`, or `None` to keep going.
-///
-/// `collected` is every hit gathered so far **including this page**, and it —
-/// not page arithmetic — is what proves coverage. cordis's equivalent asks
-/// `page * page_size >= total`, which counts the listing positions *requested*;
-/// the short-page bug this function exists to kill is precisely a page that
-/// asked for 1000 and delivered 100, so on the second page of a 1366-record
-/// corpus that test reads `2000 >= 1366` and calls 1100 records a complete
-/// sweep. Counting what actually arrived is the only proof that survives a
-/// partially-served page.
-///
-/// The cost of the stricter test: an upstream whose `hitCount` is racy (the
-/// corpus shrank mid-walk) ends `ShortPage` with a warning instead of
-/// `Complete`. A false "coverage unproven" is recoverable; a false "corpus
-/// covered" is the failure that hides money.
-///
-/// The ordering is load-bearing and mirrors cordis's: proof of coverage first,
-/// then the per-run cap, then the short page — because a short page is
-/// **evidence of nothing** (a rate-limited upstream produces exactly the same
-/// shape as a genuine tail) and must never outrank the proof.
-fn walk_end(
-    page: u64,
-    rows: u64,
-    hit_count: u64,
-    got: u64,
-    collected: u64,
-    max_pages: u64,
-) -> Option<SweepEnd> {
-    if hit_count == 0 {
-        // No usable total. Two sub-cases, told apart by what the SAME response
-        // served — which is the only evidence available here.
-        if got == 0 {
-            // Self-consistent: no total, no hits. An honestly empty result set
-            // (a narrowed pull matching nothing) IS fully swept. Whether it is
-            // instead drift is decided against the STORED corpus by
-            // [`empty_listing_is_drift`], never against this same response.
-            return Some(SweepEnd::Complete);
-        }
-        // Self-contradictory: hits served under a zero total. Keep walking —
-        // a short page or the cap is the only end signal left — but never
-        // report complete.
-        return (got < rows || page >= max_pages).then_some(SweepEnd::UnknownTotal);
-    }
-    if collected >= hit_count {
-        return Some(SweepEnd::Complete);
-    }
-    if page >= max_pages {
-        return Some(SweepEnd::Capped);
-    }
-    if got < rows {
-        return Some(SweepEnd::ShortPage);
-    }
-    None
-}
-
-/// Whether a page that returned nothing is contract drift.
-///
-/// It is drift when the listing's own `hitCount` places this page **inside** the
-/// corpus: the records are there, `data.oppHits` did not deliver them. A page
-/// past the end of a shrunken listing produces the same empty shape and is not
-/// drift — the arithmetic tells them apart. cordis's `empty_first_page_is_drift`
-/// generalized to every page, because grants-gov re-walks from 0 every run and
-/// therefore has no "first page of this run" that is special.
-fn empty_page_is_drift(page: u64, rows: u64, hit_count: u64, got: u64) -> bool {
-    hit_count > 0 && got == 0 && page.saturating_sub(1).saturating_mul(rows) < hit_count
-}
+// `SweepEnd`, `walk_end` and `empty_page_is_drift` are `grants_common`'s. This
+// app forked all three privately and `ca-grants` forked them again from here;
+// the shared crate's doc comment recorded the debt ("lifting all three copies
+// into `grants_common` is the follow-up") and this is that follow-up. Everything
+// that was actually federal about them — `rows`, `search2`, `hitCount` — travels
+// as `SWEEP_VOCAB` instead, so the emitted warnings are byte-identical while the
+// walk arithmetic has ONE definition. The `unknown_total` arm this app paid a
+// one-page corpus to discover can no longer be fixed on one side of the fleet.
 
 /// Whether the query selects the whole corpus, i.e. whether an empty answer is
 /// allowed to be judged against the stored corpus at all.
@@ -819,10 +737,12 @@ fn whole_corpus_query(keyword: &str, eligibilities: &str) -> bool {
 /// result: the API reported nothing at all for a whole-corpus query while
 /// opportunities are already stored locally.
 ///
-/// This is cordis's `empty_listing_is_drift` reasoning, with one addition it
-/// does not need (cordis runs a single fixed query): the whole-corpus gate. The
-/// count must come from the STORED corpus, never from the same response being
-/// doubted.
+/// The shared predicate (`grants_common::empty_listing_is_drift` — nothing came
+/// back while rows are stored) plus the ONE thing that is genuinely federal
+/// about it: the whole-corpus gate. `grants-gov` is the only grant source whose
+/// params can narrow *within* a corpus, so it is the only one that must not
+/// accuse a targeted pull of drift. Keeping the gate here and the arithmetic
+/// there means a fix to the arithmetic reaches all four apps.
 ///
 /// Tombstones: the count comes from `Datasets::count_filtered`, which is
 /// `removed_at IS NULL`. That is deliberate in both directions — this app only
@@ -835,7 +755,7 @@ fn empty_listing_is_drift(
     stored_corpus: i64,
     whole_corpus_query: bool,
 ) -> bool {
-    hit_count == 0 && fetched == 0 && stored_corpus > 0 && whole_corpus_query
+    whole_corpus_query && grants_common::empty_listing_is_drift(hit_count, fetched, stored_corpus)
 }
 
 /// Why a grants.gov envelope is NOT an application-level success, or `None` when
@@ -875,55 +795,11 @@ fn envelope_error(parsed: &Value) -> Option<String> {
     }
 }
 
-/// The human-readable warning for a walk that did not prove its coverage, or
-/// `None` for a complete sweep.
-///
-/// Every non-complete arm reaches the caller through `warnings[]` as well as
-/// through `sweep`/`truncated`, because a consumer reading only the warnings
-/// channel is exactly the consumer who would otherwise never learn that the
-/// federal corpus is short.
-fn sweep_warning(
-    end: SweepEnd,
-    pages: u64,
-    max_pages: u64,
-    rows: u64,
-    hit_count: u64,
-    fetched: usize,
-) -> Option<String> {
-    match end {
-        SweepEnd::Complete => None,
-        SweepEnd::Capped => Some(format!(
-            "coverage truncated: stopped at maxPages={max_pages} after {fetched} of \
-             {hit_count} records — raise rows/maxPages to cover the full corpus"
-        )),
-        SweepEnd::ShortPage => Some(format!(
-            "coverage truncated: page {pages} returned fewer than rows={rows} while \
-             search2 reports {hit_count} total, so the walk stopped at {fetched} records \
-             — treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
-             partially-served page looks exactly like a genuine tail)"
-        )),
-        SweepEnd::UnknownTotal => Some(format!(
-            "coverage unproven: search2 served {fetched} records over {pages} page(s) while \
-             reporting hitCount:0 — the total is missing or renamed, so nothing can prove \
-             the corpus was covered. The walk ran to a short page or maxPages={max_pages} \
-             instead of trusting the total"
-        )),
-    }
-}
-
-/// Appends a warning to a result's `warnings` array (creating it if absent).
-/// `UnifiedOutcome::merge_into` extends `warnings` rather than replacing it, so any
-/// coverage warning survives whichever side of the merge pushes it.
-fn append_warning(out: &mut Value, msg: String) {
-    if let Value::Object(map) = out {
-        match map.get_mut("warnings") {
-            Some(Value::Array(w)) => w.push(json!(msg)),
-            _ => {
-                map.insert("warnings".into(), json!([msg]));
-            }
-        }
-    }
-}
+// `sweep_warning` and `append_warning` are `grants_common`'s too — see
+// `SWEEP_VOCAB` at the top of this file for the three federal nouns the shared
+// template renders, and `grants_common`'s
+// `one_template_still_speaks_each_sources_own_nouns` for the guard that they
+// keep arriving.
 
 /// Consecutive detail-stage failures after which the stage is treated as broken
 /// rather than flaky. Five in a row is not bad luck: it is a fetchOpportunity
@@ -1791,13 +1667,21 @@ mod tests {
 
     #[test]
     fn sweep_warnings_name_the_arm_they_came_from() {
-        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366).is_none());
-        let capped = sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000).unwrap();
+        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366, SWEEP_VOCAB).is_none());
+        let capped =
+            sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000, SWEEP_VOCAB).unwrap();
         assert!(capped.contains("maxPages=25"), "{capped}");
-        let short = sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100).unwrap();
+        // The federal noun, not the shared crate's default: this app's manifest
+        // publishes `rows`, so "raise pageSize/maxPages" would name a knob the
+        // operator does not have.
+        assert!(capped.contains("raise rows/maxPages"), "{capped}");
+        let short =
+            sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100, SWEEP_VOCAB).unwrap();
         assert!(short.contains("TRUNCATED page"), "{short}");
         assert!(short.contains("not the end of the corpus"), "{short}");
-        let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400).unwrap();
+        assert!(short.contains("rows=1000"), "{short}");
+        let unproven =
+            sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400, SWEEP_VOCAB).unwrap();
         assert!(unproven.contains("hitCount:0"), "{unproven}");
         assert!(unproven.contains("coverage unproven"), "{unproven}");
     }

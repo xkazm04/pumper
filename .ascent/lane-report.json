@@ -2,27 +2,45 @@
   "v": 1,
   "items": [
     {
-      "recommendationId": "6489c63d-40e3-4446-97b0-797cd60c1d75",
+      "recommendationId": "f25cfbb0-816d-470e-91b9-c882e5808f4d",
       "verdict": "resolved",
-      "reason": "The hooks are no longer a setup step: every everyday justfile recipe (check, build, test, lint, fmt, fmt-check, run, dev, ci) now depends on a private `_hooks-auto` that points core.hooksPath at .githooks/ the first time any `just` command runs in a clone — writing only an UNSET value so an explicit `just hooks-uninstall` or a custom path is never overridden, never failing a recipe, and opt-out-able with PUMPER_NO_HOOKS=1 — and the one rung that a per-clone hook can never guarantee (commit-message shape) was additionally made server-side: `scripts/ci/commit-lint.mjs` is now the single implementation, `.githooks/commit-msg` delegates to it, and the `Conventional commits` step in the `Ship inventory` CI job judges every commit in `origin/<base>..HEAD` on each pull request, so an uninstalled hook or a `--no-verify` no longer skips the rule. `scripts/ci/commit-lint.test.mjs` (wired into `just inventory`, `just ci` and the CI job) proves the gate can go red on eight unconventional subjects, pins the 0/2/3 exit-code contract, and reconciles the wiring itself: the hook must delegate, its sh fallback type list must equal the shared TYPES, the listed recipes must still carry `_hooks-auto`, and ci.yml must still run the gate. Honest limits: git cannot install hooks at clone time, so a contributor who only ever runs bare cargo still has none locally (which is exactly why the commit rule also runs in CI); and the scan's question about how many past CI failures a default hook would have caught could not be answered here — reading CI history needs network.",
+      "reason": "Collapsed the forked sweep-honesty layer that grants-gov and ca-grants each carried privately (SweepEnd, walk_end, empty_page_is_drift, sweep_warning, append_warning) into grants-common, with the only genuinely per-source part — the nouns — travelling as a new SweepVocab struct so every emitted warning is byte-identical; cordis's hand-rolled warnings insert now goes through the same door.",
       "files": [
-        "justfile",
-        ".githooks/commit-msg",
-        ".githooks/pre-commit",
-        "scripts/ci/commit-lint.mjs",
-        "scripts/ci/commit-lint.test.mjs",
-        ".github/workflows/ci.yml",
-        ".ai/manifest.yaml",
-        "SECURITY.md",
-        "CLAUDE.md",
-        "MEMORY.md"
+        "crates/apps/grants-common/src/lib.rs",
+        "crates/apps/grants-gov/src/lib.rs",
+        "crates/apps/ca-grants/src/lib.rs",
+        "crates/apps/eu-sedia/src/lib.rs",
+        "crates/apps/cordis/src/lib.rs"
       ]
+    },
+    {
+      "recommendationId": "d9e21f7f-4d1b-4ecd-8504-eb4d8c2b1545",
+      "verdict": "skipped",
+      "reason": "Flipping `verified: false` in .ai/manifest.yaml means actually running each capability (cargo test, just ci, pwsh smoke); this session has no shell, and editing the flags without running the commands would make the manifest lie in the opposite direction.",
+      "files": []
+    },
+    {
+      "recommendationId": "9686595c-6795-4828-9c0c-7293b2990ceb",
+      "verdict": "skipped",
+      "reason": "Mutation testing requires installing and running cargo-mutants over crates/core — no network to fetch it and no shell to run it; a committed cargo-mutants config with no evidence of a run is exactly the detector-without-the-work this lane forbids.",
+      "files": []
+    },
+    {
+      "recommendationId": "4bbae25f-4397-4718-9fca-50f650f0ff24",
+      "verdict": "skipped",
+      "reason": "A commits-per-PR / time-to-merge budget has to be calibrated against this repo's actual history before a ceiling is honest, and git is unavailable in this session; an uncalibrated threshold would be a number invented rather than measured.",
+      "files": []
+    },
+    {
+      "recommendationId": "ae1c37fc-ebe2-4caa-a0b6-6178ef076e05",
+      "verdict": "needs_human",
+      "reason": "Drafted the skill input/output/failure-mode contract for .claude/skills/passport-onboard/SKILL.md plus a sibling README defining the shape, but the write to .claude/skills/ was refused by this session's permissions, so nothing landed.",
+      "files": []
     }
   ],
   "lessons": [
-    "A local guardrail in this org's repos should ship in two halves, and the report should say which half is which: the local half (auto-installed git hooks, for fast feedback before the commit exists) and a server-side rung running the SAME file (for the clone that never opted in, and for `--no-verify`). Shipping only the local half is what makes an opt-in hook read as enforcement while refusing nothing.",
-    "In pumper, a rule stated in two places will be tested for agreement or it will drift: the repo's own idiom is the EXPECTED-diff inventory test (crates/server/src/routes/mod.rs), and it applies to non-Rust surfaces too — the commit-msg hook's sh fallback types are now reconciled against the JS list, and the justfile recipes are asserted to still carry the auto-install prerequisite.",
-    "Adding a CI job to this repo is not free of gates: `.github/unpinned-actions.json` carries a `ceiling` that counts `uses:` REFERENCES and only ever moves down, so a new job with its own checkout/setup-node would turn `just pin-check` red. Extend an existing job instead, or pin the new references to SHAs (which needs network).",
-    "This session had no shell, so nothing here was executed — the node suites and the workflow change are reviewed-correct, not observed-green. When an Ascent lane cannot run a check it adds, say so rather than implying a passing run; the repo's own doctrine is that a cannot-check is not a pass."
+    "This repo records its own deferred refactors inside the doc comment of the code that carries the debt (\"lifting all three copies into grants_common is the follow-up\"). Grepping doc comments for phrases like \"the follow-up\" / \"deliberately left in place\" / \"out of this change's write set\" surfaces pre-approved, pre-designed de-duplication work faster than any duplicate-function scan.",
+    "When unifying forked helpers here, the fork is usually justified by per-source WORDING rather than per-source logic. Lifting the wording into a small Copy struct of &'static str and asserting each dialect's exact rendering in the shared crate lets the deletion be byte-for-byte output-preserving, so no downstream test assertion has to be relaxed — which matters because this repo treats a changed assertion as a lowered bar.",
+    "Sessions in this lane may have no shell at all: cargo, git and sed were all refused here. Plan rungs that are verifiable by reading (deletions, signature-preserving unifications) and skip rungs whose whole content is running a tool."
   ]
 }

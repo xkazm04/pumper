@@ -516,10 +516,12 @@ impl ScrapeApp for Cordis {
         ) {
             warnings.push(w);
         }
-        if !warnings.is_empty() {
-            if let Value::Object(map) = &mut out {
-                map.insert("warnings".into(), json!(warnings));
-            }
+        // Through `grants_common::append_warning`, the one door for the
+        // extend-not-clobber rule: a bare `map.insert("warnings", ...)` is
+        // correct only while nothing upstream has already put a warning there,
+        // which is a property of the code above it rather than of this line.
+        for w in warnings {
+            grants_common::append_warning(&mut out, w);
         }
         Ok(out)
     }

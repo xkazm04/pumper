@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use grants_common::SweepEnd;
+use grants_common::{SweepEnd, SweepVocab};
 use pumper_core::datasets::JsonFilter;
 use pumper_core::{
     html_to_markdown, AppContext, AppManifest, CostClass, DerivedPaths, Error, HttpMethod,
@@ -41,6 +41,14 @@ pub struct EuSedia;
 const SEDIA_URL: &str = "https://api.tech.ec.europa.eu/search-api/prod/rest/search";
 // Multipart boundary — a fixed token that never appears in the JSON parts.
 const BOUNDARY: &str = "----PumperSediaBoundaryQ1W2E3R4T5Y6";
+// SEDIA's dialect for `grants_common::sweep_warning`. The search API is not
+// branded in the warning text ("the source") because the caller-visible surface
+// here is the portal, not the search-api host.
+const SWEEP_VOCAB: SweepVocab = SweepVocab {
+    page_size_param: "pageSize",
+    source: "the source",
+    total_field: "totalResults",
+};
 
 #[async_trait]
 impl ScrapeApp for EuSedia {
@@ -411,24 +419,20 @@ impl ScrapeApp for EuSedia {
             page_size,
             total,
             records.len(),
-            "totalResults",
+            SWEEP_VOCAB,
         ) {
-            // After merge_into, which appended the drift warnings.
-            if let Value::Object(map) = &mut out {
-                // The SEDIA-specific consequence, appended to the shared text:
-                // the match-all window has no stable sort, so what is uncovered
-                // differs between runs.
-                let msg = format!(
+            // The SEDIA-specific consequence, appended to the shared text: the
+            // match-all window has no stable sort, so what is uncovered differs
+            // between runs. Appended AFTER merge_into, which landed the drift
+            // warnings — `append_warning` extends rather than clobbers, so the
+            // order of the two is a preference, not a correctness condition.
+            grants_common::append_warning(
+                &mut out,
+                format!(
                     "{msg} (the SEDIA match-all window is non-deterministic, so uncovered \
                      topics drift in and out between runs)"
-                );
-                match map.get_mut("warnings") {
-                    Some(Value::Array(w)) => w.push(json!(msg)),
-                    _ => {
-                        map.insert("warnings".into(), json!([msg]));
-                    }
-                }
-            }
+                ),
+            );
         }
         Ok(out)
     }
