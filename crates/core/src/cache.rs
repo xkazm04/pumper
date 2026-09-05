@@ -521,6 +521,9 @@ impl ResearchCache {
             duration_ms: None,
             num_turns: None,
             session_id: None,
+            // Not stored in the cache row — a hit never ran the engine, so
+            // there is no model to report.
+            model: None,
         }))
     }
 

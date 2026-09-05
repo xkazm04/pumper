@@ -624,7 +624,9 @@ impl ScrapeApp for Research {
                 ),
             };
 
-            let mut request = ResearchRequest::new(prompt).with_role(role.clone());
+            let mut request = ResearchRequest::new(prompt)
+                .with_role(role.clone())
+                .with_use_case("research.web_agent");
             request.max_turns = step_turns;
             request.model = model.clone();
             request.effort = effort.clone();
@@ -2312,6 +2314,7 @@ mod tests {
                     duration_ms: Some(1),
                     num_turns: Some(1),
                     session_id: Some(self.session_id.clone()),
+                    model: None,
                 })
             }
         }

@@ -428,7 +428,9 @@ fn change_summary_request(label: &str, added: &[String], removed: &[String]) -> 
         clamp(removed),
     );
 
-    let mut req = ResearchRequest::new(prompt).with_role("research");
+    let mut req = ResearchRequest::new(prompt)
+        .with_role("research")
+        .with_use_case("connector.change_summary");
     req.max_turns = Some(1);
     req
 }
@@ -568,6 +570,7 @@ mod tests {
             duration_ms: Some(0),
             num_turns: Some(1),
             session_id: None,
+            model: None,
         }
     }
 

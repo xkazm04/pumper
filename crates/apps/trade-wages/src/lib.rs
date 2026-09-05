@@ -176,7 +176,9 @@ impl ScrapeApp for TradeWages {
              (e.g. 30.10), annual in whole dollars. Include all {n_trades} trades."
         );
 
-        let mut request = ResearchRequest::new(prompt).with_role(role);
+        let mut request = ResearchRequest::new(prompt)
+            .with_role(role)
+            .with_use_case("trade_wages.extract");
         request.max_turns = max_turns;
         request.model = ctx
             .params
@@ -444,7 +446,9 @@ async fn propose_trade(
          \"notes\": string (one sentence on the mapping and any ambiguity)}}\n\
          The label must NOT duplicate an existing trade ({existing})."
     );
-    let mut request = ResearchRequest::new(prompt).with_role(role);
+    let mut request = ResearchRequest::new(prompt)
+        .with_role(role)
+        .with_use_case("trade_wages.extract");
     request.max_turns = max_turns;
     request.model = ctx
         .params

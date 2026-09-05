@@ -143,6 +143,7 @@ async fn research_records_and_replays_at_zero_cost() {
             duration_ms: Some(1200),
             num_turns: Some(2),
             session_id: None,
+            model: None,
         },
     );
     let ctx = TestContext::new(&store.storage, "vcr-test")

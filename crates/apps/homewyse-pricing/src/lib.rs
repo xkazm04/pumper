@@ -187,7 +187,9 @@ impl ScrapeApp for HomewysePricing {
              \"median\": number, \"high\": number}}]}}]}}"
         );
 
-        let mut request = ResearchRequest::new(prompt).with_role(role);
+        let mut request = ResearchRequest::new(prompt)
+            .with_role(role)
+            .with_use_case("homewyse.pricing_extract");
         request.max_turns = max_turns;
         request.model = ctx
             .params

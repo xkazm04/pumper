@@ -46,6 +46,10 @@ tempfile = { version = "3", optional = true }
 cron = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+# LightTrack emitter (M25): a fire-and-forget POST alongside the internal cost
+# ledger. Same reqwest major the HTTP/archive engines already carry, so this
+# adds no new dependency to the tree — just a new edge from core onto it.
+reqwest.workspace = true
 
 [dev-dependencies]
 # Self-referential: core's own integration tests get the harness.

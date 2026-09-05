@@ -226,7 +226,9 @@ impl ScrapeApp for StateTax {
              where the top rate applies (0 for flat/none)."
         );
 
-        let mut request = ResearchRequest::new(prompt).with_role(role);
+        let mut request = ResearchRequest::new(prompt)
+            .with_role(role)
+            .with_use_case("state_tax.extract");
         request.max_turns = max_turns;
         request.model = ctx
             .params

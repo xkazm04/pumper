@@ -1022,7 +1022,8 @@ impl ScrapeApp for Provisioner {
              \"cadence\": \"daily|weekly|monthly|quarterly|annual|on-demand\", \
              \"expected_fields\": string[]}}]}}"
             ))
-            .with_role("research");
+            .with_role("research")
+            .with_use_case("provisioner.source_discovery");
             discover.max_budget_usd = budget_usd;
             discover.json_schema = Some(discovery_schema);
             let out = ctx.research(discover).await?;
@@ -1149,7 +1150,9 @@ impl ScrapeApp for Provisioner {
                      Revise the rule set (same JSON shape, full object, all fields)."
                 ),
             };
-            let mut req = ResearchRequest::new(draft_prompt).with_role("research");
+            let mut req = ResearchRequest::new(draft_prompt)
+                .with_role("research")
+                .with_use_case("provisioner.draft_proposal");
             req.max_budget_usd = budget_usd;
             req.resume_session = session_id.clone();
             let out = ctx.research(req).await?;

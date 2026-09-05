@@ -229,6 +229,7 @@ pub fn research_output(text: impl Into<String>) -> ResearchOutput {
         duration_ms: Some(0),
         num_turns: Some(1),
         session_id: None,
+        model: None,
     }
 }
 

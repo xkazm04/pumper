@@ -1682,6 +1682,7 @@ mod tests {
                 duration_ms: None,
                 num_turns: None,
                 session_id: None,
+                model: None,
             })
         }
     }

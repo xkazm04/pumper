@@ -38,6 +38,7 @@ pub mod induce;
 pub mod jitter;
 pub mod job;
 pub mod json_salvage;
+mod lighttrack;
 pub mod lru;
 pub mod markdown;
 // N16 mesh wire format: signed bundle envelopes + the dataset live-set digest,

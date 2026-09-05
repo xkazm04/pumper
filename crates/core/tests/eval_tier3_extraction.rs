@@ -122,6 +122,7 @@ impl Case {
             duration_ms: env["duration_ms"].as_u64(),
             num_turns: env["num_turns"].as_u64(),
             session_id: env["session_id"].as_str().map(String::from),
+            model: None,
         }
     }
 }

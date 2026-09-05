@@ -502,6 +502,7 @@ impl Researcher for ClaudeEngine {
             duration_ms: envelope["duration_ms"].as_u64(),
             num_turns: envelope["num_turns"].as_u64(),
             session_id: envelope["session_id"].as_str().map(String::from),
+            model: resolved.model.clone(),
         })
     }
 }

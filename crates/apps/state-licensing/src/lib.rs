@@ -256,7 +256,9 @@ impl ScrapeApp for StateLicensing {
             }
 
             let prompt = licensing_prompt(&year, label);
-            let mut request = ResearchRequest::new(prompt).with_role(role.clone());
+            let mut request = ResearchRequest::new(prompt)
+                .with_role(role.clone())
+                .with_use_case("state_licensing.extract");
             request.max_turns = max_turns;
             request.model = ctx
                 .params

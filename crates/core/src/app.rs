@@ -569,6 +569,7 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
+        let started = std::time::Instant::now();
         let out = match self.engines.researcher().research(req.clone()).await {
             Ok(out) => out,
             // **A failed call still spent money.** The CLI reports
@@ -578,11 +579,35 @@ impl AppContext {
             // Meter first, then propagate unchanged.
             Err(e) => {
                 self.meter_failed_spend(&e, None).await;
+                // External sink, same spend the internal write just landed —
+                // AFTER it, never instead of it, and never able to change what
+                // gets returned below. `ledger_event` is also the "did the
+                // internal write happen at all" check (a bare `Spawn` failure
+                // writes nothing, so this sends nothing either).
+                if let Some((cost, _)) = e.claude_spend().and_then(|s| s.ledger_event()) {
+                    crate::lighttrack::emit_research(crate::lighttrack::ResearchEvent {
+                        use_case: req.use_case.as_deref(),
+                        model: req.model.as_deref(),
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        cost_usd: Some(cost),
+                        error: Some(&e.to_string()),
+                    });
+                }
                 return Err(e);
             }
         };
+        let latency_ms = started.elapsed().as_millis() as u64;
         let (cost, detail) = success_spend_event(out.cost_usd);
         self.meter("claude", None, cost, detail).await;
+        // External sink, same call the internal write above just recorded —
+        // fire-and-forget, cannot fail this call or change `out`.
+        crate::lighttrack::emit_research(crate::lighttrack::ResearchEvent {
+            use_case: req.use_case.as_deref(),
+            model: out.model.as_deref(),
+            latency_ms,
+            cost_usd: out.cost_usd,
+            error: None,
+        });
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");

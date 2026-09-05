@@ -153,7 +153,9 @@ impl ScrapeApp for ValuationMultiples {
              Multiples are ratios (e.g. 2.5 means 2.5x SDE). Include all {n_trades} trades."
         );
 
-        let mut request = ResearchRequest::new(prompt).with_role(role);
+        let mut request = ResearchRequest::new(prompt)
+            .with_role(role)
+            .with_use_case("valuation_multiples.extract");
         request.max_turns = max_turns;
         request.model = ctx
             .params

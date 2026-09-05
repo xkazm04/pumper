@@ -3707,6 +3707,7 @@ dependencies = [
  "pumper-core",
  "rayon",
  "regex",
+ "reqwest 0.12.28",
  "ring",
  "scraper",
  "serde",

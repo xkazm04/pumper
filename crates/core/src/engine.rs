@@ -1169,6 +1169,18 @@ pub struct ResearchRequest {
     /// question must still share one cached answer.
     #[serde(skip)]
     pub job_id: Option<uuid::Uuid>,
+    /// The declared use-case key this call answers (`.ai/use-cases.json`),
+    /// e.g. `"research.web_agent"` — set by the calling app, never inferred
+    /// from `app` alone (several apps declare more than one use case;
+    /// `provisioner` has two). Forwarded to the LightTrack emitter as `name`
+    /// so external spend is attributable at the same granularity the use-case
+    /// inventory is declared at. `#[serde(skip)]` like `job_id`: it labels the
+    /// call for telemetry, not a fact a request body should be trusted to
+    /// assert, and it is deliberately NOT part of
+    /// [`crate::cache::ResearchCache::key`] — a cache hit answers the same
+    /// question for any use case that asks it.
+    #[serde(skip)]
+    pub use_case: Option<String>,
 }
 
 impl ResearchRequest {
@@ -1184,6 +1196,14 @@ impl ResearchRequest {
         self.role = Some(role.into());
         self
     }
+
+    /// Labels this call with its declared use-case key
+    /// (`.ai/use-cases.json`), e.g. `"research.web_agent"` — see
+    /// [`Self::use_case`].
+    pub fn with_use_case(mut self, use_case: impl Into<String>) -> Self {
+        self.use_case = Some(use_case.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1196,6 +1216,12 @@ pub struct ResearchOutput {
     pub duration_ms: Option<u64>,
     pub num_turns: Option<u64>,
     pub session_id: Option<String>,
+    /// The model id the engine actually resolved and ran (request override,
+    /// then role preset, then config default — see `ClaudeEngine::resolve`).
+    /// `None` for outputs that never reached the engine (cache hit, VCR
+    /// replay, test doubles) — there is no "actual" model to report for those.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Plain HTTP fetching — fast path for server-rendered pages and APIs.

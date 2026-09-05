@@ -633,6 +633,7 @@ pub fn to_research_output(entry: &CassetteEntry, replay_of: Uuid) -> Result<Rese
         duration_ms: Some(0),
         num_turns: None,
         session_id: None,
+        model: None,
     })
 }
 
@@ -1215,6 +1216,7 @@ mod tests {
             duration_ms: Some(900),
             num_turns: Some(3),
             session_id: Some("s".into()),
+            model: None,
         };
         let entry = research_entry("canonical-key", &req, &out);
         assert_eq!(entry.method, METHOD_RESEARCH);
@@ -1396,6 +1398,7 @@ mod tests {
             duration_ms: None,
             num_turns: None,
             session_id: None,
+            model: None,
         };
         let mut entry = research_entry("canonical-key", &req, &out);
         entry.req_hash = "not-a-digest".into();
@@ -1507,6 +1510,7 @@ mod tests {
                 duration_ms: None,
                 num_turns: None,
                 session_id: None,
+                model: None,
             },
         ))
         .await;
