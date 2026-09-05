@@ -1,0 +1,61 @@
+{
+  "v": 1,
+  "items": [
+    {
+      "recommendationId": "68ecc844-de74-4c59-8b2d-7f62524e5bc4",
+      "verdict": "skipped",
+      "reason": "Half of it landed for real — both workflows now declare top-level `permissions: contents: read` (nothing here needs write; the release job widens it in its own block with a comment) and a fixture asserts every workflow file has one — but all 33 `uses:` references are still on floating tags, because resolving a tag to a commit SHA needs a network round trip and inventing a SHA breaks the workflow rather than pinning it; instead `just pin-check` now blocks any NEW floating ref against `.github/unpinned-actions.json`, and the human step is `gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq .object.sha` per entry.",
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/unpinned-actions.json",
+        "scripts/ci/pinned-actions.mjs",
+        "scripts/ci/pinned-actions.test.mjs",
+        "justfile",
+        "SECURITY.md"
+      ]
+    },
+    {
+      "recommendationId": "d5392151-f118-4158-b125-d4d72242f8bd",
+      "verdict": "resolved",
+      "reason": "Added CODEOWNERS routing the seams the architecture already enforces (core, server, each engine, apps and their `*-common` exceptions, the generated client plane, the catalog, the gates themselves), a PR template whose checklist is exactly the things enforced somewhere other than `cargo test`, and three versioned git hooks in `.githooks/` (pre-commit: `cargo fmt --check` on staged .rs plus the pinning gate on staged workflows; commit-msg: conventional-commit shape; pre-push: clippy `-D warnings`, or all of `just ci` under PUMPER_HOOKS_FULL=1) installed by `just hooks-install` and checkable with `just hooks-status` — recorded in `.ai/manifest.yaml` as `controls.localOptIn`, not as a rung, because git hooks are per-clone and claiming otherwise is the projection bug this repo has already been burned by.",
+      "files": [
+        ".github/CODEOWNERS",
+        ".github/pull_request_template.md",
+        ".githooks/pre-commit",
+        ".githooks/commit-msg",
+        ".githooks/pre-push",
+        ".gitattributes",
+        "justfile",
+        ".ai/manifest.yaml"
+      ]
+    },
+    {
+      "recommendationId": "42a7ae93-c2ae-44dc-a4c0-0275df86ed19",
+      "verdict": "resolved",
+      "reason": "`.ai/manifest.yaml` now declares `guidance.canonical: CLAUDE.md`, `guidance.policy: .claude/CLAUDE.md`, a full `precedence` chain and an `onConflict` rule, and the root CLAUDE.md opens with a table naming both files, what only each one has, and which wins on facts versus on policy; the split is kept deliberately (orientation vs. binding policy) rather than merged. One caveat: the reciprocal pointer could NOT be added to `.claude/CLAUDE.md` itself — this harness refuses edits to that path as a sensitive file — so the cross-reference currently runs root -> .claude and manifest -> both, but not .claude -> root.",
+      "files": [".ai/manifest.yaml", "CLAUDE.md", "MEMORY.md"]
+    },
+    {
+      "recommendationId": "4c7dc859-5414-4e52-a7b5-a352f85dd2f8",
+      "verdict": "resolved",
+      "reason": "`scripts/ci/sbom.mjs` emits a deterministic CycloneDX 1.6 SBOM from the committed Cargo.lock (which already carries every crate's version and the SHA-256 cargo verified) with no network, no cargo and no dependencies — so it runs on EVERY CI change, not only on release day, with its fixture suite; and `.github/workflows/release.yml` builds the release binary with `--locked` on a `v*` tag, generates the SBOM, and signs two keyless Sigstore attestations per binary (build provenance, and an SBOM attestation bound to that exact artifact), verifiable by a consumer with `gh attestation verify --repo xkazm04/pumper`. SECURITY.md's TODO checkboxes are replaced with a table of what runs, when, and what fails — with SAST, secret scanning and license policy stated as still-open under `Not covered` rather than ticked. Honest limit: the release leg is code, not an observation — it first executes when a `v*` tag is pushed, which cannot happen from this session.",
+      "files": [
+        "scripts/ci/sbom.mjs",
+        "scripts/ci/sbom.test.mjs",
+        ".github/workflows/release.yml",
+        ".github/workflows/ci.yml",
+        "SECURITY.md",
+        "docs/deployment.md",
+        "justfile"
+      ]
+    }
+  ],
+  "lessons": [
+    "This repo's own idiom for a gap that cannot be closed in one change is a REGISTER, not a TODO: the current violations are recorded with a reason, an owner and a ceiling that only moves down, the gate reconciles register-against-tree in BOTH directions, and the exit codes distinguish 0 clean / 2 findings / 3 CANNOT CHECK because a cannot-run is not a pass. `.flake/register.json` and `.lanes/criteria.json` already do this; new gates should copy the shape rather than invent one.",
+    "Any new gate here needs a fixture suite proving it can go RED, and the repo says why in its own comments: a gate that lands green by construction is indistinguishable from a gate that cannot fail. Corollary for offline sessions — a claim like 'the check passes' is worthless without it, since the passing run proves nothing about the check.",
+    "Enforcement claims in `.ai/manifest.yaml` are load-bearing and have been wrong before: a `prePush` rung was advertised that no clone had, and the file now carries a comment saying a projection that overstates a gate is worse than a missing one. Anything opt-in (git hooks) must be listed as opt-in, with a `*-status` recipe that lets a clone answer whether it is actually running it.",
+    "The deployment model decides the supply-chain answer. This project refuses containers on purpose (a real Chrome you log into, a host `claude` CLI, one SQLite file), so the shippable artifact is a native binary and the right controls are a lockfile-derived SBOM plus keyless GitHub attestations — not image scanning, and not cosign keys. Read `docs/deployment.md` before proposing a D9 control.",
+    "This harness refuses edits to `.claude/CLAUDE.md` as a sensitive path, so any recommendation whose fix must be written INTO that file cannot be completed by an Ascent lane — route those to a human, or land the machine-readable half in `.ai/manifest.yaml` and say which half is missing."
+  ]
+}

@@ -1,0 +1,50 @@
+#!/bin/sh
+# pre-push — the rung that actually costs something, at the moment it becomes
+# worth paying: once, per push, instead of once per commit.
+#
+# `.ai/manifest.yaml` records `prePushHabit: [ci]` — a HABIT, because until this
+# file is installed nothing refuses anything. That entry used to read `prePush`,
+# and the manifest's own comment explains why it was demoted: "a projection that
+# overstates a gate is worse than a missing one — it is read as authoritative."
+# This hook is the smallest thing that makes some of it real without making the
+# claim bigger than the enforcement, so the manifest still says opt-in.
+#
+# Default: clippy with `-D warnings`, the same command the `Clippy` CI step runs.
+# It is the rung most likely to be red in a change that formats cleanly, and the
+# one whose failure is most annoying to discover after a push.
+#
+#   PUMPER_HOOKS_FULL=1 git push   # run `just ci` instead — every rung CI blocks
+#                                  # on. Minutes. Worth it before a release.
+#   PUMPER_SKIP_HOOKS=1 git push   # skip
+#   git push --no-verify           # skip every hook
+
+set -e
+
+if [ -n "$PUMPER_SKIP_HOOKS" ]; then
+    echo "pre-push: skipped (PUMPER_SKIP_HOOKS is set)"
+    exit 0
+fi
+
+fail() {
+    echo ""
+    echo "pre-push: BLOCKED — $1"
+    echo "          bypass with: PUMPER_SKIP_HOOKS=1 git push ..."
+    exit 1
+}
+
+command -v cargo >/dev/null 2>&1 || {
+    echo "pre-push: cargo is not on PATH, skipping (CI still runs every rung)"
+    exit 0
+}
+
+if [ -n "$PUMPER_HOOKS_FULL" ]; then
+    command -v just >/dev/null 2>&1 || fail "PUMPER_HOOKS_FULL is set but \`just\` is not on PATH (cargo install just)"
+    echo "pre-push: just ci"
+    just ci || fail "\`just ci\` is red"
+    exit 0
+fi
+
+echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings || fail "clippy findings — the CI gate refuses these too"
+
+exit 0

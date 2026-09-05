@@ -26,6 +26,17 @@ capabilities:
   fmt-check: { command: "cargo fmt --check", verified: false }
   ci: { command: "just ci", verified: false }
   audit: { command: "cargo deny check advisories bans sources", verified: false }
+  # The two supply-chain instruments, and the fixtures that prove both can go
+  # red. `pin-check` reconciles every workflow `uses:` against
+  # .github/unpinned-actions.json in both directions (0 clean / 2 findings / 3
+  # CANNOT CHECK); `sbom` emits a deterministic CycloneDX 1.6 document from
+  # Cargo.lock with no network and no cargo.
+  pin-check: { command: "just pin-check", verified: false }
+  sbom: { command: "just sbom", verified: false }
+  supply-chain: { command: "just supply-chain", verified: false }
+  # Point core.hooksPath at the versioned hooks in .githooks/. Opt-in by
+  # construction — see `controls.localOptIn` below.
+  hooks-install: { command: "just hooks-install", verified: false }
   # The fixture suite, NOT the hook itself: the hook reads a Stop-hook payload on
   # stdin, so invoking it bare now exits 3 ("cannot check" — it used to exit 0,
   # which is the false green this capability would have advertised as a pass).
@@ -46,6 +57,40 @@ capabilities:
   # own pre-declared statistical criteria, one artifact per run. Minutes — which
   # is exactly why it is not in `ci` below.
   lanes: { command: "just lanes", verified: false }
+
+# WHICH GUIDANCE FILE WINS. Two CLAUDE.md files exist and neither used to say
+# anything about the other, so what an agent knew depended on which one it
+# happened to open: `.claude/CLAUDE.md` carries the context-map protocol, the
+# same-session doc-sync rule and the "bug fixes ship as extracted, tested
+# functions" doctrine, while the ROOT CLAUDE.md carries the commands table, the
+# architecture map and the dependency rule. Each is silent about the other's
+# content, so neither omission looks like one.
+#
+# The split is kept, because it is a split by AUDIENCE and not by accident: the
+# root file is the orientation an agent needs to do anything at all, the .claude
+# file is binding policy about HOW to change things. Merging them would put a
+# 200-line policy document in front of every "what is the test command" lookup.
+# What was missing was the declaration, which is this block.
+guidance:
+  # Read this FIRST and read it whole. It is the entry point, and it points at
+  # everything else — including the policy file below.
+  canonical: CLAUDE.md
+  # Binding, and NOT optional: the root file's "Where the depth is" section says
+  # so in words, and this says so in a field. If the two ever disagree on a rule,
+  # the policy file wins on policy (doc-sync, context-map, bug-fix shape) and the
+  # canonical file wins on facts (commands, architecture, layout).
+  policy: .claude/CLAUDE.md
+  precedence: [CLAUDE.md, .claude/CLAUDE.md, ONBOARDING.md, README.md]
+  # The tiebreaker of last resort, and the rule the root file already states:
+  # "When docs disagree with each other, trust the code, then fix whichever doc
+  # is stale."
+  onConflict: "code wins; then fix the stale doc in the same change"
+  supplements:
+    - ONBOARDING.md          # the agent-facing contract: engine choice, seams, invariants, §8 verification loop
+    - README.md              # human quickstart, the API surface by example, the roadmap
+    - MEMORY.md              # the durable-state index; read at session start
+    - docs/features/         # what each feature does TODAY (API/params, data model, known gaps)
+    - docs/harness/harness-learnings.md
 
 # Pointers — these subsystems can change format underneath without breaking this contract.
 paths:
@@ -81,8 +126,22 @@ controls:
   # -> scripts/docs/check-doc-sync.mjs). Advisory by construction — exit 2 is a
   # reminder that never blocks, and it runs on no clone that lacks the settings.
   localAdvisory: [doc-sync]
+  # Versioned git hooks (.githooks/) that BLOCK once installed — and that do
+  # nothing at all until someone runs `just hooks-install`, because git hooks are
+  # not versioned and .git/hooks is per-clone. Listed as opt-in rather than as a
+  # rung for the same reason the old `prePush` entry was demoted: a projection
+  # that overstates a gate is worse than a missing one. `just hooks-status` is
+  # how a clone answers "am I actually running these".
+  #   pre-commit  fmt-check on staged .rs, pin-check on staged workflows
+  #   commit-msg  conventional-commit shape
+  #   pre-push    lint (PUMPER_HOOKS_FULL=1 -> ci)
+  localOptIn: [fmt-check, pin-check, lint, commit-msg-shape]
   # The binding rung. Everything below it is a latency optimization.
-  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, flake-check, harness-test]
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, supply-chain, flake-check, harness-test]
+  # Runs on a `v*` tag (.github/workflows/release.yml), not on a change: the
+  # release binary, its CycloneDX SBOM, and two Sigstore attestations — build
+  # provenance and an SBOM attestation bound to that exact binary.
+  releaseAttestation: [sbom]
   # Certification, NOT a gate — and the distinction is the technique's, not a
   # convenience: a long lane judges behaviour over time, which is not a property
   # of any single change, so blocking a merge on it would destroy the merge

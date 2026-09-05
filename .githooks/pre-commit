@@ -1,0 +1,62 @@
+#!/bin/sh
+# pre-commit — the seconds-long half of the CI ladder, run before the commit
+# exists rather than after the push.
+#
+# BUDGET IS THE WHOLE DESIGN. A pre-commit hook that costs a minute is a hook
+# that gets `--no-verify`d within a week, and a hook everyone bypasses is worse
+# than no hook: it is a gate the projection counts and the tree does not have.
+# So this runs only what is seconds — `cargo fmt --check` over the workspace,
+# and the node-only supply-chain gate when a workflow is what changed. Clippy
+# (minutes on a cold cache) and the test suite live in pre-push and in CI, where
+# their cost is already priced in.
+#
+# Installed by `just hooks-install`, which points core.hooksPath here. Not
+# installed by cloning: git hooks are not versioned, so this file is inert until
+# someone opts in. That is stated rather than hidden — .ai/manifest.yaml's
+# `controls` block records it as opt-in for exactly this reason.
+#
+# Escape hatches, in order of bluntness:
+#   PUMPER_SKIP_HOOKS=1 git commit ...   # skip this hook, keep the others
+#   git commit --no-verify ...           # skip every hook
+
+set -e
+
+if [ -n "$PUMPER_SKIP_HOOKS" ]; then
+    echo "pre-commit: skipped (PUMPER_SKIP_HOOKS is set)"
+    exit 0
+fi
+
+fail() {
+    echo ""
+    echo "pre-commit: BLOCKED — $1"
+    echo "            fix it, or bypass with: PUMPER_SKIP_HOOKS=1 git commit ..."
+    exit 1
+}
+
+staged() {
+    git diff --cached --name-only --diff-filter=ACMR
+}
+
+# --- formatting --------------------------------------------------------------
+# Whole-workspace rather than per-file: `cargo fmt` has no useful single-file
+# mode against a workspace, and the check is seconds either way. This is the
+# exact command the `Format` CI job runs, so a green here predicts a green there.
+if staged | grep -q '\.rs$'; then
+    command -v cargo >/dev/null 2>&1 || fail "cargo is not on PATH"
+    echo "pre-commit: cargo fmt --check"
+    cargo fmt --check || fail "formatting drift — run \`just fmt\`"
+fi
+
+# --- the supply-chain register ------------------------------------------------
+# Only when a workflow or the register itself moved, because that is the only
+# way this can newly go red. Node-only, no toolchain, milliseconds.
+if staged | grep -Eq '^\.github/(workflows/|unpinned-actions\.json)'; then
+    if command -v node >/dev/null 2>&1; then
+        echo "pre-commit: node scripts/ci/pinned-actions.mjs"
+        node scripts/ci/pinned-actions.mjs || fail "an unpinned or unregistered action — see \`just pin-check\`"
+    else
+        echo "pre-commit: node not on PATH, skipping the pinning gate (CI still runs it)"
+    fi
+fi
+
+exit 0

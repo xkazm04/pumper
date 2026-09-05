@@ -1,0 +1,85 @@
+# Review routing. GitHub requests a review from the LAST matching pattern, so
+# order is specificity ascending: the catch-all first, the load-bearing seams
+# last.
+#
+# This repository has one maintainer today, so every line resolves to the same
+# handle and none of them gate anything by themselves. That is deliberate and it
+# is not decoration: the file's job here is to make the OWNERSHIP BOUNDARIES
+# explicit and reviewable, so that adding a second maintainer is one handle
+# edited per area rather than an argument about where the areas are. The
+# boundaries below are the ones the architecture already enforces (CLAUDE.md
+# §Architecture, README.md §Architecture) — they are not invented for this file.
+#
+# To make these binding, enable "Require review from Code Owners" in the branch
+# protection rule for `master`, alongside the required checks
+# (Format / test / Consumer clients / Ship inventory + doc-sync / Test harness
+# gates / Dependency audit).
+
+# Everything, unless something more specific claims it.
+*                                   @xkazm04
+
+# --- the load-bearing seams --------------------------------------------------
+
+# The traits every other crate plugs into. A change here is a change to every
+# app and every engine at once: ScrapeApp, the engine traits, the tiered
+# Fetcher, Storage (the SQLite job queue), Datasets, the Governor, config.
+/crates/core/                       @xkazm04
+
+# The wiring layer. The one crate allowed to depend on everything — routes, the
+# worker pool, the scheduler, webhooks, triggers, SSE, datahub.
+/crates/server/                     @xkazm04
+
+# The engines. Each depends only on `core`; a change that makes one depend on
+# another, or on an app, breaks the dependency rule this repo is built on.
+/crates/engine-http/                @xkazm04
+/crates/engine-browser/             @xkazm04
+/crates/engine-claude/              @xkazm04
+/crates/engine-wasm/                @xkazm04
+/crates/engine-search/              @xkazm04
+/crates/engine-archive/             @xkazm04
+/crates/engine-remote/              @xkazm04
+
+# The apps. Self-contained by contract — an app depends only on `core` plus
+# parsing libs, never on another app or on an engine crate. The `*-common`
+# crates are the ONE exception (shared helpers within a family), which is
+# exactly why they are worth routing separately from the apps that use them.
+/crates/apps/                       @xkazm04
+/crates/apps/grants-common/         @xkazm04
+/crates/apps/census-common/         @xkazm04
+/crates/apps/trades-common/         @xkazm04
+
+# --- the contracts that reach outside this repo ------------------------------
+
+# The published consumer plane. `openapi.json` is generated from the router and
+# pinned to it by a cargo test; every client's wire types are generated from
+# that document and diffed in CI. A hand edit here is drift by construction.
+/clients/                           @xkazm04
+/clients/openapi.json               @xkazm04
+/scripts/gen/                       @xkazm04
+
+# The machine-readable pipeline registry. Every app must have a `[[source]]`
+# entry (ONBOARDING.md §10).
+/catalog/                           @xkazm04
+
+# --- the gates themselves ----------------------------------------------------
+
+# Supply chain and CI. A change here changes what every other change is checked
+# against, so it is the one area where a second reviewer buys the most.
+/.github/                           @xkazm04
+/deny.toml                          @xkazm04
+/Cargo.lock                         @xkazm04
+/rust-toolchain.toml                @xkazm04
+/SECURITY.md                        @xkazm04
+
+# The task runner and the local guardrails. `justfile` is the canonical
+# definition of what CI runs; `.githooks/` is what runs before it.
+/justfile                           @xkazm04
+/.githooks/                         @xkazm04
+/scripts/ci/                        @xkazm04
+
+# The agent-facing contract. `.ai/manifest.yaml` nominates the canonical
+# guidance file; the two CLAUDE.md files are that guidance.
+/.ai/                               @xkazm04
+/CLAUDE.md                          @xkazm04
+/.claude/CLAUDE.md                  @xkazm04
+/docs/features/                     @xkazm04

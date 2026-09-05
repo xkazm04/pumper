@@ -1,5 +1,23 @@
 # CLAUDE.md
 
+> **This file is canonical.** Two `CLAUDE.md` files exist in this repo and they
+> do not overlap, so which one you opened used to decide what you knew. The
+> split is by audience, not by accident:
+>
+> | file | what only it has | authority |
+> | --- | --- | --- |
+> | **`CLAUDE.md`** (this one) | commands table, architecture map, the dependency rule, where every other doc is | **canonical** — read it first, and read it whole |
+> | [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | the `context-map.json` protocol, the same-session documentation-sync rule, the "bug fixes ship as extracted, tested functions" doctrine | **binding policy** — read it before editing code |
+>
+> Neither supersedes the other wholesale. On **policy** (doc-sync, context-map,
+> the shape a bug fix ships in) `.claude/CLAUDE.md` wins; on **facts** (commands,
+> architecture, layout) this file wins. Precedence past those two:
+> `ONBOARDING.md`, then `README.md`. When docs disagree with each other, trust
+> the code, then fix whichever doc is stale — in the same change.
+>
+> This is declared machine-readably as `guidance.canonical` in
+> [`.ai/manifest.yaml`](.ai/manifest.yaml); keep the two in sync.
+
 Pumper is a **local-first scraping service**: one Rust binary that exposes an HTTP
 API, runs a durable job queue on SQLite (WAL), and scrapes through pluggable
 engines. Cargo workspace, edition 2021, `resolver = "2"`.
@@ -26,7 +44,11 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just harness-test` | the fixture suites that prove `flake-check`, `lane-certify` and `disk-check` can still go red |
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
-| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just pin-check` / `just pin-report` | the action-pinning register as a gate — every workflow `uses:` must be a 40-hex SHA or be registered in `.github/unpinned-actions.json` with a reason, an owner and a ceiling that only moves down; 0 clean / 2 findings / **3 cannot check** / the burn-down list |
+| `just sbom [--out F]` | a deterministic CycloneDX 1.6 SBOM from `Cargo.lock` — no network, no cargo, no dependencies. `just sbom-summary` for the counts |
+| `just supply-chain` | the pinning verdict plus both supply-chain fixture suites (the gates that prove pinning and the SBOM can still go red). Part of `just ci` |
+| `just hooks-install` / `hooks-status` / `hooks-uninstall` | point `core.hooksPath` at the versioned hooks in `.githooks/` (pre-commit `fmt-check` + `pin-check`, `commit-msg` conventional shape, pre-push `lint`). **Opt-in** — git hooks are per-clone, so they are inert until installed; `PUMPER_SKIP_HOOKS=1` or `--no-verify` bypasses |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory supply-chain flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just openapi` | regenerates `clients/openapi.json` from the **router** (needs cargo). A `cargo test` asserts the committed copy matches, so skipping this fails the Rust suite rather than shipping stale clients |
 | `just clients` | regenerates every client's wire types from that document — TypeScript, the CLI's copy, and the Python TypedDicts. Node only, seconds |
 | `just clients-check` | the same generation, diffed against what is committed: exit 1 on drift. Part of `sdk`, so `just ci` blocks on it |

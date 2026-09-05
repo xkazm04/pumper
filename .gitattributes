@@ -1,2 +1,11 @@
 # Normalize line endings to LF in the repo; check out native per-platform.
 * text=auto
+
+# Shell scripts must check out with LF even on Windows. The primary development
+# box here is Windows, and `core.autocrlf=true` would hand `.githooks/pre-commit`
+# to Git Bash with CRLF line endings — where the trailing \r becomes part of the
+# last argument and the hook dies with `$'\r': command not found` on its first
+# line. A guardrail that only fails on the platform it was written on is worse
+# than none.
+.githooks/* text eol=lf
+*.sh text eol=lf

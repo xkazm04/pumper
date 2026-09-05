@@ -25,6 +25,49 @@ index, a WASM host, and a lazily-launched Chrome. It is not a request-scoped
 service and does not scale horizontally — two processes over one `data/` directory
 would fight over the SQLite writer and the Tantivy exclusive writer lock.
 
+### Released artifacts, and how to verify one
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
+which is the only place release artifacts are made. Per target
+(`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`) it publishes:
+
+| artifact | what it is |
+| --- | --- |
+| `pumper-<target>[.exe]` | the binary, built with `cargo build --release --locked` |
+| `pumper-<target>.cdx.json` | a CycloneDX 1.6 SBOM of every crate linked into it, generated from the committed `Cargo.lock` |
+| `SHA256SUMS-<target>` | digests for both of the above |
+
+`--locked` is load-bearing: the SBOM is generated *from* `Cargo.lock`, so a build
+allowed to resolve anything else would ship an SBOM describing a binary nobody
+built. It is also the only sense in which this repo claims reproducibility.
+
+Two Sigstore attestations are signed per binary with the workflow's OIDC
+identity — keyless, so there is no signing key to leak or rotate. Build
+provenance says *which workflow, which commit, which runner*; the SBOM
+attestation binds the SBOM above to that exact binary, so a consumer cannot be
+handed one build's SBOM alongside another build's bytes:
+
+```bash
+gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper
+gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper \
+    --predicate-type https://cyclonedx.org/bom
+```
+
+The SBOM covers the **cargo dependency graph only**. It says nothing about the
+host Chrome `engine-browser` drives or the `claude` CLI `engine-claude` shells
+out to — see [Not containerized](#not-containerized--on-purpose) for why those
+are the operator's, and `SECURITY.md` for the rest of the supply-chain posture.
+
+Generate the same document locally, offline, with no cargo:
+
+```bash
+just sbom --out /tmp/pumper.cdx.json   # or `just sbom-summary` for the counts
+```
+
+`workflow_dispatch` runs the whole chain — build, SBOM, both attestations —
+without uploading anything, so the release path can be rehearsed without cutting
+a release.
+
 ## Local-first run story
 
 ```

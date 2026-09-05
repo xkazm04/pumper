@@ -30,6 +30,26 @@ on:
   # a fix, without waiting for the next night.
   workflow_dispatch:
 
+# Least privilege, declared at the workflow so it is the DEFAULT rather than a
+# per-job opt-in that a new job can forget.
+#
+# Without this block every job here runs with whatever the repository's default
+# `GITHUB_TOKEN` scope is — historically read/write on `contents`, `issues`,
+# `packages` and more — which is a write-capable credential handed to eleven
+# third-party actions and to `cargo`'s build scripts, for a workflow whose jobs
+# only ever READ the checkout. Nothing below pushes, comments, tags or publishes:
+#
+#   - actions/cache save+restore and actions/upload-artifact use the run-scoped
+#     Actions service token, not `contents:`, so they keep working at read.
+#   - $GITHUB_STEP_SUMMARY is a file on the runner, not an API write.
+#   - cargo-deny reads the advisory DB over plain HTTPS.
+#
+# Any job that later needs more must say so in its own `permissions:` block,
+# where the widening is visible in review. The release workflow
+# (.github/workflows/release.yml) is the one place that does.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -261,7 +281,7 @@ jobs:
   # clone without .claude/settings.json it does not exist at all — this is the
   # rung that at least keeps it from rotting unnoticed.
   inventory:
-    name: Ship inventory + doc-sync hook
+    name: Ship inventory + doc-sync hook + supply chain
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
@@ -274,6 +294,37 @@ jobs:
       - name: Doc-sync hook fixtures
         if: ${{ !cancelled() }}
         run: node --test scripts/docs/check-doc-sync.test.mjs
+      # The action-pinning register, reconciled against the workflows in this
+      # same commit. This is the rung that turns a NEW floating `uses:` red —
+      # the case that matters, because the existing floating set is registered
+      # and being drained, while a newly added one is an unreviewed third party
+      # arriving with the workflow's credentials.
+      - name: Action pinning register
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/pinned-actions.mjs
+      # Both supply-chain instruments' fixture suites. The pinning gate lands
+      # green by construction, and an SBOM is a document nobody reads until an
+      # advisory lands — two shapes of instrument that rot in total silence, so
+      # neither is trusted on the evidence of having passed.
+      - name: Supply-chain gate fixtures
+        if: ${{ !cancelled() }}
+        run: |
+          node --test scripts/ci/pinned-actions.test.mjs
+          node --test scripts/ci/sbom.test.mjs
+      # Generated per change, not only per release: an SBOM generator first
+      # exercised on release day is a release-day surprise. The counts go in the
+      # step summary so a dependency-set change is visible on the run that made
+      # it, next to the audit that judged it.
+      - name: SBOM
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '## Supply chain'
+            echo '```'
+            node scripts/ci/sbom.mjs --summary || true
+            node scripts/ci/pinned-actions.mjs --report || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The quarantine register as a gate, plus the fixture suites that prove both
   # this gate and the lane certifier can still go red.

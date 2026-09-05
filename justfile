@@ -139,6 +139,93 @@ inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
 
+# --- supply chain -------------------------------------------------------------
+
+# Every `uses:` in .github/workflows must resolve to a 40-hex commit SHA, or be
+# named in .github/unpinned-actions.json with a reason and an owner. A floating
+# tag is third-party code fetched at run time from a ref its author can move
+# AFTER review, executed with the workflow's credentials; a SHA cannot be
+# re-pointed.
+#
+# Reconciles in both directions (an unregistered floating ref fails, and so does
+# a waiver naming an action no workflow uses any more) and enforces a ceiling
+# that only moves down. Three outcomes, three exit codes: 0 clean / 2 findings /
+# 3 CANNOT CHECK. A 3 is not a pass.
+#
+# The action-pinning register as a gate. Node only, milliseconds.
+pin-check:
+    node scripts/ci/pinned-actions.mjs
+
+# The burn-down: what is pinned, what is still floating, and the ceiling.
+pin-report:
+    node scripts/ci/pinned-actions.mjs --report
+
+# A CycloneDX 1.6 SBOM of everything linked into the binary, generated from the
+# committed Cargo.lock — which already names every crate at the exact version
+# that will be linked, with the SHA-256 cargo verified before unpacking it. No
+# network, no cargo, no dependencies, and byte-for-byte deterministic, so "did
+# the dependency set change" is answerable by diff.
+#
+# .github/workflows/release.yml runs this per release target and binds the output
+# to that exact binary with a Sigstore SBOM attestation.
+#
+# Write the SBOM to stdout (or `just sbom --out dist/pumper.cdx.json`).
+sbom *args:
+    node scripts/ci/sbom.mjs {{args}}
+
+# Component counts — how many carry a checksum, how many are workspace-local.
+sbom-summary:
+    node scripts/ci/sbom.mjs --summary
+
+# The pinning gate's verdict plus the fixture suites behind BOTH supply-chain
+# instruments. The pinning gate lands green by construction (everything floating
+# today is registered), so "it passed" carries no information about whether it
+# works — the fixtures are what prove it can still go red. Node only, seconds.
+supply-chain:
+    node scripts/ci/pinned-actions.mjs
+    node --test scripts/ci/pinned-actions.test.mjs
+    node --test scripts/ci/sbom.test.mjs
+
+# --- local guardrails ---------------------------------------------------------
+
+# Point core.hooksPath at .githooks/ — the ONE thing that turns the versioned
+# hooks in that directory from files into enforcement.
+#
+# Git hooks are not versioned and .git/hooks is per-clone, so this is opt-in by
+# construction and there is no way around that. It is therefore stated rather
+# than assumed: .ai/manifest.yaml records these under `localOptIn`, not under the
+# binding rung, because a projection that overstates a gate is read as
+# authoritative and this repo has been burned by exactly that before.
+#
+# What you get:
+#   pre-commit  cargo fmt --check (staged .rs), pin-check (staged workflows)
+#   commit-msg  conventional-commit shape
+#   pre-push    cargo clippy -D warnings; PUMPER_HOOKS_FULL=1 runs `just ci`
+# Bypass any of them with PUMPER_SKIP_HOOKS=1, or git's own --no-verify.
+hooks-install:
+    #!/usr/bin/env sh
+    set -e
+    chmod +x .githooks/* 2>/dev/null || true
+    git config core.hooksPath .githooks
+    echo "hooks: core.hooksPath -> .githooks"
+    echo "hooks: pre-commit, commit-msg, pre-push are now live for this clone"
+
+# Restore git's default (.git/hooks), leaving the versioned hooks in place.
+hooks-uninstall:
+    git config --unset core.hooksPath || true
+    @echo "hooks: core.hooksPath cleared — .githooks/ is inert again"
+
+# Is this clone actually running them? A hook nobody installed and a hook that
+# works look identical from the outside.
+hooks-status:
+    #!/usr/bin/env sh
+    p=$(git config core.hooksPath || true)
+    if [ "$p" = ".githooks" ]; then
+        echo "hooks: INSTALLED (core.hooksPath = .githooks)"
+    else
+        echo "hooks: not installed (core.hooksPath = ${p:-<default .git/hooks>}) — run \`just hooks-install\`"
+    fi
+
 # --- test harness: the flake register and the long lanes ----------------------
 
 # Reconciles .flake/register.json against every `#[ignore]` in crates/, IN BOTH
@@ -230,8 +317,13 @@ lane-health:
 # absent: they are certifications on their own clock (`just lanes`), and hanging
 # a minutes-long run off the pre-push habit is how the habit stops happening.
 #
+# `supply-chain` joins the list for the same reason: the `Ship inventory` job
+# runs the pinning gate and both supply-chain fixture suites, so a local `ci`
+# that skipped them would understate the enforced policy — the only direction
+# this drift ever goes.
+#
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check
+ci: fmt-check lint test audit plugins-verify sdk inventory supply-chain flake-check harness-test disk-check
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:

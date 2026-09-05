@@ -1,0 +1,89 @@
+{
+  "$comment": [
+    "The action-pinning burn-down register, enforced by scripts/ci/pinned-actions.mjs.",
+    "",
+    "Every `uses:` in .github/workflows must resolve to a 40-hex commit SHA. A floating",
+    "tag is third-party code, fetched at run time from a ref its author can move after",
+    "review, executed with this workflow's credentials. A SHA cannot be re-pointed.",
+    "",
+    "The entries below are the set that was already floating when the gate landed.",
+    "Resolving a tag to a SHA needs a network round trip to GitHub, so they could not be",
+    "pinned in the same offline change that added the gate. They are registered rather",
+    "than ignored so the gate is green on arrival and BLOCKS anything new — the shape",
+    ".flake/register.json uses for quarantined tests.",
+    "",
+    "TO DRAIN ONE (repeat per action, one PR is fine for all of them):",
+    "  gh api repos/actions/checkout/git/ref/tags/v7 --jq .object.sha",
+    "  # then in every workflow: uses: actions/checkout@<sha> # v7",
+    "  # and delete that entry below",
+    "Dependabot's github-actions ecosystem (.github/dependabot.yml) already covers this",
+    "repo and bumps SHA pins in place, keeping the trailing `# v7` comment current — so",
+    "pinning costs no ongoing maintenance once done.",
+    "",
+    "`ceiling` counts REFERENCES, not distinct actions — 33 `uses:` lines across 12 actions",
+    "as of this file. It only ever moves DOWN: pin something before adding something."
+  ],
+  "ceiling": 33,
+  "waived": [
+    {
+      "action": "actions/checkout",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v7 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/setup-node",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v7 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/setup-python",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v6 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/cache/restore",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v6 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/cache/save",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v6 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/upload-artifact",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v7 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/attest-build-provenance",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v2 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "actions/attest-sbom",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v2 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "dtolnay/rust-toolchain",
+      "reason": "referenced by BRANCH (@stable), not even a tag — the highest-risk entry here, and the first worth draining",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "Swatinem/rust-cache",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v2 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "taiki-e/install-action",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v2 to a SHA",
+      "owner": "xkazm04"
+    },
+    {
+      "action": "EmbarkStudios/cargo-deny-action",
+      "reason": "floating when the gate landed; needs a network round trip to resolve v2 to a SHA",
+      "owner": "xkazm04"
+    }
+  ]
+}
