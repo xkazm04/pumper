@@ -97,7 +97,8 @@ struct Event {
     model: String,
     operation: &'static str,
     status: &'static str,
-    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     latency_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
@@ -111,9 +112,11 @@ struct Event {
 pub(crate) struct ResearchEvent<'a> {
     /// The declared use-case key (`.ai/use-cases.json`), e.g.
     /// `"research.web_agent"` — sourced from `ResearchRequest::use_case`,
-    /// which every call site sets explicitly. `None` is reported as
-    /// `"unattributed"` rather than dropped, so a call site that forgot to
-    /// set it shows up in LightTrack instead of vanishing.
+    /// which every call site sets explicitly. `None` is OMITTED from the
+    /// event rather than sent as a placeholder: the sink already counts
+    /// name-less events in its own unattributed bucket, so a magic string
+    /// would turn a counted absence into a fake use case that reads as
+    /// undeclared traffic. Absent is a fact; "unattributed" is a claim.
     pub use_case: Option<&'a str>,
     /// The model that actually ran. `None` only for shapes that never reach
     /// a real model call — a test double is the only case in practice, since
@@ -155,7 +158,7 @@ pub(crate) fn emit_research(ev: ResearchEvent<'_>) {
     let Some(cfg) = config_from_env() else {
         return;
     };
-    let name = ev.use_case.unwrap_or("unattributed").to_string();
+    let name = ev.use_case.map(str::to_string);
     let model = ev.model.unwrap_or("unknown").to_string();
     let status = if ev.error.is_some() {
         "error"
@@ -261,7 +264,7 @@ mod tests {
             model: "claude-sonnet-5".into(),
             operation: OPERATION,
             status: "success",
-            name: "research.web_agent".into(),
+            name: Some("research.web_agent".into()),
             latency_ms: 42,
             cost_usd: Some(0.12),
             error: None,
@@ -270,6 +273,27 @@ mod tests {
         assert!(json.get("error").is_none(), "success must omit `error`");
         assert_eq!(json["name"], "research.web_agent");
         assert_eq!(json["status"], "success");
+
+        // A call site that set no use case sends NO name. The sink counts
+        // name-less events in its own unattributed bucket; a placeholder would
+        // turn that counted absence into a fake use case reading as undeclared
+        // traffic.
+        let anonymous = Event {
+            project_id: PROJECT_ID,
+            provider: PROVIDER,
+            model: "claude-sonnet-5".into(),
+            operation: OPERATION,
+            status: "success",
+            name: None,
+            latency_ms: 42,
+            cost_usd: Some(0.12),
+            error: None,
+        };
+        let json = serde_json::to_value(&anonymous).unwrap();
+        assert!(
+            json.get("name").is_none(),
+            "an unset use case omits `name` rather than inventing one"
+        );
 
         let failure = Event {
             error: Some("cli reported error: boom".into()),
