@@ -21,6 +21,15 @@
 // already wrong: `test` is really two matrix legs, and the inventory job had been
 // renamed.)
 //
+// `--verify-live` is the OTHER half, and it needs a caller who has a token: hand
+// it whatever GitHub actually returns for the branch and it reconciles the LIVE
+// rule against this declaration. It is a pure function of the payload, so the
+// network round trip lives entirely in the caller (`just protection-verify`, and
+// the weekly `Ship inventory` steps) and nothing here has to be trusted blind.
+// Until that ran, "declared" and "applied" were two different claims and only the
+// first one was ever checked — a declaration nobody applied looks exactly like a
+// rule that is on.
+//
 // Reconciliation runs in BOTH directions, for the reason pinned-actions.mjs and
 // flake-check.mjs do it: a declaration that outlives what it describes stops
 // being read. So a job in a gated workflow that this file classifies neither as
@@ -34,6 +43,7 @@
 //
 // `--report` prints the required-check list and the one command that applies it.
 // `--json`   prints the GitHub branch-protection API payload, for that command.
+// `--verify-live <file|->` judges a live payload fetched by the caller.
 //
 // Run by `just protection-check` and by the `Ship inventory` CI job.
 
@@ -261,6 +271,222 @@ export function protectionPayload(decl, contexts) {
   };
 }
 
+/**
+ * What GitHub actually has, flattened into the shape `protectionPayload` emits.
+ *
+ * Two payloads can arrive here and they answer different questions, so the shape
+ * is detected rather than assumed:
+ *
+ *   `GET /repos/{o}/{r}/branches/{branch}/protection` — the whole rule. Needs a
+ *     token with ADMIN on the repo; a workflow's own GITHUB_TOKEN cannot get it
+ *     (there is no `administration:` scope to grant in a `permissions:` block).
+ *   `GET /repos/{o}/{r}/branches/{branch}` — carries `protected: true|false` and
+ *     nothing else that binds. Any read token can fetch it, which makes it the
+ *     one live signal available with zero setup: it cannot confirm the required
+ *     checks, but it turns "somebody switched protection off" red.
+ *
+ * The API returns `{enabled: bool}` objects where the PUT payload takes bare
+ * booleans, so every flag is normalised through `on()` before anything compares
+ * it — a rule read as `{"enabled": false}` and compared against `false` would
+ * otherwise be judged as drift in the safe direction and never in the unsafe one.
+ *
+ * @returns {null | {shape: 'branch', protected: boolean} | {shape: 'protection', ...}}
+ */
+export function normalizeLive(live) {
+  if (!live || typeof live !== 'object') return null;
+
+  // The shallow payload first: it is the one with `protected` at the top level.
+  if (typeof live.protected === 'boolean' && !live.required_status_checks) {
+    return { shape: 'branch', protected: live.protected };
+  }
+
+  const on = (v) => (typeof v === 'boolean' ? v : !!v && typeof v === 'object' && v.enabled === true);
+  const rsc = live.required_status_checks;
+  if (!rsc && !live.enforce_admins && !live.required_linear_history) return null;
+
+  // `contexts` is the deprecated flat list and `checks` the current one; GitHub
+  // still returns both, but a rule written through the newer API can arrive with
+  // only `checks`, and reading the wrong key reports every required check missing.
+  const contexts = Array.isArray(rsc?.contexts)
+    ? rsc.contexts
+    : Array.isArray(rsc?.checks)
+      ? rsc.checks.map((c) => c.context).filter(Boolean)
+      : [];
+  const rev = live.required_pull_request_reviews ?? null;
+
+  return {
+    shape: 'protection',
+    required_status_checks: { strict: rsc?.strict === true, contexts },
+    enforce_admins: on(live.enforce_admins),
+    required_pull_request_reviews: rev
+      ? {
+          required_approving_review_count: rev.required_approving_review_count ?? 0,
+          require_code_owner_reviews: rev.require_code_owner_reviews === true,
+          dismiss_stale_reviews: rev.dismiss_stale_reviews === true,
+        }
+      : null,
+    required_linear_history: on(live.required_linear_history),
+    required_conversation_resolution: on(live.required_conversation_resolution),
+    allow_force_pushes: on(live.allow_force_pushes),
+    allow_deletions: on(live.allow_deletions),
+  };
+}
+
+/** Every flag that must match, and what its drift costs — the message IS the gate. */
+const LIVE_FLAGS = {
+  enforce_admins: 'a rule an admin can walk around binds only the people who were never the risk',
+  required_linear_history: 'a merge commit hides which tree the required checks actually ran against',
+  required_conversation_resolution: 'an unresolved review thread stops being a blocker',
+  allow_force_pushes: 'a force push rewrites the history every one of these checks was run against',
+  allow_deletions: 'the protected branch itself becomes deletable',
+};
+
+/**
+ * The live rule against the declaration — the half `judge()` cannot see.
+ *
+ * Compared against `protectionPayload(decl, contexts)` rather than against the
+ * declaration's raw `settings`, so the verifier and the applier can never disagree
+ * about what the declaration MEANS: whatever `just protection-apply` would install
+ * is exactly what this expects to find.
+ *
+ * Reconciles in both directions, for the reason `judge()` does. A context GitHub
+ * requires that this repo does not declare is as much a finding as one it declares
+ * and GitHub does not: the first leaves pull requests pending on a check nobody
+ * reports, the second is a rung that has quietly stopped binding.
+ *
+ * @returns {{findings: string[], partial: boolean, unreadable: boolean}}
+ */
+export function judgeLive(live, decl, contexts) {
+  const norm = normalizeLive(live);
+  if (!norm) return { findings: [], partial: false, unreadable: true };
+
+  const branch = decl.branch ?? 'the protected branch';
+
+  if (norm.shape === 'branch') {
+    if (!norm.protected) {
+      return {
+        findings: [
+          `GitHub reports \`${branch}\` as UNPROTECTED. Every rung in ${DECLARATION_PATH} is declared and ` +
+            `none of it binds: apply it with \`just protection-apply\`.`,
+        ],
+        partial: false,
+        unreadable: false,
+      };
+    }
+    // Protected, and that is genuinely all this payload can say.
+    return { findings: [], partial: true, unreadable: false };
+  }
+
+  const want = protectionPayload(decl, contexts);
+  const findings = [];
+
+  const have = new Set(norm.required_status_checks.contexts);
+  for (const c of want.required_status_checks.contexts) {
+    if (!have.has(c)) {
+      findings.push(
+        `GitHub does not require the check "${c}" on \`${branch}\`, but ${DECLARATION_PATH} declares it. ` +
+          `That rung is running and reporting, and merging does not wait for it.`
+      );
+    }
+  }
+  const declared = new Set(want.required_status_checks.contexts);
+  for (const c of norm.required_status_checks.contexts) {
+    if (!declared.has(c)) {
+      findings.push(
+        `GitHub requires the check "${c}" on \`${branch}\`, which ${DECLARATION_PATH} does not declare — ` +
+          `either the declaration is stale, or every pull request is waiting on a check no job reports.`
+      );
+    }
+  }
+
+  if (want.required_status_checks.strict !== norm.required_status_checks.strict) {
+    findings.push(
+      `GitHub has \`strict\` (require branches to be up to date) = ${norm.required_status_checks.strict}, ` +
+        `declared ${want.required_status_checks.strict} — a check that passed against a stale base is a ` +
+        `check about a tree nobody is merging.`
+    );
+  }
+
+  for (const [key, why] of Object.entries(LIVE_FLAGS)) {
+    if (want[key] !== norm[key]) {
+      findings.push(`GitHub has \`${key}\` = ${norm[key]}, declared ${want[key]} — ${why}.`);
+    }
+  }
+
+  const wantRev = want.required_pull_request_reviews;
+  const haveRev = norm.required_pull_request_reviews;
+  if (wantRev && !haveRev) {
+    findings.push(
+      `GitHub requires no pull-request review on \`${branch}\`, but ${DECLARATION_PATH} declares one — ` +
+        `.github/CODEOWNERS routes a request nobody has to satisfy.`
+    );
+  } else if (!wantRev && haveRev) {
+    findings.push(
+      `GitHub requires pull-request review on \`${branch}\` (code owners: ${haveRev.require_code_owner_reviews}), ` +
+        `which ${DECLARATION_PATH} does not declare — apply the declaration, or update it to say so.`
+    );
+  } else if (wantRev && haveRev) {
+    for (const key of ['required_approving_review_count', 'require_code_owner_reviews', 'dismiss_stale_reviews']) {
+      if (wantRev[key] !== haveRev[key]) {
+        findings.push(`GitHub has \`${key}\` = ${haveRev[key]}, declared ${wantRev[key]}.`);
+      }
+    }
+  }
+
+  return { findings, partial: false, unreadable: false };
+}
+
+function readLive(arg) {
+  try {
+    const raw = arg === '-' || arg === undefined ? fs.readFileSync(0, 'utf8') : fs.readFileSync(arg, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function verifyLive(argv, decl, contexts) {
+  const at = argv.indexOf('--verify-live');
+  const arg = argv[at + 1] && !argv[at + 1].startsWith('--') ? argv[at + 1] : '-';
+  const live = readLive(arg);
+  if (live === null) {
+    console.error(
+      `protection-verify: CANNOT CHECK — no readable branch payload at \`${arg}\`. Fetch one with\n` +
+        '  gh api repos/xkazm04/pumper/branches/master/protection   # needs ADMIN on the repo\n' +
+        '  gh api repos/xkazm04/pumper/branches/master              # any read token; `protected` only'
+    );
+    return 3;
+  }
+
+  const { findings, partial, unreadable } = judgeLive(live, decl, contexts);
+  if (unreadable) {
+    console.error('protection-verify: CANNOT CHECK — that payload is neither a branch nor a branch-protection rule');
+    return 3;
+  }
+  if (findings.length) {
+    console.error('protection-verify: FINDINGS — the live rule and the declaration disagree');
+    for (const f of findings) console.error(`  - ${f}`);
+    return 2;
+  }
+  if (partial) {
+    // A 3, deliberately. `protected: true` says a rule exists, not that it is
+    // THIS rule — and reporting a half-answer as green is exactly how a
+    // required-check list rots behind a settings page that still looks right.
+    console.error(
+      `protection-verify: CANNOT CHECK the required-check list — GitHub confirms \`${decl.branch}\` is ` +
+        'protected, but reading WHICH checks it requires needs a token with admin rights on the repo.\n' +
+        '  gh secret set PROTECTION_AUDIT_TOKEN   # a fine-grained PAT with Administration: read\n' +
+        'Until then this is a partial verdict, and a partial verdict is not a pass.'
+    );
+    return 3;
+  }
+  console.log(
+    `protection-verify: ok — GitHub's rule for \`${decl.branch}\` matches ${DECLARATION_PATH} ` +
+      `(${contexts.length} required checks)`
+  );
+  return 0;
+}
+
 function main(argv) {
   const decl = readDeclaration(REPO_ROOT);
   if (!decl) {
@@ -274,6 +500,18 @@ function main(argv) {
   }
 
   const { findings, contexts } = judge(workflows, decl);
+
+  if (argv.includes('--verify-live')) {
+    // The same refusal `--json` makes, for the same reason: a live rule judged
+    // against a declaration that no longer describes the workflows would report
+    // drift against a required-check list that is itself wrong.
+    if (findings.length) {
+      console.error('protection-verify: refusing to judge — the declaration itself has findings:');
+      for (const f of findings) console.error(`  - ${f}`);
+      return 2;
+    }
+    return verifyLive(argv, decl, contexts);
+  }
 
   if (argv.includes('--json')) {
     // Refuses on findings rather than emitting them: a payload built from a
@@ -297,6 +535,9 @@ function main(argv) {
     console.log('apply (needs admin rights on the repo):');
     console.log('  node scripts/ci/branch-protection.mjs --json |');
     console.log('    gh api -X PUT repos/xkazm04/pumper/branches/master/protection --input -');
+    console.log('verify what GitHub actually has (`just protection-verify`):');
+    console.log('  gh api repos/xkazm04/pumper/branches/master/protection |');
+    console.log('    node scripts/ci/branch-protection.mjs --verify-live -');
     return 0;
   }
 

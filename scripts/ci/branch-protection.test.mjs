@@ -21,6 +21,8 @@ import {
   contextsFor,
   jobsInWorkflow,
   judge,
+  judgeLive,
+  normalizeLive,
   protectionPayload,
   readDeclaration,
   readWorkflows,
@@ -189,6 +191,151 @@ test('the_api_payload_carries_code_owner_review_once_it_is_turned_on', () => {
   const p = protectionPayload(d, []);
   assert.equal(p.required_pull_request_reviews.require_code_owner_reviews, true);
   assert.equal(p.required_pull_request_reviews.required_approving_review_count, 1);
+});
+
+// --- the live rule, judged against the declaration ---------------------------
+//
+// `judge()` above can only see whether the declaration still describes the
+// workflows. These cover the other half — whether GitHub HAS the rule — which is
+// the half that was never checked at all: a declaration nobody applied reads
+// exactly like a rule that is on, and both look green in a checkout.
+//
+// The payload shapes here are GitHub's, not this repo's: the read API answers
+// with `{"enabled": true}` where the write API takes `true`, and a rule written
+// through the newer API carries `checks` where the older one carried `contexts`.
+// Reading either one wrong reports every required check as missing, so both are
+// pinned by a fixture.
+
+const CONTEXTS = ['Format', 'test (ubuntu-latest)', 'test (windows-latest)'];
+
+/** What `GET /repos/{o}/{r}/branches/master/protection` returns for a rule that IS the declaration. */
+function liveFor(d = decl(), over = {}) {
+  const p = protectionPayload(d, CONTEXTS);
+  return {
+    required_status_checks: { strict: p.required_status_checks.strict, contexts: [...p.required_status_checks.contexts] },
+    enforce_admins: { enabled: p.enforce_admins },
+    ...(p.required_pull_request_reviews ? { required_pull_request_reviews: { ...p.required_pull_request_reviews } } : {}),
+    required_linear_history: { enabled: p.required_linear_history },
+    required_conversation_resolution: { enabled: p.required_conversation_resolution },
+    allow_force_pushes: { enabled: p.allow_force_pushes },
+    allow_deletions: { enabled: p.allow_deletions },
+    ...over,
+  };
+}
+
+const live = (over = {}, d = decl()) => judgeLive(liveFor(d, over), d, CONTEXTS);
+
+test('an_enabled_object_is_read_as_the_boolean_the_payload_would_have_sent', () => {
+  const n = normalizeLive(liveFor());
+  assert.equal(n.shape, 'protection');
+  assert.equal(n.enforce_admins, true, '{enabled: true} is not truthy-by-accident, it is read');
+  assert.equal(normalizeLive(liveFor({ enforce_admins: { enabled: false } })).enforce_admins, false);
+});
+
+test('the_newer_checks_list_is_read_the_same_as_the_deprecated_contexts_list', () => {
+  const payload = liveFor();
+  payload.required_status_checks = { strict: true, checks: CONTEXTS.map((context) => ({ context, app_id: null })) };
+  assert.deepEqual(normalizeLive(payload).required_status_checks.contexts, CONTEXTS);
+  assert.deepEqual(judgeLive(payload, decl(), CONTEXTS).findings, []);
+});
+
+test('the_live_rule_that_matches_the_declaration_is_clean', () => {
+  const { findings, partial, unreadable } = live();
+  assert.deepEqual(findings, []);
+  assert.equal(partial, false, 'a full protection payload is a full verdict');
+  assert.equal(unreadable, false);
+});
+
+test('a_declared_check_github_does_not_require_is_a_finding', () => {
+  // The failure this whole gate exists for: the rung runs, reports, goes red —
+  // and nothing waits for it, because the settings page never learned its name.
+  const { findings } = live({ required_status_checks: { strict: true, contexts: ['Format'] } });
+  assert.equal(findings.length, 2);
+  assert.match(findings.join('\n'), /does not require the check "test \(ubuntu-latest\)"/);
+});
+
+test('a_check_github_requires_that_nothing_declares_is_a_finding_too', () => {
+  // Reconciliation in the other direction: GitHub waiting on a context no job
+  // reports leaves every pull request pending forever, and says nothing about why.
+  const { findings } = live({ required_status_checks: { strict: true, contexts: [...CONTEXTS, 'Ghost'] } });
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /requires the check "Ghost"/);
+});
+
+test('a_weakened_live_flag_is_a_finding_per_flag', () => {
+  const weakened = [
+    ['enforce_admins', { enabled: false }],
+    ['allow_force_pushes', { enabled: true }],
+    ['allow_deletions', { enabled: true }],
+    ['required_linear_history', { enabled: false }],
+    ['required_conversation_resolution', { enabled: false }],
+  ];
+  for (const [key, bad] of weakened) {
+    const { findings } = live({ [key]: bad });
+    assert.equal(findings.length, 1, `${key} produced ${findings.length} findings`);
+    assert.match(findings[0], new RegExp(`\`${key}\``));
+  }
+  const stale = live({ required_status_checks: { strict: false, contexts: CONTEXTS } });
+  assert.equal(stale.findings.length, 1);
+  assert.match(stale.findings[0], /`strict`/);
+});
+
+test('code_owner_review_declared_but_not_applied_is_a_finding', () => {
+  // The day a second maintainer joins, CONTRIBUTING.md §8 says to flip this field
+  // AND re-apply. This is the gate that catches the second step being forgotten —
+  // otherwise CODEOWNERS goes back to describing a routing nothing enforces, with
+  // the declaration now claiming it does.
+  const d = decl();
+  d.settings.require_code_owner_reviews = true;
+  d.settings.required_approving_review_count = 1;
+  const payload = liveFor(d);
+  delete payload.required_pull_request_reviews; // applied before the flip
+  const { findings } = judgeLive(payload, d, CONTEXTS);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /requires no pull-request review/);
+});
+
+test('review_settings_that_drift_from_the_declaration_are_findings', () => {
+  const d = decl();
+  d.settings.require_code_owner_reviews = true;
+  d.settings.required_approving_review_count = 1;
+  const payload = liveFor(d, {
+    required_pull_request_reviews: {
+      required_approving_review_count: 1,
+      require_code_owner_reviews: false,
+      dismiss_stale_reviews: true,
+    },
+  });
+  const { findings } = judgeLive(payload, d, CONTEXTS);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /`require_code_owner_reviews`/);
+});
+
+test('an_unprotected_branch_is_a_finding_from_the_shallow_payload_alone', () => {
+  // The one live signal any read token can get. It cannot confirm the rule, but
+  // "somebody turned protection off" is the largest single regression available
+  // here, and this is what turns it red without a maintainer-scoped secret.
+  const { findings, partial } = judgeLive({ name: 'master', protected: false }, decl(), CONTEXTS);
+  assert.equal(partial, false);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /UNPROTECTED/);
+});
+
+test('a_protected_flag_alone_is_partial_not_a_pass', () => {
+  // `protected: true` says A rule exists, not that it is THIS rule. Reporting
+  // that as clean is precisely the 3-treated-as-0 the exit-code convention exists
+  // to prevent, so the verdict carries `partial` and the CLI exits 3 on it.
+  const { findings, partial } = judgeLive({ name: 'master', protected: true }, decl(), CONTEXTS);
+  assert.deepEqual(findings, []);
+  assert.equal(partial, true, 'a half-answer must not read as a pass');
+});
+
+test('a_payload_that_is_neither_shape_is_cannot_check_not_clean', () => {
+  for (const junk of [null, 'nope', {}, { message: 'Not Found' }]) {
+    const { unreadable, findings } = judgeLive(junk, decl(), CONTEXTS);
+    assert.equal(unreadable, true, `${JSON.stringify(junk)} must not read as a verdict`);
+    assert.deepEqual(findings, []);
+  }
 });
 
 test('this_repos_declaration_still_describes_its_workflows', () => {

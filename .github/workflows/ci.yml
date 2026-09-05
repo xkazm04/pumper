@@ -343,6 +343,50 @@ jobs:
         run: |
           node --test scripts/ci/branch-protection.test.mjs
           node scripts/ci/branch-protection.mjs
+      # And the half a checkout CANNOT see: whether GitHub actually HAS the rule.
+      #
+      # Everything above this point reconciles the declaration against the
+      # workflows, which is worth doing and is not the same claim. A declaration
+      # nobody applied — or one applied once and then edited in the settings UI —
+      # reads exactly like a rule that is on, from every angle available inside a
+      # checkout. So `require_code_owner_reviews`, the required-check list and
+      # `enforce_admins` were all *asserted* by this repo and *verified* by nothing.
+      #
+      # SCHEDULE AND DISPATCH ONLY, deliberately. Not on pull_request: a fork PR
+      # gets no secrets, and a required check that depends on repository
+      # administration would block every contribution on a permission the
+      # contributor cannot have. This is an audit of the repo's configuration, not
+      # of the change — so it runs on the weekly clock, where the thing it watches
+      # (a settings page a human can edit at any time) actually changes.
+      #
+      # TWO TOKENS, TWO DEPTHS. Reading the protection rule needs admin on the
+      # repo, and a workflow's GITHUB_TOKEN cannot be granted it — there is no
+      # `administration:` scope in a `permissions:` block. With
+      # PROTECTION_AUDIT_TOKEN set (a fine-grained PAT, `Administration: read`,
+      # this repo only) the whole rule is reconciled field by field. Without it the
+      # fallback still fetches `protected` with the run's own token, which turns
+      # "protection was switched off" red for free — and then reports CANNOT CHECK
+      # (exit 3) for the part it could not read, because a half-answer that exits 0
+      # is how a stale required-check list survives behind a settings page that
+      # still looks right.
+      - name: Fetch the live branch-protection rule
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ secrets.PROTECTION_AUDIT_TOKEN || github.token }}
+        run: |
+          set -uo pipefail
+          rm -f live-protection.json
+          if gh api "repos/${GITHUB_REPOSITORY}/branches/master/protection" > live-protection.json; then
+            echo "read the full protection rule"
+          elif gh api "repos/${GITHUB_REPOSITORY}/branches/master" > live-protection.json; then
+            echo "::warning::no admin-scoped PROTECTION_AUDIT_TOKEN — only \`protected\` is readable"
+          else
+            echo "::warning::GitHub returned nothing for this branch"
+            rm -f live-protection.json
+          fi
+      - name: Live rule vs the declaration
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        run: node scripts/ci/branch-protection.mjs --verify-live live-protection.json
       # The action-pinning register, reconciled against the workflows in this
       # same commit. This is the rung that turns a NEW floating `uses:` red —
       # the case that matters, because the existing floating set is registered
