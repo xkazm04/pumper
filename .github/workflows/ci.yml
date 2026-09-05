@@ -327,6 +327,22 @@ jobs:
           git fetch --no-tags --quiet origin \
             "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
           node scripts/ci/commit-lint.mjs --range "origin/$GITHUB_BASE_REF..HEAD"
+      # The branch-protection rule, reconciled against the workflows in this same
+      # commit. It cannot see whether GitHub has the rule enabled — that needs a
+      # token this job deliberately does not have — but it is the only thing that
+      # can catch the rule going stale: a required check named
+      # `test` when the job reports `test (ubuntu-latest)` blocks nothing, and
+      # nothing about the settings page says so. It also fails when a NEW job here
+      # is neither required nor explicitly excused, which is how a required-check
+      # list rots without anyone editing it.
+      #
+      # Its own fixtures run first, for the reason every other gate's do: this one
+      # is green by construction on the commit that wrote the declaration.
+      - name: Branch-protection declaration
+        if: ${{ !cancelled() }}
+        run: |
+          node --test scripts/ci/branch-protection.test.mjs
+          node scripts/ci/branch-protection.mjs
       # The action-pinning register, reconciled against the workflows in this
       # same commit. This is the rung that turns a NEW floating `uses:` red —
       # the case that matters, because the existing floating set is registered

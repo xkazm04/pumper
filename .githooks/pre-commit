@@ -6,7 +6,8 @@
 # that gets `--no-verify`d within a week, and a hook everyone bypasses is worse
 # than no hook: it is a gate the projection counts and the tree does not have.
 # So this runs only what is seconds — `cargo fmt --check` over the workspace,
-# and the node-only supply-chain gate when a workflow is what changed. Clippy
+# and the two node-only workflow gates (pinning, branch protection) when a
+# workflow is what changed. Clippy
 # (minutes on a cold cache) and the test suite live in pre-push and in CI, where
 # their cost is already priced in.
 #
@@ -58,6 +59,21 @@ if staged | grep -Eq '^\.github/(workflows/|unpinned-actions\.json)'; then
         node scripts/ci/pinned-actions.mjs || fail "an unpinned or unregistered action — see \`just pin-check\`"
     else
         echo "pre-commit: node not on PATH, skipping the pinning gate (CI still runs it)"
+    fi
+fi
+
+# --- the branch-protection declaration ----------------------------------------
+# Same trigger, same budget, different subject: renaming a job — or adding one —
+# is what silently invalidates a required-check list, and it is a workflow edit
+# like any other. Catching it here means the declaration and the workflow move in
+# the same commit rather than in a follow-up nobody writes. CI runs it too.
+if staged | grep -Eq '^\.github/(workflows/|branch-protection\.json)'; then
+    if command -v node >/dev/null 2>&1; then
+        echo "pre-commit: node scripts/ci/branch-protection.mjs"
+        node scripts/ci/branch-protection.mjs \
+            || fail "the branch-protection declaration no longer matches the workflows — see \`just protection-check\`"
+    else
+        echo "pre-commit: node not on PATH, skipping the protection gate (CI still runs it)"
     fi
 fi
 

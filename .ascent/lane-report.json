@@ -2,45 +2,37 @@
   "v": 1,
   "items": [
     {
-      "recommendationId": "f25cfbb0-816d-470e-91b9-c882e5808f4d",
-      "verdict": "resolved",
-      "reason": "Collapsed the forked sweep-honesty layer that grants-gov and ca-grants each carried privately (SweepEnd, walk_end, empty_page_is_drift, sweep_warning, append_warning) into grants-common, with the only genuinely per-source part — the nouns — travelling as a new SweepVocab struct so every emitted warning is byte-identical; cordis's hand-rolled warnings insert now goes through the same door.",
+      "recommendationId": "d79b40df-2680-4cf5-8298-8dd876ebccc0",
+      "verdict": "needs_human",
+      "reason": "The githooks half was already closed (versioned .githooks/ auto-installed by every just recipe, with server-side commit-lint in CI), so the open half is branch protection — which no worktree can enable; I versioned the rule as .github/branch-protection.json, added a CI-run gate that keeps its required-check names matching the workflows (it caught two names CODEOWNERS already had wrong), and a one-command `just protection-apply`, but a maintainer with admin rights still has to run it.",
       "files": [
-        "crates/apps/grants-common/src/lib.rs",
-        "crates/apps/grants-gov/src/lib.rs",
-        "crates/apps/ca-grants/src/lib.rs",
-        "crates/apps/eu-sedia/src/lib.rs",
-        "crates/apps/cordis/src/lib.rs"
+        ".github/branch-protection.json",
+        "scripts/ci/branch-protection.mjs",
+        "scripts/ci/branch-protection.test.mjs",
+        ".github/workflows/ci.yml",
+        ".github/CODEOWNERS",
+        ".githooks/pre-commit",
+        "justfile",
+        ".ai/manifest.yaml",
+        "CLAUDE.md"
       ]
     },
     {
-      "recommendationId": "d9e21f7f-4d1b-4ecd-8504-eb4d8c2b1545",
+      "recommendationId": "58c1e5d7-0586-4dca-b178-53df25d22311",
       "verdict": "skipped",
-      "reason": "Flipping `verified: false` in .ai/manifest.yaml means actually running each capability (cargo test, just ci, pwsh smoke); this session has no shell, and editing the flags without running the commands would make the manifest lie in the opposite direction.",
+      "reason": "Pinning needs a network round trip to resolve each tag to a commit SHA and inventing one would break the workflow; the second half of the item (wire `just pin-check` into CI as a gate) was already done before this cycle — scripts/ci/pinned-actions.mjs runs in the `Ship inventory` job with a ceiling of 33 that exactly equals today's floating count, so it already blocks anything new.",
       "files": []
     },
     {
-      "recommendationId": "9686595c-6795-4828-9c0c-7293b2990ceb",
-      "verdict": "skipped",
-      "reason": "Mutation testing requires installing and running cargo-mutants over crates/core — no network to fetch it and no shell to run it; a committed cargo-mutants config with no evidence of a run is exactly the detector-without-the-work this lane forbids.",
-      "files": []
-    },
-    {
-      "recommendationId": "4bbae25f-4397-4718-9fca-50f650f0ff24",
-      "verdict": "skipped",
-      "reason": "A commits-per-PR / time-to-merge budget has to be calibrated against this repo's actual history before a ceiling is honest, and git is unavailable in this session; an uncalibrated threshold would be a number invented rather than measured.",
-      "files": []
-    },
-    {
-      "recommendationId": "ae1c37fc-ebe2-4caa-a0b6-6178ef076e05",
-      "verdict": "needs_human",
-      "reason": "Drafted the skill input/output/failure-mode contract for .claude/skills/passport-onboard/SKILL.md plus a sibling README defining the shape, but the write to .claude/skills/ was refused by this session's permissions, so nothing landed.",
-      "files": []
+      "recommendationId": "7fa1ae04-7c71-44d7-8602-ec3b687c08eb",
+      "verdict": "resolved",
+      "reason": "Added CONTRIBUTING.md covering setup and the auto-installed hooks, the verify loop and the repo's 0/2/3-exit-code convention, the conventional-commit rule, the required checks by their exact GitHub names, branch protection, releases, and the four edits that add a second maintainer; linked from README.md, CLAUDE.md and .ai/manifest.yaml.",
+      "files": ["CONTRIBUTING.md", "README.md", "CLAUDE.md", ".ai/manifest.yaml"]
     }
   ],
   "lessons": [
-    "This repo records its own deferred refactors inside the doc comment of the code that carries the debt (\"lifting all three copies into grants_common is the follow-up\"). Grepping doc comments for phrases like \"the follow-up\" / \"deliberately left in place\" / \"out of this change's write set\" surfaces pre-approved, pre-designed de-duplication work faster than any duplicate-function scan.",
-    "When unifying forked helpers here, the fork is usually justified by per-source WORDING rather than per-source logic. Lifting the wording into a small Copy struct of &'static str and asserting each dialect's exact rendering in the shared crate lets the deletion be byte-for-byte output-preserving, so no downstream test assertion has to be relaxed — which matters because this repo treats a changed assertion as a lowered bar.",
-    "Sessions in this lane may have no shell at all: cargo, git and sed were all refused here. Plan rungs that are verifiable by reading (deletions, signature-preserving unifications) and skip rungs whose whole content is running a tool."
+    "In this repo a guardrail is only considered real if something can observe it going RED: every instrument under scripts/ci/ ships with a *.test.mjs fixture suite, uses exit codes 0 clean / 2 findings / 3 CANNOT-CHECK, and reconciles its register against the tree in BOTH directions. Match that shape when adding a gate here, or it will read as decoration.",
+    "Required-check lists rot invisibly. This repo's CODEOWNERS named `test` and `Ship inventory + doc-sync` — but a matrix job reports `test (ubuntu-latest)` / `test (windows-latest)` and the job had been renamed, so two of six names would have matched nothing. When a scan says branch protection is unverifiable, the closable half is usually keeping the declared check names reconciled with the workflow jobs.",
+    "Scanners under-report guardrails that are implemented without the canonical config filename: this repo's pre-commit hooks live in .githooks/ (auto-installed via core.hooksPath) and its commit-message rule is a 200-line node script, so `.pre-commit-config.yaml` and `commitlint.config.js` are both absent while both controls actually operate. Check for the practice before adding the file."
   ]
 }

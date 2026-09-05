@@ -45,9 +45,10 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
 | `just pin-check` / `just pin-report` | the action-pinning register as a gate — every workflow `uses:` must be a 40-hex SHA or be registered in `.github/unpinned-actions.json` with a reason, an owner and a ceiling that only moves down; 0 clean / 2 findings / **3 cannot check** / the burn-down list |
+| `just protection-check` / `protection-report` / `protection-apply` | the branch-protection rule as a versioned declaration (`.github/branch-protection.json`) — the gate reconciles every required check against the jobs that produce it (matrix legs expanded) and fails when a workflow job is neither required nor excused; 0 clean / 2 findings / **3 cannot check**. `protection-apply` installs it via `gh` (needs admin). Part of `just inventory`, so `just ci` blocks on it |
 | `just sbom [--out F]` | a deterministic CycloneDX 1.6 SBOM from `Cargo.lock` — no network, no cargo, no dependencies. `just sbom-summary` for the counts |
 | `just supply-chain` | the pinning verdict plus both supply-chain fixture suites (the gates that prove pinning and the SBOM can still go red). Part of `just ci` |
-| `just hooks-install` / `hooks-status` / `hooks-uninstall` | point `core.hooksPath` at the versioned hooks in `.githooks/` (pre-commit `fmt-check` + `pin-check`, `commit-msg` conventional shape, pre-push `lint`). **Auto-installed** by the private `_hooks-auto` prerequisite on the first `just` recipe you run in a clone — it only writes an UNSET `core.hooksPath`, `PUMPER_NO_HOOKS=1` opts out, `PUMPER_SKIP_HOOKS=1` / `--no-verify` bypass a single run |
+| `just hooks-install` / `hooks-status` / `hooks-uninstall` | point `core.hooksPath` at the versioned hooks in `.githooks/` (pre-commit `fmt-check` + `pin-check` + `protection-check`, `commit-msg` conventional shape, pre-push `lint`). **Auto-installed** by the private `_hooks-auto` prerequisite on the first `just` recipe you run in a clone — it only writes an UNSET `core.hooksPath`, `PUMPER_NO_HOOKS=1` opts out, `PUMPER_SKIP_HOOKS=1` / `--no-verify` bypass a single run |
 | `just commit-lint [args]` | the conventional-commit rule as a gate — the same `scripts/ci/commit-lint.mjs` the `commit-msg` hook delegates to and CI runs over a PR's commits. 0 clean / 2 findings / **3 cannot check**; `--report` prints the rule |
 | `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory supply-chain flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just openapi` | regenerates `clients/openapi.json` from the **router** (needs cargo). A `cargo test` asserts the committed copy matches, so skipping this fails the Rust suite rather than shipping stale clients |
@@ -134,6 +135,11 @@ Do not let a hard-won fact live only in the transcript.
   the `context-map.json` protocol, the same-session documentation-sync rule, and
   the "bug fixes ship as extracted, tested functions" doctrine. Read it before
   editing code. Not duplicated here.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how a change gets from a working tree
+  into `master`: setup and the auto-installed hooks, the verify loop and the
+  0/2/**3-is-not-a-pass** exit-code convention, the commit rule, the required
+  checks by their exact names, branch protection, and the four edits that add a
+  second maintainer.
 - **[ONBOARDING.md](ONBOARDING.md)** — the agent-facing contract: engine choice,
   extension seams, invariants (§7), verification loop (§8), the continuous-
   development charter (§9), the catalog rule (§10).

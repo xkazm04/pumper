@@ -32,6 +32,13 @@ capabilities:
   # CANNOT CHECK); `sbom` emits a deterministic CycloneDX 1.6 document from
   # Cargo.lock with no network and no cargo.
   pin-check: { command: "just pin-check", verified: false }
+  # The branch-protection rule as a VERSIONED declaration
+  # (.github/branch-protection.json) reconciled against the workflows that produce
+  # the checks it requires. It cannot read GitHub's setting — no token in a
+  # checkout — so what it gates is the half that rots: a required-check context no
+  # job reports any more, and a new job that nothing classifies. `just
+  # protection-apply` installs the declaration (admin rights required).
+  protection-check: { command: "just protection-check", verified: false }
   sbom: { command: "just sbom", verified: false }
   supply-chain: { command: "just supply-chain", verified: false }
   # Point core.hooksPath at the versioned hooks in .githooks/. Every `just`
@@ -89,6 +96,7 @@ guidance:
   # is stale."
   onConflict: "code wins; then fix the stale doc in the same change"
   supplements:
+    - CONTRIBUTING.md        # how a change reaches master: hooks, verify loop, commit rule, required checks, branch protection
     - ONBOARDING.md          # the agent-facing contract: engine choice, seams, invariants, §8 verification loop
     - README.md              # human quickstart, the API surface by example, the roadmap
     - MEMORY.md              # the durable-state index; read at session start
@@ -137,17 +145,25 @@ controls:
   # `localAutoInstalled` rather than promoting it keeps the projection under the
   # enforcement, which is the direction this repo has been burned by before.
   # `just hooks-status` is how a clone answers "am I actually running these".
-  #   pre-commit  fmt-check on staged .rs, pin-check on staged workflows
+  #   pre-commit  fmt-check on staged .rs, pin-check + protection-check on staged workflows
   #   commit-msg  conventional-commit shape (delegates to scripts/ci/commit-lint.mjs)
   #   pre-push    lint (PUMPER_HOOKS_FULL=1 -> ci)
-  localAutoInstalled: [fmt-check, pin-check, lint, commit-lint]
+  localAutoInstalled: [fmt-check, pin-check, protection-check, lint, commit-lint]
   # The binding rung. Everything below it is a latency optimization.
   #
   # `commit-lint` is on it because a commit-message convention enforced only by a
   # local hook is enforced only for whoever installed the hook: the `Conventional
   # commits` step in the `Ship inventory` job judges every commit a pull request
   # contains, through the same file the hook delegates to.
-  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, supply-chain, flake-check, harness-test, commit-lint]
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, supply-chain, flake-check, harness-test, commit-lint, protection-check]
+  # DECLARED, not confirmed-enabled — and named separately for exactly that
+  # reason. .github/branch-protection.json states the rule that makes every entry
+  # in `ciHardPass` above actually block a merge (and makes CODEOWNERS routing
+  # bind); `protection-check` keeps that declaration matching the workflows on
+  # every PR; `just protection-apply` installs it with one command. Whether GitHub
+  # currently HAS it on cannot be read from a checkout, so this repo does not
+  # claim it here — the same rule that kept the git hooks out of `ciHardPass`.
+  declaredNeedsAdminToApply: [branch-protection]
   # Runs on a `v*` tag (.github/workflows/release.yml), not on a change: the
   # release binary, its CycloneDX SBOM, and two Sigstore attestations — build
   # provenance and an SBOM attestation bound to that exact binary.

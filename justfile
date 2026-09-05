@@ -134,15 +134,55 @@ clients-check:
 # (the out-of-graph check), then replays the doc-sync hook against its fixtures.
 # Node only, no dependencies, seconds.
 #
-# The three node-only gates, as the `Ship inventory + doc-sync hook` job runs
-# them. `commit-lint.test.mjs` joins the list for the reason the doc-sync
+# The node-only gates, as the `Ship inventory + doc-sync hook + supply chain` job
+# runs them. `commit-lint.test.mjs` joins the list for the reason the doc-sync
 # fixtures are in it: a guardrail whose wiring nobody checks (the hook that
 # delegates, the recipes that auto-install, the CI step that judges) reads as
-# enforcement long after it stopped being any.
+# enforcement long after it stopped being any. `branch-protection` is here for
+# the same reason and one worse: its subject lives on GitHub's side, so the only
+# thing a checkout can keep honest is whether the declaration still describes the
+# workflows — and it is the rung every other rung hangs off.
 inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
     node --test scripts/ci/commit-lint.test.mjs
+    node scripts/ci/branch-protection.mjs
+    node --test scripts/ci/branch-protection.test.mjs
+
+# --- branch protection ---------------------------------------------------------
+
+# The branch-protection rule as a versioned declaration
+# (.github/branch-protection.json), reconciled against the workflows that produce
+# the checks it requires.
+#
+# It cannot ask GitHub whether the rule is ON — no token in a worktree. What it
+# checks is the half that rots: that every required check still names a context a
+# job actually reports (matrix legs expanded), that no job in a gated workflow is
+# un-required by OMISSION, and that the settings are not weakened. A stale
+# required-check name is the worst failure available, because GitHub either waits
+# forever for a check nobody sends or never matches the name — and the settings
+# page keeps showing the rung either way.
+#
+# 0 clean / 2 findings / 3 CANNOT CHECK. A 3 is not a pass.
+protection-check:
+    node scripts/ci/branch-protection.mjs
+
+# The required-check list, and the one command that applies it.
+protection-report:
+    node scripts/ci/branch-protection.mjs --report
+
+# Apply the declaration to GitHub. Needs `gh` authenticated with ADMIN rights on
+# the repo, so it is a maintainer action and not part of `just ci` — but it is one
+# command, which is the difference between a control that gets turned on and a
+# paragraph in a doc. `--json` refuses to emit a payload while the declaration has
+# findings, so this cannot install a stale required-check list.
+protection-apply repo="xkazm04/pumper":
+    #!/usr/bin/env sh
+    set -e
+    node scripts/ci/branch-protection.mjs --json \
+      | gh api -X PUT "repos/{{repo}}/branches/master/protection" --input -
+    echo "branch protection: applied — verify with"
+    echo "  gh api repos/{{repo}}/branches/master/protection --jq .required_status_checks.contexts"
 
 # --- supply chain -------------------------------------------------------------
 
@@ -258,7 +298,8 @@ commit-lint *args:
 # holds on a clone that never ran `just` at all.
 #
 # What you get:
-#   pre-commit  cargo fmt --check (staged .rs), pin-check (staged workflows)
+#   pre-commit  cargo fmt --check (staged .rs), pin-check + protection-check
+#               (staged workflows)
 #   commit-msg  conventional-commit shape
 #   pre-push    cargo clippy -D warnings; PUMPER_HOOKS_FULL=1 runs `just ci`
 # Bypass any of them with PUMPER_SKIP_HOOKS=1, or git's own --no-verify.

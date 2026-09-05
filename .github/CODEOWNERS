@@ -10,10 +10,30 @@
 # boundaries below are the ones the architecture already enforces (CLAUDE.md
 # §Architecture, README.md §Architecture) — they are not invented for this file.
 #
-# To make these binding, enable "Require review from Code Owners" in the branch
-# protection rule for `master`, alongside the required checks
-# (Format / test / Consumer clients / Ship inventory + doc-sync / Test harness
-# gates / Dependency audit).
+# WHAT MAKES THESE BINDING. A branch-protection rule on `master` that requires
+# review from Code Owners. That rule is no longer folklore: it is declared in
+# .github/branch-protection.json, applied from it with one command, and
+# reconciled against the workflows on every PR by `just protection-check`
+# (scripts/ci/branch-protection.mjs, run in the `Ship inventory` CI job).
+#
+# The required checks it names — exactly as GitHub reports them, which is the
+# whole point of putting a gate over this list. Two of the names this header used
+# to carry were already wrong (`test` is really two matrix legs, and the inventory
+# job had been renamed), and a required-check name that matches nothing binds
+# nothing:
+#
+#   Format
+#   test (ubuntu-latest)
+#   test (windows-latest)
+#   Consumer clients (TS SDK, CLI, Python)
+#   Ship inventory + doc-sync hook + supply chain
+#   Test harness gates
+#   Dependency audit
+#
+# Code-owner review itself is OFF in that declaration while this repo has one
+# maintainer (GitHub does not let an author approve their own PR, so requiring it
+# today means nothing merges). CONTRIBUTING.md §"Adding a second maintainer" is
+# the one-field edit that turns it on the day a second handle appears below.
 
 # Everything, unless something more specific claims it.
 *                                   @xkazm04
