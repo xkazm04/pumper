@@ -21,11 +21,11 @@ default:
 # is ambiguous.
 #
 # Boot the server (http://127.0.0.1:8088 by default; see [server] in config.toml).
-run:
+run: _hooks-auto
     cargo run -p pumper-server --bin pumper
 
 # Boot the server with verbose logs (ONBOARDING.md §8).
-dev:
+dev: _hooks-auto
     RUST_LOG=debug cargo run -p pumper-server --bin pumper
 
 # --- build / verify ----------------------------------------------------------
@@ -37,15 +37,15 @@ dev:
 # can never invalidate the build/test artifacts.
 #
 # Fast type-check of the whole workspace.
-check:
+check: _hooks-auto
     CARGO_INCREMENTAL=1 cargo check --workspace
 
 # Build the binaries (debug); append `--release` yourself for an optimized build.
-build:
+build: _hooks-auto
     cargo build -p pumper-server
 
 # Unit + integration tests, exactly as CI runs them.
-test:
+test: _hooks-auto
     cargo test --workspace
 
 # The #[ignore]d environment-dependent tests (real Chrome, built wasm, timing).
@@ -69,15 +69,15 @@ test-recorded:
 # direction this drift ever goes.
 #
 # Lint exactly as CI does (.github/workflows/ci.yml, job `test`, step `Clippy`).
-lint:
+lint: _hooks-auto
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Format in place.
-fmt:
+fmt: _hooks-auto
     cargo fmt
 
 # Format check exactly as CI does (fails on drift).
-fmt-check:
+fmt-check: _hooks-auto
     cargo fmt --check
 
 # Needs `cargo install cargo-deny`. `licenses` is deliberately absent from the
@@ -134,10 +134,15 @@ clients-check:
 # (the out-of-graph check), then replays the doc-sync hook against its fixtures.
 # Node only, no dependencies, seconds.
 #
-# The two node-only gates, as the `Ship inventory + doc-sync hook` job runs them.
+# The three node-only gates, as the `Ship inventory + doc-sync hook` job runs
+# them. `commit-lint.test.mjs` joins the list for the reason the doc-sync
+# fixtures are in it: a guardrail whose wiring nobody checks (the hook that
+# delegates, the recipes that auto-install, the CI step that judges) reads as
+# enforcement long after it stopped being any.
 inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
+    node --test scripts/ci/commit-lint.test.mjs
 
 # --- supply chain -------------------------------------------------------------
 
@@ -188,14 +193,69 @@ supply-chain:
 
 # --- local guardrails ---------------------------------------------------------
 
-# Point core.hooksPath at .githooks/ — the ONE thing that turns the versioned
-# hooks in that directory from files into enforcement.
+# The hooks install THEMSELVES, on the first `just` invocation in a clone.
 #
-# Git hooks are not versioned and .git/hooks is per-clone, so this is opt-in by
-# construction and there is no way around that. It is therefore stated rather
-# than assumed: .ai/manifest.yaml records these under `localOptIn`, not under the
-# binding rung, because a projection that overstates a gate is read as
-# authoritative and this repo has been burned by exactly that before.
+# Why this changed: `just hooks-install` was a setup step a contributor had to
+# know about and remember, which makes the pre-commit rungs a guardrail for
+# whoever already knew — everyone else discovered a formatting or pinning
+# violation from a red CI run, after the commit existed and after the push. The
+# repo already treats "a gate nobody installed and a gate that works look
+# identical from the outside" as a bug (see `hooks-status`); this closes the
+# install half of it.
+#
+# Deliberately narrow, so it can never surprise anyone:
+#   - it writes core.hooksPath ONLY when this clone has none set, so an explicit
+#     `just hooks-uninstall`, or a hooksPath of your own, is never overridden;
+#   - it is --local, so it cannot touch a global or system config;
+#   - PUMPER_NO_HOOKS=1 opts out entirely;
+#   - it never fails a recipe: no git, no repo, no permission — it says nothing
+#     and gets out of the way, because a task runner that refuses to run
+#     `cargo check` over a hook-config problem is worse than the drift.
+#
+# It prints once (the run that installs), and is silent on every run after.
+_hooks-auto:
+    #!/usr/bin/env sh
+    [ -n "$PUMPER_NO_HOOKS" ] && exit 0
+    command -v git >/dev/null 2>&1 || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+    current=$(git config --local core.hooksPath 2>/dev/null || true)
+    [ -n "$current" ] && exit 0
+    [ -d .githooks ] || exit 0
+    chmod +x .githooks/* 2>/dev/null || true
+    git config --local core.hooksPath .githooks 2>/dev/null || exit 0
+    echo "hooks: installed for this clone (core.hooksPath -> .githooks)"
+    echo "hooks: pre-commit fmt/pin, commit-msg shape, pre-push clippy — \`just hooks-uninstall\` or PUMPER_NO_HOOKS=1 to opt out"
+
+# The conventional-commit rule, run the way CI runs it. The same file the
+# commit-msg hook delegates to, so a local verdict predicts the remote one.
+#
+#   just commit-lint                     # judge HEAD's subject
+#   just commit-lint "--range master..HEAD"
+#   just commit-lint --report            # print the rule
+#
+# 0 clean / 2 findings / 3 CANNOT CHECK — a 3 is not a pass.
+commit-lint *args:
+    #!/usr/bin/env sh
+    if [ -n "{{args}}" ]; then
+        node scripts/ci/commit-lint.mjs {{args}}
+    else
+        git log -1 --format=%s | node scripts/ci/commit-lint.mjs
+    fi
+
+# Point core.hooksPath at .githooks/ — the ONE thing that turns the versioned
+# hooks in that directory from files into enforcement. `_hooks-auto` above now
+# does this for you on the first `just` run; this recipe stays for the clone
+# that opted out and changed its mind, and for re-running after an uninstall.
+#
+# Git hooks are not versioned and .git/hooks is per-clone, so a CLONE can never
+# arrive with them live — `_hooks-auto` narrows that window to "the first `just`
+# command you run" rather than "whenever you read the setup docs", and it cannot
+# close it entirely. That limit is stated rather than assumed: .ai/manifest.yaml
+# records these under `localAutoInstalled`, still not under the binding rung,
+# because a projection that overstates a gate is read as authoritative and this
+# repo has been burned by exactly that before. The conventional-commit rule is
+# the one that ALSO runs server-side (scripts/ci/commit-lint.mjs, in CI), so it
+# holds on a clone that never ran `just` at all.
 #
 # What you get:
 #   pre-commit  cargo fmt --check (staged .rs), pin-check (staged workflows)
@@ -223,7 +283,7 @@ hooks-status:
     if [ "$p" = ".githooks" ]; then
         echo "hooks: INSTALLED (core.hooksPath = .githooks)"
     else
-        echo "hooks: not installed (core.hooksPath = ${p:-<default .git/hooks>}) — run \`just hooks-install\`"
+        echo "hooks: not installed (core.hooksPath = ${p:-<default .git/hooks>}) — run \`just hooks-install\`, or any \`just\` recipe (they auto-install unless PUMPER_NO_HOOKS is set)"
     fi
 
 # --- test harness: the flake register and the long lanes ----------------------
@@ -323,7 +383,7 @@ lane-health:
 # this drift ever goes.
 #
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory supply-chain flake-check harness-test disk-check
+ci: _hooks-auto fmt-check lint test audit plugins-verify sdk inventory supply-chain flake-check harness-test disk-check
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:

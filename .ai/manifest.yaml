@@ -34,9 +34,12 @@ capabilities:
   pin-check: { command: "just pin-check", verified: false }
   sbom: { command: "just sbom", verified: false }
   supply-chain: { command: "just supply-chain", verified: false }
-  # Point core.hooksPath at the versioned hooks in .githooks/. Opt-in by
-  # construction — see `controls.localOptIn` below.
+  # Point core.hooksPath at the versioned hooks in .githooks/. Every `just`
+  # recipe now does this on first run — see `controls.localAutoInstalled` below.
   hooks-install: { command: "just hooks-install", verified: false }
+  # The conventional-commit shape, as ONE implementation the local commit-msg
+  # hook and the CI job both run (0 clean / 2 findings / 3 CANNOT CHECK).
+  commit-lint: { command: "just commit-lint", verified: false }
   # The fixture suite, NOT the hook itself: the hook reads a Stop-hook payload on
   # stdin, so invoking it bare now exits 3 ("cannot check" — it used to exit 0,
   # which is the false green this capability would have advertised as a pass).
@@ -126,18 +129,25 @@ controls:
   # -> scripts/docs/check-doc-sync.mjs). Advisory by construction — exit 2 is a
   # reminder that never blocks, and it runs on no clone that lacks the settings.
   localAdvisory: [doc-sync]
-  # Versioned git hooks (.githooks/) that BLOCK once installed — and that do
-  # nothing at all until someone runs `just hooks-install`, because git hooks are
-  # not versioned and .git/hooks is per-clone. Listed as opt-in rather than as a
-  # rung for the same reason the old `prePush` entry was demoted: a projection
-  # that overstates a gate is worse than a missing one. `just hooks-status` is
-  # how a clone answers "am I actually running these".
+  # Versioned git hooks (.githooks/) that BLOCK once installed — and that are now
+  # installed by the FIRST `just` recipe run in a clone (the private `_hooks-auto`
+  # prerequisite), rather than by a setup command a contributor had to know about.
+  # Still not a rung: git hooks are per-clone, a clone that never runs `just` has
+  # none, and PUMPER_SKIP_HOOKS / --no-verify bypass them. Naming this
+  # `localAutoInstalled` rather than promoting it keeps the projection under the
+  # enforcement, which is the direction this repo has been burned by before.
+  # `just hooks-status` is how a clone answers "am I actually running these".
   #   pre-commit  fmt-check on staged .rs, pin-check on staged workflows
-  #   commit-msg  conventional-commit shape
+  #   commit-msg  conventional-commit shape (delegates to scripts/ci/commit-lint.mjs)
   #   pre-push    lint (PUMPER_HOOKS_FULL=1 -> ci)
-  localOptIn: [fmt-check, pin-check, lint, commit-msg-shape]
+  localAutoInstalled: [fmt-check, pin-check, lint, commit-lint]
   # The binding rung. Everything below it is a latency optimization.
-  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, supply-chain, flake-check, harness-test]
+  #
+  # `commit-lint` is on it because a commit-message convention enforced only by a
+  # local hook is enforced only for whoever installed the hook: the `Conventional
+  # commits` step in the `Ship inventory` job judges every commit a pull request
+  # contains, through the same file the hook delegates to.
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, supply-chain, flake-check, harness-test, commit-lint]
   # Runs on a `v*` tag (.github/workflows/release.yml), not on a change: the
   # release binary, its CycloneDX SBOM, and two Sigstore attestations — build
   # provenance and an SBOM attestation bound to that exact binary.

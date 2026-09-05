@@ -10,10 +10,12 @@
 # (minutes on a cold cache) and the test suite live in pre-push and in CI, where
 # their cost is already priced in.
 #
-# Installed by `just hooks-install`, which points core.hooksPath here. Not
-# installed by cloning: git hooks are not versioned, so this file is inert until
-# someone opts in. That is stated rather than hidden — .ai/manifest.yaml's
-# `controls` block records it as opt-in for exactly this reason.
+# Installed by `just hooks-install`, which points core.hooksPath here — and, as
+# of the `_hooks-auto` recipe, by the FIRST `just` invocation in a clone, so a
+# contributor who never read the setup instructions still gets the guardrail.
+# Cloning alone is still not enough (git hooks are not versioned and .git/hooks
+# is per-clone), which is why the conventional-commit rule this hook's sibling
+# enforces also runs server-side in CI: see scripts/ci/commit-lint.mjs.
 #
 # Escape hatches, in order of bluntness:
 #   PUMPER_SKIP_HOOKS=1 git commit ...   # skip this hook, keep the others

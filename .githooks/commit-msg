@@ -13,7 +13,15 @@
 # lockfile to keep current, for a regex. The types below are the ones this
 # history actually uses plus the standard set.
 #
-# Escape hatches: PUMPER_SKIP_HOOKS=1, or `git commit --no-verify`.
+# THE RULE LIVES IN scripts/ci/commit-lint.mjs, not here. This hook delegates to
+# it, and CI runs the same file against every commit in a pull request — so the
+# clone that never installed hooks, and the commit made with --no-verify, still
+# meet the rule at the server side. The `sh` implementation below is the
+# FALLBACK for a machine with no node on PATH; commit-lint.test.mjs fails if its
+# type list ever differs from the shared one.
+#
+# Escape hatches: PUMPER_SKIP_HOOKS=1, or `git commit --no-verify`. Both are
+# local-only — neither reaches the CI rung.
 
 set -e
 
@@ -22,6 +30,17 @@ if [ -n "$PUMPER_SKIP_HOOKS" ]; then
 fi
 
 MSG_FILE="$1"
+
+# --- the shared implementation, when node is available ------------------------
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+if command -v node >/dev/null 2>&1 && [ -f "$ROOT/scripts/ci/commit-lint.mjs" ]; then
+    # Exit 2 = findings, 3 = could not check. Either way the commit is refused:
+    # a hook that cannot judge must not wave the commit through, because that is
+    # the failure mode nobody notices.
+    node "$ROOT/scripts/ci/commit-lint.mjs" --file "$MSG_FILE" >/dev/null || exit 1
+    exit 0
+fi
+
 # The subject: first line, ignoring the comment block git appends.
 SUBJECT=$(grep -v '^#' "$MSG_FILE" | sed -n '1p')
 

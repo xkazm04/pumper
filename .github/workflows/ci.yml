@@ -285,7 +285,12 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
+      # Full history, because the `Conventional commits` step below judges the
+      # commits a pull request actually contains (`origin/<base>..HEAD`), and a
+      # depth-1 checkout has no base to diff against. Seconds on this repo.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
@@ -294,6 +299,34 @@ jobs:
       - name: Doc-sync hook fixtures
         if: ${{ !cancelled() }}
         run: node --test scripts/docs/check-doc-sync.test.mjs
+      # The commit-message rule, judged where no local configuration can skip it.
+      #
+      # `.githooks/commit-msg` enforces the same rule through the same file — but
+      # git hooks are per-clone, so before this step the rule refused nothing on
+      # a clone that never ran `just hooks-install`, and nothing at all after a
+      # `--no-verify`. This is the rung that makes the convention a control:
+      # every commit a PR proposes must carry a conventional subject, or this job
+      # fails and the merge is blocked.
+      #
+      # Its own fixtures run first, and for the usual reason: this gate is green
+      # by construction on a compliant branch, so "it passed" says nothing about
+      # whether it can still go red.
+      - name: Commit-message gate fixtures
+        if: ${{ !cancelled() }}
+        run: node --test scripts/ci/commit-lint.test.mjs
+      - name: Conventional commits
+        # pull_request only: on a push to master the commits are already merged,
+        # and `github.base_ref` is empty there — a range that would not resolve,
+        # which this gate correctly reports as CANNOT CHECK (exit 3) rather than
+        # as a pass. Nothing is gained by asking it a question it cannot answer.
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          # Explicit refspec: on a pull_request event the checkout fetches the
+          # merge ref, so `origin/<base>` is not guaranteed to exist as a
+          # remote-tracking branch until this asks for it by name.
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          node scripts/ci/commit-lint.mjs --range "origin/$GITHUB_BASE_REF..HEAD"
       # The action-pinning register, reconciled against the workflows in this
       # same commit. This is the rung that turns a NEW floating `uses:` red —
       # the case that matters, because the existing floating set is registered

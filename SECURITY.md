@@ -87,17 +87,27 @@ just sbom-summary
 
 ## Local guardrails
 
-Versioned in [`.githooks/`](.githooks), inert until installed — git hooks are
-per-clone and cannot be shipped by a checkout:
+Versioned in [`.githooks/`](.githooks) and **installed by the first `just`
+recipe you run in a clone** — git hooks are per-clone and cannot be shipped by a
+checkout, so the justfile's private `_hooks-auto` prerequisite points
+`core.hooksPath` at `.githooks/` instead of leaving that to a setup step nobody
+reads. It writes only an unset `core.hooksPath` (an explicit
+`just hooks-uninstall`, or a path of your own, is never overridden), never fails
+a recipe, and `PUMPER_NO_HOOKS=1` opts out.
 
 ```bash
-just hooks-install     # points core.hooksPath at .githooks
 just hooks-status      # is this clone actually running them?
+just hooks-install     # after an opt-out, or to re-point explicitly
 ```
 
 `pre-commit` runs `cargo fmt --check` and, when a workflow is staged, the pinning
-gate. `pre-push` runs clippy (`PUMPER_HOOKS_FULL=1` runs all of `just ci`).
-Bypass with `PUMPER_SKIP_HOOKS=1` or git's `--no-verify`.
+gate. `commit-msg` runs the conventional-commit gate. `pre-push` runs clippy
+(`PUMPER_HOOKS_FULL=1` runs all of `just ci`). Bypass with `PUMPER_SKIP_HOOKS=1`
+or git's `--no-verify` — neither reaches the CI rung below.
+
+| Control | Command | When | On failure |
+| --- | --- | --- | --- |
+| Conventional commit subjects | `node scripts/ci/commit-lint.mjs --range origin/<base>..HEAD` (`just commit-lint`) | every pull request, in the `Ship inventory` job — the same file the local `commit-msg` hook delegates to, so an uninstalled hook or a `--no-verify` cannot skip the rule | the job fails, blocking the merge (exit 2 findings, exit 3 could-not-check — a 3 is not a pass) |
 
 ## Not covered
 
