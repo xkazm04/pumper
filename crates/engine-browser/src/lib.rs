@@ -326,6 +326,68 @@ impl Closable for Tab {
     }
 }
 
+/// Tabs whose [`RenderScope`] was dropped somewhere the close could not be
+/// *performed*: `Drop` cannot `.await`, and with no runtime entered there is
+/// nowhere to hand the await to either. The drop still fires — it always fires —
+/// it simply lacks the capability to finish, so it records the debt here and a
+/// checkpoint that provably has a runtime settles it.
+///
+/// The checkpoint is [`BrowserEngine::acquire`], which is `async` and therefore
+/// has one by construction, and which every subsequent render passes through.
+///
+/// `None` = closed: the engine is gone, its Chrome with it, and a late arrival
+/// has nothing left to close. That is a deliberate discard, not a leak.
+struct PendingCloses {
+    queue: std::sync::Mutex<Option<Vec<Arc<dyn Closable>>>>,
+    /// Length hint, so the drain checkpoint on the hot render path is a relaxed
+    /// load in the common (empty) case instead of a mutex acquisition. It may
+    /// lag; it therefore gates only `maybe_drain`, never `close`.
+    len: AtomicUsize,
+}
+
+impl PendingCloses {
+    fn new() -> Self {
+        Self {
+            queue: std::sync::Mutex::new(Some(Vec::new())),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Called from `Drop`. Always legal: no await, no runtime, no CDP traffic —
+    /// only a push. A poisoned lock is recovered rather than propagated, because
+    /// a panicking destructor is worse than a contended one.
+    fn enqueue(&self, page: Arc<dyn Closable>) {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        match q.as_mut() {
+            Some(v) => {
+                v.push(page);
+                self.len.store(v.len(), Ordering::Relaxed);
+            }
+            None => warn!("browser engine closed; deferred tab close discarded"),
+        }
+    }
+
+    /// The checkpoint. Cheap and inline when there is nothing owed, which is
+    /// every render but the ones following a runtime-less drop.
+    async fn maybe_drain(&self) {
+        if self.len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let owed = {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let taken = q.as_mut().map(std::mem::take).unwrap_or_default();
+            self.len.store(0, Ordering::Relaxed);
+            taken
+        };
+        if !owed.is_empty() {
+            info!(count = owed.len(), "closing tabs deferred from a runtime-less drop");
+        }
+        for page in owed {
+            page.close().await;
+        }
+    }
+}
+
 /// Everything ONE render must give back, released by [`Drop`] instead of by
 /// remembering to release it on each exit path.
 ///
@@ -349,6 +411,9 @@ struct RenderScope {
     page: Option<Arc<dyn Closable>>,
     /// Tasks whose only reason to exist is this render's tab.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Where to record the close when `Drop` has no runtime to perform it on.
+    /// `None` in tests that construct a scope without an engine behind it.
+    pending: Option<Arc<PendingCloses>>,
 }
 
 impl RenderScope {
@@ -356,7 +421,15 @@ impl RenderScope {
         Self {
             page: Some(page),
             tasks: Vec::new(),
+            pending: None,
         }
+    }
+
+    /// Names the queue this scope owes its close to when it drops without a
+    /// runtime. Without it the drop degrades exactly as it did before: a warn,
+    /// and the tab left to the recycle relaunch.
+    fn defer_to(&mut self, pending: Arc<PendingCloses>) {
+        self.pending = Some(pending);
     }
 
     /// Binds a spawned task's life to this render's tab.
@@ -402,7 +475,16 @@ impl Drop for RenderScope {
             Ok(handle) => {
                 handle.spawn(async move { page.close().await });
             }
-            Err(_) => warn!("render scope dropped outside a tokio runtime; tab left to recycle"),
+            // No runtime: the close cannot be *performed* here, so it is
+            // recorded and settled at the next `acquire`, which has one. Where
+            // no queue was named, this degrades to the previous behaviour.
+            Err(_) => match self.pending.take() {
+                Some(pending) => {
+                    pending.enqueue(page);
+                    warn!("render scope dropped outside a tokio runtime; tab close deferred");
+                }
+                None => warn!("render scope dropped outside a tokio runtime; tab left to recycle"),
+            },
         }
     }
 }
@@ -446,6 +528,9 @@ pub struct BrowserEngine {
     holders: Mutex<Holders>,
     /// Caps concurrent renders (tabs) across all profiles. `None` = unlimited.
     render_slots: Option<Arc<Semaphore>>,
+    /// Closes owed by renders that dropped with no runtime to perform them on.
+    /// Drained at [`Self::acquire`]; see [`PendingCloses`].
+    pending_closes: Arc<PendingCloses>,
 }
 
 impl BrowserEngine {
@@ -459,6 +544,7 @@ impl BrowserEngine {
             profiles_dir: profiles_dir.into(),
             holders: Mutex::new(Holders::default()),
             render_slots,
+            pending_closes: Arc::new(PendingCloses::new()),
         }
     }
 
@@ -552,6 +638,12 @@ impl BrowserEngine {
     /// died (crash detection) or hit the recycle threshold. Counts one render and
     /// LRU-evicts the least-recently-used other profile past [`MAX_LIVE_PROFILES`].
     async fn acquire(&self, profile: Option<&str>) -> Result<Arc<ChromeBrowser>> {
+        // Checkpoint for closes a runtime-less drop could not perform. This is
+        // `async`, so a runtime is entered by construction — the one thing
+        // `RenderScope::drop` could not guarantee about itself. A relaxed load
+        // when nothing is owed, which is every render but the rare ones.
+        self.pending_closes.maybe_drain().await;
+
         // Validated (and the path built) before any lock is taken.
         let user_data_dir = self.user_data_dir(profile)?;
         let key = profile.unwrap_or(DEFAULT_PROFILE_KEY).to_string();
@@ -683,6 +775,7 @@ impl Browser for BrowserEngine {
         // not exits at all (a cancelled or timed-out job drops this future
         // mid-await) — releases the tab and its tasks through this guard.
         let mut scope = RenderScope::new(Arc::new(Tab(page.clone())));
+        scope.defer_to(self.pending_closes.clone());
 
         // Resource-blocking drainer. Only wired when interception is enabled at
         // launch (`block_resources`); otherwise no Fetch events ever fire.
@@ -2003,6 +2096,66 @@ mod tests {
             rx.try_recv().is_err(),
             "cleanup ran twice; the close-once latch is not latching"
         );
+    }
+
+    /// The half `Drop` alone can never cover: the scope is dropped on a thread
+    /// with **no runtime entered**, so there is nowhere to hand the `await` to.
+    /// Before `PendingCloses` the tab was simply lost here (a warn, and the
+    /// recycle relaunch as the only backstop). The close is not skipped and not
+    /// performed — it is *owed*, and settled at the next checkpoint.
+    ///
+    /// Both arms of the A/B live in this one test: the scope WITHOUT a queue is
+    /// the old behaviour and must report nothing; the scope WITH one must report
+    /// its close the moment a checkpoint runs.
+    #[tokio::test]
+    async fn runtime_less_drop_defers_its_close_to_the_next_checkpoint() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = Arc::new(PendingCloses::new());
+
+        // Arm A — no queue named. Dropped off-runtime on a plain thread.
+        {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _scope = RenderScope::new(Arc::new(RecordingTab(tx)));
+            })
+            .join()
+            .unwrap();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "arm A: without a queue a runtime-less drop closes nothing (the old behaviour)"
+        );
+
+        // Arm B — same drop, same thread, queue named.
+        {
+            let tx = tx.clone();
+            let pending = pending.clone();
+            std::thread::spawn(move || {
+                let mut scope = RenderScope::new(Arc::new(RecordingTab(tx)));
+                scope.defer_to(pending);
+            })
+            .join()
+            .unwrap();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "arm B: the close is owed, not performed — Drop must not have closed it"
+        );
+
+        // The checkpoint. `acquire` is async and launches Chrome, so the drain
+        // is exercised directly; this is the same call it makes.
+        pending.maybe_drain().await;
+        assert_eq!(
+            rx.recv().await.expect("arm B must settle its debt at the checkpoint"),
+            "tab-closed"
+        );
+
+        // Drained exactly once, and a second checkpoint owes nothing.
+        pending.maybe_drain().await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the deferred close ran twice");
     }
 
     /// The mirror risk: the success path still closes at its own point, so the
