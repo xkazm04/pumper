@@ -149,9 +149,20 @@ impl ArchiveEngine {
 }
 
 /// The CDX query for the newest 200-status capture of `target`.
+///
 /// `to` (14-digit or any prefix, e.g. `2019`) bounds the capture time from
-/// above — unused by the freshness path (which wants the newest capture and
-/// window-checks it locally) but the seam the future backfill job builds on.
+/// above: "the newest capture no later than T". The freshness path passes
+/// `None` — it wants the newest capture outright and window-checks it locally,
+/// which is one query instead of two and the reason the bound is unused there.
+///
+/// **It has no caller today, and the doc used to explain that by pointing at
+/// "the future backfill job".** That job shipped: `list_snapshots` +
+/// [`cdx_range_query_url`] enumerate a range, which is a different query
+/// (ascending, `collapse=digest`, `limit = max + 1`) and does not go through
+/// here. The bound is kept because point-in-time retrieval — one capture as of
+/// a date, not every capture in a window — is a real and distinct shape that
+/// range enumeration answers expensively. Naming the plan that superseded it is
+/// the point: a parameter documented by a promise nobody kept reads as live.
 pub fn cdx_query_url(base_url: &str, target: &str, to: Option<&str>) -> String {
     let mut url = format!(
         "{}/cdx/search/cdx?url={}&limit=1&sort=reverse&filter=statuscode:200",
