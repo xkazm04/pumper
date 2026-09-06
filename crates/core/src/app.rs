@@ -1157,7 +1157,8 @@ fn safe_path_segment(s: &str, what: &str) -> std::result::Result<(), String> {
 /// over `GET /apps`, and only surfaces its gap via a failed job).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// An environment variable that must be set (typically an API key/credential).
+    /// An environment variable that must be set to a **non-blank** value
+    /// (typically an API key/credential).
     Env(&'static str),
 }
 
@@ -1165,7 +1166,7 @@ impl Requirement {
     /// Whether this precondition is satisfied in the current environment.
     pub fn is_satisfied(&self) -> bool {
         match self {
-            Requirement::Env(name) => std::env::var(name).is_ok(),
+            Requirement::Env(name) => env_value_satisfies(std::env::var(name).ok().as_deref()),
         }
     }
 
@@ -1175,6 +1176,26 @@ impl Requirement {
             Requirement::Env(name) => format!("env:{name}"),
         }
     }
+}
+
+/// Whether an environment variable's value actually satisfies a
+/// [`Requirement::Env`] — present **and** not blank.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `std::env::var(name).is_ok()`, under which a
+/// variable set to the empty string reads as satisfied. A `.env` line left as a
+/// bare `CENSUS_API_KEY=` is exactly what a human writes when they have not got
+/// the key yet, and `load_dotenv` sets it verbatim — so the app reported
+/// `ready: true` on `GET /apps`, was offered to an agent in the MCP tool list
+/// (`routes/meta.rs` filters on this very predicate), and announced its missing
+/// credential as an upstream 403 on the first job instead of as a gap before
+/// the first job. A credential that is present and blank is a credential that
+/// is missing, and readiness is the one field whose whole purpose is to say so
+/// in advance.
+///
+/// Whitespace counts as blank for the same reason: a quoted `"   "` is a
+/// placeholder, never a key.
+fn env_value_satisfies(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.trim().is_empty())
 }
 
 // ── App manifest (agent-ready registry) ─────────────────────────────────────
@@ -1314,10 +1335,37 @@ pub trait ScrapeApp: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_managed_by, budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, router_pin,
-        safe_path_segment, schedule_request, success_spend_event, FetchOutcome, RouterPin,
+        app_managed_by, budget_exhausted_error, budget_is_exhausted, env_value_satisfies,
+        fetch_cost_detail, router_pin, safe_path_segment, schedule_request, success_spend_event,
+        FetchOutcome, RouterPin,
     };
     use serde_json::json;
+
+    /// THE ANTI-PATTERN: `std::env::var(name).is_ok()`, under which a variable
+    /// set to the empty string reports the app READY. `.env` carries a bare
+    /// `CENSUS_API_KEY=` whenever a human has not got the key yet, so the
+    /// registry advertised a credential-gated app as ready, the MCP tool list
+    /// offered it, and the gap surfaced as an upstream 403 on the first job —
+    /// which is precisely the outcome `requires()` exists to prevent.
+    #[test]
+    fn a_blank_credential_is_missing_not_ready() {
+        assert!(
+            env_value_satisfies(Some("sk-live-abc")),
+            "a real key satisfies"
+        );
+        assert!(!env_value_satisfies(None), "unset is not satisfied");
+        assert!(
+            !env_value_satisfies(Some("")),
+            "set-but-empty is the whole bug: a blank credential is a missing one"
+        );
+        assert!(
+            !env_value_satisfies(Some("   \t ")),
+            "a whitespace placeholder is not a key either"
+        );
+        // Leading/trailing whitespace around a REAL value is a typo, not an
+        // absence — the variable is still satisfied.
+        assert!(env_value_satisfies(Some(" sk-live-abc ")));
+    }
 
     fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
         FetchOutcome {
