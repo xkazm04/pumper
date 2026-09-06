@@ -240,6 +240,9 @@ jobs:
       - name: Doc-sync hook fixtures
         if: ${{ !cancelled() }}
         run: node --test scripts/docs/check-doc-sync.test.mjs
+      - name: MCP gate parity
+        if: ${{ !cancelled() }}
+        run: node --test scripts/ci/mcp-gate-parity.test.mjs
 
   # The quarantine register as a gate, plus the fixture suites that prove both
   # this gate and the lane certifier can still go red.

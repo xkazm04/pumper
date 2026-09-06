@@ -104,6 +104,7 @@ sdk:
 inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
+    node --test scripts/ci/mcp-gate-parity.test.mjs
 
 # --- test harness: the flake register and the long lanes ----------------------
 
