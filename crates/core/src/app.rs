@@ -406,17 +406,12 @@ impl AppContext {
                 ) {
                     RouterPin::StartAtBrowser => {
                         req.skip_http = true;
-                        tier_note = Some(
-                            "http tier skipped: learned host preference (persistent http losses)"
-                                .to_string(),
-                        );
+                        tier_note = Some(format!("http tier skipped: {BROWSER_PIN_REASON}"));
                     }
                     RouterPin::ConsultRecipes => {
                         req.use_recipes = true;
-                        recipe_note = Some(
-                            "api_recipe tier consulted: learned host preference (a validated                              recipe last served this host)"
-                                .to_string(),
-                        );
+                        recipe_note =
+                            Some(format!("api_recipe tier consulted: {RECIPE_PIN_REASON}"));
                     }
                     RouterPin::None => {}
                 },
@@ -468,7 +463,7 @@ impl AppContext {
                 cache_hit: None,
                 latency_ms: 0,
                 cost_usd: None,
-                detail: Some("learned host preference (persistent http losses)".to_string()),
+                detail: Some(BROWSER_PIN_REASON.to_string()),
             });
             outcome.escalations.push(note);
         }
@@ -1046,6 +1041,26 @@ pub async fn apply_schedule_requests(
 /// `[recipes] enabled`, `[fetcher] xray` or the per-request `use_recipes` say
 /// so, and a pin said none of those things. The anti-pattern the tests name:
 /// `api_recipe_pin_not_left_as_decoration`.
+/// Why a `browser` pin re-routed a fetch, in the words the operator reads.
+///
+/// One literal for two surfaces: the structured `TierTrace.detail` and the
+/// human trail line `AppContext::fetch` pushes onto `escalations` (which
+/// `fetch_cost_detail` then writes into the job's receipt). They were two
+/// copies of one sentence, so a reworded trail line would silently have stopped
+/// matching the trace beside it.
+pub(crate) const BROWSER_PIN_REASON: &str = "learned host preference (persistent http losses)";
+
+/// Why an `api_recipe` pin consulted recipes ahead of the live ladder.
+///
+/// This one shipped with a thirty-space run inside it — a wrapped source line
+/// whose indentation landed *in the string* rather than between two of them.
+/// It reached the job's receipt verbatim through `escalations` ->
+/// `fetch_cost_detail`, where nothing collapses whitespace. Hoisted to a const
+/// so it is one line of source with no wrap to mangle, and pinned by
+/// `a_pin_note_reads_as_one_sentence_on_the_receipt`.
+pub(crate) const RECIPE_PIN_REASON: &str =
+    "learned host preference (a validated recipe last served this host)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouterPin {
     /// No pin, or a pin this request already satisfies / must not honour.
@@ -1378,6 +1393,40 @@ mod tests {
         success_spend_event, FetchOutcome, RouterPin,
     };
     use serde_json::json;
+
+    /// THE ANTI-PATTERN: a wrapped source line whose indentation landed INSIDE
+    /// the string. The `api_recipe` pin's trail line carried thirty consecutive
+    /// spaces mid-sentence, and it is not an internal log: `fetch` pushes it
+    /// onto `FetchOutcome.escalations`, `fetch_cost_detail` joins those into the
+    /// cost event's `detail`, and that is the row a job's receipt keeps about
+    /// the fetch. Nothing between here and the operator collapses whitespace.
+    #[test]
+    fn a_pin_note_reads_as_one_sentence_on_the_receipt() {
+        for reason in [super::BROWSER_PIN_REASON, super::RECIPE_PIN_REASON] {
+            assert!(
+                !reason.contains("  "),
+                "a receipt line must not carry a run of spaces: {reason:?}"
+            );
+            assert_eq!(
+                reason.trim(),
+                reason,
+                "nor lead or trail with whitespace: {reason:?}"
+            );
+            assert!(
+                !reason.contains('\n'),
+                "nor a newline, which would split the joined detail: {reason:?}"
+            );
+            assert!(
+                reason.starts_with("learned host preference"),
+                "both pins say WHY in the same words, so the two trail lines \
+                 read as one vocabulary: {reason:?}"
+            );
+        }
+        // The browser pin's reason is the single source for both the structured
+        // `TierTrace.detail` and the human trail line; the recipe pin has no
+        // trace entry of its own, by design.
+        assert_ne!(super::BROWSER_PIN_REASON, super::RECIPE_PIN_REASON);
+    }
 
     /// THE ANTI-PATTERN: one fixed `network-capture.json`. `xray` runs once per
     /// captured page, so the second page's captures silently replaced the
