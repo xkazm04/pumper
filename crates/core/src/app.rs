@@ -222,16 +222,15 @@ impl AppContext {
     pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         // `name` may be composed from job params (e.g. census `cbp-{naics}.json`),
         // so reject anything that isn't a single safe segment — otherwise a `..`
-        // or absolute name escapes the per-job artifact dir.
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\\')
-            || std::path::Path::new(name).is_absolute()
-        {
-            return Err(Error::App(format!("unsafe artifact name: {name:?}")));
-        }
+        // or absolute name escapes the per-job artifact dir. Through the SHARED
+        // `safe_path_segment`, not a second copy of its predicate: this method
+        // used to re-type the same six clauses inline, so the repo had one rule
+        // with two implementations and a test on only one of them. Hardening the
+        // guard for the read path would silently have left the write path on the
+        // old rule.
+        // `safe_path_segment` already renders `unsafe artifact name: "..."`, so
+        // the operator-visible message is byte-identical to the inline guard's.
+        safe_path_segment(name, "artifact name").map_err(Error::App)?;
         tokio::fs::create_dir_all(&self.artifacts_dir).await?;
         let path = self.artifacts_dir.join(name);
         tokio::fs::write(&path, bytes).await?;
