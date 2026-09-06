@@ -645,9 +645,12 @@ impl AppContext {
         if page.network.is_empty() {
             return Ok((0, 0));
         }
-        // Raw captures land beside the job's other artifacts for inspection.
+        // Raw captures land beside the job's other artifacts for inspection —
+        // one file per captured page, because this method is called once per
+        // page (see `network_capture_name`).
         let bytes = serde_json::to_vec_pretty(&page.network)?;
-        self.save_artifact("network-capture.json", &bytes).await?;
+        self.save_artifact(&network_capture_name(&bytes), &bytes)
+            .await?;
 
         let candidates = crate::recipes::discover_recipes(&page.network, extracted);
         let mut stored = 0usize;
@@ -1178,6 +1181,29 @@ impl Requirement {
     }
 }
 
+/// The artifact name one X-ray capture is written under.
+///
+/// THE ANTI-PATTERN THIS CLOSES: a fixed `network-capture.json`.
+/// [`AppContext::xray`] is called once per captured *page* — the only caller,
+/// `extractor::xray_captures`, loops over every document in the run — so under
+/// one name the Nth call overwrote the previous N−1. A forty-page run left a
+/// single file while the return value counted every capture and the feature doc
+/// promised all of them were on disk; the raw payloads the recipe heuristic
+/// scored were exactly what an operator could no longer inspect.
+///
+/// Content-addressed over the serialized captures rather than over the page
+/// URL, because the caller that exists rebuilds a bare `RenderedPage` carrying
+/// only `network` — there is no URL to key on. Two consequences, both wanted:
+/// identical captures collapse onto one file (a re-run rewrites instead of
+/// accumulating), and distinct ones cannot collide.
+fn network_capture_name(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "network-capture-{}.json",
+        hex::encode(&Sha256::digest(bytes)[..8])
+    )
+}
+
 /// Whether an environment variable's value actually satisfies a
 /// [`Requirement::Env`] — present **and** not blank.
 ///
@@ -1336,10 +1362,34 @@ pub trait ScrapeApp: Send + Sync {
 mod tests {
     use super::{
         app_managed_by, budget_exhausted_error, budget_is_exhausted, env_value_satisfies,
-        fetch_cost_detail, router_pin, safe_path_segment, schedule_request, success_spend_event,
-        FetchOutcome, RouterPin,
+        fetch_cost_detail, network_capture_name, router_pin, safe_path_segment, schedule_request,
+        success_spend_event, FetchOutcome, RouterPin,
     };
     use serde_json::json;
+
+    /// THE ANTI-PATTERN: one fixed `network-capture.json`. `xray` runs once per
+    /// captured page, so the second page's captures silently replaced the
+    /// first's — a forty-page run left one file while the return value counted
+    /// forty and the feature doc said all of them had landed.
+    #[test]
+    fn a_second_captured_page_does_not_overwrite_the_first() {
+        let a = network_capture_name(br#"[{"url":"https://a.test/api"}]"#);
+        let b = network_capture_name(br#"[{"url":"https://b.test/api"}]"#);
+        assert_ne!(a, b, "two pages' captures must land in two files");
+        assert_eq!(
+            a,
+            network_capture_name(br#"[{"url":"https://a.test/api"}]"#),
+            "the same capture keeps the same name: a re-run rewrites one file \
+             instead of accumulating a copy per attempt"
+        );
+        assert!(
+            a.starts_with("network-capture-") && a.ends_with(".json"),
+            "{a}"
+        );
+        // The generated name goes straight into `save_artifact`, so it must
+        // clear the very guard that method applies to it.
+        assert!(safe_path_segment(&a, "artifact name").is_ok(), "{a}");
+    }
 
     /// THE ANTI-PATTERN: `std::env::var(name).is_ok()`, under which a variable
     /// set to the empty string reports the app READY. `.env` carries a bare
