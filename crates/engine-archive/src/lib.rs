@@ -120,6 +120,17 @@ impl ArchiveEngine {
                 }
             }
         }
+        // An inverted window is refused rather than queried: CDX answers it with
+        // an empty body, which is the same answer as "never archived here" (see
+        // `inverted_cdx_range`).
+        if inverted_cdx_range(from, to) {
+            return Err(Error::Http(format!(
+                "archive range for {url} is empty by construction: 'from' {} is after 'to' {} \
+                 — narrow the window, do not invert it",
+                from.unwrap_or_default(),
+                to.unwrap_or_default()
+            )));
+        }
         let max = max.max(1);
         let req = HttpRequest::get(cdx_range_query_url(&self.base_url, url, from, to, max + 1));
         let resp = self.inner.fetch(req).await?;
@@ -190,6 +201,46 @@ pub fn cdx_range_query_url(
 /// `YYYYMMDDhhmmss` timestamp or any prefix, e.g. `2019` or `201906`).
 pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Widens a digit-prefix bound to a full 14-digit timestamp at the extreme it
+/// stands for: `filler` is `b'0'` for a lower bound (the earliest instant the
+/// prefix admits) and `b'9'` for an upper one (the latest). The padded upper
+/// bound is not a real datetime — it does not need to be, because two 14-digit
+/// numeric strings order the same way the instants they denote do.
+fn widen_cdx_bound(bound: &str, filler: u8) -> String {
+    let mut s = String::with_capacity(CDX_TS_LEN);
+    s.push_str(bound);
+    while s.len() < CDX_TS_LEN {
+        s.push(filler as char);
+    }
+    s
+}
+
+/// Whether a `from`/`to` pair names a window that is **empty by construction** —
+/// `from` strictly after `to`.
+///
+/// THE ANTI-PATTERN THIS CLOSES: both bounds pass [`valid_cdx_bound`]
+/// individually, nothing compared them, and CDX answers an inverted range with
+/// an empty body. [`ArchiveEngine::list_snapshots`] then returned
+/// `SnapshotList { snapshots: [], truncated: false }` — byte-identical to the
+/// answer for a URL that was genuinely never archived in that window. The
+/// caller cannot tell a typo from a fact.
+///
+/// It is not a hypothetical typo, either: the documented way to resume a
+/// truncated enumeration (`extractor/src/lib.rs:31`) is to *narrow the
+/// `from`/`to` window*, so the workflow that produces these pairs by hand is
+/// exactly the workflow this engine ships for.
+///
+/// Bounds are prefixes of different lengths (`2019` against `20200630`), so
+/// each is widened to the extreme it denotes before comparing: `from=2020,
+/// to=2019` becomes `20200000000000 > 20199999999999` and is refused, while
+/// `from=2019, to=2019` widens to a whole year and is not.
+fn inverted_cdx_range(from: Option<&str>, to: Option<&str>) -> bool {
+    let (Some(from), Some(to)) = (from, to) else {
+        return false;
+    };
+    widen_cdx_bound(from, b'0') > widen_cdx_bound(to, b'9')
 }
 
 /// Raw snapshot-body URL: the `id_` flag asks Wayback for the archived bytes
@@ -494,6 +545,39 @@ mod tests {
         assert!(!u.contains("&from=") && !u.contains("&to="));
     }
 
+    /// THE ANTI-PATTERN: two bounds each valid on their own, never compared to
+    /// each other. CDX answers an inverted range with an empty body, so
+    /// `list_snapshots` returned an empty, untruncated list — the exact same
+    /// value it returns for a URL genuinely never archived in that window. The
+    /// documented way to resume a truncated enumeration is to narrow `from`/`to`
+    /// by hand, so this is the mistake the shipped workflow invites.
+    #[test]
+    fn an_inverted_range_is_not_the_same_as_no_captures() {
+        assert!(inverted_cdx_range(Some("2020"), Some("2019")));
+        assert!(inverted_cdx_range(
+            Some("20200101000000"),
+            Some("20190101000000")
+        ));
+        // Prefixes of different lengths widen to the extreme each denotes.
+        assert!(
+            inverted_cdx_range(Some("20200701"), Some("2019")),
+            "a July 2020 lower bound is after all of 2019"
+        );
+        assert!(
+            !inverted_cdx_range(Some("2019"), Some("20190101")),
+            "a whole-year lower bound starts before 1 Jan of that year ends"
+        );
+        assert!(
+            !inverted_cdx_range(Some("2019"), Some("2019")),
+            "one year to itself is a real window, not an inversion"
+        );
+        assert!(!inverted_cdx_range(Some("2019"), Some("2020")));
+        // An open-ended window cannot be inverted.
+        assert!(!inverted_cdx_range(Some("2020"), None));
+        assert!(!inverted_cdx_range(None, Some("2019")));
+        assert!(!inverted_cdx_range(None, None));
+    }
+
     #[test]
     fn cdx_bounds_validate_digit_prefixes() {
         assert!(valid_cdx_bound("2019"));
@@ -621,6 +705,33 @@ mod tests {
             "{err}"
         );
         assert!(inner.seen.lock().unwrap().is_empty());
+    }
+
+    /// An inverted window is refused at the door, like a malformed bound — and
+    /// for the same reason: the answer CDX would give (an empty body) is
+    /// indistinguishable from the answer for a URL with no captures in range,
+    /// so querying it would spend a request to buy an ambiguous result.
+    #[tokio::test]
+    async fn list_snapshots_refuses_an_inverted_window_instead_of_reporting_it_empty() {
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: String::new(),
+            page_body: String::new(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .list_snapshots("https://example.com/", Some("2020"), Some("2019"), 10)
+            .await
+            .expect_err("an inverted window is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("empty by construction"), "{msg}");
+        assert!(
+            msg.contains("2020") && msg.contains("2019"),
+            "the refusal must show the operator both bounds it compared: {msg}"
+        );
+        assert!(
+            inner.seen.lock().unwrap().is_empty(),
+            "refusing must cost no CDX request"
+        );
     }
 
     #[test]
