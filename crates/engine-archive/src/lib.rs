@@ -200,6 +200,36 @@ pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Why the newest-capture lookup produced nothing, told apart by what the CDX
+/// index actually sent back.
+///
+/// THE ANTI-PATTERN THIS CLOSES: one sentence, "no archive snapshot recorded
+/// for <url>", for two different facts. `parse_cdx_first_line` returns `None`
+/// both for an empty body (the archive genuinely holds no 200-status capture)
+/// and for a body whose every line failed to parse (the archive answered and
+/// this engine could not read it — a changed field order, an HTML error page
+/// served with a 200, a truncated response). The first is a fact about the
+/// world and the correct answer is "fall through to the live ladder and stop
+/// asking". The second is a fact about this parser, and reporting it as the
+/// first sends an operator to check a URL's archive coverage when what broke
+/// is here. `copy-auditor`'s misdirection class, in a tier-zero miss that
+/// nothing else in the stack will ever contradict.
+///
+/// Both remain typed [`Error::Http`] misses, because both must still fall
+/// through — the tiered fetcher's behaviour is unchanged and only the sentence
+/// differs.
+fn no_snapshot_reason(body: &str, url: &str) -> Error {
+    if body.trim().is_empty() {
+        return Error::Http(format!("no archive snapshot recorded for {url}"));
+    }
+    let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    Error::Http(format!(
+        "unreadable archive CDX index for {url}: {lines} row(s) came back and none parsed as \
+         `urlkey timestamp original ...` with a 14-digit timestamp — the archive answered, this \
+         engine could not read it"
+    ))
+}
+
 /// The error one failed CDX request raises — the same sentence for both CDX
 /// call sites, carrying the cause when the status has a known one.
 ///
@@ -389,7 +419,7 @@ impl HttpClient for ArchiveEngine {
             return Err(cdx_failure("query", &req.url, cdx_resp.status));
         }
         let snap = parse_cdx_first_line(&cdx_resp.body)
-            .ok_or_else(|| Error::Http(format!("no archive snapshot recorded for {}", req.url)))?;
+            .ok_or_else(|| no_snapshot_reason(&cdx_resp.body, &req.url))?;
         let captured = snapshot_datetime(&snap.timestamp).ok_or_else(|| {
             Error::Http(format!(
                 "unparseable archive capture timestamp '{}' for {}",
@@ -634,6 +664,82 @@ mod tests {
         assert!(cdx_failure("range query", "https://a/", 500)
             .to_string()
             .contains("archive CDX range query for https://a/ failed: status 500"));
+    }
+
+    /// THE ANTI-PATTERN: one sentence for two facts. "No archive snapshot
+    /// recorded for X" was raised both when the index was empty (true, and the
+    /// operator should stop asking) and when the index answered with rows this
+    /// parser could not read (false, and the operator should look here). The
+    /// second sent people to check a URL's archive coverage over a bug in the
+    /// field-order assumption.
+    #[test]
+    fn an_unreadable_index_is_not_reported_as_an_unarchived_url() {
+        let absent = no_snapshot_reason("", "https://example.com/").to_string();
+        assert!(absent.contains("no archive snapshot recorded"), "{absent}");
+        assert!(
+            no_snapshot_reason("\n   \n", "https://example.com/")
+                .to_string()
+                .contains("no archive snapshot recorded"),
+            "a whitespace-only body is still an empty index"
+        );
+
+        // Rows came back and none parsed: a changed field order, an HTML error
+        // page served with a 200, a truncated response.
+        let garbage = no_snapshot_reason(
+            "<html><body>Server Error</body></html>\n",
+            "https://example.com/",
+        )
+        .to_string();
+        assert!(
+            garbage.contains("unreadable archive CDX index"),
+            "{garbage}"
+        );
+        assert!(
+            !garbage.contains("no archive snapshot recorded"),
+            "the two facts must not share a sentence: {garbage}"
+        );
+        assert!(garbage.contains("1 row"), "the count is shown: {garbage}");
+
+        // A body of well-formed rows never reaches here (parse succeeds), so
+        // the only multi-row case is the unreadable one - and it counts them.
+        let two = no_snapshot_reason("bad one\nbad two\n", "https://example.com/").to_string();
+        assert!(two.contains("2 row"), "{two}");
+    }
+
+    /// The same distinction, driven through the engine so the miss path is
+    /// proved to REACH it rather than merely to have it available.
+    #[tokio::test]
+    async fn both_empty_and_unreadable_indexes_miss_but_say_which() {
+        let (engine, _) = engine_over(ScriptedInner {
+            cdx_body: String::new(),
+            page_body: "never served".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("an empty index is a miss");
+        assert!(err.to_string().contains("no archive snapshot"), "{err}");
+
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: "<html>rate limited</html>\n".into(),
+            page_body: "never served".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("an unreadable index is also a miss");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+        assert!(
+            matches!(err, Error::Http(_)),
+            "both stay typed misses so the tiered fetcher still falls through"
+        );
+        assert_eq!(
+            inner.seen.lock().unwrap().len(),
+            1,
+            "no snapshot body is fetched on either miss"
+        );
     }
 
     #[test]
