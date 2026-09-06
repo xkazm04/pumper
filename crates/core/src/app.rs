@@ -1027,10 +1027,6 @@ pub async fn apply_schedule_requests(
     out
 }
 
-/// This build's identity, stamped on every run row so a fleet-wide break
-/// correlates with a deploy in one query instead of looking like thirty sites
-/// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
-/// else the crate version.
 /// What the learned tier pin for a host does to one fetch request.
 ///
 /// The router used to branch on `browser` and nothing else, so the third
@@ -1100,6 +1096,10 @@ pub(crate) fn router_pin(
     }
 }
 
+/// This build's identity, stamped on every run row so a fleet-wide break
+/// correlates with a deploy in one query instead of looking like thirty sites
+/// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
+/// else the crate version.
 fn build_id() -> Option<String> {
     Some(std::env::var("PUMPER_BUILD_ID").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()))
 }
