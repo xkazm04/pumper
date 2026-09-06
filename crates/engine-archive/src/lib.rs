@@ -135,10 +135,7 @@ impl ArchiveEngine {
         let req = HttpRequest::get(cdx_range_query_url(&self.base_url, url, from, to, max + 1));
         let resp = self.inner.fetch(req).await?;
         if !resp.is_success() {
-            return Err(Error::Http(format!(
-                "archive CDX range query for {url} failed: status {}",
-                resp.status
-            )));
+            return Err(cdx_failure("range query", url, resp.status));
         }
         let list = select_snapshots(parse_cdx_lines(&resp.body), max);
         debug!(
@@ -201,6 +198,34 @@ pub fn cdx_range_query_url(
 /// `YYYYMMDDhhmmss` timestamp or any prefix, e.g. `2019` or `201906`).
 pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The error one failed CDX request raises — the same sentence for both CDX
+/// call sites, carrying the cause when the status has a known one.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `failed: status 400`, and nothing else. This
+/// module's own header records a live-verified fact — *the CDX API returns 400
+/// for requests without a User-Agent header* — and that fact sat four hundred
+/// lines away from the only place an operator ever meets the 400. The
+/// production `HttpEngine` always sets one from `[http] user_agent`, so the
+/// person who hits this is by definition the one who wired a different inner
+/// client, which is exactly the reader who cannot know why.
+///
+/// Only the 400 carries a cause. Every other status gets the bare status
+/// deliberately: this engine is tier zero and any error here means "fall
+/// through to the live ladder", so guessing at causes it has not verified
+/// would trade one unhelpful message for a misleading one.
+fn cdx_failure(what: &str, url: &str, status: u16) -> Error {
+    let cause = if status == 400 {
+        " — the CDX API answers 400 to a request with no User-Agent header, \
+         so the inner HttpClient must set one (the production HTTP engine \
+         does, via `[http] user_agent`)"
+    } else {
+        ""
+    };
+    Error::Http(format!(
+        "archive CDX {what} for {url} failed: status {status}{cause}"
+    ))
 }
 
 /// Widens a digit-prefix bound to a full 14-digit timestamp at the extreme it
@@ -361,10 +386,7 @@ impl HttpClient for ArchiveEngine {
         cdx_req.timeout_secs = req.timeout_secs;
         let cdx_resp = self.inner.fetch(cdx_req).await?;
         if !cdx_resp.is_success() {
-            return Err(Error::Http(format!(
-                "archive CDX query for {} failed: status {}",
-                req.url, cdx_resp.status
-            )));
+            return Err(cdx_failure("query", &req.url, cdx_resp.status));
         }
         let snap = parse_cdx_first_line(&cdx_resp.body)
             .ok_or_else(|| Error::Http(format!("no archive snapshot recorded for {}", req.url)))?;
@@ -578,6 +600,42 @@ mod tests {
         assert!(!inverted_cdx_range(None, None));
     }
 
+    /// THE ANTI-PATTERN: `failed: status 400` with the cause documented four
+    /// hundred lines away in the module header. The 400 has exactly one known
+    /// trigger (a CDX request with no User-Agent), and the only operator who
+    /// can hit it is one who wired a non-production inner client — the reader
+    /// least able to guess. Both CDX call sites now raise the one sentence.
+    #[test]
+    fn a_cdx_400_names_the_missing_user_agent_instead_of_only_its_status() {
+        let msg = cdx_failure("query", "https://example.com/", 400).to_string();
+        assert!(msg.contains("status 400"), "{msg}");
+        assert!(
+            msg.contains("User-Agent"),
+            "the known cause is named: {msg}"
+        );
+        assert!(msg.contains("user_agent"), "and the setting that fixes it");
+
+        // Every other status stays bare rather than guessing at a cause this
+        // engine has not verified.
+        for status in [403u16, 429, 500, 503] {
+            let msg = cdx_failure("range query", "https://example.com/", status).to_string();
+            assert!(msg.contains(&format!("status {status}")), "{msg}");
+            assert!(
+                !msg.contains("User-Agent"),
+                "a {status} must not be blamed on the header: {msg}"
+            );
+        }
+
+        // One sentence, two call sites - only the noun differs. (`Error::Http`
+        // adds its own Display prefix, so this matches the body, not the head.)
+        assert!(cdx_failure("query", "https://a/", 500)
+            .to_string()
+            .contains("archive CDX query for https://a/ failed: status 500"));
+        assert!(cdx_failure("range query", "https://a/", 500)
+            .to_string()
+            .contains("archive CDX range query for https://a/ failed: status 500"));
+    }
+
     #[test]
     fn cdx_bounds_validate_digit_prefixes() {
         assert!(valid_cdx_bound("2019"));
@@ -788,6 +846,54 @@ mod tests {
                 cache_hit: false,
             })
         }
+    }
+
+    /// Inner stub that answers every request with one non-success status —
+    /// the shape an operator hits when their inner client sends no User-Agent.
+    struct FailingInner(u16);
+
+    #[async_trait]
+    impl HttpClient for FailingInner {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: self.0,
+                headers: HashMap::new(),
+                body: String::new(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn engine_over_failing(status: u16) -> ArchiveEngine {
+        let cfg = ArchiveConfig {
+            enabled: true,
+            base_url: "https://web.archive.org".into(),
+        };
+        ArchiveEngine::new(&cfg, Arc::new(FailingInner(status)))
+    }
+
+    /// Both CDX doors must REACH the shared sentence, not merely produce an
+    /// equivalent one of their own — the point of `cdx_failure` existing. Gut
+    /// it and this goes red for both `fetch` and `list_snapshots`.
+    #[tokio::test]
+    async fn both_cdx_doors_surface_the_cause_of_a_400() {
+        let engine = engine_over_failing(400);
+
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("a 400 from CDX is a miss");
+        assert!(err.to_string().contains("User-Agent"), "fetch: {err}");
+
+        let err = engine
+            .list_snapshots("https://example.com/", None, None, 5)
+            .await
+            .expect_err("a 400 from CDX is a failure");
+        assert!(
+            err.to_string().contains("User-Agent"),
+            "list_snapshots: {err}"
+        );
     }
 
     fn engine_over(inner: ScriptedInner) -> (ArchiveEngine, Arc<ScriptedInner>) {
