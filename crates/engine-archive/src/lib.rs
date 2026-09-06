@@ -211,6 +211,46 @@ pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Header names never forwarded to the archive: the ones that carry a secret.
+///
+/// Compared lowercased, and a name is dropped if it *contains* any of these, so
+/// `X-Api-Key`, `X-Auth-Token` and `Proxy-Authorization` are all caught by two
+/// entries rather than by an enumeration nobody maintains.
+const CREDENTIAL_HEADER_MARKERS: &[&str] = &["authorization", "cookie", "api-key", "auth-token"];
+
+/// The caller's headers, minus anything that carries a credential.
+///
+/// **This is a guard, not a fix for a reachable leak, and the distinction is
+/// worth stating.** `AppContext::fetch` reaches this engine through
+/// `FetchRequest`, which has no `headers` field at all, and the one place that
+/// does set `HttpRequest::headers` to a credential (`apps/peer/src/mesh.rs`
+/// sends an API key) calls `ctx.engines.http` directly and never touches the
+/// archive tier. So nothing leaks today — traced, not assumed.
+///
+/// What made it safe, though, is the *absence* of a field on someone else's
+/// struct, not a decision anyone took here. The day `FetchRequest` grows
+/// `headers` (a reasonable thing to want: per-request `Accept-Language`, a
+/// site-specific token), this engine would begin forwarding the origin's
+/// credentials to archive.org, silently, on the tier that runs FIRST and
+/// therefore on every fetch. The guard costs a `retain` and makes that
+/// impossible instead of unlikely.
+///
+/// Content-negotiation headers are kept: `Accept`, `Accept-Language` and a
+/// custom `User-Agent` all mean the same thing to the archive as to the origin,
+/// and the CDX API requires the last of them.
+fn headers_safe_for_the_archive(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !CREDENTIAL_HEADER_MARKERS.iter().any(|m| lower.contains(m))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Why the newest-capture lookup produced nothing, told apart by what the CDX
 /// index actually sent back.
 ///
@@ -458,7 +498,10 @@ impl HttpClient for ArchiveEngine {
         body_req.ttl_override = req.ttl_override;
         body_req.max_body_bytes = req.max_body_bytes;
         body_req.timeout_secs = req.timeout_secs;
-        body_req.headers = req.headers.clone();
+        // The caller's headers were composed for the ORIGIN site; this request
+        // goes to archive.org. Credential-class headers are dropped rather than
+        // forwarded to a third party (see `headers_safe_for_the_archive`).
+        body_req.headers = headers_safe_for_the_archive(&req.headers);
         let mut resp = self.inner.fetch(body_req).await?;
         debug!(
             url = %req.url,
@@ -751,6 +794,62 @@ mod tests {
             1,
             "no snapshot body is fetched on either miss"
         );
+    }
+
+    /// THE ANTI-PATTERN: forwarding the caller's whole header map to a third
+    /// party because it happened to arrive on the request. The headers were
+    /// composed for the ORIGIN site; the snapshot fetch goes to archive.org.
+    /// Nothing reaches this with a credential today — `FetchRequest` has no
+    /// `headers` field, and the one credential-setting caller
+    /// (`apps/peer/src/mesh.rs`) goes straight to `engines.http` — so what this
+    /// pins is that the day either of those changes, the secret still does not
+    /// travel.
+    #[test]
+    fn a_credential_meant_for_the_origin_is_not_forwarded_to_the_archive() {
+        let headers = HashMap::from([
+            (
+                "Authorization".to_string(),
+                "Bearer sk-live-abc".to_string(),
+            ),
+            ("Cookie".to_string(), "session=deadbeef".to_string()),
+            ("X-Api-Key".to_string(), "k-123".to_string()),
+            ("x-auth-token".to_string(), "t-456".to_string()),
+            ("PROXY-AUTHORIZATION".to_string(), "Basic zzz".to_string()),
+            // Content negotiation means the same thing to the archive.
+            ("Accept-Language".to_string(), "cs-CZ".to_string()),
+            ("Accept".to_string(), "text/html".to_string()),
+            ("User-Agent".to_string(), "pumper/1.0".to_string()),
+        ]);
+        let safe = headers_safe_for_the_archive(&headers);
+
+        for secret in ["sk-live-abc", "deadbeef", "k-123", "t-456", "zzz"] {
+            assert!(
+                !safe.values().any(|v| v.contains(secret)),
+                "{secret} must not reach archive.org: {safe:?}"
+            );
+        }
+        assert_eq!(
+            safe.len(),
+            3,
+            "only the negotiation headers survive: {safe:?}"
+        );
+        assert_eq!(
+            safe.get("Accept-Language").map(String::as_str),
+            Some("cs-CZ")
+        );
+        assert_eq!(
+            safe.get("User-Agent").map(String::as_str),
+            Some("pumper/1.0"),
+            "the CDX API requires a User-Agent, so it must never be scrubbed"
+        );
+        // Casing is not a bypass.
+        assert!(headers_safe_for_the_archive(&HashMap::from([(
+            "aUtHoRiZaTiOn".to_string(),
+            "Bearer x".to_string()
+        )]))
+        .is_empty());
+        // An empty map stays empty rather than gaining anything.
+        assert!(headers_safe_for_the_archive(&HashMap::new()).is_empty());
     }
 
     #[test]
