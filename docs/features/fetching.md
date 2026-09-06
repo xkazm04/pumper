@@ -62,6 +62,19 @@ Three properties worth knowing:
 
 Historical **backfill** over a date range is a different surface — the extractor app's `source.archive` mode, which enumerates CDX captures and tags records `_fetched_via: "wayback"`. See [extraction.md](extraction.md).
 
+### What an archive miss tells you
+
+Every failure here is a fall-through, so the *message* is the only thing that ever distinguishes them — nothing downstream will contradict it, because the live ladder then succeeds. Four are told apart deliberately:
+
+| Situation | What you get |
+| --- | --- |
+| The index holds no 200-status capture | `no archive snapshot recorded for <url>` — a fact about the world; stop asking |
+| The index answered and none of its rows parsed | `unreadable archive CDX index for <url>: <n> row(s) came back and none parsed…` — a fact about **this engine** (a changed CDX field order, an HTML error page served with a 200, a truncated response). It used to share the sentence above, which sent people to check a URL's archive coverage when the parser was what broke |
+| The CDX request returned `400` | the status **plus its one known cause**: the CDX API refuses a request with no `User-Agent`. The production HTTP engine always sets one from `[http] user_agent`, so this only reaches somebody who wired a different inner client. Other statuses stay bare rather than guessing at causes this engine has not verified |
+| `list_snapshots` was given `from` after `to` | refused before any request: `archive range for <url> is empty by construction…`. CDX answers an inverted window with an empty body — the same value as "no captures in this range" — and narrowing `from`/`to` by hand is the documented way to resume a truncated enumeration, so it is the mistake the workflow invites. Bounds are digit prefixes of different lengths, so each is widened to the extreme it denotes: `from=2019, to=20190101` is a real window, `from=20200701, to=2019` is not |
+
+**Only content-negotiation headers reach archive.org.** A snapshot fetch forwards `Accept`, `Accept-Charset`, `Accept-Language` and `User-Agent` (which the CDX API requires) from the caller's request, and drops everything else. It is an allowlist rather than a scrub of credential-looking names, per the registry's `broker-proxy-attaches-secret`: a denylist forwards whatever header is invented next. Nothing routes a credential here today — `FetchRequest` carries no headers at all — so this is a guard against the day it does, on the tier that runs first and therefore on every fetch.
+
 ## Engine capability contract
 
 The capability traits (`HttpClient`, `Browser`, `Researcher`) carry **default-bodied** methods, so an engine that does not implement one still compiles. Two rules keep that from becoming a silent hole, both enforced by the cross-engine conformance battery in `crates/server/src/e2e/engine_conformance.rs` (it lives there because `crates/core` depends on no engine crate, so only the server can see every implementor at once):
