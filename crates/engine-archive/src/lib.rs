@@ -211,12 +211,23 @@ pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Header names never forwarded to the archive: the ones that carry a secret.
+/// The **only** request headers forwarded to the archive: content negotiation,
+/// plus the `User-Agent` the CDX API requires.
 ///
-/// Compared lowercased, and a name is dropped if it *contains* any of these, so
-/// `X-Api-Key`, `X-Auth-Token` and `Proxy-Authorization` are all caught by two
-/// entries rather than by an enumeration nobody maintains.
-const CREDENTIAL_HEADER_MARKERS: &[&str] = &["authorization", "cookie", "api-key", "auth-token"];
+/// An allowlist, not a denylist of credential-ish names, and that is the
+/// registry's call rather than this file's taste — `software-engineering /
+/// browser-credential-boundary / broker-proxy-attaches-secret` puts it plainly:
+/// *"A denylist fails the same way it always fails: the header added to the
+/// protocol next year is forwarded by default, and nobody who added it knew
+/// about your route."* A first pass here shipped exactly that denylist
+/// (`authorization`, `cookie`, `api-key`, `auth-token` as substrings), which
+/// would have forwarded `X-Amz-Security-Token` and every future spelling.
+///
+/// Compared lowercased. The cost of the stricter form is that a genuinely
+/// useful new header must be added here deliberately, which is the direction
+/// this failure should point.
+const ARCHIVE_FORWARDABLE_HEADERS: &[&str] =
+    &["accept", "accept-charset", "accept-language", "user-agent"];
 
 /// The caller's headers, minus anything that carries a credential.
 ///
@@ -235,9 +246,10 @@ const CREDENTIAL_HEADER_MARKERS: &[&str] = &["authorization", "cookie", "api-key
 /// therefore on every fetch. The guard costs a `retain` and makes that
 /// impossible instead of unlikely.
 ///
-/// Content-negotiation headers are kept: `Accept`, `Accept-Language` and a
-/// custom `User-Agent` all mean the same thing to the archive as to the origin,
-/// and the CDX API requires the last of them.
+/// What survives is [`ARCHIVE_FORWARDABLE_HEADERS`]: the negotiation headers,
+/// which mean the same thing to the archive as to the origin, and `User-Agent`,
+/// which the CDX API requires. Everything else is dropped whether or not it
+/// looks like a secret — an allowlist does not need to recognise the danger.
 fn headers_safe_for_the_archive(
     headers: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -245,7 +257,7 @@ fn headers_safe_for_the_archive(
         .iter()
         .filter(|(name, _)| {
             let lower = name.to_ascii_lowercase();
-            !CREDENTIAL_HEADER_MARKERS.iter().any(|m| lower.contains(m))
+            ARCHIVE_FORWARDABLE_HEADERS.contains(&lower.as_str())
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
@@ -850,6 +862,35 @@ mod tests {
         .is_empty());
         // An empty map stays empty rather than gaining anything.
         assert!(headers_safe_for_the_archive(&HashMap::new()).is_empty());
+    }
+
+    /// AND IT MUST BE AN ALLOWLIST, not a denylist of credential-ish names.
+    /// The registry's `broker-proxy-attaches-secret` states the reason a first
+    /// pass here got wrong: *"the header added to the protocol next year is
+    /// forwarded by default, and nobody who added it knew about your route."*
+    /// Each of these four carries a secret and matches none of the words a
+    /// denylist would have been written from, so under one shape they travel to
+    /// archive.org and under the other they do not.
+    #[test]
+    fn the_forward_set_is_an_allowlist_so_an_unrecognised_secret_still_stops() {
+        let exotic = HashMap::from([
+            ("X-Amz-Security-Token".to_string(), "IQoJb3Jp".to_string()),
+            ("Dpop".to_string(), "eyJhbGci".to_string()),
+            ("X-Csrf".to_string(), "9f2c".to_string()),
+            ("Signature".to_string(), "keyId=live".to_string()),
+        ]);
+        assert!(
+            headers_safe_for_the_archive(&exotic).is_empty(),
+            "an allowlist drops what it does not recognise, which is the point: \
+             none of these contains 'authorization', 'cookie', 'api-key' or \
+             'auth-token'"
+        );
+        // The set is exactly what it says, and nothing has crept into it.
+        assert_eq!(
+            super::ARCHIVE_FORWARDABLE_HEADERS,
+            ["accept", "accept-charset", "accept-language", "user-agent"],
+            "widening the forward set is a deliberate act, not a drive-by"
+        );
     }
 
     #[test]
