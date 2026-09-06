@@ -980,6 +980,16 @@ pub struct ScheduleRequestOutcome {
     /// Requests dropped because an existing row with that id is owned by
     /// somebody else — the ownership fence held.
     pub not_owned: usize,
+    /// Requests never looked at because the per-run cap was already spent.
+    ///
+    /// THE GAP THIS CLOSES: the surplus left through `.take(cap)` and was
+    /// counted nowhere — not `created`, not `rejected`, not `not_owned` — so
+    /// this struct's own promise above ("every number is reported") did not hold
+    /// for the one disposition an operator can actually act on by raising
+    /// `[worker] max_app_schedules_per_run`. With a cap of zero the run dropped
+    /// every request and `created + not_owned == 0` also suppressed the worker's
+    /// summary line, leaving no trace of any kind.
+    pub over_cap: usize,
 }
 
 /// Applies a run's schedule requests, fenced on `managed_by = "app:<name>"`.
@@ -993,7 +1003,10 @@ pub async fn apply_schedule_requests(
     requests: &[Value],
     cap: usize,
 ) -> ScheduleRequestOutcome {
-    let mut out = ScheduleRequestOutcome::default();
+    let mut out = ScheduleRequestOutcome {
+        over_cap: requests.len().saturating_sub(cap),
+        ..Default::default()
+    };
     for body in requests.iter().take(cap) {
         match schedule_request(requested_by, body) {
             Err(why) => out.rejected.push(why),

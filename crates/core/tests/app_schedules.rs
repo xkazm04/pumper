@@ -27,6 +27,19 @@ async fn an_apps_requests_become_real_rows_capped_by_the_per_run_ceiling() {
     );
     assert!(out.rejected.is_empty());
     assert_eq!(out.not_owned, 0);
+    // THE ANTI-PATTERN THIS FORBIDS: the surplus leaving through `.take(cap)`
+    // counted nowhere. Five asked, three written, and every disposition field
+    // reading zero — so the one outcome an operator can act on (raise
+    // `[worker] max_app_schedules_per_run`) was the one they could not see.
+    assert_eq!(
+        out.over_cap, 2,
+        "the surplus is REPORTED, not silently dropped"
+    );
+    assert_eq!(
+        out.created + out.not_owned + out.rejected.len() + out.over_cap,
+        requests.len(),
+        "every request must land in exactly one disposition bucket"
+    );
 
     let rows = store.storage.list_schedules().await.expect("list");
     assert_eq!(rows.len(), 3);
@@ -44,6 +57,15 @@ async fn an_apps_requests_become_real_rows_capped_by_the_per_run_ceiling() {
     let none = apply_schedule_requests(&store.storage, "research", &requests, 0).await;
     assert_eq!(none.created, 0);
     assert_eq!(store.storage.list_schedules().await.expect("list").len(), 3);
+    // …and says so. This is the case that used to leave NO trace at all: the
+    // worker's summary line is gated on `created > 0 || not_owned > 0`, both of
+    // which are zero here, so a run that dropped every request it made was
+    // indistinguishable from a run that made none.
+    assert_eq!(
+        none.over_cap,
+        requests.len(),
+        "a cap of zero drops all five audibly"
+    );
 }
 
 #[tokio::test]
