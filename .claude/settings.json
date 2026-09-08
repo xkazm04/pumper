@@ -11,5 +11,12 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(*--no-verify*)",
+      "Bash(git push*--force*)",
+      "Bash(git push* -f *)"
+    ]
   }
 }

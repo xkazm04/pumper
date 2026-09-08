@@ -119,6 +119,10 @@ Do not let a hard-won fact live only in the transcript.
 When docs disagree with each other, trust the code, then fix whichever doc is stale.
 
 <!-- personas:context-map:start -->
+## Git policy (harness-enforced)
+
+**Commit on the current branch; never push.** The owner pushes after reading the log. Do not push, force-push, or open a pull request unless this session's prompt asks for it. This line exists because the harness's own default for an unattended session is to push and open a draft PR when the file says nothing (measured 2026-09-08: without such a line the agent pushed; with it the agent stopped at the commit). The gate bypass is denied to agents at the permission layer (`.claude/settings.json` `permissions.deny`: `--no-verify`, force-push) - do not work around it; if a gate is red, fix the tree.
+
 ## Project Context Map
 
 This project is organized into **46 contexts** across **8 groups**. The full machine-readable map lives in `context-map.json` at the project root — read it at task start to scope your edits to the relevant context's files.
