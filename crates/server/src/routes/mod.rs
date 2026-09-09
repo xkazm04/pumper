@@ -56,7 +56,7 @@ mod events;
 mod health;
 mod host_weather;
 mod ingress;
-mod jobs;
+pub(crate) mod jobs;
 mod meta;
 mod provenance;
 mod provisioner;

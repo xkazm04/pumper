@@ -28,7 +28,19 @@ agents can discover apps, query datasets, search, watch events, and await
 jobs, but cannot create them. When enabled, every enqueue's `budget_usd`
 (`enqueue_job`, `deep_research`) is clamped to `max_job_budget_usd` (absent =
 the ceiling itself; `0` = free tiers only) — an agent cannot ask its way past
-the operator's rail.
+the operator's rail *on this door*.
+
+That qualifier is load-bearing. The clamp lives in the MCP module and
+`enqueue_app` takes the ceiling as an argument, so the rail is a property of this
+surface rather than of the job engine: `POST /jobs` validates the same field with
+`validate_budget_usd`, which passes the caller's number through untouched and
+treats an omitted `budget_usd` as *no ceiling at all*. Both doors sit on the same
+unauthenticated listener, so an agent that also holds a shell or a fetch tool on
+this host reaches the unclamped one. The asymmetry is deliberate — the operator at
+the REST surface is inside the trust boundary, the agent at the MCP surface is at
+it — but it means `allow_enqueue` and `max_job_budget_usd` bound what the *tool*
+will do, not what the *session* can cause. Bind the listener accordingly.
+(`mcp::tests::the_budget_rail_is_this_doors_property_not_the_engines` pins it.)
 
 ## Client config (`.mcp.json`)
 

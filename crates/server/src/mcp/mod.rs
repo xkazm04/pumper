@@ -1030,4 +1030,44 @@ mod tests {
         // Ceiling 0 = free tiers only, even when the agent asks for spend.
         assert_eq!(clamp_budget(Some(3.0), 0.0), 0.0);
     }
+
+    /// The budget rail is a property of THIS door, not of the engine behind it.
+    ///
+    /// `enqueue_app` takes the ceiling as an argument, so `clamp_budget` is the
+    /// only thing applying it and it is reachable only from the four MCP tool
+    /// handlers. The REST door (`POST /jobs`) validates the same field with
+    /// `routes::jobs::validate_budget_usd`, which refuses a non-positive budget
+    /// and otherwise passes the caller's number straight through — and treats an
+    /// omitted field as *no ceiling at all*.
+    ///
+    /// The asymmetry is deliberate and correct: the operator at the REST surface
+    /// is inside the trust boundary, the agent at the MCP surface is at it. What
+    /// this test pins is that it is an asymmetry between two doors on one
+    /// unauthenticated listener, not a property of the engine — so an agent that
+    /// also holds a shell or a fetch tool on this host reaches the unclamped one.
+    /// `docs/features/mcp.md` says the rail cannot be argued past; that is true of
+    /// this function and not of the deployment, and the doc now says which.
+    ///
+    /// If this test goes red the two doors have converged. That is a real change
+    /// in the security story, not a broken test: update the doc and delete this.
+    #[test]
+    fn the_budget_rail_is_this_doors_property_not_the_engines() {
+        use crate::routes::jobs::validate_budget_usd;
+
+        // Same requested budget, two doors, opposite answers.
+        assert_eq!(clamp_budget(Some(100.0), 1.0), 1.0, "MCP door clamps to the rail");
+        assert_eq!(
+            validate_budget_usd(Some(100.0)),
+            Ok(Some(100.0)),
+            "REST door passes the caller's number through untouched"
+        );
+
+        // The sharpest row is the omitted field: same absence, opposite meaning.
+        assert_eq!(clamp_budget(None, 1.0), 1.0, "MCP door: omitted = the rail");
+        assert_eq!(
+            validate_budget_usd(None),
+            Ok(None),
+            "REST door: omitted = NO spend ceiling"
+        );
+    }
 }
