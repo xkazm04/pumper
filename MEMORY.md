@@ -15,6 +15,7 @@ rediscover. Anything you can learn from a five-minute skim does not belong here.
 | [.perfect/Architect/backlog.md](.perfect/Architect/backlog.md) | The architectural queue: pending / shipped / abandoned, ranked by (reach × payoff) / (risk × effort). **Check "Pending" before proposing structural work.** |
 | [.perfect/Architect/decisions/](.perfect/Architect/decisions/) | ADR-style records, one per shipped decision, with the commits that carried it. |
 | [.perfect/Architect/coverage.md](.perfect/Architect/coverage.md) | Which themes/areas have been scanned and when — the anti-rescan ledger. |
+| [.perfect/Architect/kpi-baselines.md](.perfect/Architect/kpi-baselines.md) | The back-measure ledger: each goal's meters, the command behind each number, and the last reading. **Re-run the commands and diff; do not re-describe.** |
 | [.perfect/Architect/strong-patterns.md](.perfect/Architect/strong-patterns.md) | Patterns codified as house style. Follow them; don't reinvent. |
 | [.perfect/Architect/weak-patterns.md](.perfect/Architect/weak-patterns.md) | Known anti-patterns and where they still live. |
 | [.perfect/Architect/architect-preferences.md](.perfect/Architect/architect-preferences.md) | How the user wants scans run and proposals framed. |
