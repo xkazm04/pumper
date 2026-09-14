@@ -48,6 +48,12 @@ Not a `just ci` rung, but a CI job and the `commit-msg` hook, and red:
 
 - `just commit-lint` → exit 2, BLOCKED on master's own tip `2d3b9d8 ai: …` — `ai`
   is not in the type list, and the subject is 88 chars against a 72 advisory.
+  Scope matters here and is easy to get wrong: bare `just commit-lint` judges
+  **HEAD's subject only**, while the CI job passes `--range`, so master's history
+  is not re-judged on every PR. The finding is therefore not "CI is red"; it is
+  that a commit typed `ai:` reached master at all, which means the `commit-msg`
+  hook was bypassed, and that every future autopilot commit under that type will
+  be rejected by the hook and by CI.
 
 And one gate that cannot report a cannot-run in its own convention:
 
