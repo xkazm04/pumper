@@ -2,6 +2,8 @@
 name = "pumper-core"
 version.workspace = true
 edition.workspace = true
+# Path-only workspace member: never published to a registry.
+publish = false
 
 [features]
 # `storage` pulls sqlx + the SQLite-backed modules (Storage/Datasets/HttpCache +

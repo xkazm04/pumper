@@ -2,6 +2,8 @@
 name = "app-research"
 version.workspace = true
 edition.workspace = true
+# Path-only workspace member: never published to a registry.
+publish = false
 
 [dependencies]
 pumper-core.workspace = true
