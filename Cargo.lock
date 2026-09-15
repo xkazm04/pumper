@@ -1643,12 +1643,6 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ego-tree"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2972feb8dffe7bc8c5463b1dacda1b0dfbed3710e50f977d965429692d74cd8"
-
-[[package]]
-name = "ego-tree"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b04dc5a38e4f151a79d9f2451ae6037fb6eaf5cba34771f44781f80e508498e3"
@@ -3682,7 +3676,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
- "ego-tree 0.10.0",
+ "ego-tree",
  "futures",
  "pumper-core",
  "rayon",
@@ -4305,7 +4299,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdd0be4d296f048bfb06dd01bbc80ef789ddd2e55583e8d2e6b804942abfabc2"
 dependencies = [
  "cssparser",
- "ego-tree 0.11.0",
+ "ego-tree",
  "getopts",
  "html5ever",
  "precomputed-hash",
