@@ -20,7 +20,7 @@ ran.
 | `criteria.json` | yes | the standard: every lane, its command, where it can run, and its pre-declared bounds |
 | `runs/*.json` | no | per-run measurement artifacts, emitted by the harness itself |
 | `verdicts/*.json` | no | measurement + criteria + verdict together, one file per certification |
-| `health.json` | no | the lane-health ledger: first-green, and each lane's pass-rate history |
+| `health.json` | no | the lane-health ledger: first-green, each lane's pass-rate history, and the canary's newest catch |
 
 ## Measurement here, judgement there
 
@@ -81,8 +81,35 @@ local browser or live `web.archive.org`, and a lane that reddens because a third
 party is down reports nothing about this repo. They stay listed so the gap stays
 counted rather than forgotten.
 
-Exit codes: **2** if any lane failed, **3** if any lane could not be seen (or the
-criteria file is unreadable), **0** otherwise.
+Exit codes: **2** if any lane failed, **3** if any lane could not be seen, the
+canary is dead (below), or the criteria file is unreadable, **0** otherwise.
+
+## Two more verdicts, for the lane that exists to fail
+
+`canary` is a lane declared `"canary": true` whose emitter
+(`scripts/ci/lane-canary.mjs`) writes a value outside the lane's own declared
+bound on every run. It is judged in this population, on this clock, by this
+judge — which is the only arrangement under which it can say anything about
+them — so every reading of it is inverted:
+
+| verdict | meaning |
+| --- | --- |
+| `canary-alive` | the planted breach **was** caught. The judge fired and the lanes were scheduled. The healthy state, and it does not block the run. |
+| `canary-dead` | the canary passed, emitted nothing, or lost the metric its criterion names. Exit **3**: nothing else in this run is certified, because the judge that produced every other green is unproven. |
+
+Three rules come with it, and each one is a thing the ordinary machinery would
+otherwise get backwards:
+
+- **Its failure must not block.** Read as an ordinary lane, a caught canary is a
+  breached bound and the suite is red forever — which is how a red stops meaning
+  anything.
+- **Its pass is the finding.** A canary that no longer catches its own breach is
+  the exact state every other liveness signal here is blind to, and unmodified it
+  reads as `PASS`.
+- **It never travels alone.** A population reaching the judge with the canary and
+  no real lane certifies nothing; the certifier refuses it as CANNOT CHECK.
+
+Never relax the canary's bound or lower its planted constant to quiet a red run.
 
 ## Lane health: earned green, planted red, and never green
 
@@ -104,6 +131,15 @@ is an explicit tracked event and the report calls out three distinct states:
 `health.json` lives in CI's cache rather than in the repo, so an evicted cache
 reads as `NO RUNS RECORDED` — unobserved, which is the honest reading — and never
 as a green.
+
+The canary's row is kept the other way up. A real lane's recorded fact is its
+**first** green, because what it certifies is stability and a first green never
+becomes untrue; the canary's is its **newest** catch (`lastAlive`), because what
+it certifies is that something was alive *recently*, and a first catch kept
+forever is how a canary that died months ago goes on radiating confidence from
+the ledger. Its row prints that date, flags `STALE` when the newest recorded run
+is not the newest catch, and is never routed through the `NEVER GREEN` sentence —
+for a canary, never-green is the design.
 
 ## Schedule
 
@@ -130,6 +166,6 @@ set a run history.
 
 ## Commands
 
-    just lanes           # run every runnable lane, then certify
+    just lanes           # run every runnable lane and the canary, then certify
     just lane-certify    # judge whatever artifacts are in runs/
     just lane-health     # each lane's pass-rate history

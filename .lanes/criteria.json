@@ -233,6 +233,23 @@
       "unavailableReason": "Needs live web.archive.org. Same reasoning as browser-render: the lane would certify a third party's uptime. Listed as cannot-run so the gap stays counted.",
       "command": "cargo test -p pumper-engine-archive -- --ignored live_wayback",
       "criteria": []
+    },
+    "canary": {
+      "kind": "canary",
+      "canary": true,
+      "description": "A lane that breaches its own declared bound on every run, judged in this population by this judge. Its FAILURE is the healthy state: it is the standing proof that the lanes were scheduled and that the certifier's bound checking still fires. A PASS here, or a missing artifact, is a CANNOT CHECK about the whole run — see scripts/ci/lane-canary.mjs.",
+      "runsOn": ["linux", "win32", "darwin"],
+      "command": "node scripts/ci/lane-canary.mjs",
+      "criteria": [
+        {
+          "id": "planted",
+          "kind": "scalar",
+          "scalar": "planted",
+          "max": 0,
+          "predicate": "the single constant the canary emitter writes on every run; it is 1 by construction against a bound of 0, so the only way this criterion can be met is for the judge to have stopped working.",
+          "basis": "Not a measurement and never re-baselined: a constant chosen to sit outside its own bound (emitter: scripts/ci/lane-canary.mjs). Relaxing this bound to quiet a red run disables the only lane that can tell a dead judge from a clean codebase."
+        }
+      ]
     }
   }
 }

@@ -384,6 +384,12 @@ jobs:
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: node scripts/ci/flake-record.mjs --lane quarantine-watch -- cargo test -p pumper-core --lib governor -- --ignored
+      # The canary rides with the real lanes, every run: it is how the Certify
+      # step below can tell "the lanes were clean" from "the lanes never ran and
+      # the judge never fired". Its own failure is the healthy state.
+      - name: Lane - canary
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/lane-canary.mjs
       - name: Certify
         if: ${{ !cancelled() }}
         run: node scripts/ci/lane-certify.mjs

@@ -31,8 +31,29 @@
 //               live network). Recorded as its own category, never counted as a
 //               pass, never silently omitted.
 //
-// Exit: 2 if any lane failed, else 3 if any lane could not be seen or the
-// instrument is broken, else 0.
+// TWO MORE, FOR THE LANE THAT EXISTS TO FAIL
+//
+// A lane declared `"canary": true` emits an artifact that breaches its own
+// declared bound on every run (scripts/ci/lane-canary.mjs). It is judged in this
+// population, on this clock, by this judge — which is the only way it can say
+// anything about them — and every reading of it is therefore inverted:
+//
+//   canary-alive  the canary's planted breach WAS caught. The judge fired and the
+//                 lanes were scheduled. This is the healthy state and it does not
+//                 block the run.
+//   canary-dead   the canary passed, emitted nothing, or lost the metric its
+//                 criterion names. Nothing else in this run is certified: the
+//                 judge that produced every other green is unproven.
+//
+// The inversion runs through the ledger too. A real lane's evidence is its FIRST
+// green, kept forever, because what it certifies is stability. A canary's
+// evidence is its NEWEST catch, because what it certifies is that something was
+// alive recently — so the health row carries `lastAlive` and prints its date, and
+// the never-green sentence (an unbuilt lane wearing a gate's clothes) must never
+// be printed about a canary, for which never-green is the design.
+//
+// Exit: 2 if any lane failed, else 3 if any lane could not be seen, the canary is
+// dead, or the instrument is broken, else 0.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,7 +65,7 @@ import { defaultRepoRoot } from './flake-id.mjs';
 export const EXIT_FINDINGS = 2;
 export const EXIT_CANNOT_CHECK = 3;
 
-export const VERDICTS = ['pass', 'fail', 'cannot-see', 'cannot-run'];
+export const VERDICTS = ['pass', 'fail', 'cannot-see', 'cannot-run', 'canary-alive', 'canary-dead'];
 
 // --- statistics -------------------------------------------------------------
 
@@ -209,12 +230,61 @@ export function loadArtifact(lane, dir) {
 
 // --- certifying every lane --------------------------------------------------
 
+/**
+ * The canary's reading of an ordinary verdict, which is the ordinary reading
+ * inverted.
+ *
+ * A canary enrolled in the judged population inherits that population's
+ * machinery — the same judge, the same artifact contract, the same exit code —
+ * and every one of those was written for a lane that is supposed to pass. Read
+ * unchanged, the canary breaks the suite it is supposed to certify: its planted
+ * breach reads as a product failure (so the gate is permanently red and its red
+ * becomes wallpaper), and the one state that matters — the canary stopped
+ * catching its own breach — reads as a PASS, which is the false green this whole
+ * file exists to refuse.
+ */
+function asCanary(lane, res) {
+  if (res.verdict === 'cannot-run') return { ...res, canary: true };
+  if (res.verdict === 'fail') {
+    const breached = res.criteria.filter((c) => c.verdict === 'fail').length;
+    return {
+      ...res,
+      canary: true,
+      verdict: 'canary-alive',
+      detail:
+        `caught its own planted breach (${breached}/${res.criteria.length} criteria breached) — ` +
+        `the judge fired on this run and the lanes were scheduled`,
+    };
+  }
+  if (res.verdict === 'pass') {
+    return {
+      ...res,
+      canary: true,
+      verdict: 'canary-dead',
+      detail:
+        `emitted its artifact and the planted breach was NOT caught: ${res.detail}. The judge or the ` +
+        `bound is broken, so no other lane's green in this run is supported`,
+    };
+  }
+  return {
+    ...res,
+    canary: true,
+    verdict: 'canary-dead',
+    detail:
+      `produced no usable evidence that it ran (${res.detail}) — a population whose canary did not ` +
+      `run certifies nothing, because nothing proves the others ran either`,
+  };
+}
+
 export function certify(criteria, dir, platform) {
   const results = [];
+  // Every verdict leaves through here, so a canary's inversion cannot be
+  // forgotten at one of the four ways a lane can end.
+  const emit = (spec, res) => results.push(spec.canary === true ? asCanary(res.lane, res) : res);
   for (const [lane, spec] of Object.entries(criteria.lanes || {})) {
     const runsOn = spec.runsOn || [];
     if (!runsOn.includes(platform)) {
-      results.push({
+      emit(spec, {
         lane,
         verdict: 'cannot-run',
         detail: spec.unavailableReason || `not declared to run on ${platform}`,
@@ -224,7 +294,7 @@ export function certify(criteria, dir, platform) {
     }
     const artifact = loadArtifact(lane, dir);
     if (!artifact) {
-      results.push({
+      emit(spec, {
         lane,
         verdict: 'cannot-see',
         detail:
@@ -236,7 +306,7 @@ export function certify(criteria, dir, platform) {
     }
     const judged = (spec.criteria || []).map((c) => ({ ...c, ...judge(c, artifact) }));
     if (judged.length === 0) {
-      results.push({
+      emit(spec, {
         lane,
         verdict: 'cannot-see',
         detail: 'the lane declares no criteria — an unjudged measurement certifies nothing',
@@ -250,7 +320,7 @@ export function certify(criteria, dir, platform) {
       : judged.some((j) => j.verdict === 'cannot-see')
         ? 'cannot-see'
         : 'pass';
-    results.push({
+    emit(spec, {
       lane,
       verdict,
       detail: `${judged.filter((j) => j.verdict === 'pass').length}/${judged.length} criteria met`,
@@ -259,6 +329,27 @@ export function certify(criteria, dir, platform) {
     });
   }
   return results;
+}
+
+/**
+ * A run carrying only the canary certifies nothing.
+ *
+ * The canary's whole claim is about the lanes beside it: that they were
+ * scheduled, and that the judge that read them fires. On its own it proves that
+ * a one-lane population containing a lane designed to fail contains a lane
+ * designed to fail. So a population that reaches the judge with a canary and no
+ * real lane is an instrument error, not a certification — the same shape as a
+ * scan whose walked population came back empty.
+ */
+export function canaryIsPaired(results) {
+  const canaries = results.filter((r) => r.canary === true);
+  if (canaries.length === 0) return null;
+  const real = results.filter((r) => r.canary !== true && r.verdict !== 'cannot-run');
+  if (real.length > 0) return null;
+  return (
+    `the population reaching the judge is the canary (${canaries.map((c) => c.lane).join(', ')}) and ` +
+    `nothing else — a canary certifies the lanes beside it and says nothing on its own`
+  );
 }
 
 // --- lane health: earned green, planted red, and NEVER green ----------------
@@ -284,7 +375,18 @@ export function updateHealth(health, results, { at, sha }) {
     // Keep the ledger bounded; the lane's dashboard is the sequence, and 200
     // runs is more than a nightly lane accumulates in half a year.
     if (entry.runs.length > 200) entry.runs = entry.runs.slice(-200);
-    if (r.verdict === 'pass' && !entry.firstGreen) entry.firstGreen = at;
+    if (r.canary === true) {
+      // The inverted retention rule. A real lane's kept fact is its FIRST green,
+      // because what it certifies is stability and a first green never becomes
+      // untrue. A canary's kept fact is its NEWEST catch, because what it
+      // certifies is that something was alive recently — and a first catch, kept
+      // forever, is exactly how a canary that died years ago goes on radiating
+      // confidence from the ledger.
+      entry.canary = true;
+      if (r.verdict === 'canary-alive') entry.lastAlive = at;
+    } else if (r.verdict === 'pass' && !entry.firstGreen) {
+      entry.firstGreen = at;
+    }
     health.lanes[r.lane] = entry;
   }
   return health;
@@ -300,11 +402,21 @@ export function updateHealth(health, results, { at, sha }) {
  * clothes, and the finding it reports is about the harness rather than about the
  * product. So `first-green` is tracked as an explicit lane event, and "no runs
  * recorded" is a different sentence from "never green".
+ *
+ * A canary is read the other way up, and it gets its own branch for that reason:
+ * never-green is its design, its pass is the finding, and the number a reader
+ * needs from it is the AGE of its newest catch. Printing the never-green
+ * sentence about a canary would be the report diagnosing its own liveness probe
+ * as an unbuilt lane.
  */
 export function healthReport(health) {
   const lines = [];
   for (const [lane, e] of Object.entries(health.lanes)) {
     const runs = e.runs || [];
+    if (e.canary === true) {
+      lines.push(`  ${lane}: ${canaryHealthLine(runs, e)}`);
+      continue;
+    }
     const attempts = runs.filter((r) => r.verdict === 'pass' || r.verdict === 'fail' || r.verdict === 'cannot-see');
     const greens = runs.filter((r) => r.verdict === 'pass').length;
     if (runs.length === 0) {
@@ -325,6 +437,31 @@ export function healthReport(health) {
     }
   }
   return lines;
+}
+
+/** The canary's health row: how long ago it last caught its own planted breach. */
+function canaryHealthLine(runs, entry) {
+  const attempts = runs.filter((r) => r.verdict === 'canary-alive' || r.verdict === 'canary-dead');
+  const alive = runs.filter((r) => r.verdict === 'canary-alive').length;
+  if (runs.length === 0) {
+    return 'NO RUNS RECORDED — the ledger has never seen the canary. Not "never caught"; unobserved.';
+  }
+  if (attempts.length === 0) {
+    return `never attempted here — ${runs.length} recorded run(s), all cannot-run on their runner.`;
+  }
+  if (alive === 0) {
+    return (
+      `NEVER CAUGHT — 0 of ${attempts.length} attempted run(s) caught its own planted breach. The ` +
+      `canary is the thing that proves the judge fires; unproven, every other lane's green in those ` +
+      `runs is a report nobody verified.`
+    );
+  }
+  const newest = runs[runs.length - 1].at;
+  const stale = entry.lastAlive !== newest;
+  return (
+    `last caught its planted breach ${entry.lastAlive}${stale ? ` — STALE, the newest recorded run is ${newest}` : ''} ` +
+    `(${alive}/${attempts.length} attempted run(s) alive; predicate: recorded runs in .lanes/health.json).`
+  );
 }
 
 // --- the report -------------------------------------------------------------
@@ -367,6 +504,8 @@ function main() {
   }
 
   const results = certify(criteria, dir, platform);
+  const unpaired = canaryIsPaired(results);
+  if (unpaired) cannotCheck(unpaired);
   const at = new Date().toISOString();
   let sha = process.env.GITHUB_SHA || null;
   if (!sha) {
@@ -402,6 +541,18 @@ function main() {
   });
 
   if (results.some((r) => r.verdict === 'fail')) process.exit(EXIT_FINDINGS);
+  // A dead canary is a CANNOT CHECK about the whole run, not a finding about one
+  // lane: the judge that produced every other verdict here is unproven, so the
+  // greens above are reports nobody verified.
+  const dead = results.filter((r) => r.verdict === 'canary-dead');
+  if (dead.length > 0) {
+    process.stderr.write(
+      `\nThe canary is dead (${dead.map((r) => r.lane).join(', ')}). A canary that does not fail is\n` +
+        `not a quiet gate, it is an absent one: nothing in this run proves the judge fires or that the\n` +
+        `lanes were scheduled, so no lane above is certified — including the ones that say PASS.\n`
+    );
+    process.exit(EXIT_CANNOT_CHECK);
+  }
   if (results.some((r) => r.verdict === 'cannot-see')) {
     process.stderr.write(
       `\nOne or more lanes produced no evidence. "Found nothing" and "cannot see" are different\n` +

@@ -15,6 +15,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  canaryIsPaired,
   certify,
   healthReport,
   judge,
@@ -266,6 +267,140 @@ test('the_certifier_writes_an_artifact_carrying_measurement_criteria_and_verdict
   assert.equal(written.results[0].verdict, 'pass');
   assert.equal(written.results[0].criteria[0].max, 10);
   assert.equal(written.results[0].artifact.scalars.a, 5);
+});
+
+// --- the canary enrolled in the judged population ---------------------------
+//
+// Four states, and the planted reds are for the certifier's reading of them: a
+// canary is the one lane whose failure is health, so every ordinary reading of
+// it is wrong in a way that either reddens the suite forever or greens it
+// falsely.
+
+const CANARY_CRITERIA = {
+  lanes: {
+    x: { runsOn: ['linux'], command: 'x', criteria: [{ id: 'b', kind: 'scalar', scalar: 'a', max: 10 }] },
+    canary: {
+      runsOn: ['linux'],
+      canary: true,
+      command: 'node scripts/ci/lane-canary.mjs',
+      criteria: [{ id: 'planted', kind: 'scalar', scalar: 'planted', max: 0 }],
+    },
+  },
+};
+const REAL_OK = { lane: 'x', scalars: { a: 5 }, series: {} };
+
+test('a_caught_canary_is_alive_and_does_not_redden_the_population', () => {
+  const dir = artifactDir({ 'x.json': REAL_OK, 'canary.json': { lane: 'canary', scalars: { planted: 1 }, series: {} } });
+  const res = certify(CANARY_CRITERIA, dir, 'linux');
+  const canary = res.find((r) => r.lane === 'canary');
+  assert.equal(canary.verdict, 'canary-alive');
+  assert.equal(canary.canary, true);
+  assert.match(canary.detail, /caught its own planted breach/);
+  assert.equal(res.find((r) => r.lane === 'x').verdict, 'pass');
+});
+
+test('a_canary_that_passes_is_dead_and_unsupports_every_other_green', () => {
+  // The state the whole item exists for: the judge stopped firing, so the canary
+  // no longer catches its own breach. Read as an ordinary lane this is a PASS and
+  // the run goes green — a false green manufactured BY the liveness probe.
+  const dir = artifactDir({ 'x.json': REAL_OK, 'canary.json': { lane: 'canary', scalars: { planted: 0 }, series: {} } });
+  const canary = certify(CANARY_CRITERIA, dir, 'linux').find((r) => r.lane === 'canary');
+  assert.equal(canary.verdict, 'canary-dead');
+  assert.match(canary.detail, /NOT caught/);
+});
+
+test('a_canary_that_emitted_nothing_is_dead_not_merely_unseen', () => {
+  const dir = artifactDir({ 'x.json': REAL_OK });
+  const canary = certify(CANARY_CRITERIA, dir, 'linux').find((r) => r.lane === 'canary');
+  assert.equal(canary.verdict, 'canary-dead');
+  assert.match(canary.detail, /no usable evidence/);
+});
+
+test('a_canary_missing_the_metric_its_criterion_names_is_dead', () => {
+  const dir = artifactDir({ 'x.json': REAL_OK, 'canary.json': { lane: 'canary', scalars: { other: 1 }, series: {} } });
+  const canary = certify(CANARY_CRITERIA, dir, 'linux').find((r) => r.lane === 'canary');
+  assert.equal(canary.verdict, 'canary-dead');
+});
+
+test('a_population_carrying_only_the_canary_certifies_nothing', () => {
+  const dir = artifactDir({ 'canary.json': { lane: 'canary', scalars: { planted: 1 }, series: {} } });
+  const only = { lanes: { canary: CANARY_CRITERIA.lanes.canary } };
+  assert.match(canaryIsPaired(certify(only, dir, 'linux')), /says nothing on its own/);
+  // With a real lane beside it there is nothing to report.
+  const dir2 = artifactDir({ 'x.json': REAL_OK, 'canary.json': { lane: 'canary', scalars: { planted: 1 }, series: {} } });
+  assert.equal(canaryIsPaired(certify(CANARY_CRITERIA, dir2, 'linux')), null);
+  // And a population with no canary at all is not this check's business.
+  assert.equal(canaryIsPaired(certify({ lanes: { x: CANARY_CRITERIA.lanes.x } }, dir2, 'linux')), null);
+});
+
+test('the_canarys_kept_fact_is_its_newest_catch_not_its_first', () => {
+  // The inverted retention rule. A real lane keeps its FIRST green (stability);
+  // a canary keeps its NEWEST catch, because a first catch kept forever is how a
+  // canary that died years ago goes on radiating confidence.
+  let health = { lanes: {} };
+  health = updateHealth(health, [{ lane: 'canary', canary: true, verdict: 'canary-alive' }], { at: '2026-08-01', sha: 'a' });
+  health = updateHealth(health, [{ lane: 'canary', canary: true, verdict: 'canary-alive' }], { at: '2026-08-09', sha: 'b' });
+  assert.equal(health.lanes.canary.lastAlive, '2026-08-09');
+  assert.equal(health.lanes.canary.firstGreen, null, 'a canary has no first-green semantics');
+  const line = healthReport(health)[0];
+  assert.match(line, /last caught its planted breach 2026-08-09/);
+  assert.doesNotMatch(line, /unbuilt lane/, 'never-green is the canary design, not a diagnosis');
+});
+
+test('a_canary_whose_newest_run_did_not_catch_reads_as_stale', () => {
+  let health = { lanes: {} };
+  health = updateHealth(health, [{ lane: 'canary', canary: true, verdict: 'canary-alive' }], { at: '2026-08-01', sha: 'a' });
+  health = updateHealth(health, [{ lane: 'canary', canary: true, verdict: 'canary-dead' }], { at: '2026-09-17', sha: 'b' });
+  assert.match(healthReport(health)[0], /STALE, the newest recorded run is 2026-09-17/);
+});
+
+test('a_canary_that_never_caught_anything_is_its_own_sentence', () => {
+  let health = { lanes: {} };
+  for (const at of ['2026-08-01', '2026-08-02']) {
+    health = updateHealth(health, [{ lane: 'canary', canary: true, verdict: 'canary-dead' }], { at, sha: 'a' });
+  }
+  const line = healthReport(health)[0];
+  assert.match(line, /NEVER CAUGHT — 0 of 2 attempted run\(s\)/);
+  assert.doesNotMatch(line, /unbuilt lane/);
+});
+
+test('the_certifier_exits_cannot_check_when_the_canary_is_dead_even_with_every_real_lane_green', () => {
+  const root = fakeRoot(CANARY_CRITERIA, {
+    'x.json': REAL_OK,
+    'canary.json': { lane: 'canary', scalars: { planted: 0 }, series: {} },
+  });
+  const r = runCertify(root);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stdout, /CANARY-DEAD/);
+  assert.match(r.stderr, /A canary that does not fail is/);
+});
+
+test('the_certifier_is_green_when_the_canary_is_caught_and_the_real_lanes_hold', () => {
+  const root = fakeRoot(CANARY_CRITERIA, {
+    'x.json': REAL_OK,
+    'canary.json': { lane: 'canary', scalars: { planted: 1 }, series: {} },
+  });
+  const r = runCertify(root);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /CANARY-ALIVE/);
+});
+
+test('the_canary_emitter_plants_a_value_outside_the_bound_this_repo_declares_for_it', () => {
+  // The emitter and the criterion are two files, and the whole mechanism rests
+  // on them disagreeing. A relaxed bound or a lowered constant would leave a
+  // canary that passes forever, which is the one state nothing else can see.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-canary-'));
+  const emit = spawnSync(process.execPath, [path.join(HERE, 'lane-canary.mjs')], {
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_PROJECT_DIR: root },
+  });
+  assert.equal(emit.status, 0, emit.stdout + emit.stderr);
+  const artifact = JSON.parse(fs.readFileSync(path.join(root, '.lanes/runs/canary.json'), 'utf8'));
+  const declared = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, '.lanes/criteria.json'), 'utf8')).lanes.canary;
+  assert.equal(declared.canary, true);
+  const criterion = declared.criteria.find((c) => c.scalar === 'planted');
+  assert.ok(artifact.scalars.planted > criterion.max, 'the planted value must breach its own bound');
+  assert.equal(judge(criterion, artifact).verdict, 'fail');
 });
 
 // --- canary over the repo's own criteria ------------------------------------

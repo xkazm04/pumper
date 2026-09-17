@@ -163,6 +163,7 @@ lanes:
         cargo test -p pumper-core --test derived_backfill_perf -- --ignored --nocapture
     node scripts/ci/flake-record.mjs --lane fingerprint-shared-dom -- \
         cargo test -p pumper-core --test fingerprint_shared_dom perf_ -- --ignored --nocapture
+    node scripts/ci/lane-canary.mjs
     node scripts/ci/lane-certify.mjs
 
 # Judges whatever artifacts are already in .lanes/runs/ without re-running
