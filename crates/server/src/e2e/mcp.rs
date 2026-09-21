@@ -445,22 +445,34 @@ async fn tool_args_are_validated_against_the_schema_the_tool_publishes() {
     let (state, _store, search) = mcp_state_recording(false).await;
 
     // A typo'd key on a tool whose schema closes the object.
-    let resp = handle_rpc(&state, &call("search", json!({ "q": "x", "srot": "newest" })))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &call("search", json!({ "q": "x", "srot": "newest" })),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp["result"]["isError"], true, "typo'd key was accepted");
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("srot"), "the message must name the bad key: {text}");
+    assert!(
+        text.contains("srot"),
+        "the message must name the bad key: {text}"
+    );
     assert!(
         search.last.lock().unwrap().is_none(),
         "a refused request never reaches the index"
     );
 
     // A required property the schema names and the handler does not check.
-    let resp = handle_rpc(&state, &call("query_dataset", json!({ "app": "schematic" })))
-        .await
-        .unwrap();
-    assert_eq!(resp["result"]["isError"], true, "missing required arg was accepted");
+    let resp = handle_rpc(
+        &state,
+        &call("query_dataset", json!({ "app": "schematic" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "missing required arg was accepted"
+    );
 
     // The valid call still works — the gate refuses violations, not traffic.
     let resp = handle_rpc(&state, &call("search", json!({ "q": "x" })))

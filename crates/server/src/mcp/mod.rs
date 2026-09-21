@@ -1055,7 +1055,11 @@ mod tests {
         use crate::routes::jobs::validate_budget_usd;
 
         // Same requested budget, two doors, opposite answers.
-        assert_eq!(clamp_budget(Some(100.0), 1.0), 1.0, "MCP door clamps to the rail");
+        assert_eq!(
+            clamp_budget(Some(100.0), 1.0),
+            1.0,
+            "MCP door clamps to the rail"
+        );
         assert_eq!(
             validate_budget_usd(Some(100.0)),
             Ok(Some(100.0)),
