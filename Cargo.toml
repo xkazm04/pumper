@@ -94,7 +94,7 @@ simd-json = "0.14"
 url = "2"
 
 # sandboxed WASM plugin runtime
-wasmtime = "46"
+wasmtime = "48"
 
 # embedded full-text search (in-process, no external service)
 tantivy = "0.26"
