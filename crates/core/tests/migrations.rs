@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 const EXPECTED_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "api_recipes",
+    "body_pins",
     "checkpoints",
     "cost_events",
     "datahub_govern_actions",
@@ -28,6 +29,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "doc_fingerprints",
     "field_invariants",
     "field_sketches",
+    "golden_docs",
     "job_stages",
     "job_yield",
     "http_cache",
@@ -41,6 +43,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "saved_search_seen",
     "saved_searches",
     "schedules",
+    "source_rulesets",
     "source_runs",
     "sources",
     "tier_memory",
