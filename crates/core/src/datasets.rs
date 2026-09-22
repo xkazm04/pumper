@@ -2902,6 +2902,29 @@ impl Datasets {
         Ok(row.map(BodyPin::from))
     }
 
+    /// The newest pinned observation of one document of a source — the body a
+    /// record was most recently extracted from, even when that extraction was
+    /// an equal-value upsert that appended no revision (and so stamped no
+    /// `artifact_sha` anywhere). `body_pins` is the per-observation log for
+    /// exactly this reason.
+    pub async fn latest_body_pin_for_key(
+        &self,
+        source_id: &str,
+        document_key: &str,
+    ) -> Result<Option<BodyPin>> {
+        let row: Option<BodyPinRow> = sqlx::query_as(
+            "SELECT body_sha, observation_id, source_id, job_id, document_key, original_url, \
+                    captured_at \
+             FROM body_pins WHERE source_id = ?1 AND document_key = ?2 \
+             ORDER BY captured_at DESC, observation_id DESC LIMIT 1",
+        )
+        .bind(source_id)
+        .bind(document_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(BodyPin::from))
+    }
+
     /// The repairability facts of each named source that HAS a `sources` row:
     /// its active ruleset hash and how many body pins it holds. A source with
     /// no row is absent from the map (unknown source), never defaulted.

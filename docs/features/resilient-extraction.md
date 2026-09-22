@@ -962,6 +962,14 @@ reads the pinned file, and replays with the pin's `original_url` as base (so `ur
 reproduce). Without a pin it falls back to the record's `artifact_path` + `job_id`, base-less, as
 before. The response gains `diverged: bool` (the negation of `verdict == "reproduced"`) and
 `base_url: string | null`. Enrolled extractor rows return `diverged: false`.
+When the record's head revision has no `artifact_sha` — data written before enrolment, which an
+equal-value `rules_ref` run re-confirms without appending a revision — but its key was pinned after
+that revision, rederive replays the latest pinned observation of the key (`body_pins`, source
+`<app>/<dataset>`, `document_key = key`) with its `original_url` as base and the ruleset the pinning
+job's result reports (`rules_hash`), else the active head. Every response carries
+`replayed_from: "revision" | "latest_observation"`, `observation_id` (null unless an observation
+was replayed) and `rules_from: "revision" | "observation_job" | "active"`; with no pin either, the
+honest 409 stands. Older (non-head) revisions never take the fallback.
 
 ### Saved-search views
 
