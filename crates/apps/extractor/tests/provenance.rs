@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use app_extractor::Extractor;
-use pumper_core::datasets::rules_hash;
+use pumper_core::datasets::{canonical_rules_hash, canonical_rules_json, rules_hash};
 use pumper_core::testing::{TempStore, TestContext};
 use pumper_core::{AppContext, ScrapeApp};
 use serde_json::{json, Value};
@@ -65,7 +65,9 @@ async fn every_record_is_stamped_with_the_registered_rules_hash() {
     // The hash stamped on the revision IS the canonical hash of the rules the
     // job was given — not a per-run id — so two runs of the same rules pin the
     // same version and a rule edit is visible as a different pin.
-    let expected = rules_hash(&RULES());
+    // Updated to the intended behaviour (canonical identity, Stage 2), not weakened.
+    let parsed: pumper_core::RuleSet = serde_json::from_value(RULES()).unwrap();
+    let expected = canonical_rules_hash(&parsed);
     let datasets = store.datasets();
     for key in ["http://a", "http://b"] {
         let rev = datasets
@@ -87,7 +89,9 @@ async fn every_record_is_stamped_with_the_registered_rules_hash() {
     // …and the rules themselves are retrievable by that hash, which is what
     // makes the stamp a re-derivation pin rather than an opaque fingerprint.
     let registered = datasets.rules_by_hash(&expected).await.unwrap();
-    assert_eq!(registered.as_ref(), Some(&RULES()));
+    // Updated to the intended behaviour: the registry holds the CANONICAL JSON.
+    assert_eq!(registered, Some(canonical_rules_json(&parsed)));
+    assert_eq!(rules_hash(registered.as_ref().unwrap()), expected);
 }
 
 #[tokio::test]

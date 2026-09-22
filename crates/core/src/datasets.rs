@@ -218,6 +218,273 @@ pub fn rules_hash(rules: &Value) -> String {
     hash_value(rules)
 }
 
+/// The canonical JSON of a RuleSet: the value round-tripped through serde, so
+/// every default the parser fills in (`attr: null`, `all: false`, an absent
+/// `transforms`) is spelled exactly one way. Object keys are BTreeMap-sorted
+/// by `serde_json::Value` itself.
+pub fn canonical_rules_json(rules: &crate::RuleSet) -> Value {
+    // A RuleSet is a map of plain serde types; serialization cannot fail, and
+    // `Null` here would only ever hash as the (registered-nowhere) null rules.
+    serde_json::to_value(rules).unwrap_or(Value::Null)
+}
+
+/// Content hash of a RuleSet's **meaning**, not its spelling: [`rules_hash`]
+/// over [`canonical_rules_json`].
+///
+/// THE ANTI-PATTERN THIS CLOSES: [`rules_hash`] of the raw params JSON gave
+/// `{"type":"css","selector":"h1"}` and the same rule with `"all": false`
+/// spelled out two different identities, so a pointer (`source_rulesets`)
+/// comparing hashes would call one ruleset two. Raw hashes already stamped on
+/// revisions stay resolvable through [`Datasets::rules_by_hash`] — nothing is
+/// rewritten.
+pub fn canonical_rules_hash(rules: &crate::RuleSet) -> String {
+    rules_hash(&canonical_rules_json(rules))
+}
+
+/// Where an activation of a source's ruleset pointer came from. The wire
+/// strings are exactly `import | human | rollback` (Stage-4 origins —
+/// `inversion | split_half | induction` — are reserved and not writable here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RulesetOrigin {
+    /// A job's inline `params.rules`, registered as the source's first head.
+    Import,
+    /// An operator activated a new ruleset.
+    Human,
+    /// An operator moved the pointer back to a ruleset in the lineage.
+    Rollback,
+}
+
+impl RulesetOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::Human => "human",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+/// One row of a source's ruleset pointer lineage (`source_rulesets`). Every key
+/// is always serialized; `parent_hash: null` means "the first head".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RulesetHead {
+    pub rules_hash: String,
+    pub parent_hash: Option<String>,
+    /// The stored origin string, read back verbatim — a Stage-4 origin this
+    /// build cannot write is still reported honestly rather than coerced.
+    pub origin: String,
+    pub epoch: i64,
+    pub activated_at: String,
+    /// Always `"none"` before Stage 5.
+    pub licence_at_move: String,
+}
+
+/// Why a ruleset pointer operation was refused. Typed rather than folded into
+/// [`Error`] because the three refusals are three different HTTP answers
+/// (400 / 404 / 409), and a stringly error would force the route to guess.
+#[derive(Debug)]
+pub enum RulesetError {
+    /// The reference itself is unusable: too short, not hex, or ambiguous.
+    BadRef(String),
+    /// Nothing answers to it: unknown source, unknown hash, no active head.
+    Unknown(String),
+    /// The pointer is not in the state the operation requires.
+    Conflict(String),
+    /// The store failed.
+    Store(Error),
+}
+
+impl std::fmt::Display for RulesetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRef(m) | Self::Unknown(m) | Self::Conflict(m) => f.write_str(m),
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RulesetError {}
+
+impl From<Error> for RulesetError {
+    fn from(e: Error) -> Self {
+        Self::Store(e)
+    }
+}
+
+impl From<sqlx::Error> for RulesetError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Store(Error::from(e))
+    }
+}
+
+/// Shortest hash prefix a ruleset reference may use — a short prefix is a
+/// collision waiting for the lineage to grow.
+pub const MIN_RULES_PREFIX: usize = 8;
+
+/// Resolves a hash-or-prefix `reference` among `candidates` (a source's
+/// lineage). Pure, so the three refusal classes are testable without a store:
+///
+/// - shorter than [`MIN_RULES_PREFIX`] or not hex → [`RulesetError::BadRef`];
+/// - matching more than one distinct candidate → [`RulesetError::BadRef`]
+///   (ambiguous — never "the newest one wins");
+/// - matching none → [`RulesetError::Unknown`].
+///
+/// Matching is case-insensitive; hashes are stored lowercase.
+pub fn resolve_rules_prefix(
+    candidates: &[&str],
+    reference: &str,
+) -> std::result::Result<String, RulesetError> {
+    let wanted = reference.trim().to_ascii_lowercase();
+    if wanted.len() < MIN_RULES_PREFIX {
+        return Err(RulesetError::BadRef(format!(
+            "ruleset reference '{reference}' is shorter than {MIN_RULES_PREFIX} hex characters"
+        )));
+    }
+    if !wanted.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(RulesetError::BadRef(format!(
+            "ruleset reference '{reference}' is not a hex hash or prefix (or \"active\")"
+        )));
+    }
+    let mut matches: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.starts_with(&wanted))
+        .collect();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => Err(RulesetError::Unknown(format!(
+            "no ruleset in this source's lineage matches '{reference}'"
+        ))),
+        many => Err(RulesetError::BadRef(format!(
+            "ruleset reference '{reference}' is ambiguous: it matches {} rulesets",
+            many.len()
+        ))),
+    }
+}
+
+/// The `activated_at` for a new pointer row: now, or one microsecond past the
+/// previous activation when the clock has not moved past it.
+///
+/// `(source_id, activated_at)` is the table's primary key, so two activations
+/// inside one microsecond (or a clock step backwards) would otherwise collide —
+/// or worse, sort a newer epoch before an older one.
+pub fn next_activation_ts(now: DateTime<Utc>, prev: Option<&str>) -> String {
+    let floor = prev
+        .and_then(|p| parse_ts(p).ok())
+        .map(|p| p + chrono::Duration::microseconds(1));
+    match floor {
+        Some(f) if f > now => ts(f),
+        _ => ts(now),
+    }
+}
+
+/// Directory (under `<artifacts_root>/<app>/`) holding content-addressed
+/// bodies of enrolled sources — one file per distinct body, named
+/// `<sha256>.html`. It sits where a job directory would, so the retention
+/// scanner sees these files as `ArtifactRef { app, job_id: "bodies", .. }` and
+/// [`Datasets::pinned_artifact_refs`] vetoes the ones a revision cites.
+pub const PINNED_BODIES_DIR: &str = "bodies";
+
+/// True for a lowercase-or-uppercase 64-hex sha256 — the only shape a pinned
+/// body's file name may be built from (it arrives from stored rows).
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The retention address of a pinned body.
+pub fn pinned_body_ref(app: &str, body_sha: &str) -> ArtifactRef {
+    ArtifactRef {
+        app: app.to_string(),
+        job_id: PINNED_BODIES_DIR.to_string(),
+        name: format!("{body_sha}.html"),
+    }
+}
+
+/// `<artifacts_root>/<app>/bodies/<sha>.html`, or `None` when `app` or
+/// `body_sha` is not a safe single segment (`body_sha` must be 64 hex).
+pub fn pinned_body_path(
+    artifacts_root: &std::path::Path,
+    app: &str,
+    body_sha: &str,
+) -> Option<std::path::PathBuf> {
+    let app_ok =
+        !app.is_empty() && app != "." && app != ".." && !app.contains('/') && !app.contains('\\');
+    (app_ok && is_sha256_hex(body_sha)).then(|| pinned_body_ref(app, body_sha).path(artifacts_root))
+}
+
+/// sha256 (hex) of a body — the `artifact_sha` / `body_sha` of a pinned body.
+pub fn body_sha256(body: &str) -> String {
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+/// One observation of a pinned body (`body_pins`). Bytes are deduplicated by
+/// `body_sha`; observations never are.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BodyPin {
+    pub body_sha: String,
+    /// `<job_id>:<document key>`.
+    pub observation_id: String,
+    pub source_id: String,
+    pub job_id: Option<String>,
+    pub document_key: Option<String>,
+    pub original_url: Option<String>,
+    pub captured_at: String,
+}
+
+/// What decides whether a source can be repaired: its ruleset pointer and its
+/// retained bodies. See [`Datasets::source_repair_facts`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SourceRepairFacts {
+    /// `sources.active_rules_hash` — `None` = not enrolled.
+    pub active_rules_hash: Option<String>,
+    /// `body_pins` rows for the source.
+    pub pinned_bodies: i64,
+}
+
+/// The provenance facts every row of a per-row-stamped batch agrees on — the
+/// stamp the batch's derived writes may honestly carry. A field that differs
+/// between any two rows is `None` (unknown), never one row's value.
+pub fn shared_provenance(rows: &[(String, Value, Provenance)]) -> Provenance {
+    fn common<'a>(mut it: impl Iterator<Item = &'a Option<String>>) -> Option<String> {
+        let first = it.next()?.clone()?;
+        it.all(|v| v.as_deref() == Some(first.as_str()))
+            .then_some(first)
+    }
+    Provenance {
+        job_id: common(rows.iter().map(|(_, _, p)| &p.job_id)),
+        source_url: common(rows.iter().map(|(_, _, p)| &p.source_url)),
+        artifact_sha: common(rows.iter().map(|(_, _, p)| &p.artifact_sha)),
+        rules_hash: common(rows.iter().map(|(_, _, p)| &p.rules_hash)),
+    }
+}
+
+/// One trust group of a batch: the trust it writes (`None` = stable) and its
+/// `(key, value)` items.
+pub type TrustGroup = (Option<String>, Vec<(String, Value)>);
+
+/// Groups `(key, value)` items by the trust each will be written with,
+/// preserving first-appearance order of the groups and item order inside each.
+/// `trusts` is positional with `items`. `None` and `"stable"` are one group
+/// (both write `NULL`, which means stable).
+pub fn group_by_trust(items: Vec<(String, Value)>, trusts: &[Option<String>]) -> Vec<TrustGroup> {
+    let mut groups: Vec<TrustGroup> = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        let t = trusts
+            .get(i)
+            .cloned()
+            .flatten()
+            .filter(|t| !t.trim().is_empty() && t != TRUST_STABLE);
+        match groups.iter_mut().find(|(g, _)| *g == t) {
+            Some((_, v)) => v.push(item),
+            None => groups.push((t, vec![item])),
+        }
+    }
+    groups
+}
+
 /// A keyset page of revisions plus the cursor to fetch the next page (None at
 /// the end). The tiebreak differs by feed — rowid for the cross-key change feed,
 /// per-key `revision` for a single record's history — so the cursor is built
@@ -1082,8 +1349,22 @@ impl Datasets {
             .iter()
             .map(|h| (h.id.clone(), h.materialize_value()))
             .collect();
-        let summary = self.upsert_many(app, dataset, &items).await?;
-        let present: Vec<String> = items.into_iter().map(|(k, _)| k).collect();
+        let present: Vec<String> = items.iter().map(|(k, _)| k.clone()).collect();
+        // Each view row carries the trust of the record its hit points at. A
+        // hit carries no trust of its own (the index stores none), and writing
+        // every row with `None` laundered a provisional source record into a
+        // stable-looking view row. A hit whose source record is gone (or a
+        // job-result doc with no record) has no known trust and writes `NULL`.
+        let trusts = self.hit_source_trusts(hits).await?;
+        let mut summary = UpsertSummary::default();
+        for (trust, group) in group_by_trust(items, &trusts) {
+            let part = self
+                .upsert_many_trusted(app, dataset, &group, trust.as_deref())
+                .await?;
+            summary.new.extend(part.new);
+            summary.changed.extend(part.changed);
+            summary.unchanged += part.unchanged;
+        }
         let removed = self
             .detect_removed(
                 app,
@@ -1093,6 +1374,48 @@ impl Datasets {
             )
             .await?;
         Ok((summary, removed))
+    }
+
+    /// The stored trust of the source record behind each hit, positional with
+    /// `hits` (`None` = stable, or no such record). One IN-list read per
+    /// `(app, dataset)` group, not one per hit.
+    async fn hit_source_trusts(&self, hits: &[crate::SearchHit]) -> Result<Vec<Option<String>>> {
+        let mut by_pair: std::collections::BTreeMap<(&str, &str), Vec<&str>> = Default::default();
+        for h in hits {
+            by_pair
+                .entry((h.app.as_str(), h.dataset.as_str()))
+                .or_default()
+                .push(h.source_key());
+        }
+        let mut found: std::collections::HashMap<(String, String, String), Option<String>> =
+            Default::default();
+        for ((app, dataset), keys) in by_pair {
+            for slice in keys.chunks(rows_per_statement(1, 2)) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT key, trust FROM records WHERE app = ",
+                );
+                qb.push_bind(app);
+                qb.push(" AND dataset = ");
+                qb.push_bind(dataset);
+                qb.push(" AND key IN (");
+                push_key_list(&mut qb, slice);
+                qb.push(")");
+                let rows: Vec<(String, Option<String>)> =
+                    qb.build_query_as().fetch_all(&self.pool).await?;
+                for (key, trust) in rows {
+                    found.insert((app.to_string(), dataset.to_string(), key), trust);
+                }
+            }
+        }
+        Ok(hits
+            .iter()
+            .map(|h| {
+                found
+                    .get(&(h.app.clone(), h.dataset.clone(), h.source_key().to_string()))
+                    .cloned()
+                    .flatten()
+            })
+            .collect())
     }
 
     /// Transactional body of one removal: tombstone the record and append its
@@ -1187,6 +1510,92 @@ impl Datasets {
     ) -> Result<UpsertSummary> {
         self.upsert_many_at_depth(app, dataset, items, trust, prov, &DerivedPaths::NONE, 0)
             .await
+    }
+
+    /// A batch upsert where **each row carries its own** [`Provenance`] — the
+    /// write path for facts that differ per record (an enrolled source's
+    /// per-document `artifact_sha` + `source_url`), which
+    /// [`upsert_many_stamped`](Self::upsert_many_stamped) cannot express
+    /// because it shares one stamp across the batch.
+    ///
+    /// Not a second write path: every row goes through the same
+    /// [`upsert_in_tx`](Self::upsert_in_tx) body `upsert_stamped` uses, chunked
+    /// [`UPSERT_CHUNK`] rows per `BEGIN IMMEDIATE` on one held connection (the
+    /// batch path's commit shape). Verdicts, revision numbering, trust
+    /// refresh on unchanged rows and removed-record revival are therefore
+    /// exactly the single-row semantics. Derived specs then run once over the
+    /// fresh keys, stamped with [`shared_provenance`] — the facts every row
+    /// agrees on, never one row's.
+    pub async fn upsert_many_row_stamped(
+        &self,
+        app: &str,
+        dataset: &str,
+        rows: &[(String, Value, Provenance)],
+        trust: Option<&str>,
+    ) -> Result<UpsertSummary> {
+        if rows.is_empty() {
+            return Ok(UpsertSummary::default());
+        }
+        // Fingerprint before taking the write lock (see `upsert_many_inner`).
+        let prints: Vec<(String, i64)> = rows
+            .iter()
+            .map(|(_, v, _)| (hash_value(v), crate::simhash::simhash_value(v) as i64))
+            .collect();
+        let summary = self
+            .instrument
+            .metered(&self.pool, StoreOp::DatasetWrite, |mut conn| async move {
+                let mut summary = UpsertSummary::default();
+                for (chunk, prints) in rows.chunks(UPSERT_CHUNK).zip(prints.chunks(UPSERT_CHUNK)) {
+                    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                    let now = Utc::now();
+                    let mut part = UpsertSummary::default();
+                    let mut failed = None;
+                    for ((key, value, prov), (hash, sim)) in chunk.iter().zip(prints) {
+                        match Self::upsert_in_tx(
+                            &mut conn,
+                            app,
+                            dataset,
+                            key,
+                            value,
+                            hash,
+                            *sim,
+                            now,
+                            trust,
+                            Some(prov),
+                        )
+                        .await
+                        {
+                            Ok(ChangeKind::New) => part.new.push(key.clone()),
+                            Ok(ChangeKind::Changed) => part.changed.push(key.clone()),
+                            Ok(ChangeKind::Unchanged) => part.unchanged += 1,
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = failed {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e);
+                    }
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    summary.new.extend(part.new);
+                    summary.changed.extend(part.changed);
+                    summary.unchanged += part.unchanged;
+                }
+                Ok((summary, rows.len() as u64))
+            })
+            .await?;
+        if summary.new.len() + summary.changed.len() > 0 {
+            let items: Vec<(String, Value)> = rows
+                .iter()
+                .map(|(k, v, _)| (k.clone(), v.clone()))
+                .collect();
+            let shared = shared_provenance(rows);
+            self.apply_derived(app, dataset, &items, &summary, 0, trust, Some(&shared))
+                .await;
+        }
+        Ok(summary)
     }
 
     /// [`upsert_many_stamped`](Self::upsert_many_stamped) declaring which record
@@ -2172,6 +2581,362 @@ impl Datasets {
         .transpose()
     }
 
+    /// Registers a parsed RuleSet under its **canonical** identity
+    /// ([`canonical_rules_hash`]) and stores the canonical JSON, so every
+    /// spelling of one ruleset shares one `rules_versions` row. Idempotent.
+    pub async fn register_ruleset(&self, rules: &crate::RuleSet) -> Result<String> {
+        let canonical = canonical_rules_json(rules);
+        let hash = rules_hash(&canonical);
+        sqlx::query(
+            "INSERT OR IGNORE INTO rules_versions (hash, rules, created_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(&hash)
+        .bind(canonical.to_string())
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(hash)
+    }
+
+    // ── ruleset pointer (`source_rulesets`, migration 0044) ──────────────────
+    // The bodies stay content-addressed in `rules_versions`; this is only the
+    // per-source pointer, its lineage, and the activation epoch.
+
+    /// The source's active ruleset: the non-retired row with the greatest
+    /// epoch. `None` = the source is not enrolled (inline rules, or never
+    /// imported).
+    pub async fn ruleset_head(&self, source_id: &str) -> Result<Option<RulesetHead>> {
+        let row: Option<RulesetRow> = sqlx::query_as(
+            "SELECT rules_hash, parent_hash, origin, epoch, activated_at, licence_at_move \
+             FROM source_rulesets WHERE source_id = ?1 AND retired_at IS NULL \
+             ORDER BY epoch DESC LIMIT 1",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(RulesetHead::from))
+    }
+
+    /// Every pointer row the source ever had, newest epoch first.
+    pub async fn ruleset_lineage(&self, source_id: &str) -> Result<Vec<RulesetHead>> {
+        let rows: Vec<RulesetRow> = sqlx::query_as(
+            "SELECT rules_hash, parent_hash, origin, epoch, activated_at, licence_at_move \
+             FROM source_rulesets WHERE source_id = ?1 ORDER BY epoch DESC",
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(RulesetHead::from).collect())
+    }
+
+    /// Resolves a `rules_ref` for one source: `"active"` is the head's hash;
+    /// anything else is a hash or unique prefix among the source's lineage
+    /// ([`resolve_rules_prefix`]). Never resolves outside the lineage — a
+    /// source cannot be pointed at a ruleset nobody activated for it by prefix.
+    pub async fn resolve_rules_ref(
+        &self,
+        source_id: &str,
+        reference: &str,
+    ) -> std::result::Result<String, RulesetError> {
+        if reference.trim() == "active" {
+            return self
+                .ruleset_head(source_id)
+                .await?
+                .map(|h| h.rules_hash)
+                .ok_or_else(|| {
+                    RulesetError::Unknown(format!(
+                        "source '{source_id}' has no active ruleset (import one first: \
+                         POST /sources/{source_id}/rules/import)"
+                    ))
+                });
+        }
+        let lineage = self.ruleset_lineage(source_id).await?;
+        let hashes: Vec<&str> = lineage.iter().map(|h| h.rules_hash.as_str()).collect();
+        resolve_rules_prefix(&hashes, reference)
+    }
+
+    /// Moves the source's pointer to `rules_hash` in ONE `BEGIN IMMEDIATE`:
+    /// retires the current head, appends the new row (`epoch = old + 1`, first
+    /// = 1, `parent_hash` = old head, `licence_at_move = "none"`) and sets
+    /// `sources.active_rules_hash`.
+    ///
+    /// Refused — with zero writes — when the source has no `sources` row
+    /// (`Unknown`: this never creates one; only `observe` does), when the hash
+    /// is not registered (`Unknown`), or when it is already the head
+    /// (`Conflict`: an activation that changes nothing must not mint an epoch).
+    pub async fn activate_ruleset(
+        &self,
+        source_id: &str,
+        rules_hash: &str,
+        origin: RulesetOrigin,
+    ) -> std::result::Result<RulesetHead, RulesetError> {
+        self.move_pointer(source_id, rules_hash, origin, false)
+            .await
+    }
+
+    /// [`activate_ruleset`](Self::activate_ruleset) with origin `import`, which
+    /// is only legal as the FIRST head: a source that already has one is a
+    /// `Conflict` (moving an enrolled source is `human` or `rollback`).
+    pub async fn import_ruleset(
+        &self,
+        source_id: &str,
+        rules_hash: &str,
+    ) -> std::result::Result<RulesetHead, RulesetError> {
+        self.move_pointer(source_id, rules_hash, RulesetOrigin::Import, true)
+            .await
+    }
+
+    async fn move_pointer(
+        &self,
+        source_id: &str,
+        rules_hash: &str,
+        origin: RulesetOrigin,
+        first_only: bool,
+    ) -> std::result::Result<RulesetHead, RulesetError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let outcome =
+            Self::move_pointer_in_tx(&mut conn, source_id, rules_hash, origin, first_only).await;
+        match outcome {
+            Ok(head) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(head)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn move_pointer_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        source_id: &str,
+        rules_hash: &str,
+        origin: RulesetOrigin,
+        first_only: bool,
+    ) -> std::result::Result<RulesetHead, RulesetError> {
+        let known: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sources WHERE id = ?1")
+            .bind(source_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if known.is_none() {
+            return Err(RulesetError::Unknown(format!(
+                "unknown source '{source_id}' (a source exists once it has reported a run)"
+            )));
+        }
+        let registered: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM rules_versions WHERE hash = ?1")
+                .bind(rules_hash)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if registered.is_none() {
+            return Err(RulesetError::Unknown(format!(
+                "ruleset {rules_hash} is not in the rules_versions registry"
+            )));
+        }
+        let head: Option<(String,)> = sqlx::query_as(
+            "SELECT rules_hash FROM source_rulesets WHERE source_id = ?1 AND retired_at IS NULL \
+             ORDER BY epoch DESC LIMIT 1",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let parent = head.map(|(h,)| h);
+        if first_only {
+            if let Some(p) = &parent {
+                return Err(RulesetError::Conflict(format!(
+                    "source '{source_id}' already has an active ruleset ({p}); import only \
+                     registers the FIRST head — move it with POST /sources/{source_id}/rules \
+                     or /rules/rollback"
+                )));
+            }
+        }
+        if parent.as_deref() == Some(rules_hash) {
+            return Err(RulesetError::Conflict(format!(
+                "ruleset {rules_hash} is already the active ruleset of '{source_id}'"
+            )));
+        }
+        let (max_epoch, last_at): (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT MAX(epoch), MAX(activated_at) FROM source_rulesets WHERE source_id = ?1",
+        )
+        .bind(source_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let epoch = max_epoch.unwrap_or(0) + 1;
+        let at = next_activation_ts(Utc::now(), last_at.as_deref());
+        sqlx::query(
+            "UPDATE source_rulesets SET retired_at = ?2 \
+             WHERE source_id = ?1 AND retired_at IS NULL",
+        )
+        .bind(source_id)
+        .bind(&at)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO source_rulesets (source_id, rules_hash, parent_hash, origin, \
+                                          incident_id, licence_at_move, epoch, activated_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 'none', ?5, ?6)",
+        )
+        .bind(source_id)
+        .bind(rules_hash)
+        .bind(&parent)
+        .bind(origin.as_str())
+        .bind(epoch)
+        .bind(&at)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("UPDATE sources SET active_rules_hash = ?2 WHERE id = ?1")
+            .bind(source_id)
+            .bind(rules_hash)
+            .execute(&mut *conn)
+            .await?;
+        Ok(RulesetHead {
+            rules_hash: rules_hash.to_string(),
+            parent_hash: parent,
+            origin: origin.as_str().to_string(),
+            epoch,
+            activated_at: at,
+            licence_at_move: "none".to_string(),
+        })
+    }
+
+    /// `sources.active_rules_hash` for a source, `None` when the source has no
+    /// row or is not enrolled.
+    pub async fn active_rules_hash(&self, source_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT active_rules_hash FROM sources WHERE id = ?1")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    // ── body pins (`body_pins`, migration 0044) ──────────────────────────────
+
+    /// Records observations of pinned bodies. `observation_id` is the key: a
+    /// retried job re-pinning the same document replaces its own row rather
+    /// than failing the run.
+    pub async fn pin_bodies(&self, pins: &[BodyPin]) -> Result<()> {
+        if pins.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let mut failed = None;
+        for p in pins {
+            let r = sqlx::query(
+                "INSERT OR REPLACE INTO body_pins (body_sha, observation_id, source_id, job_id, \
+                                                   document_key, original_url, captured_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&p.body_sha)
+            .bind(&p.observation_id)
+            .bind(&p.source_id)
+            .bind(&p.job_id)
+            .bind(&p.document_key)
+            .bind(&p.original_url)
+            .bind(&p.captured_at)
+            .execute(&mut *conn)
+            .await;
+            if let Err(e) = r {
+                failed = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(e.into());
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(())
+    }
+
+    /// The newest pin per document key of a source — the corpus a dry run or a
+    /// `replay` over `{"source": id}` extracts. Keys are ordered; `limit`
+    /// bounds the documents, not the rows scanned.
+    pub async fn latest_body_pins(&self, source_id: &str, limit: i64) -> Result<Vec<BodyPin>> {
+        let rows: Vec<BodyPinRow> = sqlx::query_as(
+            "SELECT body_sha, observation_id, source_id, job_id, document_key, original_url, \
+                    captured_at \
+             FROM body_pins AS p \
+             WHERE source_id = ?1 AND document_key IS NOT NULL \
+               AND observation_id = ( \
+                   SELECT q.observation_id FROM body_pins AS q \
+                   WHERE q.source_id = p.source_id AND q.document_key = p.document_key \
+                   ORDER BY q.captured_at DESC, q.observation_id DESC LIMIT 1) \
+             ORDER BY document_key LIMIT ?2",
+        )
+        .bind(source_id)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(BodyPin::from).collect())
+    }
+
+    /// The pin a revision's `artifact_sha` resolves to. Two documents may share
+    /// one body, so the pin whose `original_url` equals `prefer_url` (the
+    /// revision's own `source_url`) wins; otherwise the newest pin of the sha.
+    pub async fn body_pin(
+        &self,
+        body_sha: &str,
+        prefer_url: Option<&str>,
+    ) -> Result<Option<BodyPin>> {
+        let row: Option<BodyPinRow> = sqlx::query_as(
+            "SELECT body_sha, observation_id, source_id, job_id, document_key, original_url, \
+                    captured_at \
+             FROM body_pins WHERE body_sha = ?1 \
+             ORDER BY (original_url IS ?2) DESC, captured_at DESC LIMIT 1",
+        )
+        .bind(body_sha)
+        .bind(prefer_url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(BodyPin::from))
+    }
+
+    /// The repairability facts of each named source that HAS a `sources` row:
+    /// its active ruleset hash and how many body pins it holds. A source with
+    /// no row is absent from the map (unknown source), never defaulted.
+    pub async fn source_repair_facts(
+        &self,
+        source_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, SourceRepairFacts>> {
+        let mut out = std::collections::HashMap::with_capacity(source_ids.len());
+        for slice in source_ids.chunks(rows_per_statement(1, 0)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT s.id, s.active_rules_hash, \
+                        (SELECT COUNT(*) FROM body_pins AS p WHERE p.source_id = s.id) \
+                 FROM sources AS s WHERE s.id IN (",
+            );
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            let rows: Vec<(String, Option<String>, i64)> =
+                qb.build_query_as().fetch_all(&self.pool).await?;
+            for (id, active_rules_hash, pinned_bodies) in rows {
+                out.insert(
+                    id,
+                    SourceRepairFacts {
+                        active_rules_hash,
+                        pinned_bodies,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// How many body pins a source has.
+    pub async fn body_pin_count(&self, source_id: &str) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM body_pins WHERE source_id = ?1")
+                .bind(source_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     /// Stamp coverage of one record's revision chain, computed in SQL so the
     /// numbers cover the WHOLE chain even when the caller pages it:
     /// `(total, with job_id, replayable = artifact_sha AND rules_hash)`.
@@ -2259,10 +3024,32 @@ impl Datasets {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let mut refs: HashSet<ArtifactRef> = rows
             .into_iter()
             .map(|(app, job_id, name)| ArtifactRef { app, job_id, name })
-            .collect())
+            .collect();
+        // Arm 3 — content-addressed bodies of ENROLLED sources
+        // (`<app>/bodies/<sha>.html`). Their revisions carry no
+        // `job_id`/`artifact_path` in data (the extractor's records are its
+        // extraction, not a pointer to a crawl body), so arms 1-2 can never see
+        // them. A pinned body is kept while any revision stamped with a
+        // `rules_hash` cites its sha — exactly the revisions `rederive` will
+        // replay — and becomes reclaimable once none does.
+        let pinned: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT p.source_id, p.body_sha FROM body_pins AS p \
+             JOIN (SELECT DISTINCT artifact_sha FROM record_revisions \
+                   WHERE artifact_sha IS NOT NULL AND rules_hash IS NOT NULL) AS r \
+               ON r.artifact_sha = p.body_sha",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (source_id, sha) in pinned {
+            let app = source_id
+                .split_once('/')
+                .map_or(source_id.as_str(), |(a, _)| a);
+            refs.insert(pinned_body_ref(app, &sha));
+        }
+        Ok(refs)
     }
 
     // ── store integrity (read-only; `datasets doctor`) ───────────────────────
@@ -4299,6 +5086,54 @@ fn diff_into(path: &str, old: &Value, new: &Value, out: &mut serde_json::Map<Str
         (a, b) => {
             let p = if path.is_empty() { "$" } else { path };
             out.insert(p.to_string(), serde_json::json!({ "from": a, "to": b }));
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RulesetRow {
+    rules_hash: String,
+    parent_hash: Option<String>,
+    origin: String,
+    epoch: i64,
+    activated_at: String,
+    licence_at_move: String,
+}
+
+impl From<RulesetRow> for RulesetHead {
+    fn from(r: RulesetRow) -> Self {
+        Self {
+            rules_hash: r.rules_hash,
+            parent_hash: r.parent_hash,
+            origin: r.origin,
+            epoch: r.epoch,
+            activated_at: r.activated_at,
+            licence_at_move: r.licence_at_move,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct BodyPinRow {
+    body_sha: String,
+    observation_id: String,
+    source_id: String,
+    job_id: Option<String>,
+    document_key: Option<String>,
+    original_url: Option<String>,
+    captured_at: String,
+}
+
+impl From<BodyPinRow> for BodyPin {
+    fn from(r: BodyPinRow) -> Self {
+        Self {
+            body_sha: r.body_sha,
+            observation_id: r.observation_id,
+            source_id: r.source_id,
+            job_id: r.job_id,
+            document_key: r.document_key,
+            original_url: r.original_url,
+            captured_at: r.captured_at,
         }
     }
 }

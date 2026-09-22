@@ -45,7 +45,12 @@ pub(crate) struct SourcesQuery {
     responses(
         (status = 200, description = "`{enabled, enforcing, contracts_enforce, contracts, count, \
             unmonitored, sources: [{id, app, dataset, state, degradation_score, state_since, \
-            last_verdict, tripped_of_last3, monitored, ..., contract?}]}`. \
+            last_verdict, tripped_of_last3, monitored, ..., contract?, active_rules_hash, \
+            repairable, repairable_reason}]}`. \
+            `active_rules_hash` is the source's active ruleset head (null = not enrolled). \
+            `repairable: false` carries exactly one `repairable_reason` (`not an extractor \
+            source`, `inline rules` = no ruleset head, or `no pinned bodies`); \
+            `repairable: true` carries `repairable_reason: null`. \
             `monitored: false` means the source has never produced a cohort at or above \
             `[resilience] min_cohort_docs`, so the distributional tests have never applied to \
             it — `state: \"healthy\"` on such a row means *unwatched*, not *verified*, and \
@@ -93,6 +98,8 @@ pub(crate) async fn list_sources(
     let (catalog, contracts) = ContractsStatus::load(state.config.contracts.enforce);
     let windows = verdict_windows(catalog.as_ref(), super::query::CATALOG_STALE_GRACE);
     let now = chrono::Utc::now();
+    let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
+    let facts = state.datasets.source_repair_facts(&ids).await?;
     let sources: Vec<Value> = sources
         .iter()
         .map(|s| {
@@ -102,6 +109,7 @@ pub(crate) async fn list_sources(
                     let window = window_for(windows.as_ref(), &s.id);
                     map.insert("contract".into(), verdict_with_age(v, window, now));
                 }
+                insert_repair_fields(map, &s.app, facts.get(&s.id));
             }
             row
         })
@@ -129,7 +137,8 @@ pub(crate) async fn list_sources(
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
     responses(
         (status = 200, description = "`{source, contract, runs, fields, invariants, \
-            statistical_coverage}`. `contract` is the latest declared-contract verdict with its \
+            statistical_coverage}`. `source` carries `active_rules_hash`, `repairable` and \
+            `repairable_reason` exactly as the `/sources` rows do. `contract` is the latest declared-contract verdict with its \
             own `age_secs`/`stale`/`stale_reason?` attached (null when none recorded since boot); \
             `fields` pairs the latest run's per-field sketch with its baseline; \
             `statistical_coverage: false` means the *latest run* was below the cohort \
@@ -188,8 +197,13 @@ pub(crate) async fn get_source(
     let contract = contract_verdict(&state, &id)
         .map(|v| verdict_with_age(v, window_for(windows.as_ref(), &id), chrono::Utc::now()))
         .unwrap_or(Value::Null);
+    let facts = state.datasets.source_repair_facts(&[id.as_str()]).await?;
+    let mut source_row = serde_json::to_value(&source).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut source_row {
+        insert_repair_fields(map, &source.app, facts.get(&id));
+    }
     Ok(Json(json!({
-        "source": source,
+        "source": source_row,
         "contract": contract,
         "enforcing": state.health.enforcing(),
         "statistical_coverage": coverage,
@@ -374,6 +388,382 @@ pub(crate) async fn set_source_state(
     Ok(Json(
         json!({ "id": id, "state": parsed.as_str(), "reason": reason }),
     ))
+}
+
+// ── ruleset pointer (Stage 2: pointer + reprint) ────────────────────────────
+
+/// The only app whose sources carry a declarative, registrable RuleSet.
+const EXTRACTOR_APP: &str = "extractor";
+
+/// Pinned documents one dry run replays (the replay mode's default page cap).
+const DRY_RUN_MAX_DOCS: usize = 500;
+
+/// Why a source cannot be repaired, or `None` when it can.
+///
+/// Exactly one reason, checked in dependency order — a hardcoded app has no
+/// rules to point at, a rule-backed source with no pointer runs inline rules,
+/// and an enrolled source with no retained bodies has nothing to replay:
+/// `"not an extractor source"` → `"inline rules"` → `"no pinned bodies"`.
+pub(crate) fn repairable_reason(
+    app: &str,
+    active_rules_hash: Option<&str>,
+    pinned_bodies: i64,
+) -> Option<&'static str> {
+    if app != EXTRACTOR_APP {
+        return Some("not an extractor source");
+    }
+    if active_rules_hash.is_none() {
+        return Some("inline rules");
+    }
+    if pinned_bodies <= 0 {
+        return Some("no pinned bodies");
+    }
+    None
+}
+
+/// Writes `active_rules_hash`, `repairable` and `repairable_reason` onto a
+/// rendered source row — every key always present, `null` when unknown.
+fn insert_repair_fields(
+    map: &mut serde_json::Map<String, Value>,
+    app: &str,
+    facts: Option<&pumper_core::datasets::SourceRepairFacts>,
+) {
+    let active = facts.and_then(|f| f.active_rules_hash.clone());
+    let pins = facts.map_or(0, |f| f.pinned_bodies);
+    let reason = repairable_reason(app, active.as_deref(), pins);
+    map.insert("active_rules_hash".into(), json!(active));
+    map.insert("repairable".into(), json!(reason.is_none()));
+    map.insert("repairable_reason".into(), json!(reason));
+}
+
+/// A refused pointer operation, as its HTTP answer.
+fn ruleset_error(e: pumper_core::datasets::RulesetError) -> ApiError {
+    use pumper_core::datasets::RulesetError as R;
+    match e {
+        R::BadRef(m) => ApiError(StatusCode::BAD_REQUEST, m),
+        R::Unknown(m) => ApiError(StatusCode::NOT_FOUND, m),
+        R::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
+        R::Store(e) => ApiError::from(e),
+    }
+}
+
+/// 404 unless the source has a `sources` row — pointer endpoints never create
+/// one (only a reported run does).
+async fn require_source(state: &AppState, id: &str) -> Result<(), ApiError> {
+    let facts = state.datasets.source_repair_facts(&[id]).await?;
+    if facts.contains_key(id) {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown source '{id}' (a source exists once it has reported a run)"),
+        ))
+    }
+}
+
+/// Parses and compiles a caller-supplied RuleSet — both are the caller's
+/// input, so both failures are a 400, never the 500 a core parse error maps to.
+fn parse_candidate_rules(rules: &Value) -> Result<pumper_core::RuleSet, ApiError> {
+    let parsed: pumper_core::RuleSet = serde_json::from_value(rules.clone())
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("bad rules: {e}")))?;
+    parsed.compile().map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("rules do not compile: {e}"),
+        )
+    })?;
+    Ok(parsed)
+}
+
+/// The registered RuleSet behind a hash (a 409 when the registry lost it — a
+/// pointer to a body that is not there is a store inconsistency, stated).
+async fn registered_rules(state: &AppState, hash: &str) -> Result<pumper_core::RuleSet, ApiError> {
+    let json = state.datasets.rules_by_hash(hash).await?.ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            format!("ruleset {hash} is not in the rules_versions registry"),
+        )
+    })?;
+    serde_json::from_value(json).map_err(|e| {
+        ApiError(
+            StatusCode::CONFLICT,
+            format!("registered ruleset {hash} is not a RuleSet: {e}"),
+        )
+    })
+}
+
+/// The dry-run diff of `candidate` against the source's active head over its
+/// pinned bodies. Writes nothing.
+async fn dry_run_diff(
+    state: &AppState,
+    id: &str,
+    candidate: &pumper_core::RuleSet,
+    candidate_hash: &str,
+) -> Result<Value, ApiError> {
+    let head = state.datasets.ruleset_head(id).await?;
+    let baseline = match &head {
+        Some(h) => Some(registered_rules(state, &h.rules_hash).await?),
+        None => None,
+    };
+    let replay = app_extractor::replay_pinned_bodies(
+        &state.datasets,
+        &state.storage.artifacts_dir,
+        id,
+        candidate,
+        baseline.as_ref(),
+        DRY_RUN_MAX_DOCS,
+    )
+    .await?;
+    Ok(json!({
+        "id": id,
+        "dry_run": true,
+        "candidate_hash": candidate_hash,
+        "active": head,
+        "replay": replay,
+    }))
+}
+
+/// A source's ruleset pointer: the active head and its full lineage.
+#[utoipa::path(
+    get,
+    path = "/sources/{id}/rules",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    responses(
+        (status = 200, description = "`{id, active: {rules_hash, parent_hash, origin, epoch, \
+            activated_at, licence_at_move} | null, lineage: [same, newest epoch first]}`. \
+            `active: null` = not enrolled (the source runs inline rules)."),
+        (status = 404, description = "Unknown source", body = Object),
+    )
+)]
+pub(crate) async fn get_source_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_source(&state, &id).await?;
+    let active = state.datasets.ruleset_head(&id).await?;
+    let lineage = state.datasets.ruleset_lineage(&id).await?;
+    Ok(Json(
+        json!({ "id": id, "active": active, "lineage": lineage }),
+    ))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RulesImportBody {
+    /// An extractor job that wrote this source's dataset with inline
+    /// `params.rules`.
+    job_id: String,
+}
+
+/// Enrols a source: registers a job's inline `params.rules` (under its
+/// canonical hash) as the source's FIRST ruleset head, origin `import`.
+///
+/// The running schedule's output does not change — it may switch to
+/// `"rules_ref": "active"` afterwards and extract byte-identical records.
+#[utoipa::path(
+    post,
+    path = "/sources/{id}/rules/import",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    request_body = RulesImportBody,
+    responses(
+        (status = 200, description = "`{id, active}` — the new head (epoch 1)"),
+        (status = 400, description = "Bad job id; the job is not an extractor job writing this \
+            source's dataset; or it carries no inline rules", body = Object),
+        (status = 404, description = "Unknown source or job", body = Object),
+        (status = 409, description = "The source already has an active ruleset", body = Object),
+    )
+)]
+pub(crate) async fn import_source_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RulesImportBody>,
+) -> Result<Json<Value>, ApiError> {
+    let rules = import_rules_of_job(&state, &id, &body.job_id).await?;
+    let hash = state.datasets.register_ruleset(&rules).await?;
+    let head = state
+        .datasets
+        .import_ruleset(&id, &hash)
+        .await
+        .map_err(ruleset_error)?;
+    Ok(Json(json!({ "id": id, "active": head })))
+}
+
+/// The inline RuleSet an import may register for `source_id`, from `job_id`.
+async fn import_rules_of_job(
+    state: &AppState,
+    source_id: &str,
+    job_id: &str,
+) -> Result<pumper_core::RuleSet, ApiError> {
+    let (app, dataset) = source_id.split_once('/').ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("source id '{source_id}' is not `<app>/<dataset>`"),
+        )
+    })?;
+    let uuid = uuid::Uuid::parse_str(job_id)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("bad job_id: {e}")))?;
+    let job = state
+        .storage
+        .get(uuid)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("unknown job '{job_id}'")))?;
+    let job_dataset = job
+        .params
+        .get("dataset")
+        .and_then(Value::as_str)
+        .unwrap_or("extracted");
+    if let Some(refusal) = import_refusal(app, dataset, &job.app, job_dataset, &job.params) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, refusal));
+    }
+    parse_candidate_rules(&job.params["rules"])
+}
+
+/// Why a job cannot be imported as `source_app/source_dataset`'s first head,
+/// or `None` when it can. Pure, so every refusal is pinned by a test.
+pub(crate) fn import_refusal(
+    source_app: &str,
+    source_dataset: &str,
+    job_app: &str,
+    job_dataset: &str,
+    params: &Value,
+) -> Option<String> {
+    if source_app != EXTRACTOR_APP {
+        return Some(format!(
+            "source '{source_app}/{source_dataset}' is not an extractor source — only \
+             extractor rulesets can be imported"
+        ));
+    }
+    if job_app != EXTRACTOR_APP {
+        return Some(format!("job is a '{job_app}' job, not an extractor job"));
+    }
+    if job_dataset != source_dataset {
+        return Some(format!(
+            "job writes dataset '{job_dataset}', not this source's '{source_dataset}'"
+        ));
+    }
+    if !params.get("rules").is_some_and(Value::is_object) {
+        return Some(
+            "job carries no inline params.rules (a rules_ref job is already on the pointer)".into(),
+        );
+    }
+    None
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RulesActivateBody {
+    /// The candidate RuleSet.
+    #[schema(value_type = Object)]
+    rules: Value,
+    /// Default `true`: replay-diff only, nothing written.
+    #[serde(default = "default_dry_run")]
+    dry_run: bool,
+}
+
+/// Proposes a new ruleset for a source. **Dry run by default**: replays
+/// `rules` against the active head over the source's pinned bodies and returns
+/// the diff, writing nothing. `"dry_run": false` compiles, registers and
+/// activates it (origin `human`).
+#[utoipa::path(
+    post,
+    path = "/sources/{id}/rules",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    request_body = RulesActivateBody,
+    responses(
+        (status = 200, description = "Dry run: `{id, dry_run: true, candidate_hash, active, \
+            replay: {source, docs, docs_matching, truncated, missing, missing_keys, baseline, \
+            fields, inner_fields, regressed_urls, regressions}}`. Activation: `{id, dry_run: \
+            false, active}` — the new head."),
+        (status = 400, description = "Rules do not parse or compile; not an extractor source", body = Object),
+        (status = 404, description = "Unknown source", body = Object),
+        (status = 409, description = "That ruleset is already the active one", body = Object),
+    )
+)]
+pub(crate) async fn propose_source_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RulesActivateBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_extractor_source(&state, &id).await?;
+    let rules = parse_candidate_rules(&body.rules)?;
+    if body.dry_run {
+        let hash = pumper_core::datasets::canonical_rules_hash(&rules);
+        return Ok(Json(dry_run_diff(&state, &id, &rules, &hash).await?));
+    }
+    let hash = state.datasets.register_ruleset(&rules).await?;
+    let head = state
+        .datasets
+        .activate_ruleset(&id, &hash, pumper_core::datasets::RulesetOrigin::Human)
+        .await
+        .map_err(ruleset_error)?;
+    Ok(Json(json!({ "id": id, "dry_run": false, "active": head })))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RulesRollbackBody {
+    /// A hash or unique prefix (>= 8 hex) in this source's lineage.
+    to: String,
+    /// Default `true`: replay-diff only, nothing written.
+    #[serde(default = "default_dry_run")]
+    dry_run: bool,
+}
+
+/// Moves a source's pointer back to a ruleset in its own lineage. Same shape as
+/// `POST /sources/{id}/rules`: dry run by default; `"dry_run": false` activates
+/// it (origin `rollback`).
+#[utoipa::path(
+    post,
+    path = "/sources/{id}/rules/rollback",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    request_body = RulesRollbackBody,
+    responses(
+        (status = 200, description = "Dry run: `{id, dry_run: true, candidate_hash, active, \
+            replay}`. Activation: `{id, dry_run: false, active}`."),
+        (status = 400, description = "`to` shorter than 8 hex, not hex, or ambiguous", body = Object),
+        (status = 404, description = "Unknown source, or `to` matches nothing in the lineage", body = Object),
+        (status = 409, description = "`to` is already the active ruleset", body = Object),
+    )
+)]
+pub(crate) async fn rollback_source_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RulesRollbackBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_extractor_source(&state, &id).await?;
+    let hash = state
+        .datasets
+        .resolve_rules_ref(&id, &body.to)
+        .await
+        .map_err(ruleset_error)?;
+    if body.dry_run {
+        let rules = registered_rules(&state, &hash).await?;
+        return Ok(Json(dry_run_diff(&state, &id, &rules, &hash).await?));
+    }
+    let head = state
+        .datasets
+        .activate_ruleset(&id, &hash, pumper_core::datasets::RulesetOrigin::Rollback)
+        .await
+        .map_err(ruleset_error)?;
+    Ok(Json(json!({ "id": id, "dry_run": false, "active": head })))
+}
+
+/// 404 for an unknown source, 400 for a source whose app has no RuleSet.
+async fn require_extractor_source(state: &AppState, id: &str) -> Result<(), ApiError> {
+    require_source(state, id).await?;
+    let app = id.split_once('/').map_or(id, |(a, _)| a);
+    if app != EXTRACTOR_APP {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("source '{id}' is not an extractor source — it has no ruleset to move"),
+        ));
+    }
+    Ok(())
 }
 
 /// The latest publish-time data-contract verdict for a `<app>/<dataset>`
@@ -649,5 +1039,286 @@ mod tests {
         let ok = serde_json::to_value(ContractsStatus::of(&Catalog::default(), true))
             .expect("serializes");
         assert_eq!(ok["enforce_observed"], json!(true));
+    }
+}
+
+#[cfg(test)]
+pub(super) mod ruleset_pointer_tests {
+    use super::{import_refusal, repairable_reason};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use pumper_core::storage::EnqueueOptions;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const ID: &str = "extractor%2Fd";
+
+    /// A headless `AppState` over a temp store (the `e2e::harness` assembly,
+    /// which is private to that module tree). Keep the store alive.
+    pub(crate) async fn headless_state() -> (crate::state::AppState, pumper_core::testing::TempStore)
+    {
+        let store = pumper_core::testing::TempStore::new("routes-ruleset").await;
+        let mut config = pumper_core::config::Config::default();
+        config.storage.database_path = store.path().join("pumper.db");
+        config.storage.artifacts_dir = store.storage.artifacts_dir.clone();
+        let state = crate::state::AppState::from_parts(crate::state::AppStateParts {
+            config,
+            storage: Arc::new(store.storage.clone()),
+            governor: Arc::new(pumper_core::Governor::new(
+                &pumper_core::config::GovernorConfig::default(),
+            )),
+            engines: pumper_core::testing::dead_engines(),
+            plugins: Arc::new(pumper_core::NoPlugins),
+            search: Arc::new(pumper_core::NoSearch),
+            registry: Default::default(),
+        })
+        .expect("assemble AppState");
+        (state, store)
+    }
+
+    /// The anti-pattern: a `repairable` flag computed from whichever fact was
+    /// checked first, so a hardcoded app read as "inline rules" and an enrolled
+    /// source with no bodies read as repairable.
+    #[test]
+    fn repairable_reason_names_the_first_missing_prerequisite_not_any() {
+        assert_eq!(
+            repairable_reason("mpsv-ispv", Some("h"), 10),
+            Some("not an extractor source"),
+            "a hardcoded app has no rules to point at, whatever else is true"
+        );
+        assert_eq!(
+            repairable_reason("extractor", None, 10),
+            Some("inline rules")
+        );
+        assert_eq!(
+            repairable_reason("extractor", Some("h"), 0),
+            Some("no pinned bodies")
+        );
+        assert_eq!(repairable_reason("extractor", Some("h"), 1), None);
+    }
+
+    #[test]
+    fn import_refuses_every_job_that_is_not_this_sources_inline_extraction() {
+        let rules = json!({ "rules": { "t": { "type": "css", "selector": "h1" } } });
+        assert_eq!(
+            import_refusal("extractor", "d", "extractor", "d", &rules),
+            None
+        );
+        assert!(import_refusal("crawl", "pages", "extractor", "pages", &rules).is_some());
+        assert!(import_refusal("extractor", "d", "crawl", "d", &rules).is_some());
+        assert!(
+            import_refusal("extractor", "d", "extractor", "other", &rules)
+                .is_some_and(|m| m.contains("'other'"))
+        );
+        assert!(import_refusal(
+            "extractor",
+            "d",
+            "extractor",
+            "d",
+            &json!({ "rules_ref": "active" })
+        )
+        .is_some_and(|m| m.contains("no inline")));
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&b).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let resp = router
+            .clone()
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn pointer_rows(state: &crate::state::AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM source_rulesets")
+            .fetch_one(&state.storage.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_pointer_moves_one_row_per_activation_and_dry_runs_write_nothing() {
+        let (state, _store) = headless_state().await;
+        let router = crate::routes::router(state.clone());
+        let first = json!({ "t": { "type": "css", "selector": "h1" } });
+        let second = json!({ "t": { "type": "css", "selector": "h2" } });
+
+        // No source row yet: every pointer route is a 404, and none creates one.
+        let job = state
+            .storage
+            .enqueue(
+                "extractor",
+                EnqueueOptions {
+                    params: json!({ "rules": first, "urls": ["https://a.test/"], "dataset": "d" }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/import"),
+            Some(json!({ "job_id": job.id.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(&router, "GET", &format!("/sources/{ID}/rules"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        state
+            .health
+            .store()
+            .unwrap()
+            .ensure_source("extractor", "d")
+            .await
+            .unwrap();
+
+        // Import: the first head.
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/import"),
+            Some(json!({ "job_id": job.id.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active"]["epoch"], 1);
+        assert_eq!(body["active"]["origin"], "import");
+        let first_hash = body["active"]["rules_hash"].as_str().unwrap().to_string();
+        assert_eq!(pointer_rows(&state).await, 1);
+
+        // A second import is a conflict.
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/import"),
+            Some(json!({ "job_id": job.id.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "conflict");
+
+        // Dry run (the default): a diff, and zero pointer writes.
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules"),
+            Some(json!({ "rules": second })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["active"]["rules_hash"], json!(first_hash));
+        assert!(body["replay"]["fields"].is_array(), "{body}");
+        assert_eq!(pointer_rows(&state).await, 1, "a dry run writes nothing");
+
+        // Activation: exactly one more row.
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules"),
+            Some(json!({ "rules": second, "dry_run": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active"]["epoch"], 2);
+        assert_eq!(body["active"]["origin"], "human");
+        assert_eq!(body["active"]["parent_hash"], json!(first_hash));
+        assert_eq!(pointer_rows(&state).await, 2);
+
+        // Rollback: dry by default, then one more row.
+        let to = &first_hash[..10];
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/rollback"),
+            Some(json!({ "to": to })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["candidate_hash"], json!(first_hash));
+        assert_eq!(pointer_rows(&state).await, 2);
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/rollback"),
+            Some(json!({ "to": to, "dry_run": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active"]["epoch"], 3);
+        assert_eq!(body["active"]["origin"], "rollback");
+        assert_eq!(pointer_rows(&state).await, 3);
+
+        // Refusals: a short prefix is a 400, an unknown one a 404.
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/rollback"),
+            Some(json!({ "to": "abc" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules/rollback"),
+            Some(json!({ "to": "0000000000" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Rules that do not compile are the caller's 400, not a 500.
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/rules"),
+            Some(json!({ "rules": { "t": { "type": "css", "selector": "[[" } } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The pointer reads back, and the source rows carry the repair fields.
+        let (status, body) = call(&router, "GET", &format!("/sources/{ID}/rules"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let epochs: Vec<i64> = body["lineage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["epoch"].as_i64().unwrap())
+            .collect();
+        assert_eq!(epochs, vec![3, 2, 1], "epoch strictly increases");
+        assert_eq!(body["active"]["rules_hash"], json!(first_hash));
+        let (_, body) = call(&router, "GET", &format!("/sources/{ID}"), None).await;
+        assert_eq!(body["source"]["active_rules_hash"], json!(first_hash));
+        assert_eq!(body["source"]["repairable"], false);
+        assert_eq!(body["source"]["repairable_reason"], "no pinned bodies");
+        let (_, body) = call(&router, "GET", "/sources", None).await;
+        let row = &body["sources"][0];
+        assert_eq!(row["active_rules_hash"], json!(first_hash));
+        assert!(
+            row.get("repairable_reason").is_some(),
+            "the key is present even when null"
+        );
     }
 }

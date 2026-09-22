@@ -261,6 +261,9 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_source))
         .routes(routes!(source_runs))
         .routes(routes!(set_source_state))
+        .routes(routes!(get_source_rules, propose_source_rules))
+        .routes(routes!(import_source_rules))
+        .routes(routes!(rollback_source_rules))
         .routes(routes!(enforcement_preview))
         .routes(routes!(list_proposals))
         .routes(routes!(validate_proposal))
@@ -631,6 +634,10 @@ mod api_spec_tests {
         "GET /sources/{id}",
         "GET /sources/{id}/runs",
         "POST /sources/{id}/state",
+        "GET /sources/{id}/rules",
+        "POST /sources/{id}/rules",
+        "POST /sources/{id}/rules/import",
+        "POST /sources/{id}/rules/rollback",
         "GET /enforcement/preview",
         "GET /provisioner/proposals",
         "POST /provisioner/proposals/{key}/validate",

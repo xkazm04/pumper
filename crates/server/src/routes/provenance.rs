@@ -154,9 +154,12 @@ pub(crate) struct RederiveQuery {
         RederiveQuery,
     ),
     responses(
-        (status = 200, description = "`{verdict: reproduced|diverged, diff?}` — the archived body \
-            replayed through the revision's registered ruleset, compared field-by-field against \
-            the stored snapshot. Read-only: nothing is written either way."),
+        (status = 200, description = "`{verdict: reproduced|diverged, diverged, base_url, diff?}` \
+            — the archived body replayed through the revision's registered ruleset, compared \
+            field-by-field against the stored snapshot. An enrolled source's revision resolves \
+            its PINNED body (`body_pins`) and replays it with the pin's original URL as \
+            `base_url`; any other revision uses the record's `artifact_path` + `job_id` with \
+            `base_url: null`. Read-only: nothing is written either way."),
         (status = 404, description = "No such record / revision"),
         (status = 409, description = "Not replayable, with the reason: stamp incomplete \
             (artifact_sha/rules_hash unknown), ruleset not registered, archived body missing, \
@@ -235,11 +238,28 @@ pub(crate) async fn rederive_provenance(
         .compile()
         .map_err(|e| not_replayable(format!("registered rules no longer compile: {e}")))?;
 
-    // Locate the archived body via the record's own artifact convention
-    // (`artifact_path` + `job_id` under data/artifacts/<app>/<job_id>/ — the
-    // crawl→extract seam), then verify it IS the stamped body by hash.
-    let body = load_artifact(&state, &app, &record.data)
-        .map_err(|reason| not_replayable(format!("archived body unavailable: {reason}")))?;
+    // Locate the archived body. An enrolled source's revision cites a PINNED
+    // body (`body_pins` → `<app>/bodies/<sha>.html`), fetched from the URL the
+    // pin recorded — which is also the base its links resolved against. Any
+    // other revision uses the record's own artifact convention (`artifact_path`
+    // + `job_id` under data/artifacts/<app>/<job_id>/ — the crawl→extract
+    // seam). Either way the body is then verified to BE the stamped one.
+    let pinned = state
+        .datasets
+        .body_pin(artifact_sha, rev.provenance.source_url.as_deref())
+        .await?;
+    let (body, base) = match pinned {
+        Some(pin) => {
+            let body = load_pinned_body(&state, &pin)
+                .map_err(|reason| not_replayable(format!("pinned body unavailable: {reason}")))?;
+            (body, pin.original_url)
+        }
+        None => (
+            load_artifact(&state, &app, &record.data)
+                .map_err(|reason| not_replayable(format!("archived body unavailable: {reason}")))?,
+            None,
+        ),
+    };
     let body_sha = format!("{:x}", Sha256::digest(body.as_bytes()));
     if body_sha != artifact_sha {
         return Err(not_replayable(format!(
@@ -251,7 +271,7 @@ pub(crate) async fn rederive_provenance(
     // Replay, then compare against the snapshot minus its `_`-prefixed meta
     // stamps (`_url`, `_observed_at`, … are written by the pipeline around the
     // rules, not produced by them) — reported, not hidden.
-    let replayed = pumper_core::extract_one(&compiled, &body);
+    let replayed = replay_body(&compiled, &body, base.as_deref());
     let (stored_cmp, ignored_meta) = strip_meta(stored);
     let verdict_reproduced = canonical(&stored_cmp) == canonical(&replayed);
     let mut out = json!({
@@ -261,13 +281,43 @@ pub(crate) async fn rederive_provenance(
         "revision": rev.revision,
         "artifact_sha": artifact_sha,
         "rules_hash": stamped_rules_hash,
+        "base_url": base,
         "ignored_meta_fields": ignored_meta,
         "verdict": if verdict_reproduced { "reproduced" } else { "diverged" },
+        "diverged": !verdict_reproduced,
     });
     if !verdict_reproduced {
         out["diff"] = diff_values(&stored_cmp, &replayed);
     }
     Ok(Json(out))
+}
+
+/// Replays one body through a compiled ruleset. With a `base` (a pinned body's
+/// original URL) `url_absolute` resolves exactly as it did when the row was
+/// written; without one the replay is the historical base-less extraction —
+/// resolving against something invented here would fabricate a match.
+fn replay_body(compiled: &pumper_core::CompiledRuleSet, body: &str, base: Option<&str>) -> Value {
+    match base {
+        Some(url) => pumper_core::extract::extract_one_with_report_at(compiled, body, Some(url)).0,
+        None => pumper_core::extract_one(compiled, body),
+    }
+}
+
+/// Reads a pinned body from its content address. The address is built only
+/// from the pin's source app and a 64-hex sha (see `pinned_body_path`), so a
+/// stored row cannot steer the read outside the artifacts root.
+fn load_pinned_body(
+    state: &AppState,
+    pin: &pumper_core::datasets::BodyPin,
+) -> Result<String, String> {
+    let app = pin
+        .source_id
+        .split_once('/')
+        .map_or(pin.source_id.as_str(), |(a, _)| a);
+    let path =
+        pumper_core::datasets::pinned_body_path(&state.storage.artifacts_dir, app, &pin.body_sha)
+            .ok_or_else(|| format!("unsafe pinned-body address for {}", pin.observation_id))?;
+    std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Reads the archived body a record's data points at, guarding every untrusted
@@ -353,6 +403,91 @@ mod tests {
         let (kept, ignored) = strip_meta(&json!([1, 2]));
         assert_eq!(kept, json!([1, 2]));
         assert!(ignored.is_empty());
+    }
+
+    /// Serves one fixed body for every URL.
+    struct OnePage(String);
+
+    #[async_trait::async_trait]
+    impl pumper_core::HttpClient for OnePage {
+        async fn fetch(
+            &self,
+            req: pumper_core::HttpRequest,
+        ) -> pumper_core::Result<pumper_core::HttpResponse> {
+            Ok(pumper_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: self.0.clone(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// The anti-pattern: every extractor revision was unreplayable — no
+    /// `artifact_sha` was ever stamped, and rederive replayed without the
+    /// document's URL, so a `url_absolute` field could only ever "diverge".
+    #[tokio::test]
+    async fn an_enrolled_extractor_row_rederives_not_diverges() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use pumper_core::ScrapeApp;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let (state, store) = crate::routes::health::ruleset_pointer_tests::headless_state().await;
+        // Enrol extractor/d, as `POST /sources/{id}/rules/import` does.
+        state
+            .health
+            .store()
+            .unwrap()
+            .ensure_source("extractor", "d")
+            .await
+            .unwrap();
+        let rules: RuleSet = serde_json::from_value(json!({
+            "link": {"type": "css", "selector": "a", "attr": "href",
+                     "transforms": [{"op": "url_absolute"}]}
+        }))
+        .unwrap();
+        let hash = state.datasets.register_ruleset(&rules).await.unwrap();
+        state
+            .datasets
+            .import_ruleset("extractor/d", &hash)
+            .await
+            .unwrap();
+
+        let site = Arc::new(OnePage(
+            "<html><a href=\"/item/1\">one</a></html>".to_string(),
+        ));
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "extractor")
+            .params(json!({"rules_ref": "active", "urls": ["https://s.test/p"], "dataset": "d"}))
+            .engines(pumper_core::testing::engines_with(
+                site,
+                Arc::new(pumper_core::testing::Dead),
+                Arc::new(pumper_core::testing::Dead),
+            ))
+            .build();
+        let out = app_extractor::Extractor.run(ctx).await.unwrap();
+        assert_eq!(out["new"], 1, "{out}");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/provenance/extractor/d/https:%2F%2Fs.test%2Fp/rederive")
+            .body(Body::empty())
+            .unwrap();
+        let resp = crate::routes::router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["verdict"], "reproduced", "{body}");
+        assert_eq!(body["diverged"], false);
+        assert_eq!(body["base_url"], "https://s.test/p");
+        assert_eq!(body["rules_hash"], json!(hash));
     }
 
     #[test]

@@ -11,8 +11,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use pumper_core::datasets::{body_sha256, pinned_body_path, BodyPin};
 use pumper_core::extract::extract_batch_with_report_at;
-use pumper_core::{AppContext, DocReport, Error, FieldStatus, Record, Result, RuleSet};
+use pumper_core::{AppContext, Datasets, DocReport, Error, FieldStatus, Record, Result, RuleSet};
 use serde_json::{json, Map, Value};
 
 use crate::{versions_for, MISSING_ECHO_LIMIT, SOURCE_LIST_LIMIT};
@@ -32,8 +33,11 @@ const BISECT_ECHO_LIMIT: usize = 50;
 
 /// Parsed and validated `replay` params.
 pub(crate) struct ReplayParams {
-    pub candidate: RuleSet,
-    pub baseline: Option<RuleSet>,
+    pub candidate: RulesSpec,
+    pub baseline: Option<RulesSpec>,
+    /// `against.source`: replay that source's PINNED bodies (latest pin per
+    /// document key) instead of an `app`/`dataset` of stored records.
+    pub source: Option<String>,
     pub app: String,
     pub dataset: String,
     pub url_pattern: Option<String>,
@@ -43,6 +47,100 @@ pub(crate) struct ReplayParams {
     pub bisect_field: Option<String>,
 }
 
+/// A replay rule set: inline, or a reference to a source's registered one.
+#[derive(Debug, Clone)]
+pub(crate) enum RulesSpec {
+    Inline(RuleSet),
+    /// `{"rules_ref": "active" | "<hash-or-prefix>", "source"?: "<id>"}` —
+    /// resolved in `source` (default: `against.source`) at run time.
+    Ref {
+        reference: String,
+        source: Option<String>,
+    },
+}
+
+/// Parses one replay rule-set slot. A `{"rules_ref": "<string>"}` object is a
+/// reference; anything else must parse as a RuleSet. The discriminator is the
+/// VALUE's type — a field that happens to be named `rules_ref` carries a rule
+/// object, never a string, so an inline ruleset can never be misread.
+pub(crate) fn parse_rules_spec(v: &Value, what: &str) -> std::result::Result<RulesSpec, String> {
+    if let Some(reference) = v.get("rules_ref").and_then(Value::as_str) {
+        let extra: Vec<&str> = v
+            .as_object()
+            .map(|m| {
+                m.keys()
+                    .map(String::as_str)
+                    .filter(|k| *k != "rules_ref" && *k != "source")
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !extra.is_empty() {
+            return Err(format!(
+                "{what}: a rules_ref object takes only `rules_ref` and `source`, got {}",
+                extra.join(", ")
+            ));
+        }
+        if reference.trim().is_empty() {
+            return Err(format!(
+                "{what}.rules_ref must be \"active\" or a hash prefix"
+            ));
+        }
+        let source = match v.get("source") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(format!("{what}.source must be a source id string")),
+        };
+        return Ok(RulesSpec::Ref {
+            reference: reference.to_string(),
+            source,
+        });
+    }
+    serde_json::from_value(v.clone())
+        .map(RulesSpec::Inline)
+        .map_err(|e| format!("bad {what}: {e}"))
+}
+
+/// Resolves a [`RulesSpec`] to the RuleSet it names. A reference needs a
+/// source to resolve in — its own `source`, else `against.source` — and a
+/// reference with neither is refused rather than guessed.
+pub(crate) async fn resolve_rules_spec(
+    datasets: &Datasets,
+    spec: &RulesSpec,
+    default_source: Option<&str>,
+    what: &str,
+) -> Result<RuleSet> {
+    let (reference, source) = match spec {
+        RulesSpec::Inline(r) => return Ok(r.clone()),
+        RulesSpec::Ref { reference, source } => (reference, source.as_deref().or(default_source)),
+    };
+    let source = source.ok_or_else(|| {
+        Error::App(format!(
+            "{what}.rules_ref needs a source to resolve in: give {what}.source or \
+             replay.against.source"
+        ))
+    })?;
+    let hash = datasets
+        .resolve_rules_ref(source, reference)
+        .await
+        .map_err(|e| {
+            Error::App(format!(
+                "{what}.rules_ref '{reference}' did not resolve for source '{source}': {e}"
+            ))
+        })?;
+    load_registered_ruleset(datasets, &hash).await
+}
+
+/// The registered RuleSet behind a hash, or a named error.
+pub(crate) async fn load_registered_ruleset(datasets: &Datasets, hash: &str) -> Result<RuleSet> {
+    let json = datasets.rules_by_hash(hash).await?.ok_or_else(|| {
+        Error::App(format!(
+            "ruleset {hash} is not in the rules_versions registry"
+        ))
+    })?;
+    serde_json::from_value(json)
+        .map_err(|e| Error::App(format!("registered ruleset {hash} is not a RuleSet: {e}")))
+}
+
 /// Pure parse/validation of the `replay` object: `rules` required;
 /// `against.versions` must be `"all"`/`"latest"`; `max_pages` clamps into
 /// `1..=`[`MAX_PAGES_CEILING`]; `bisect_field` needs the version history, so
@@ -50,21 +148,37 @@ pub(crate) struct ReplayParams {
 pub(crate) fn parse_replay_params(
     replay: &Map<String, Value>,
 ) -> std::result::Result<ReplayParams, String> {
-    let candidate: RuleSet = replay
+    let candidate = replay
         .get("rules")
-        .cloned()
         .ok_or_else(|| "replay.rules (the candidate rule set) is required".to_string())
-        .and_then(|v| serde_json::from_value(v).map_err(|e| format!("bad replay.rules: {e}")))?;
-    let baseline: Option<RuleSet> = replay
+        .and_then(|v| parse_rules_spec(v, "replay.rules"))?;
+    let baseline = replay
         .get("baseline_rules")
-        .cloned()
-        .map(|v| serde_json::from_value(v).map_err(|e| format!("bad replay.baseline_rules: {e}")))
+        .map(|v| parse_rules_spec(v, "replay.baseline_rules"))
         .transpose()?;
     let against = replay
         .get("against")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let source = match against.get("source") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(_) => {
+            return Err("replay.against.source must be a source id \"<app>/<dataset>\"".into())
+        }
+    };
+    if source.is_some() {
+        if let Some(clash) = ["app", "dataset", "versions"]
+            .into_iter()
+            .find(|k| against.get(*k).is_some_and(|v| !v.is_null()))
+        {
+            return Err(format!(
+                "replay.against.source replays the latest PINNED body per document of that \
+                 source; it cannot be combined with against.{clash}"
+            ));
+        }
+    }
     let versions_all = match against.get("versions").and_then(Value::as_str) {
         None | Some("latest") => false,
         Some("all") => true,
@@ -93,6 +207,7 @@ pub(crate) fn parse_replay_params(
     Ok(ReplayParams {
         candidate,
         baseline,
+        source,
         app: against
             .get("app")
             .and_then(Value::as_str)
@@ -422,9 +537,15 @@ pub(crate) fn bisect_field(
 /// report. Never writes a dataset — see the module doc.
 pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) -> Result<Value> {
     let p = parse_replay_params(replay).map_err(Error::App)?;
-    let candidate = Arc::new(p.candidate.compile()?);
-    let baseline = p
-        .baseline
+    let src = p.source.as_deref();
+    let candidate_rules =
+        resolve_rules_spec(&ctx.datasets, &p.candidate, src, "replay.rules").await?;
+    let baseline_rules = match &p.baseline {
+        Some(b) => Some(resolve_rules_spec(&ctx.datasets, b, src, "replay.baseline_rules").await?),
+        None => None,
+    };
+    let candidate = Arc::new(candidate_rules.compile()?);
+    let baseline = baseline_rules
         .as_ref()
         .map(|b| b.compile())
         .transpose()?
@@ -437,6 +558,29 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
                 .map_err(|e| Error::App(format!("bad replay.against.url_pattern '{s}': {e}")))
         })
         .transpose()?;
+
+    // `against.source`: the source's own pinned bodies, each with the URL it
+    // was fetched from as its extraction base.
+    if let Some(source) = src {
+        let root = artifacts_root(ctx)?;
+        let corpus =
+            load_pinned_corpus(&ctx.datasets, &root, source, pattern.as_ref(), p.max_pages).await?;
+        let against = json!({
+            "source": source,
+            "url_pattern": p.url_pattern,
+            "versions": "latest",
+            "max_pages": p.max_pages,
+        });
+        return finish_replay(
+            ctx,
+            candidate,
+            baseline,
+            corpus,
+            against,
+            p.bisect_field.as_deref(),
+        )
+        .await;
+    }
 
     // Select up to max_pages live URLs (crawl keys ARE canonical URLs).
     let mut records: Vec<Record> = ctx
@@ -501,48 +645,113 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
     // `url_absolute` is replayed exactly as it will run in production, instead
     // of being judged against relative values CI would never have produced.
     let bases: Vec<Option<String>> = keys.iter().map(|k| Some(k.url.clone())).collect();
+    let corpus = Corpus {
+        keys,
+        docs,
+        bases,
+        missing,
+        matching: matching_urls,
+        truncated,
+    };
+    let against = json!({
+        "app": p.app,
+        "dataset": p.dataset,
+        "url_pattern": p.url_pattern,
+        "versions": if p.versions_all { "all" } else { "latest" },
+        "max_pages": p.max_pages,
+    });
+    finish_replay(
+        ctx,
+        candidate,
+        baseline,
+        corpus,
+        against,
+        p.bisect_field.as_deref(),
+    )
+    .await
+}
 
-    // Both rule sets run over the IDENTICAL document vector, off the async
-    // runtime (rayon fan-out inside), so reports stay index-aligned.
-    let base_for_task = baseline.clone();
+/// The documents one replay extracts, index-aligned: identity, body, and the
+/// URL each body resolves links against.
+pub(crate) struct Corpus {
+    pub keys: Vec<DocKey>,
+    pub docs: Vec<String>,
+    pub bases: Vec<Option<String>>,
+    /// `{key, reason}` per document that could not be loaded (unbounded here;
+    /// callers truncate the echo).
+    pub missing: Vec<Value>,
+    /// Documents that matched before the page cap.
+    pub matching: usize,
+    pub truncated: bool,
+}
+
+/// The report rows both replay entrances share.
+struct CorpusDiff {
+    diff: DiffOutput,
+    inner_fields: Vec<Value>,
+    cand_reports: Vec<(Value, DocReport)>,
+    baseline: bool,
+}
+
+/// Runs candidate (+ baseline) over the IDENTICAL document vector, off the
+/// async runtime (rayon fan-out inside), so reports stay index-aligned, then
+/// diffs them.
+async fn diff_corpus(
+    candidate: Arc<pumper_core::CompiledRuleSet>,
+    baseline: Option<Arc<pumper_core::CompiledRuleSet>>,
+    corpus: &mut Corpus,
+) -> Result<CorpusDiff> {
+    // MOVED, not cloned: nothing reads the bodies after extraction.
+    let docs = std::mem::take(&mut corpus.docs);
+    let bases = std::mem::take(&mut corpus.bases);
     let (cand_reports, base_reports) = tokio::task::spawn_blocking(move || {
         let c = extract_batch_with_report_at(&candidate, &docs, &bases);
-        let b = base_for_task
+        let b = baseline
             .as_ref()
             .map(|b| extract_batch_with_report_at(b, &docs, &bases));
         (c, b)
     })
     .await
     .map_err(|e| Error::App(format!("replay extract task failed: {e}")))?;
-
-    let diff = diff_fields(&keys, &cand_reports, base_reports.as_deref());
+    let diff = diff_fields(&corpus.keys, &cand_reports, base_reports.as_deref());
     let inner_fields = diff_inner_fields(&cand_reports, base_reports.as_deref());
-    let bisect = p
-        .bisect_field
-        .as_deref()
-        .map(|f| json!({"field": f, "boundaries": bisect_field(f, &keys, &cand_reports)}));
+    Ok(CorpusDiff {
+        diff,
+        inner_fields,
+        baseline: base_reports.is_some(),
+        cand_reports,
+    })
+}
 
-    let missing_count = missing.len();
-    missing.truncate(MISSING_ECHO_LIMIT);
+/// The replay mode's report + artifact over a loaded corpus.
+async fn finish_replay(
+    ctx: &AppContext,
+    candidate: Arc<pumper_core::CompiledRuleSet>,
+    baseline: Option<Arc<pumper_core::CompiledRuleSet>>,
+    mut corpus: Corpus,
+    against: Value,
+    bisect: Option<&str>,
+) -> Result<Value> {
+    let out = diff_corpus(candidate, baseline, &mut corpus).await?;
+    let bisect = bisect.map(
+        |f| json!({"field": f, "boundaries": bisect_field(f, &corpus.keys, &out.cand_reports)}),
+    );
+
+    let missing_count = corpus.missing.len();
+    corpus.missing.truncate(MISSING_ECHO_LIMIT);
     let report = json!({
         "mode": "replay",
-        "against": {
-            "app": p.app,
-            "dataset": p.dataset,
-            "url_pattern": p.url_pattern,
-            "versions": if p.versions_all { "all" } else { "latest" },
-            "max_pages": p.max_pages,
-        },
-        "urls_matching": matching_urls,
-        "truncated": truncated,
-        "docs": keys.len(),
+        "against": against,
+        "urls_matching": corpus.matching,
+        "truncated": corpus.truncated,
+        "docs": corpus.keys.len(),
         "missing": missing_count,
-        "missing_keys": missing,
-        "baseline": base_reports.is_some(),
-        "fields": diff.fields,
-        "inner_fields": inner_fields,
-        "regressed_urls": diff.regressed_urls,
-        "regressions": diff.regressions,
+        "missing_keys": corpus.missing,
+        "baseline": out.baseline,
+        "fields": out.diff.fields,
+        "inner_fields": out.inner_fields,
+        "regressed_urls": out.diff.regressed_urls,
+        "regressions": out.diff.regressions,
         "bisect": bisect,
     });
 
@@ -555,6 +764,118 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
     let mut result = report;
     result["artifact"] = json!("replay-report.json");
     Ok(result)
+}
+
+/// The shared artifacts root (`data/artifacts`) — this job's own dir is two
+/// levels below it (`<root>/<app>/<job_id>`), the `read_source_artifact` rule.
+pub(crate) fn artifacts_root(ctx: &AppContext) -> Result<std::path::PathBuf> {
+    ctx.artifacts_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| Error::App("cannot resolve the artifacts root".into()))
+}
+
+/// Loads a source's pinned corpus: the newest pin per document key (optionally
+/// narrowed by `pattern` on the key), each body read from its content-addressed
+/// file and verified against its sha. A body that is gone or no longer matches
+/// its sha is listed in `missing`, never replayed as if it were the pinned one.
+pub(crate) async fn load_pinned_corpus(
+    datasets: &Datasets,
+    artifacts_root: &std::path::Path,
+    source_id: &str,
+    pattern: Option<&regex::Regex>,
+    max_docs: usize,
+) -> Result<Corpus> {
+    let app = source_id.split_once('/').map_or(source_id, |(app, _)| app);
+    let mut pins: Vec<BodyPin> = datasets
+        .latest_body_pins(source_id, SOURCE_LIST_LIMIT)
+        .await?
+        .into_iter()
+        .filter(|p| {
+            pattern.is_none_or(|re| p.document_key.as_deref().is_some_and(|k| re.is_match(k)))
+        })
+        .collect();
+    let matching = pins.len();
+    let truncated = matching > max_docs;
+    pins.truncate(max_docs);
+    let mut corpus = Corpus {
+        keys: Vec::new(),
+        docs: Vec::new(),
+        bases: Vec::new(),
+        missing: Vec::new(),
+        matching,
+        truncated,
+    };
+    for pin in pins {
+        let key = pin.document_key.clone().unwrap_or_default();
+        let Some(path) = pinned_body_path(artifacts_root, app, &pin.body_sha) else {
+            corpus
+                .missing
+                .push(json!({"key": key, "reason": "unsafe pinned body address"}));
+            continue;
+        };
+        match tokio::fs::read_to_string(&path).await {
+            Ok(body) if body_sha256(&body) == pin.body_sha => {
+                corpus.keys.push(DocKey {
+                    url: key,
+                    observed_at: None,
+                });
+                corpus.docs.push(body);
+                corpus.bases.push(pin.original_url.clone());
+            }
+            Ok(_) => corpus.missing.push(json!({
+                "key": key,
+                "reason": format!("pinned body {} no longer matches its sha", pin.body_sha),
+            })),
+            Err(e) => corpus.missing.push(json!({
+                "key": key,
+                "reason": format!("pinned body {} unreadable: {e}", pin.body_sha),
+            })),
+        }
+    }
+    Ok(corpus)
+}
+
+/// A dry-run diff of `candidate` against `baseline` over a source's pinned
+/// bodies — the read-only half of `POST /sources/{id}/rules` and
+/// `/rules/rollback`, sharing the replay mode's loader and diff code so a
+/// dry run and a `replay` over `{"source": id}` cannot disagree. Writes
+/// nothing at all (not even an artifact).
+pub async fn replay_pinned_bodies(
+    datasets: &Datasets,
+    artifacts_root: &std::path::Path,
+    source_id: &str,
+    candidate: &RuleSet,
+    baseline: Option<&RuleSet>,
+    max_docs: usize,
+) -> Result<Value> {
+    let candidate = Arc::new(candidate.compile()?);
+    let baseline = baseline.map(|b| b.compile()).transpose()?.map(Arc::new);
+    let mut corpus = load_pinned_corpus(
+        datasets,
+        artifacts_root,
+        source_id,
+        None,
+        max_docs.clamp(1, MAX_PAGES_CEILING),
+    )
+    .await?;
+    let out = diff_corpus(candidate, baseline, &mut corpus).await?;
+    let missing_count = corpus.missing.len();
+    corpus.missing.truncate(MISSING_ECHO_LIMIT);
+    Ok(json!({
+        "source": source_id,
+        "docs_matching": corpus.matching,
+        "truncated": corpus.truncated,
+        "docs": corpus.keys.len(),
+        "missing": missing_count,
+        "missing_keys": corpus.missing,
+        "baseline": out.baseline,
+        "fields": out.diff.fields,
+        "inner_fields": out.inner_fields,
+        "regressed_urls": out.diff.regressed_urls,
+        "regressions": out.diff.regressions,
+    }))
 }
 
 #[cfg(test)]
