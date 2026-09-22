@@ -519,6 +519,14 @@ pub struct ResilienceConfig {
     /// looked at. `0` would let a source un-quarantine itself on the first run
     /// that happened not to trip, so it is rejected.
     pub recovery_runs: u32,
+    /// Sources (`"<app>/<dataset>"`) allowed to retire themselves on sustained
+    /// permanent fetch failure. Opt-in per source: retirement stops scheduling,
+    /// so no source reaches it by default. Empty = nothing ever auto-retires.
+    pub auto_retire: Vec<String>,
+    /// Days a source must stay healthy before its golden documents may pin a
+    /// new generation. Two generations are kept, so a slowly boiled value has
+    /// to fool a reference about twice this old.
+    pub golden_refresh_days: u32,
 }
 
 impl Default for ResilienceConfig {
@@ -548,6 +556,8 @@ impl Default for ResilienceConfig {
             // to degrade, three consecutive to quarantine): recovery should cost
             // at least what the fall did.
             recovery_runs: 3,
+            auto_retire: Vec::new(),
+            golden_refresh_days: 30,
         }
     }
 }
@@ -646,6 +656,11 @@ pub struct WebhooksConfig {
     /// brief receiver outage no longer means permanent silent event loss. `false`
     /// reverts to manual-only replay. Default: true.
     pub auto_retry: bool,
+    /// If set, every source health transition into `degraded`, `quarantined`
+    /// or `retired` POSTs a `source.*` event here. Unset = nobody is told.
+    pub health_url: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `health_url` deliveries.
+    pub health_secret: Option<String>,
 }
 
 impl Default for WebhooksConfig {
@@ -653,6 +668,8 @@ impl Default for WebhooksConfig {
         Self {
             failure_url: None,
             failure_secret: None,
+            health_url: None,
+            health_secret: None,
             auto_retry: true,
         }
     }
