@@ -355,11 +355,23 @@ const ENFORCED_STATE_CONSUMERS: &[(&str, usize, &[&str])] = &[
         2,
         &["diverted_writes", "withheld_removals"],
     ),
-    // `suppress_unhealthy` (pushes) and `dataset_search_docs` (index writes).
+    // `suppress_unhealthy` (pushes) and `dataset_search_docs` (index writes),
+    // plus `enforced_states`, the one shared read behind the per-source gates on
+    // batches that mix sources: saved-search `search.matched` alerts and a
+    // view's watch/trigger fan-out (pushes), and the job-result echo index
+    // (index writes). Same two consequences, reached by more paths.
     (
         "crates/server/src/worker.rs::state.health.enforced_state",
-        2,
+        3,
         &["suppressed_pushes", "skipped_index_writes"],
+    ),
+    // `search-backfill`'s `HealthGate`: the offline rebuild skips pairs whose
+    // state keeps them out of the index — the same consequence as
+    // `dataset_search_docs`, applied to the one path that could undo it.
+    (
+        "crates/server/src/bin/search-backfill.rs::self.health.enforced_state",
+        1,
+        &["skipped_index_writes"],
     ),
     // ── Producer-side reads of the SAME consequences ─────────────────────────
     // These are apps resolving the state themselves, at the point the core seam

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pumper_core::resilience::SourceState;
 use pumper_core::storage::FailReason;
 use pumper_core::{AppContext, Job, JobStatus, SearchDoc};
 use serde_json::Value;
@@ -1216,7 +1217,13 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     let indexed_apps = run_indexed_apps(&job.app, &index_specs);
     stages
         .time(Stage::Index, async {
-            let mut docs = search_docs(&job.app, job.id, &result);
+            // A degrading source never poisons the index through its echo either
+            // — the same gate `dataset_search_docs` applies per spec.
+            let mut docs = if echo_index_withheld(&state, &job).await {
+                Vec::new()
+            } else {
+                search_docs(&job.app, job.id, &result)
+            };
             // Ghost-doc GC: identity-less job-result docs embed the job id, so
             // every run used to mint a permanent new set. Sweep the app's prior
             // snapshot BEFORE adding this run's (delete-then-add in opstamp
@@ -1548,6 +1555,188 @@ async fn suppress_unhealthy(
     }
 }
 
+/// Enforced health per distinct `(app, dataset)` pair, for the gates whose batch
+/// mixes sources — a saved search's hits, a view's deltas, the pairs one run was
+/// judged on. The one read those gates share, so the enforcement preview's
+/// inventory sees one call site for all of them.
+///
+/// Empty while `[resilience] enforce` is off: soak mode reads nothing and gates
+/// nothing, and an absent pair reads as "not suppressed" in every predicate
+/// below, exactly like `Unknown` does.
+async fn enforced_states(
+    state: &AppState,
+    pairs: Vec<(String, String)>,
+) -> HashMap<(String, String), SourceState> {
+    let mut out = HashMap::new();
+    if !state.health.enforcing() {
+        return out;
+    }
+    for pair in pairs {
+        if out.contains_key(&pair) {
+            continue;
+        }
+        let health = state.health.enforced_state(&pair.0, &pair.1).await;
+        out.insert(pair, health);
+    }
+    out
+}
+
+/// Whether `states` says the `(app, dataset)` pair may not push. A pair with no
+/// entry pushes — enforcement off, or a pair nobody judged.
+fn pair_suppresses_pushes(
+    states: &HashMap<(String, String), SourceState>,
+    app: &str,
+    dataset: &str,
+) -> bool {
+    states
+        .get(&(app.to_string(), dataset.to_string()))
+        .is_some_and(|s| s.suppresses_pushes())
+}
+
+/// The saved-search hits that may alert: those whose OWN source pair (the hit's
+/// `app`/`dataset`, i.e. the dataset the document was indexed from) does not
+/// suppress pushes.
+///
+/// The anti-pattern: gating watches and triggers but not `search.matched` — the
+/// same irreversible push, reached through the index instead of the change
+/// feed. Filtered BEFORE `claim_unseen`, so a withheld hit is not marked seen:
+/// it alerts once its source is trusted again, if it still matches.
+fn alertable_hits<'a>(
+    hits: &'a [pumper_core::SearchHit],
+    states: &HashMap<(String, String), SourceState>,
+) -> Vec<&'a pumper_core::SearchHit> {
+    hits.iter()
+        .filter(|h| !pair_suppresses_pushes(states, &h.app, &h.dataset))
+        .collect()
+}
+
+/// The source pair a saved-search view record was materialized from — its
+/// `source.{app,dataset}` provenance block (`SearchHit::materialize_value`).
+/// `None` when the block is absent, which gates nothing.
+fn view_delta_source(data: &Value) -> Option<(String, String)> {
+    let src = data.get("source")?;
+    Some((
+        src.get("app")?.as_str()?.to_string(),
+        src.get("dataset")?.as_str()?.to_string(),
+    ))
+}
+
+/// Splits a view's deltas into those that may push and a count of those
+/// withheld, judging each by its UNDERLYING source (`sources[i]` for
+/// `changes[i]`), not by the view's own pair.
+///
+/// The anti-pattern: gating a view on `(view app, view dataset)`. No app ever
+/// calls `observe_extraction` for a view, so that pair is always `Healthy` and
+/// the gate would pass a degraded source's hits straight through the view's
+/// watches and triggers. A delta whose source is unknown is kept.
+fn pushable_view_deltas(
+    changes: Vec<pumper_core::Revision>,
+    sources: &[Option<(String, String)>],
+    states: &HashMap<(String, String), SourceState>,
+) -> (Vec<pumper_core::Revision>, usize) {
+    let mut kept = Vec::with_capacity(changes.len());
+    let mut withheld = 0;
+    for (rev, src) in changes.into_iter().zip(sources) {
+        match src {
+            Some((app, dataset)) if pair_suppresses_pushes(states, app, dataset) => withheld += 1,
+            _ => kept.push(rev),
+        }
+    }
+    (kept, withheld)
+}
+
+/// [`pushable_view_deltas`] with the sources resolved: from each delta's own
+/// snapshot, or — for a `removed` delta, which carries none — from the view
+/// record it tombstoned (tombstoning keeps the row's data). A no-op that reads
+/// nothing unless `[resilience] enforce` is on.
+async fn gate_view_deltas(
+    state: &AppState,
+    search_id: &str,
+    changes: Vec<pumper_core::Revision>,
+) -> Vec<pumper_core::Revision> {
+    if !state.health.enforcing() {
+        return changes;
+    }
+    let mut sources = Vec::with_capacity(changes.len());
+    for rev in &changes {
+        let src = match &rev.data {
+            Some(data) => view_delta_source(data),
+            None => match state.datasets.get(&rev.app, &rev.dataset, &rev.key).await {
+                Ok(Some(rec)) => view_delta_source(&rec.data),
+                _ => None,
+            },
+        };
+        sources.push(src);
+    }
+    let states = enforced_states(state, sources.iter().flatten().cloned().collect()).await;
+    let (kept, withheld) = pushable_view_deltas(changes, &sources, &states);
+    if withheld > 0 {
+        warn!(
+            search = %search_id, withheld,
+            "view pushes suppressed: these deltas come from a source whose health is degraded"
+        );
+    }
+    kept
+}
+
+/// The first judged pair whose enforced state keeps it out of the search index,
+/// if any — the reason a run's job-result echo is not indexed.
+fn echo_withheld_by(
+    states: &HashMap<(String, String), SourceState>,
+) -> Option<(&str, &str, SourceState)> {
+    let mut offending: Vec<_> = states
+        .iter()
+        .filter(|(_, s)| s.skips_search_index())
+        .map(|((app, dataset), s)| (app.as_str(), dataset.as_str(), *s))
+        .collect();
+    // Deterministic for the log line: `HashMap` order is not.
+    offending.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    offending.into_iter().next()
+}
+
+/// Whether this run's job-result echo (`search_docs`: the `records`/`stories`/
+/// `items` arrays and the `_job` snapshot) stays out of the index.
+///
+/// The echo is this run's extraction output, and the pairs it came from are the
+/// ones this run was judged on (`source_runs` for the job). If any of them may
+/// not index, none of the echo is indexed — it cannot be attributed per record,
+/// and the index is a derived artifact a later healthy run refills. Withholding
+/// every doc also withholds the `_job` sweep, so the last trusted snapshot
+/// stays findable. Fail-open on a read failure, and a no-op unless
+/// `[resilience] enforce` is on.
+async fn echo_index_withheld(state: &AppState, job: &Job) -> bool {
+    if !state.health.enforcing() {
+        return false;
+    }
+    let Some(store) = state.health.store() else {
+        return false;
+    };
+    let verdicts = match state.storage.job_health_verdicts(job.id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(job = %job.id, "echo index gate: verdict read failed (indexing anyway): {e}");
+            return false;
+        }
+    };
+    let mut pairs = Vec::with_capacity(verdicts.len());
+    for v in verdicts {
+        if let Ok(Some(src)) = store.source(&v.source_id).await {
+            pairs.push((src.app, src.dataset));
+        }
+    }
+    let states = enforced_states(state, pairs).await;
+    match echo_withheld_by(&states) {
+        Some((app, dataset, health)) => {
+            warn!(
+                job = %job.id, %app, %dataset, state = health.as_str(),
+                "job-result echo not indexed: source health"
+            );
+            true
+        }
+        None => false,
+    }
+}
+
 /// Evaluates declared data contracts (`[source.contract]` in the catalog) over
 /// this run's revisions, at the same choke point where `suppress_unhealthy`
 /// gates pushes — before any webhook or trigger fires.
@@ -1788,7 +1977,27 @@ async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[Stri
                 continue;
             }
         };
-        let ids: Vec<String> = results.hits.iter().map(|h| h.id.clone()).collect();
+        // A degrading source never alerts: same gate as watches and triggers,
+        // judged per hit on the pair the document was indexed from.
+        let states = enforced_states(
+            state,
+            results
+                .hits
+                .iter()
+                .map(|h| (h.app.clone(), h.dataset.clone()))
+                .collect(),
+        )
+        .await;
+        let alertable = alertable_hits(&results.hits, &states);
+        if alertable.len() < results.hits.len() {
+            warn!(
+                search = %search.id, job = %job.id,
+                withheld = results.hits.len() - alertable.len(),
+                "saved-search alerts suppressed: these hits come from a source whose health is \
+                 degraded, and a delivered webhook cannot be recalled"
+            );
+        }
+        let ids: Vec<String> = alertable.iter().map(|h| h.id.clone()).collect();
         if ids.is_empty() {
             debug!(
                 search = %search.id, job = %job.id, query = %search.query,
@@ -1812,8 +2021,7 @@ async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[Stri
                 continue;
             }
         };
-        let matches: Vec<_> = results
-            .hits
+        let matches: Vec<_> = alertable
             .iter()
             .filter(|h| unseen.contains(&h.id))
             .collect();
@@ -1905,6 +2113,10 @@ async fn materialize_saved_search(
             return;
         }
     };
+    // A view is a push surface for its SOURCES' data, so a degrading source's
+    // hits do not reach the view's watches or triggers. The view records
+    // themselves are written regardless: suppression gates pushes, never data.
+    let changes = gate_view_deltas(state, &search.id, changes).await;
     if changes.is_empty() {
         return;
     }
@@ -1913,7 +2125,11 @@ async fn materialize_saved_search(
     // without re-badging the job. (This used to need a `view_job` clone with
     // `app = mat.app`; the widened batch keying makes that unnecessary, and the
     // real job now flows through, so provenance and lookup no longer disagree.)
-    let by_dataset = group_by_app_dataset(&changes);
+    let mut by_dataset = group_by_app_dataset(&changes);
+    // …and the main path's gate on the view's own pair, so a view pair the
+    // ladder DOES judge is held to it too. Usually a no-op: nothing observes a
+    // view, so its own pair reads `Healthy`.
+    suppress_unhealthy(state, &mut by_dataset).await;
     notify_watches(state, job, &by_dataset).await;
     // The view's hops ride the SOURCE job's id (provenance), so their dedup keys
     // are scoped by the saved search — otherwise a view whose target app is the
@@ -2027,6 +2243,11 @@ async fn finalize_with_stages(
             .await;
         }
     }
+    // Source health events: every transition this run's verdicts caused into
+    // `degraded` / `quarantined` / `retired` tells `[webhooks] health_url`.
+    // Here rather than in the success fan-out because a failed run can have
+    // been judged too. Returns before any query when nobody would be told.
+    webhook::dispatch_job_health(state, job.id).await;
     // Terminal-job triggers: the job's final status is an event other apps can
     // chain on (e.g. "when crawl succeeds, run extract").
     crate::triggers::fire_terminal_triggers(state, &job).await;
@@ -2900,6 +3121,142 @@ mod hook_scope_tests {
         let wildcard = watch("peer_hn", "*");
         assert!(watch_covers_entry(&wildcard, "peer_hn", "anything"));
         assert!(!watch_covers_entry(&wildcard, "other_ns", "anything"));
+    }
+}
+
+#[cfg(test)]
+mod health_gate_tests {
+    use std::collections::HashMap;
+
+    use pumper_core::datasets::{Provenance, Revision};
+    use pumper_core::resilience::SourceState;
+    use pumper_core::SearchHit;
+    use serde_json::json;
+
+    use super::{alertable_hits, echo_withheld_by, pushable_view_deltas, view_delta_source};
+
+    fn states(pairs: &[(&str, &str, SourceState)]) -> HashMap<(String, String), SourceState> {
+        pairs
+            .iter()
+            .map(|(a, d, s)| ((a.to_string(), d.to_string()), *s))
+            .collect()
+    }
+
+    fn hit(app: &str, dataset: &str, key: &str) -> SearchHit {
+        SearchHit {
+            id: format!("{app}:{dataset}:{key}"),
+            app: app.into(),
+            dataset: dataset.into(),
+            url: String::new(),
+            title: key.into(),
+            score: 1.0,
+            snippet: String::new(),
+        }
+    }
+
+    fn view_rev(key: &str, data: Option<serde_json::Value>) -> Revision {
+        Revision {
+            app: "view".into(),
+            dataset: "hits".into(),
+            key: key.into(),
+            revision: 1,
+            change: if data.is_some() { "new" } else { "removed" }.into(),
+            data,
+            diff: None,
+            created_at: chrono::Utc::now(),
+            trust: "stable".into(),
+            provenance: Provenance::default(),
+        }
+    }
+
+    /// The anti-pattern: `search.matched` fired for every hit while watches and
+    /// triggers were gated — a degrading source's documents reached subscribers
+    /// through the index instead of the change feed.
+    #[test]
+    fn a_degraded_sources_hits_do_not_alert_but_a_healthy_sources_do() {
+        let hits = [hit("bad", "d", "1"), hit("ok", "d", "2")];
+        let st = states(&[
+            ("bad", "d", SourceState::Degraded),
+            ("ok", "d", SourceState::Healthy),
+        ]);
+        let alertable: Vec<&str> = alertable_hits(&hits, &st)
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(alertable, vec!["ok:d:2"]);
+    }
+
+    /// Enforcement off reads no states at all, and an empty map gates nothing —
+    /// soak mode is byte-for-byte the old behaviour.
+    #[test]
+    fn no_states_read_means_every_hit_alerts_not_none() {
+        let hits = [hit("bad", "d", "1"), hit("ok", "d", "2")];
+        assert_eq!(alertable_hits(&hits, &HashMap::new()).len(), 2);
+        // Probation and Unknown do not suppress pushes either.
+        let st = states(&[
+            ("bad", "d", SourceState::Probation),
+            ("ok", "d", SourceState::Unknown),
+        ]);
+        assert_eq!(alertable_hits(&hits, &st).len(), 2);
+    }
+
+    #[test]
+    fn view_delta_source_reads_the_materialized_provenance_block() {
+        let data = hit("src", "d", "k").materialize_value();
+        assert_eq!(
+            view_delta_source(&data),
+            Some(("src".to_string(), "d".to_string()))
+        );
+        assert_eq!(view_delta_source(&json!({ "title": "no block" })), None);
+    }
+
+    /// The anti-pattern: gating a view's fan-out on the VIEW's own pair, which
+    /// nothing ever judges — so it always reads healthy and a degraded source's
+    /// hits pass straight through the view's watches and triggers.
+    #[test]
+    fn view_deltas_are_judged_by_their_source_not_the_view_pair() {
+        let changes = vec![
+            view_rev("bad:d:1", Some(hit("bad", "d", "1").materialize_value())),
+            view_rev("ok:d:2", Some(hit("ok", "d", "2").materialize_value())),
+            view_rev("unknown", None),
+        ];
+        let sources = vec![
+            Some(("bad".to_string(), "d".to_string())),
+            Some(("ok".to_string(), "d".to_string())),
+            None,
+        ];
+        let st = states(&[
+            ("bad", "d", SourceState::Quarantined),
+            ("ok", "d", SourceState::Healthy),
+            // The view's own pair says healthy — and must not be what decides.
+            ("view", "hits", SourceState::Healthy),
+        ]);
+        let (kept, withheld) = pushable_view_deltas(changes, &sources, &st);
+        let kept: Vec<&str> = kept.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["ok:d:2", "unknown"],
+            "an unattributable delta gates nothing"
+        );
+        assert_eq!(withheld, 1);
+    }
+
+    /// The anti-pattern: indexing a run's echo while the same run's dataset
+    /// revisions are held out of the index — the degraded records reach search
+    /// under a second id.
+    #[test]
+    fn echo_is_withheld_when_any_judged_pair_skips_the_index_not_only_all() {
+        assert_eq!(echo_withheld_by(&HashMap::new()), None);
+        let st = states(&[
+            ("fake", "a", SourceState::Healthy),
+            ("fake", "b", SourceState::Degraded),
+        ]);
+        assert_eq!(
+            echo_withheld_by(&st),
+            Some(("fake", "b", SourceState::Degraded))
+        );
+        let st = states(&[("fake", "a", SourceState::Suspect)]);
+        assert_eq!(echo_withheld_by(&st), None);
     }
 }
 

@@ -29,6 +29,7 @@
 //!   cargo run -p pumper-server --bin search-backfill -- --app grants   # all of an app's datasets
 //!   cargo run -p pumper-server --bin search-backfill -- --all          # every dataset
 
+use pumper_core::resilience::{Resilience, SourceState};
 use pumper_core::{
     backfill_cursor, parse_backfill_cursor, Config, Datasets, Search, SearchDoc, Storage,
 };
@@ -58,6 +59,19 @@ async fn main() -> anyhow::Result<()> {
 
     let scope = parse_scope(&std::env::args().collect::<Vec<_>>())?;
     let targets = resolve_targets(&datasets, &scope).await?;
+    let gate = HealthGate {
+        health: Resilience::new(storage.pool(), &config.resilience),
+    };
+    let (targets, withheld) = gate.partition(targets).await;
+    for (app, dataset, state) in &withheld {
+        tracing::warn!(
+            %app,
+            %dataset,
+            state = state.as_str(),
+            "skipped: source health keeps this dataset out of the search index \
+             ([resilience] enforce = true)"
+        );
+    }
     tracing::info!(datasets = targets.len(), "backfilling search index");
 
     let mut total = DatasetReport::default();
@@ -83,7 +97,66 @@ async fn main() -> anyhow::Result<()> {
          record(s) purged; index now holds {doc_count} document(s)",
         total.indexed, total.purged
     );
+    if !withheld.is_empty() {
+        println!(
+            "{} dataset(s) skipped for source health ([resilience] enforce = true): {}",
+            withheld.len(),
+            withheld
+                .iter()
+                .map(|(app, dataset, state)| format!("{app}/{dataset} ({})", state.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
+}
+
+/// The rebuild's extraction-health gate — the offline twin of the worker's
+/// per-spec index gate (`dataset_search_docs`). Without it a backfill was the
+/// one path that could put a degrading source's records back into the index
+/// the live path had kept them out of.
+///
+/// Reads nothing unless `[resilience] enforce` is on: `enforced_state` answers
+/// `Healthy` for every pair while soaking, so the scope passes through whole.
+struct HealthGate {
+    health: Resilience,
+}
+
+/// An `(app, dataset)` rebuild target.
+type Pair = (String, String);
+/// A target the health gate withheld, with the state that withheld it.
+type Withheld = (String, String, SourceState);
+
+impl HealthGate {
+    /// Splits `targets` into the pairs to rebuild and the pairs withheld, with
+    /// the state that withheld each.
+    async fn partition(&self, targets: Vec<(String, String)>) -> (Vec<Pair>, Vec<Withheld>) {
+        let mut states = Vec::with_capacity(targets.len());
+        for (app, dataset) in &targets {
+            states.push(self.health.enforced_state(app, dataset).await);
+        }
+        partition_by_health(targets, &states)
+    }
+}
+
+/// The pure half of [`HealthGate::partition`]: `states[i]` judges `targets[i]`,
+/// and a pair whose state `skips_search_index` is withheld — every record of
+/// it, purges included, exactly as the worker's gate skips a spec's whole
+/// revision window.
+fn partition_by_health(
+    targets: Vec<(String, String)>,
+    states: &[SourceState],
+) -> (Vec<Pair>, Vec<Withheld>) {
+    let mut kept = Vec::with_capacity(targets.len());
+    let mut withheld = Vec::new();
+    for ((app, dataset), state) in targets.into_iter().zip(states) {
+        if state.skips_search_index() {
+            withheld.push((app, dataset, *state));
+        } else {
+            kept.push((app, dataset));
+        }
+    }
+    (kept, withheld)
 }
 
 /// What one dataset's rebuild did.
@@ -274,11 +347,11 @@ async fn resolve_targets(
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_action, backfill_dataset, parse_scope, resolve_targets, BackfillAction,
-        DatasetReport, Scope, INDEX_CHUNK,
+        backfill_action, backfill_dataset, parse_scope, partition_by_health, resolve_targets,
+        BackfillAction, DatasetReport, HealthGate, Resilience, Scope, SourceState, INDEX_CHUNK,
     };
     use chrono::{TimeZone, Utc};
-    use pumper_core::config::SearchConfig;
+    use pumper_core::config::{ResilienceConfig, SearchConfig};
     use pumper_core::testing::TempStore;
     use pumper_core::{Datasets, Record, Search, SearchDoc, SearchRequest};
     use pumper_engine_search::TantivyIndex;
@@ -569,6 +642,89 @@ mod tests {
             "every record must be indexed, not just the first page"
         );
         assert_eq!(index.index.doc_count().await.unwrap(), n as u64);
+    }
+
+    // ── the health gate ─────────────────────────────────────────────────────
+
+    fn gate_over(store: &TempStore, enforce: bool) -> HealthGate {
+        let cfg = ResilienceConfig {
+            enabled: true,
+            enforce,
+            ..Default::default()
+        };
+        HealthGate {
+            health: Resilience::new(store.storage.pool(), &cfg),
+        }
+    }
+
+    async fn degrade(gate: &HealthGate, app: &str, dataset: &str) {
+        let hs = gate.health.store().expect("enabled health store");
+        hs.ensure_source(app, dataset).await.unwrap();
+        assert!(hs
+            .set_state_manual(
+                &pumper_core::resilience::source_id(app, dataset),
+                SourceState::Degraded,
+                "test"
+            )
+            .await
+            .unwrap());
+    }
+
+    /// The anti-pattern: a rebuild that ignores source health, so the one tool
+    /// run to repair the index is the one path that writes a degrading
+    /// source's records back into it after the live path kept them out.
+    #[tokio::test]
+    async fn a_degraded_source_is_withheld_from_the_rebuild_not_reindexed() {
+        let store = TempStore::new("backfill-health-enforced").await;
+        let gate = gate_over(&store, true);
+        degrade(&gate, "src", "d").await;
+
+        let (kept, withheld) = gate
+            .partition(vec![
+                ("src".to_string(), "d".to_string()),
+                ("ok".to_string(), "d".to_string()),
+            ])
+            .await;
+        assert_eq!(kept, vec![("ok".to_string(), "d".to_string())]);
+        assert_eq!(
+            withheld,
+            vec![("src".to_string(), "d".to_string(), SourceState::Degraded)]
+        );
+    }
+
+    /// The control: in soak mode (`enforce = false`) the same degraded source is
+    /// rebuilt like any other — enforcement off gates nothing, even offline.
+    #[tokio::test]
+    async fn soak_mode_rebuilds_a_degraded_source_unchanged() {
+        let store = TempStore::new("backfill-health-soak").await;
+        let gate = gate_over(&store, false);
+        degrade(&gate, "src", "d").await;
+
+        let targets = vec![("src".to_string(), "d".to_string())];
+        let (kept, withheld) = gate.partition(targets.clone()).await;
+        assert_eq!(kept, targets);
+        assert!(withheld.is_empty());
+    }
+
+    #[test]
+    fn partition_withholds_exactly_the_states_that_skip_the_index() {
+        let pair = |a: &str| (a.to_string(), "d".to_string());
+        let states = [
+            SourceState::Healthy,
+            SourceState::Suspect,
+            SourceState::Degraded,
+            SourceState::Quarantined,
+            SourceState::Probation,
+            SourceState::Unknown,
+        ];
+        let targets: Vec<_> = ["h", "s", "dg", "q", "p", "u"]
+            .iter()
+            .map(|a| pair(a))
+            .collect();
+        let (kept, withheld) = partition_by_health(targets, &states);
+        let withheld: Vec<&str> = withheld.iter().map(|(a, _, _)| a.as_str()).collect();
+        assert_eq!(withheld, vec!["dg", "q"]);
+        assert_eq!(kept.len(), 4, "Unknown gates nothing");
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
