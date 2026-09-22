@@ -848,6 +848,15 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // Race the app future against the wall-clock timeout, the cancel token, and
     // the heartbeat tick.
     let run_started = std::time::Instant::now();
+    // The beat in flight, if any. The tick arm SPAWNS the write rather than
+    // awaiting it: awaited inside this select, the write stopped `run` from
+    // being polled, and the app's own in-flight queries — each holding one of
+    // the pool's 8 connections until polled again — were exactly the
+    // connections the beat was waiting for. Every tick that landed during a
+    // fetch fan-out froze the job for the 30s acquire timeout. The TICK still
+    // needs this loop to be polled, so a wedged job still stops beating and
+    // the reaper still recovers it.
+    let mut beat: Option<tokio::task::JoinHandle<()>> = None;
     let outcome = loop {
         tokio::select! {
             biased;
@@ -860,7 +869,18 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 }
             },
             _ = maybe_tick(&mut heartbeat) => {
-                let _ = state.storage.heartbeat(job.id, job.attempts).await;
+                if should_beat(beat.as_ref().is_some_and(|b| !b.is_finished())) {
+                    let storage = state.storage.clone();
+                    let (id, attempt) = (job.id, job.attempts);
+                    // Fenced on (status = 'running', attempts) in
+                    // `Storage::heartbeat`, so a beat landing after the job
+                    // finished (or was re-claimed) updates nothing.
+                    beat = Some(tokio::spawn(async move {
+                        let _ = storage.heartbeat(id, attempt).await;
+                    }));
+                } else {
+                    debug!(job = %job.id, "heartbeat skipped: previous beat still in flight");
+                }
             }
         }
     };
@@ -1343,6 +1363,13 @@ fn vcr_params(params: &Value) -> Result<(bool, Option<Uuid>), String> {
 
 /// Ticks the heartbeat interval when enabled, or waits forever when it isn't —
 /// so the heartbeat select branch simply never fires with heartbeating disabled.
+/// Whether a heartbeat tick may start a write: at most ONE beat in flight. A
+/// beat still waiting on the pool when the next tick fires means the store is
+/// saturated; queueing a second write behind it would only add a waiter.
+pub(crate) fn should_beat(prev_write_in_flight: bool) -> bool {
+    !prev_write_in_flight
+}
+
 async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
     match hb {
         Some(interval) => {
