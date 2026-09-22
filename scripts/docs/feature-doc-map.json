@@ -121,7 +121,8 @@
     {
       "doc": "docs/features/resilient-extraction.md",
       "sourceGlobs": [
-        "crates/core/src/resilience/**"
+        "crates/core/src/resilience/**",
+        "crates/core/src/golden.rs"
       ]
     },
     {

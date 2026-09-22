@@ -1,0 +1,14 @@
+{
+  "title": { "type": "css", "selector": ".fatitem .titleline > a" },
+  "url": { "type": "css", "selector": ".fatitem .titleline > a", "attr": "href" },
+  "by": { "type": "css", "selector": ".fatitem .subline .hnuser" },
+  "time": { "type": "css", "selector": ".fatitem .subline .age", "attr": "title" },
+  "points": {
+    "type": "css",
+    "selector": ".fatitem .subline .score",
+    "transforms": [
+      { "op": "regex_replace", "pattern": "[^0-9]", "replacement": "" },
+      { "op": "to_int" }
+    ]
+  }
+}

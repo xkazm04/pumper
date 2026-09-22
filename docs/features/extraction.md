@@ -81,8 +81,8 @@ The `extractor` app has **four** modes, each declared by its own params root:
 
 | mode | roots | writes records? |
 | --- | --- | --- |
-| urls | `rules` + `urls` | yes |
-| source | `rules` + `source` | yes |
+| urls | `rules` or `rules_ref`, + `urls` | yes |
+| source | `rules` or `rules_ref`, + `source` | yes |
 | replay | `replay` | no (report + artifact) |
 | induce | `induce` | no (report + artifact) |
 
@@ -107,6 +107,13 @@ A JSON `null` counts as absent, so a params template that spells "not this run" 
   - **the firing trigger's key cap** — a dataset hop's `_trigger.keys` is capped at `[triggers] key_cap` (default 200) and the host declares the cut in `_trigger.keys_truncated` ([triggers.md](triggers.md)). *This used to be reported as a clean run*: `source.keys` and `_trigger.keys` were collapsed into one `Option` by an `.or_else()`, and `truncated` was only ever written by the sweep branch — so a hop that extracted 200 of 5,000 changed records emitted `truncated: false`. Both apps now read the host's flag; the two provenances are kept apart precisely because only one of them can have been capped.
 
   `truncated` stays `false` when **the caller** named the key set in `source.keys`: no cap applied to it, and it does not inherit the `keys_truncated` of whatever hop carried the job. `plugin`'s source mode behaves identically on all three points.
+
+### Rules by reference, enrolled runs, and what a run tells the health detector
+
+- **`rules_ref: "active" | "<hash-or-prefix>"`** — instead of inline `rules`, in the write modes: the ruleset is resolved in source `extractor/<dataset>`'s pointer lineage ([resilient-extraction.md §4](resilient-extraction.md)). Exactly one of `rules` / `rules_ref`: both or neither is refused at the enqueue door (schema `oneOf`) and in the app. `rules_ref` beside `replay`/`induce` is a mode conflict. An unresolvable reference fails the job, writes nothing: `rules_ref '<ref>' did not resolve for source 'extractor/<dataset>': <reason>`. `replay.rules` / `replay.baseline_rules` accept `{"rules_ref": …, "source"?: …}` too, and `replay.against.source` replays a source's pinned bodies.
+- **Enrolled urls-mode runs pin their bodies.** A source is *enrolled* when it has an active ruleset head. Its urls-mode runs save every fetched body at `data/artifacts/extractor/bodies/<sha256>.html`, insert one `body_pins` row per observation before writing records, and stamp each record with its own provenance `{job_id, source_url, artifact_sha, rules_hash}`. The result gains `enrolled: {source, bodies_pinned, bodies_written, pin_failures}`. Source, backfill and archive modes do not pin, even when enrolled.
+- **The fetch denominator.** urls mode reports `FetchHealth {attempted, ok, permanent, roster}` to the health detector: `roster` is the job's URL count (every URL is attempted), and `permanent` counts fetches the **live** site answered 404 or 410 on an uncached http tier with no later tier delivering the page. A 403, a 429, a timeout, any DNS failure, a cache hit, an archive or recipe tier and a VCR replay never count. They feed retirement ([resilient-extraction.md §2.9](resilient-extraction.md)) and are stored in `source_runs.fetch_permanent` / `fetch_roster`. Other modes report no roster (`NULL` in both).
+- **Golden refresh.** After an enrolled urls-mode run that leaves its source stored `healthy`, the extractor runs the golden-document refresh (`golden::refresh`, [resilient-extraction.md §3.2](resilient-extraction.md)). It is best-effort: a failure is logged and never fails the run, and it adds nothing to the result.
 
 ### `extractor` result shape
 

@@ -119,6 +119,7 @@ async fn observe(health: &Resilience, docs: &[ObservedDoc]) -> pumper_core::Sour
                 fetch: FetchHealth {
                     attempted: docs.len() as u32,
                     ok: docs.len() as u32,
+                    ..Default::default()
                 },
                 build_id: Some("test".into()),
             },
@@ -391,6 +392,7 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
                 fetch: FetchHealth {
                     attempted: 30,
                     ok: 3,
+                    ..Default::default()
                 },
                 build_id: None,
             },

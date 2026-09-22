@@ -32,6 +32,7 @@ pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod fetcher;
+pub mod golden;
 pub mod governor;
 pub mod induce;
 pub mod jitter;

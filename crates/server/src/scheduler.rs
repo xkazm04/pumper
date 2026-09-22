@@ -356,6 +356,28 @@ pub(crate) async fn reconcile_one(
         }
     };
 
+    // Retirement: an extractor schedule over a retired source is skipped, not
+    // fired. Read from the STORED state, not the enforced one — retirement is a
+    // scheduling decision, not a data gate, so it holds in soak mode too. The
+    // state is read on every tick, so `POST /sources/{id}/state` back to any
+    // other state resumes the schedule at its next firing.
+    if let Some(dataset) = retirement_dataset(&schedule.app, &params) {
+        let stored = state.health.state(&schedule.app, &dataset).await;
+        if schedule_blocked_by_retirement(&schedule.app, &params, stored) {
+            let eaten = missed + collapsed + usize::from(fires);
+            info!(
+                id = %schedule.id, app = %schedule.app, dataset = %dataset, eaten,
+                "source retired: skipping the scheduled firing (recorded as a skip; \
+                 POST /sources/{{id}}/state resumes it)"
+            );
+            state
+                .storage
+                .record_schedule_skip(&schedule.id, now, eaten)
+                .await?;
+            return Ok(StepOutcome::Skipped);
+        }
+    }
+
     if !fires {
         info!(
             id = %schedule.id, app = %schedule.app, missed,
@@ -436,6 +458,39 @@ pub(crate) async fn reconcile_one(
         .record_schedule_skip(&schedule.id, now, missed)
         .await?;
     Ok(StepOutcome::SkippedAndFired)
+}
+
+/// The only app whose schedules retirement can stop: its sources are
+/// `extractor/<params.dataset>`, a mapping the params state outright.
+const RETIRABLE_APP: &str = "extractor";
+
+/// The extractor's dataset when `params` names none (its documented default).
+const EXTRACTOR_DEFAULT_DATASET: &str = "extracted";
+
+/// The dataset whose source a schedule feeds, when retirement applies to it at
+/// all: `Some(params.dataset)` (default `extracted`) for an extractor schedule,
+/// `None` for every other app.
+pub(crate) fn retirement_dataset(app: &str, params: &Value) -> Option<String> {
+    (app == RETIRABLE_APP).then(|| {
+        params
+            .get("dataset")
+            .and_then(Value::as_str)
+            .unwrap_or(EXTRACTOR_DEFAULT_DATASET)
+            .to_string()
+    })
+}
+
+/// Whether a schedule must not fire because the source it feeds is retired.
+///
+/// Only an extractor schedule (see [`retirement_dataset`]), and only the
+/// stored state `retired` — `unknown` (a failed read) and every other rung
+/// fire, so a health read that fails can never stop a pipeline.
+pub(crate) fn schedule_blocked_by_retirement(
+    app: &str,
+    params: &Value,
+    stored: pumper_core::SourceState,
+) -> bool {
+    retirement_dataset(app, params).is_some() && stored == pumper_core::SourceState::Retired
 }
 
 /// Whether a schedule the pass read earlier may still be fired *now*.

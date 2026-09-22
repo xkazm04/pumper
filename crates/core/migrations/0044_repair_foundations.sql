@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS golden_docs (
     expected      TEXT NOT NULL,          -- JSON: the record's typed values
     stable_fields TEXT NOT NULL,          -- JSON array: fields with churn < threshold
     rules_hash    TEXT NOT NULL,
-    pinned_by     TEXT NOT NULL,          -- operator | refresh
+    pinned_by     TEXT NOT NULL,          -- enrol | refresh | operator (operator = frozen, never re-pinned)
     pinned_at     TEXT NOT NULL,
     PRIMARY KEY (source_id, key, generation)
 );

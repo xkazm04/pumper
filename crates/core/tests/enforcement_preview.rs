@@ -103,6 +103,7 @@ async fn observe(health: &Resilience, docs: &[ObservedDoc]) -> SourceState {
                 fetch: FetchHealth {
                     attempted: docs.len() as u32,
                     ok: docs.len() as u32,
+                    ..Default::default()
                 },
                 build_id: Some("test".into()),
             },

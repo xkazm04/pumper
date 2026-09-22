@@ -113,6 +113,11 @@
       "reason": "Same: CDX range query against web.archive.org."
     },
     {
+      "id": "pumper-server::bin:pumper::e2e::hn_source::live_hn_item_still_matches_the_ruleset",
+      "gate": "live-network",
+      "reason": "Fetches one news.ycombinator.com item page to prove the checked-in HN test-source ruleset still matches the live markup. Certifies a third party's markup, not this repo's code; the 40 checked-in fixtures (app-extractor tests/hn_source.rs) are the per-change gate."
+    },
+    {
       "id": "pumper-engine-browser::test:render::renders_example_dot_com",
       "gate": "local-chrome",
       "reason": "Needs a real Chrome binary plus live network. Recorded as cannot-run on hosted runners."

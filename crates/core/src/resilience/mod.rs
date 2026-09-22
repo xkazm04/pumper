@@ -61,7 +61,8 @@ use crate::extract::DocReport;
 use crate::simhash;
 
 pub use detect::{
-    Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, Recovery, RunEvaluation,
+    Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, Recovery, RetireRun,
+    RunEvaluation,
 };
 pub use invariants::{Invariant, InvariantKind};
 pub use sketch::FieldSketch;
@@ -92,8 +93,11 @@ pub enum SourceState {
     /// `provisional`. Another full clean streak earns `Healthy`; one tripped run
     /// drops straight back to `Quarantined`.
     Probation,
-    /// A dead source (permanently gone URLs), not a broken extractor. Set
-    /// manually; nothing auto-retires.
+    /// A dead source (permanently gone URLs), not a broken extractor. Set by an
+    /// operator, or — only for a source listed in `[resilience] auto_retire` —
+    /// by [`detect::retirement_due`] on its own fetch-failure denominator. It
+    /// stops the source's extractor schedule, and only an operator moves it
+    /// out again (`POST /sources/{id}/state`).
     Retired,
     /// **Not a rung: the absence of one.** The health of this source could not
     /// be read — the state column held a value this build does not know, or the
@@ -175,13 +179,19 @@ impl SourceState {
     /// detection then tombstones every key missing from it. The empty-batch
     /// guard in `detect_removed` does not cover a *partial* batch, and this is
     /// the guard for that case.
+    ///
+    /// `Retired` suppresses too: a source whose pages are gone produces empty
+    /// or short batches, and inferring removals from them would tombstone the
+    /// dataset of a site that merely went away.
     pub fn suppresses_removals(self) -> bool {
-        matches!(self, Self::Degraded | Self::Quarantined)
+        matches!(self, Self::Degraded | Self::Quarantined | Self::Retired)
     }
 
-    /// Whether the search index skips this source's revisions.
+    /// Whether the search index skips this source's revisions. `Retired` is
+    /// skipped for the same reason it suppresses removals: nothing it writes
+    /// now describes a live page.
     pub fn skips_search_index(self) -> bool {
-        matches!(self, Self::Degraded | Self::Quarantined)
+        matches!(self, Self::Degraded | Self::Quarantined | Self::Retired)
     }
 
     /// Whether writes are diverted to the shadow dataset.
@@ -212,6 +222,15 @@ pub enum RunVerdict {
     /// baseline entirely out of runs nobody ever judged, and then measured itself
     /// against it. See [`detect::CohortAdequacy`].
     BelowCohort,
+    /// Below the cohort floor, but the source's golden documents vouched for it:
+    /// every stable field of every golden key present in this run agreed with
+    /// its pinned value (see [`crate::golden::golden_verdict`]).
+    ///
+    /// Judged — it moves the state and counts toward recovery — but never
+    /// baseline material: the distributional tests never ran on it, and a
+    /// baseline built from runs they never looked at is the self-referential
+    /// history `BelowCohort` exists to prevent.
+    GoldenOk,
     Broken,
     /// Broken, and the cause is ours (rules, transforms or parser), not the
     /// site's.
@@ -225,6 +244,7 @@ impl RunVerdict {
             Self::Inconclusive => "inconclusive",
             Self::ContentEmpty => "content_empty",
             Self::BelowCohort => "below_cohort",
+            Self::GoldenOk => "golden_ok",
             Self::Broken => "broken",
             Self::SelfInflicted => "self_inflicted",
         }
@@ -233,7 +253,30 @@ impl RunVerdict {
     /// Whether this run says anything about the extractor's health — i.e. may
     /// move the source's state.
     pub fn judged(self) -> bool {
-        matches!(self, Self::Ok | Self::Broken | Self::SelfInflicted)
+        matches!(
+            self,
+            Self::Ok | Self::GoldenOk | Self::Broken | Self::SelfInflicted
+        )
+    }
+
+    /// The stored verdict strings [`judged`](Self::judged) is true for, as an
+    /// SQL list — what the store's trip and recovery queries filter on, so the
+    /// SQL cannot drift from the predicate (pinned by a test).
+    pub const JUDGED_SQL: &'static str = "('ok', 'golden_ok', 'broken', 'self_inflicted')";
+
+    /// Parses a stored verdict. An unrecognized value reads as `Inconclusive`:
+    /// "we cannot tell what this run said" must never be rounded up to "it was
+    /// fine", because a judged verdict is what moves a state.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "ok" => Self::Ok,
+            "content_empty" => Self::ContentEmpty,
+            "below_cohort" => Self::BelowCohort,
+            "golden_ok" => Self::GoldenOk,
+            "broken" => Self::Broken,
+            "self_inflicted" => Self::SelfInflicted,
+            _ => Self::Inconclusive,
+        }
     }
 
     /// Whether this run may enter the rolling baseline.
@@ -523,6 +566,54 @@ mod tests {
         assert!(!RunVerdict::Inconclusive.judged());
         assert!(!RunVerdict::ContentEmpty.judged());
         assert!(RunVerdict::Broken.judged());
+    }
+
+    #[test]
+    fn a_retired_source_neither_tombstones_nor_indexes_but_writes_live() {
+        // A dead site's runs are empty or short; inferring removals from them
+        // would tombstone the dataset, and indexing them would publish pages
+        // that no longer exist.
+        assert!(SourceState::Retired.suppresses_removals());
+        assert!(SourceState::Retired.skips_search_index());
+        assert!(SourceState::Retired.suppresses_pushes());
+        // …but it is not a broken extractor: nothing is diverted or restamped.
+        assert!(!SourceState::Retired.diverts_writes());
+        assert_eq!(SourceState::Retired.trust(), None);
+    }
+
+    #[test]
+    fn golden_ok_is_judged_but_never_baseline_material() {
+        assert!(RunVerdict::GoldenOk.judged());
+        assert!(!RunVerdict::GoldenOk.baselines());
+        assert_eq!(
+            RunVerdict::parse(RunVerdict::GoldenOk.as_str()),
+            RunVerdict::GoldenOk
+        );
+    }
+
+    #[test]
+    fn judged_sql_lists_exactly_the_judged_verdicts() {
+        let all = [
+            RunVerdict::Ok,
+            RunVerdict::Inconclusive,
+            RunVerdict::ContentEmpty,
+            RunVerdict::BelowCohort,
+            RunVerdict::GoldenOk,
+            RunVerdict::Broken,
+            RunVerdict::SelfInflicted,
+        ];
+        for v in all {
+            assert_eq!(RunVerdict::parse(v.as_str()), v, "round trip");
+            assert_eq!(
+                RunVerdict::JUDGED_SQL.contains(&format!("'{}'", v.as_str())),
+                v.judged(),
+                "{v:?}: the SQL filter and the predicate disagree"
+            );
+        }
+        assert_eq!(
+            RunVerdict::parse("future_variant"),
+            RunVerdict::Inconclusive
+        );
     }
 
     #[test]

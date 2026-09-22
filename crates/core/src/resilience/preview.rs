@@ -342,14 +342,9 @@ pub fn replay(
 /// `Inconclusive` — "we cannot tell what this run said" must never be rounded up
 /// to "it was fine", because a judged verdict is what moves a state.
 fn verdict_of(run: &SourceRun) -> RunVerdict {
-    match run.verdict.as_str() {
-        "ok" => RunVerdict::Ok,
-        "broken" => RunVerdict::Broken,
-        "self_inflicted" => RunVerdict::SelfInflicted,
-        "content_empty" => RunVerdict::ContentEmpty,
-        "below_cohort" => RunVerdict::BelowCohort,
-        _ => RunVerdict::Inconclusive,
-    }
+    // One parse for every stored verdict, so a variant the store writes (e.g.
+    // `golden_ok`) cannot be misread here as unjudged.
+    RunVerdict::parse(&run.verdict)
 }
 
 /// Replays the whole fleet. **Read-only**: `list_sources` + one `runs` read per
@@ -610,7 +605,12 @@ mod tests {
             vec![CONSEQUENCES[1].0, CONSEQUENCES[2].0, CONSEQUENCES[3].0],
             "degraded keeps writing to the live dataset"
         );
-        assert_eq!(gates_of(SourceState::Retired), vec![CONSEQUENCES[2].0]);
+        // A retired source keeps writing to its live dataset, but infers no
+        // removals, pushes nothing and indexes nothing.
+        assert_eq!(
+            gates_of(SourceState::Retired),
+            vec![CONSEQUENCES[1].0, CONSEQUENCES[2].0, CONSEQUENCES[3].0]
+        );
 
         // Every consequence name is reachable from some state, so none of them
         // is a label nothing can ever produce.

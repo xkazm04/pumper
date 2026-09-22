@@ -178,6 +178,17 @@ pub fn cohort_adequacy(cfg: &ResilienceConfig, docs: u32, baseline: &Baseline) -
 pub struct FetchHealth {
     pub attempted: u32,
     pub ok: u32,
+    /// Fetches the live site answered with a **permanent** "gone": HTTP 404 or
+    /// 410 on a live, uncached http tier. A 403 (bot wall), a 429, a timeout, a
+    /// DNS failure of any kind, and any cache, archive or replay response never
+    /// count — they say the fetch layer failed, not that the page is gone.
+    /// Retirement's evidence, and only retirement's: the fetch gate above never
+    /// reads it.
+    pub permanent: u32,
+    /// The URL roster this run was asked to cover — `None` when the app does
+    /// not report one (every mode but the extractor's `urls`). A run with no
+    /// roster can never count toward retirement.
+    pub roster: Option<u32>,
 }
 
 impl FetchHealth {
@@ -918,6 +929,126 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+// ---- retirement: a dead source, on its own denominator ---------------------
+
+/// Share of a run's attempted fetches that must be permanent failures, and
+/// share of its roster it must have attempted, for the run to count as dead.
+pub const RETIRE_RATIO: f64 = 0.9;
+/// Consecutive dead runs retirement needs.
+pub const RETIRE_RUNS: usize = 3;
+/// Cadence intervals the dead runs must span.
+pub const RETIRE_CADENCE_SPAN: i32 = 2;
+/// Span the dead runs must cover when the source has no known cadence.
+pub const RETIRE_FALLBACK_SPAN_DAYS: i64 = 14;
+
+/// `sources.state_reason` of a source the detector retired.
+pub const RETIRED_REASON: &str = "permanent fetch failure";
+
+/// Whether retirement is even considered for a source: it must be listed,
+/// verbatim, in `[resilience] auto_retire` (opt-in — retirement stops
+/// scheduling, so nothing reaches it by default), and not already retired.
+pub fn retirement_enrolled(auto_retire: &[String], source_id: &str, state: SourceState) -> bool {
+    state != SourceState::Retired && auto_retire.iter().any(|s| s == source_id)
+}
+
+/// One run as retirement sees it: its fetch facts and when it was recorded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetireRun {
+    pub attempted: u32,
+    pub permanent: u32,
+    /// `None` = the run reported no roster (a pre-0044 row, or a mode with no
+    /// URL list). Such a run never qualifies.
+    pub roster: Option<u32>,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+impl RetireRun {
+    /// The run being observed right now.
+    pub fn current(fetch: FetchHealth, at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            attempted: fetch.attempted,
+            permanent: fetch.permanent,
+            roster: fetch.roster,
+            at,
+        }
+    }
+
+    /// A stored `source_runs` row. The table keeps `fetch_permanent` and
+    /// `fetch_roster` (0044) but no attempted count, so a stored run's attempted
+    /// count is its roster. That is exact for the only reporter: the extractor's
+    /// `urls` mode attempts every URL of its roster (`attempted` is set from the
+    /// same list). A NULL in either column is unknown, and the run never counts.
+    pub fn stored(
+        permanent: Option<i64>,
+        roster: Option<i64>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let roster = roster.and_then(|r| u32::try_from(r).ok());
+        Self {
+            attempted: roster.unwrap_or(0),
+            permanent: permanent.and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
+            roster: permanent.and(roster),
+            at,
+        }
+    }
+
+    /// Whether this one run looks like a dead source: nearly every attempted
+    /// fetch was a permanent "gone", over nearly the whole roster. Zero attempts
+    /// never qualify — nothing was asked, so nothing is gone.
+    pub fn dead(&self) -> bool {
+        let Some(roster) = self.roster else {
+            return false;
+        };
+        self.attempted > 0
+            && roster > 0
+            && self.permanent as f64 >= RETIRE_RATIO * self.attempted as f64
+            && self.attempted as f64 >= RETIRE_RATIO * roster as f64
+    }
+}
+
+/// Whether a source has earned retirement: its last [`RETIRE_RUNS`] recorded
+/// runs (`runs` newest first, the current one included) are each [dead], and
+/// together they span at least [`RETIRE_CADENCE_SPAN`] cadence intervals — or
+/// [`RETIRE_FALLBACK_SPAN_DAYS`] days when the cadence is unknown.
+///
+/// The span is what keeps three manual retries in one afternoon from retiring
+/// a source whose host had a bad hour.
+///
+/// [dead]: RetireRun::dead
+pub fn retirement_due(runs: &[RetireRun], cadence: Option<chrono::Duration>) -> bool {
+    if runs.len() < RETIRE_RUNS {
+        return false;
+    }
+    let window = &runs[..RETIRE_RUNS];
+    if !window.iter().all(RetireRun::dead) {
+        return false;
+    }
+    let newest = window.iter().map(|r| r.at).max();
+    let oldest = window.iter().map(|r| r.at).min();
+    let (Some(newest), Some(oldest)) = (newest, oldest) else {
+        return false;
+    };
+    let needed = match cadence {
+        Some(c) if c > chrono::Duration::zero() => c * RETIRE_CADENCE_SPAN,
+        _ => chrono::Duration::days(RETIRE_FALLBACK_SPAN_DAYS),
+    };
+    newest - oldest >= needed
+}
+
+/// A schedule's cadence, read from when it actually fired: the median gap
+/// between consecutive firings (`fired` in any order). `None` with fewer than
+/// two firings — one run has no cadence.
+pub fn cadence_from_firings(fired: &[chrono::DateTime<chrono::Utc>]) -> Option<chrono::Duration> {
+    let mut sorted = fired.to_vec();
+    sorted.sort();
+    let gaps: Vec<f64> = sorted
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_seconds() as f64)
+        .filter(|g| *g > 0.0)
+        .collect();
+    median(&gaps).map(|s| chrono::Duration::seconds(s as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1136,7 @@ mod tests {
             fetch: FetchHealth {
                 attempted: docs,
                 ok: docs,
+                ..Default::default()
             },
             sketches,
             baseline,
@@ -1033,6 +1165,7 @@ mod tests {
                 fetch: FetchHealth {
                     attempted: 30,
                     ok: 9,
+                    ..Default::default()
                 },
                 ..input(&broken, &base, &[], None, 30)
             },
@@ -1051,6 +1184,7 @@ mod tests {
                 fetch: FetchHealth {
                     attempted: 30,
                     ok: 24,
+                    ..Default::default()
                 },
                 ..input(&broken, &base, &[], None, 30)
             },
@@ -1061,7 +1195,8 @@ mod tests {
         assert_eq!(
             FetchHealth {
                 attempted: 0,
-                ok: 0
+                ok: 0,
+                ..Default::default()
             }
             .rate(),
             1.0
@@ -1715,5 +1850,151 @@ mod tests {
         // The threshold is inclusive on the tripping side: `score >= degrade`.
         assert_eq!(consecutive_clean(&[0.6], d), 0);
         assert_eq!(consecutive_clean(&[0.5999], d), 1);
+    }
+
+    // ---- retirement ---------------------------------------------------------
+
+    fn day(n: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap() + chrono::Duration::days(n)
+    }
+
+    /// A run of `roster` URLs, `attempted` of them fetched, `permanent` of those
+    /// answered 404/410, recorded on `day(at)`.
+    fn dead_run(at: i64, attempted: u32, permanent: u32, roster: u32) -> RetireRun {
+        RetireRun {
+            attempted,
+            permanent,
+            roster: Some(roster),
+            at: day(at),
+        }
+    }
+
+    #[test]
+    fn two_dead_runs_do_not_retire() {
+        // Two weekly dead runs, newest first: the third is what retirement costs.
+        let runs = [dead_run(7, 40, 40, 40), dead_run(0, 40, 40, 40)];
+        assert!(!retirement_due(&runs, Some(chrono::Duration::days(7))));
+        assert!(!retirement_due(&runs[..1], None));
+        assert!(!retirement_due(&[], None));
+    }
+
+    #[test]
+    fn three_dead_runs_retire() {
+        let weekly = Some(chrono::Duration::days(7));
+        let runs = [
+            dead_run(14, 40, 40, 40),
+            dead_run(7, 40, 37, 40),
+            dead_run(0, 40, 36, 40),
+        ];
+        assert!(retirement_due(&runs, weekly), "36/40 is the 90% boundary");
+        // One live run among the three is not a dead source.
+        let revived = [runs[0], dead_run(7, 40, 20, 40), runs[2]];
+        assert!(!retirement_due(&revived, weekly));
+        // Only the newest three count: an older live run does not rescue it.
+        let with_history = [runs[0], runs[1], runs[2], dead_run(-7, 40, 0, 40)];
+        assert!(retirement_due(&with_history, weekly));
+    }
+
+    #[test]
+    fn three_dead_runs_in_one_afternoon_do_not_retire() {
+        // The span guard: three retries of a host having a bad hour.
+        let runs = [
+            RetireRun {
+                at: day(0) + chrono::Duration::hours(2),
+                ..dead_run(0, 40, 40, 40)
+            },
+            RetireRun {
+                at: day(0) + chrono::Duration::hours(1),
+                ..dead_run(0, 40, 40, 40)
+            },
+            dead_run(0, 40, 40, 40),
+        ];
+        assert!(!retirement_due(&runs, Some(chrono::Duration::days(7))));
+        // With no known cadence the span is 14 days: 13 is not enough.
+        let unknown = [
+            dead_run(13, 40, 40, 40),
+            dead_run(6, 40, 40, 40),
+            dead_run(0, 40, 40, 40),
+        ];
+        assert!(!retirement_due(&unknown, None));
+        let unknown = [
+            dead_run(14, 40, 40, 40),
+            dead_run(7, 40, 40, 40),
+            dead_run(0, 40, 40, 40),
+        ];
+        assert!(retirement_due(&unknown, None));
+    }
+
+    #[test]
+    fn unlisted_source_never_retires() {
+        let listed = vec!["extractor/hn-items".to_string()];
+        assert!(retirement_enrolled(
+            &listed,
+            "extractor/hn-items",
+            SourceState::Healthy
+        ));
+        // Not listed: however dead its runs, retirement is never considered.
+        assert!(!retirement_enrolled(
+            &listed,
+            "extractor/other",
+            SourceState::Healthy
+        ));
+        assert!(!retirement_enrolled(
+            &[],
+            "extractor/hn-items",
+            SourceState::Healthy
+        ));
+        // A prefix is not a listing.
+        assert!(!retirement_enrolled(
+            &listed,
+            "extractor/hn",
+            SourceState::Healthy
+        ));
+        // Already retired: nothing to do.
+        assert!(!retirement_enrolled(
+            &listed,
+            "extractor/hn-items",
+            SourceState::Retired
+        ));
+    }
+
+    #[test]
+    fn thin_roster_coverage_does_not_retire() {
+        // Every attempted fetch was a 404, but the runs only reached 30 of a
+        // 40-URL roster: that is not evidence the other ten are gone.
+        let runs = [
+            dead_run(14, 30, 30, 40),
+            dead_run(7, 30, 30, 40),
+            dead_run(0, 30, 30, 40),
+        ];
+        assert!(!retirement_due(&runs, Some(chrono::Duration::days(7))));
+        // Zero attempts never count, whatever the roster.
+        assert!(!dead_run(0, 0, 0, 40).dead());
+        // No roster at all (a pre-0044 row, a mode with no URL list) never counts.
+        let unknown = RetireRun {
+            roster: None,
+            ..dead_run(0, 40, 40, 40)
+        };
+        assert!(!unknown.dead());
+    }
+
+    #[test]
+    fn a_stored_row_with_a_null_column_is_unknown_not_dead() {
+        assert!(RetireRun::stored(Some(40), Some(40), day(0)).dead());
+        assert!(!RetireRun::stored(None, Some(40), day(0)).dead());
+        assert!(!RetireRun::stored(Some(40), None, day(0)).dead());
+        assert!(!RetireRun::stored(Some(10), Some(40), day(0)).dead());
+    }
+
+    #[test]
+    fn cadence_is_the_median_gap_between_firings_not_the_mean() {
+        let fired = [day(0), day(7), day(14), day(15), day(21)];
+        // Gaps 7, 7, 1, 6 → median 6.5 days; one manual re-fire does not halve it.
+        assert_eq!(
+            cadence_from_firings(&fired),
+            Some(chrono::Duration::hours(156))
+        );
+        assert_eq!(cadence_from_firings(&[day(0)]), None);
+        assert_eq!(cadence_from_firings(&[]), None);
     }
 }

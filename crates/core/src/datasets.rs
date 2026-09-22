@@ -725,6 +725,12 @@ impl Datasets {
         }
     }
 
+    /// The pool, for the crate's golden-document store (`golden`), which reads
+    /// `golden_docs` and `body_pins` beside the records this handle serves.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Shares the store's self-instrument, so this handle's writes are measured
     /// into the same rings `/metrics` and the doctor report render.
     pub fn with_instrument(mut self, instrument: Arc<StoreInstrument>) -> Self {
@@ -2923,6 +2929,40 @@ impl Datasets {
                     },
                 );
             }
+        }
+        Ok(out)
+    }
+
+    /// The field-level diffs of every `new` / `changed` revision of `keys` —
+    /// the corpus field churn is measured over (`golden::stable_fields`). A
+    /// `new` revision has no diff and yields `None`; it still counts in the
+    /// denominator, since it is a revision in which no field changed. Removals
+    /// carry no values and are left out. Chunked: the key list is caller-sized.
+    pub async fn revision_diffs(
+        &self,
+        app: &str,
+        dataset: &str,
+        keys: &[&str],
+    ) -> Result<Vec<Option<Value>>> {
+        let mut out = Vec::new();
+        for slice in keys.chunks(rows_per_statement(1, 2)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT diff FROM record_revisions WHERE change IN ('new', 'changed') AND app = ",
+            );
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            let rows: Vec<(Option<String>,)> = qb.build_query_as().fetch_all(&self.pool).await?;
+            // A diff that no longer parses is read as touching the whole record
+            // (`$`): an unreadable revision must not make a field look stable.
+            out.extend(rows.into_iter().map(|(d,)| {
+                d.map(|s| {
+                    serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({"$": null}))
+                })
+            }));
         }
         Ok(out)
     }

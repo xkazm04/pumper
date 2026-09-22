@@ -445,6 +445,46 @@ async fn pin_body_file(root: &std::path::Path, app: &str, body: &str) -> Result<
     Ok((sha, true))
 }
 
+/// The golden-document refresh, after an enrolled run whose source is now
+/// stored `healthy` (the state `observe` just settled). Best-effort: a refresh
+/// that fails leaves the existing generations in place and never fails a
+/// working extraction. See `pumper_core::golden::refresh` for the rule.
+///
+/// Here, rather than inside `observe`, because only this seam has both the
+/// artifacts root the pinned bodies live under and this run's own pins.
+async fn refresh_goldens(ctx: &AppContext, dataset: &str, source_id: &str) {
+    if !ctx.health.enabled()
+        || ctx.health.state(&ctx.app, dataset).await != pumper_core::SourceState::Healthy
+    {
+        return;
+    }
+    let Ok(root) = replay::artifacts_root(ctx) else {
+        return;
+    };
+    match pumper_core::golden::refresh(
+        &ctx.datasets,
+        &root,
+        source_id,
+        ctx.health.config().golden_refresh_days,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(keys) if !keys.is_empty() => {
+            tracing::info!(
+                source = source_id,
+                repinned = keys.len(),
+                "golden documents refreshed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            source = source_id,
+            "golden refresh failed, generations kept: {e}"
+        ),
+    }
+}
+
 /// The observation id of one pinned document: `<job_id>:<document key>`.
 fn observation_id(job_id: &str, key: &str) -> String {
     format!("{job_id}:{key}")
@@ -1700,30 +1740,39 @@ impl Extractor {
                     // of bytes.
                     Ok(out) => {
                         let healthy = tier_won(&out);
+                        let gone = permanently_gone(&out);
                         (
                             url,
                             out.html.or(out.text).filter(|d| !d.is_empty()),
                             healthy,
+                            gone,
                         )
                     }
-                    Err(_) => (url, None, false),
+                    Err(_) => (url, None, false, false),
                 }
             }
         });
-        let fetched_pairs: Vec<(String, Option<String>, bool)> = futures::stream::iter(fetches)
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+        let fetched_pairs: Vec<(String, Option<String>, bool, bool)> =
+            futures::stream::iter(fetches)
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
 
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
+        // The roster is the job's URL list, and every URL of it is attempted.
         let mut fetch = FetchHealth {
             attempted: urls.len() as u32,
             ok: 0,
+            permanent: 0,
+            roster: Some(urls.len() as u32),
         };
-        for (url, doc, healthy) in fetched_pairs {
+        for (url, doc, healthy, gone) in fetched_pairs {
             if healthy {
                 fetch.ok += 1;
+            }
+            if gone {
+                fetch.permanent += 1;
             }
             match doc {
                 Some(d) => keyed.push(SourceDoc::live(url, d)),
@@ -1772,6 +1821,9 @@ impl Extractor {
             "health": out.health.clone(),
         });
         registration.merge_into(&mut result);
+        if let Some(e) = &enrollment {
+            refresh_goldens(ctx, dataset, &e.source_id).await;
+        }
         if let (Some(e), Some(p)) = (&enrollment, &pinned) {
             result["enrolled"] = json!({
                 "source": e.source_id,
@@ -2284,9 +2336,11 @@ impl Extractor {
 
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<Value> = Vec::new();
+        // Archive mode reports no roster: a snapshot that is gone says nothing
+        // about whether the live page is, so it is never retirement evidence.
         let mut fetch = FetchHealth {
             attempted: found as u32,
-            ok: 0,
+            ..FetchHealth::default()
         };
         for (snap, outcome) in fetched_pairs {
             match outcome {
@@ -2458,6 +2512,26 @@ fn tier_won(out: &pumper_core::FetchOutcome) -> bool {
     })
 }
 
+/// Whether the live site said this page is **permanently gone**: a live http
+/// tier (not served from the cache, `cache_hit: Some(false)`) answered 404 or
+/// 410, and no tier delivered the page anyway. Retirement's evidence.
+///
+/// Read from the structured trace, never the prose. What does NOT count, each
+/// deliberately: a 403 or 429 (a bot wall or a rate limit says nothing about
+/// the page), a timeout or any DNS failure (the transport failed; the engine
+/// does not tell NXDOMAIN from SERVFAIL, so neither counts), a cache hit, an
+/// archive or recipe tier (a stored capture, not the live site), and a VCR
+/// replay (its trace carries `cache_hit: None`). A fetch that errored never
+/// reaches this function.
+fn permanently_gone(out: &pumper_core::FetchOutcome) -> bool {
+    !tier_won(out)
+        && out.trace.iter().any(|t| {
+            t.tier == pumper_core::FetchTier::Http
+                && t.cache_hit == Some(false)
+                && matches!(t.http_status, Some(404 | 410))
+        })
+}
+
 #[cfg(test)]
 mod observation_host_tests {
     use super::observation_host;
@@ -2492,6 +2566,122 @@ mod observation_host_tests {
     fn non_url_keys_yield_no_host() {
         assert_eq!(observation_host("CA:electrician"), None);
         assert_eq!(observation_host("opportunity-12345"), None);
+    }
+}
+
+#[cfg(test)]
+mod permanence_tests {
+    use super::permanently_gone;
+    use pumper_core::{FetchOutcome, FetchTier, TierTrace, TierVerdict};
+
+    fn tier(
+        tier: FetchTier,
+        verdict: TierVerdict,
+        status: Option<u16>,
+        cache: Option<bool>,
+    ) -> TierTrace {
+        TierTrace {
+            tier,
+            verdict,
+            http_status: status,
+            content_chars: None,
+            cache_hit: cache,
+            latency_ms: 1,
+            cost_usd: None,
+            detail: None,
+        }
+    }
+
+    fn outcome(trace: Vec<TierTrace>) -> FetchOutcome {
+        FetchOutcome {
+            url: "https://news.ycombinator.com/item?id=1".into(),
+            engine: "http",
+            status: trace.first().and_then(|t| t.http_status),
+            html: Some("<html></html>".into()),
+            markdown: None,
+            text: None,
+            escalations: vec![],
+            trace,
+            cost_usd: None,
+            snapshot: None,
+        }
+    }
+
+    fn live(status: u16) -> FetchOutcome {
+        // The `Http` strategy returns whatever the live tier answered, with
+        // verdict `ok` — the status is the only thing that says "gone".
+        outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(status),
+            Some(false),
+        )])
+    }
+
+    #[test]
+    fn a_live_404_or_410_is_permanent() {
+        assert!(permanently_gone(&live(404)));
+        assert!(permanently_gone(&live(410)));
+    }
+
+    #[test]
+    fn forbidden_403_is_not_permanent() {
+        // A bot wall is the fetch layer failing, not the page being gone.
+        assert!(!permanently_gone(&live(403)));
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Blocked,
+            Some(403),
+            Some(false)
+        )])));
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_are_not_permanent() {
+        assert!(!permanently_gone(&live(429)));
+        assert!(!permanently_gone(&live(503)));
+        assert!(!permanently_gone(&live(200)));
+        // A timeout or DNS failure is a tier `error` with no status.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Error,
+            None,
+            None
+        )])));
+    }
+
+    #[test]
+    fn a_cached_archived_or_replayed_404_is_not_permanent() {
+        // Served from the HTTP cache: a stored answer, not the live site.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(404),
+            Some(true)
+        )])));
+        // A VCR replay's trace carries no cache fact at all.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(404),
+            None
+        )])));
+        // An archive tier's 404 is a missing snapshot.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Archive,
+            TierVerdict::Thin,
+            Some(404),
+            Some(false)
+        )])));
+    }
+
+    #[test]
+    fn a_404_that_a_later_tier_recovered_is_not_permanent() {
+        // `auto` escalated past the 404 and the browser delivered the page.
+        assert!(!permanently_gone(&outcome(vec![
+            tier(FetchTier::Http, TierVerdict::Thin, Some(404), Some(false)),
+            tier(FetchTier::Browser, TierVerdict::Ok, None, None),
+        ])));
     }
 }
 

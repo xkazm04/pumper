@@ -338,11 +338,17 @@ pub(crate) struct SourceStateBody {
 /// Manual state override: un-quarantine a source that has been fixed, or retire a
 /// dead one.
 ///
-/// The operator path out of `quarantined`, and the only way to `retired`. A
+/// The operator path out of `quarantined` and out of `retired`, and the way
+/// into `retired` for a source not listed in `[resilience] auto_retire`. A
 /// source also leaves quarantine on its own after `[resilience] recovery_runs`
 /// consecutive clean *judged* runs — into `probation`, never straight to
 /// `healthy`, so a premature release is stamped `provisional` rather than silent.
 /// This endpoint is the shortcut for an operator who already knows it is fixed.
+///
+/// Moving a source INTO `degraded`, `quarantined` or `retired` sends one
+/// `source.*` event to `[webhooks] health_url` (`job_id: null`, `reason` = the
+/// operator's). Moving an extractor source out of `retired` resumes its
+/// schedule at the next firing.
 #[utoipa::path(
     post,
     path = "/sources/{id}/state",
@@ -379,15 +385,47 @@ pub(crate) async fn set_source_state(
         ));
     }
     let reason = body.reason.unwrap_or_else(|| "manual override".to_string());
+    // The TRUE previous state, read before the write: `dispatch_health`
+    // re-applies the entry predicate to it, so a no-op override (degraded →
+    // degraded) announces nothing.
+    let before = store.source(&id).await?;
     if !store.set_state_manual(&id, parsed, &reason).await? {
         return Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("unknown source '{id}'"),
         ));
     }
+    if let Some(ev) =
+        manual_health_event(before.as_ref(), store.source(&id).await?.as_ref(), &reason)
+    {
+        crate::webhook::dispatch_health(&state, &ev).await;
+    }
     Ok(Json(
         json!({ "id": id, "state": parsed.as_str(), "reason": reason }),
     ))
+}
+
+/// The `source.*` event a manual override announces: `from` is the state the
+/// row held before the write, `to` what it holds after, `reason` the
+/// operator's, `job_id` null (no run moved it), `at` the new `state_since`.
+/// `None` when either read found no row. Whether it is an ENTRY worth sending
+/// is `dispatch_health`'s call, not this function's.
+pub(crate) fn manual_health_event(
+    before: Option<&pumper_core::SourceHealth>,
+    after: Option<&pumper_core::SourceHealth>,
+    reason: &str,
+) -> Option<crate::webhook::SourceHealthEvent> {
+    let (before, after) = (before?, after?);
+    Some(crate::webhook::SourceHealthEvent {
+        source_id: after.id.clone(),
+        app: after.app.clone(),
+        dataset: after.dataset.clone(),
+        from: Some(before.state.as_str().to_string()),
+        to: after.state.as_str().to_string(),
+        reason: Some(reason.to_string()),
+        job_id: None,
+        at: after.state_since.clone(),
+    })
 }
 
 // ── ruleset pointer (Stage 2: pointer + reprint) ────────────────────────────
@@ -751,6 +789,115 @@ pub(crate) async fn rollback_source_rules(
         .await
         .map_err(ruleset_error)?;
     Ok(Json(json!({ "id": id, "dry_run": false, "active": head })))
+}
+
+// ── golden documents (Stage 3: anchor) ──────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct GoldenPinBody {
+    /// Record keys to pin (for the extractor's urls mode, the document URLs).
+    keys: Vec<String>,
+    /// `false` (default): an enrolment pin, `pinned_by: "enrol"`, which the
+    /// refresh keeps current. `true`: a frozen pin, `pinned_by: "operator"`,
+    /// never re-pinned automatically.
+    #[serde(default)]
+    frozen: bool,
+}
+
+/// A refused golden operation, as its HTTP answer.
+fn golden_error(e: pumper_core::golden::GoldenError) -> ApiError {
+    match e {
+        pumper_core::golden::GoldenError::BadRequest(m) => ApiError(StatusCode::BAD_REQUEST, m),
+        pumper_core::golden::GoldenError::Store(e) => ApiError::from(e),
+    }
+}
+
+/// Pins golden documents: generation 0 of each key, from its current record
+/// (`expected` = the record's values minus underscore meta fields) and its
+/// newest pinned body, copied to `data/golden/`. `pinned_by` is `"enrol"`
+/// (refreshable) by default and `"operator"` with `"frozen": true` (never
+/// re-pinned automatically).
+///
+/// A pin replaces any earlier generations of the key. Every key is checked
+/// before anything is written.
+#[utoipa::path(
+    post,
+    path = "/sources/{id}/golden",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    request_body = GoldenPinBody,
+    responses(
+        (status = 200, description = "`{id, pinned: [{source_id, key, generation, url, \
+            body_sha, expected, stable_fields, rules_hash, pinned_by: enrol|operator, pinned_at}]}`. \
+            `stable_fields` are the fields whose churn over the keys' revision history \
+            is under 5%."),
+        (status = 400, description = "Not an extractor source, no keys, a key with no record \
+            or no pinned body, or a source with no active ruleset", body = Object),
+        (status = 404, description = "Unknown source", body = Object),
+    )
+)]
+pub(crate) async fn pin_source_golden(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GoldenPinBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_extractor_source(&state, &id).await?;
+    let pinned = pumper_core::golden::pin(
+        &state.datasets,
+        &state.storage.artifacts_dir,
+        &id,
+        &body.keys,
+        body.frozen,
+        Utc::now(),
+    )
+    .await
+    .map_err(golden_error)?;
+    Ok(Json(json!({ "id": id, "pinned": pinned })))
+}
+
+/// Checks a source's golden documents. Read-only.
+///
+/// `frozen`: each frozen body re-extracted with the ACTIVE ruleset, compared
+/// on every expected field — `exact < keys` means our code or rules changed a
+/// known result. `live`: the current record against `expected` on the stable
+/// fields — `agree < keys` means the site moved a value that does not churn.
+#[utoipa::path(
+    get,
+    path = "/sources/{id}/golden/check",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    responses(
+        (status = 200, description = "`{id, rules_hash, frozen: {keys, exact}, live: {keys, \
+            agree}, mismatches: [{key, field, expected, got, kind: frozen|live}]}`. \
+            `field: null` = the whole document could not be compared (its frozen body is \
+            gone, or its live record is)."),
+        (status = 400, description = "Not an extractor source", body = Object),
+        (status = 404, description = "Unknown source", body = Object),
+        (status = 409, description = "The source has no active ruleset to check against", body = Object),
+    )
+)]
+pub(crate) async fn check_source_golden(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_extractor_source(&state, &id).await?;
+    let head = state.datasets.ruleset_head(&id).await?.ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            format!("source '{id}' has no active ruleset to re-extract its frozen bodies with"),
+        )
+    })?;
+    let rules = registered_rules(&state, &head.rules_hash).await?;
+    let check =
+        pumper_core::golden::check(&state.datasets, &state.storage.artifacts_dir, &id, &rules)
+            .await?;
+    Ok(Json(json!({
+        "id": id,
+        "rules_hash": head.rules_hash,
+        "frozen": check.frozen,
+        "live": check.live,
+        "mismatches": check.mismatches,
+    })))
 }
 
 /// 404 for an unknown source, 400 for a source whose app has no RuleSet.
@@ -1320,5 +1467,87 @@ pub(super) mod ruleset_pointer_tests {
             row.get("repairable_reason").is_some(),
             "the key is present even when null"
         );
+    }
+
+    #[tokio::test]
+    async fn golden_routes_refuse_what_cannot_be_pinned_or_checked() {
+        let (state, _store) = headless_state().await;
+        let router = crate::routes::router(state.clone());
+        let pin = json!({ "keys": ["https://a.test/1"] });
+
+        // Unknown source: 404, and nothing creates it.
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/golden"),
+            Some(pin.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(&router, "GET", &format!("/sources/{ID}/golden/check"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let hs = state.health.store().unwrap();
+        hs.ensure_source("extractor", "d").await.unwrap();
+        hs.ensure_source("crawl", "pages").await.unwrap();
+
+        // A hardcoded app has no ruleset and no pinned bodies.
+        let (status, _) = call(
+            &router,
+            "POST",
+            "/sources/crawl%2Fpages/golden",
+            Some(pin.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Not enrolled: there are no pinned bodies to anchor on.
+        let (status, body) =
+            call(&router, "POST", &format!("/sources/{ID}/golden"), Some(pin)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _) = call(
+            &router,
+            "POST",
+            &format!("/sources/{ID}/golden"),
+            Some(json!({ "keys": [] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // No active ruleset to re-extract with: a stated conflict, not a 500.
+        let (status, body) =
+            call(&router, "GET", &format!("/sources/{ID}/golden/check"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "conflict", "{body}");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM golden_docs")
+            .fetch_one(&state.storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn a_manual_event_carries_the_true_previous_state_and_no_job() {
+        let row = |state: pumper_core::SourceState, since: &str| pumper_core::SourceHealth {
+            id: "extractor/d".into(),
+            app: "extractor".into(),
+            dataset: "d".into(),
+            state,
+            degradation_score: 0.0,
+            state_since: since.into(),
+            state_reason: None,
+            last_verdict: None,
+            last_verdict_at: None,
+            tripped_of_last3: 0,
+            monitored: true,
+            updated_at: since.into(),
+        };
+        let before = row(pumper_core::SourceState::Healthy, "t0");
+        let after = row(pumper_core::SourceState::Degraded, "t1");
+        let ev = super::manual_health_event(Some(&before), Some(&after), "by hand").unwrap();
+        assert_eq!(ev.from.as_deref(), Some("healthy"));
+        assert_eq!(ev.to, "degraded");
+        assert_eq!(ev.job_id, None);
+        assert_eq!(ev.reason.as_deref(), Some("by hand"));
+        assert_eq!(ev.at, "t1", "the transition's own timestamp");
+        assert!(super::manual_health_event(None, Some(&after), "x").is_none());
     }
 }

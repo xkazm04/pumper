@@ -48,14 +48,19 @@ fn only_a_non_degrading_state_can_mint_a_removal_guard() {
         SourceState::Healthy,
         SourceState::Suspect,
         SourceState::Probation,
-        SourceState::Retired,
     ] {
         assert!(
             RemovalGuard::for_source_state(state).is_some(),
             "{state:?} does not suppress removals and must yield a guard"
         );
     }
-    for state in [SourceState::Degraded, SourceState::Quarantined] {
+    // `Retired` joined the suppressing states: a dead site's short batches must
+    // not tombstone its dataset.
+    for state in [
+        SourceState::Degraded,
+        SourceState::Quarantined,
+        SourceState::Retired,
+    ] {
         assert!(
             RemovalGuard::for_source_state(state).is_none(),
             "{state:?} suppresses removals and must NOT yield a guard"

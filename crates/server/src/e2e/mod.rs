@@ -23,6 +23,7 @@ mod fanout_offslot;
 mod fetch_proxy;
 mod harness;
 mod health_events;
+mod hn_source;
 mod host_memory_reset;
 mod host_weather;
 mod ingress_gates;
