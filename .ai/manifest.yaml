@@ -118,6 +118,7 @@ skills:
   - research
   - scan-sweep
   - ship-loop
+  - spark
   - test-before-commit
   - tiger
 
