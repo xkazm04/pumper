@@ -542,7 +542,7 @@ fn versioned_artifact_name(artifact_path: &str, revision: i64) -> String {
 /// [`Provenance::artifact_sha`], and the same digest form the rest of the
 /// platform uses for content addressing.
 fn body_sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// [`PageSink`] that upserts each batch of kept-page fingerprints into the

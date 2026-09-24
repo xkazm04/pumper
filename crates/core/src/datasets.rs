@@ -4308,7 +4308,7 @@ fn diff_into(path: &str, old: &Value, new: &Value, out: &mut serde_json::Map<Str
 fn hash_value(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Fixed-width RFC 3339 UTC micros — the stored timestamp format. Public so
