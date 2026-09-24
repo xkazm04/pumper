@@ -423,7 +423,7 @@ mod manifest_tests {
             for example in &manifest.examples {
                 let errors: Vec<String> = validator
                     .iter_errors(&example.params)
-                    .map(|e| format!("{}: {e}", e.instance_path))
+                    .map(|e| format!("{}: {e}", e.instance_path()))
                     .collect();
                 assert!(
                     errors.is_empty(),
@@ -455,7 +455,7 @@ mod manifest_tests {
             let defaults = app.default_params();
             let errors: Vec<String> = validator
                 .iter_errors(&defaults)
-                .map(|e| format!("{}: {e}", e.instance_path))
+                .map(|e| format!("{}: {e}", e.instance_path()))
                 .collect();
             assert!(
                 errors.is_empty(),

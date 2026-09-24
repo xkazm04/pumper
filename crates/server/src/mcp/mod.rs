@@ -727,7 +727,7 @@ pub(crate) fn validate_tool_args(schema: &Value, args: &Value) -> Result<(), Str
     };
     let errors: Vec<String> = validator
         .iter_errors(args)
-        .map(|e| format!("arguments{}: {e}", e.instance_path))
+        .map(|e| format!("arguments{}: {e}", e.instance_path()))
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -750,7 +750,7 @@ pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), Stri
     };
     let errors: Vec<String> = validator
         .iter_errors(params)
-        .map(|e| format!("params{}: {e}", e.instance_path))
+        .map(|e| format!("params{}: {e}", e.instance_path()))
         .collect();
     if errors.is_empty() {
         Ok(())
