@@ -240,7 +240,7 @@ pub(crate) async fn rederive_provenance(
     // crawl→extract seam), then verify it IS the stamped body by hash.
     let body = load_artifact(&state, &app, &record.data)
         .map_err(|reason| not_replayable(format!("archived body unavailable: {reason}")))?;
-    let body_sha = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let body_sha = hex::encode(Sha256::digest(body.as_bytes()));
     if body_sha != artifact_sha {
         return Err(not_replayable(format!(
             "archived body hash {body_sha} does not match the stamped artifact_sha \

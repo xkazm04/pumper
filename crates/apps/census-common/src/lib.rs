@@ -398,7 +398,7 @@ pub fn redact_key(url: &str) -> String {
 pub fn artifact_sha(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Provenance for one Census API response: the key-redacted request URL plus

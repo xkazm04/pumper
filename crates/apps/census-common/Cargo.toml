@@ -7,6 +7,7 @@ edition.workspace = true
 pumper-core.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+hex.workspace = true
 # `as_of` stamps on derived (virtual-namespace) writes, and the BFS series'
 # month arithmetic — the four apps stay chrono-free and go through here.
 chrono.workspace = true

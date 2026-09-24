@@ -39,7 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pumper_core::config::WebhooksConfig;
 use pumper_core::{Delivery, Job, Storage, Watch};
 use sha2::Sha256;
