@@ -141,6 +141,19 @@ different questions, so `Datasets::pinned_artifact_refs` has two arms:
 | `AppContext::read_source_artifact` (the crawl → extract/plugin seam) | a **live record** whose data carries `job_id` + `artifact_path` — the exact triple the reader resolves | **no** |
 | `POST /provenance/{app}/{ds}/{key}/rederive` | a **replayable revision**'s snapshot (`artifact_sha` **and** `rules_hash` stamped) — where the body was when that revision was written | **yes** |
 
+### Record provenance
+
+`GET /provenance/{app}/{dataset}/{key}?limit=` is the read of that chain.
+It returns `{app, dataset, key, trust, removed_at, coverage, chain}`. `limit`
+defaults to 50 and is clamped to 1..=500. `chain` is newest-first and stops at
+that cap. `coverage` is `{revisions, with_job, replayable}` for the **whole**
+chain, not the returned page. Each chain entry is `{revision, change,
+created_at, trust, provenance, job}`. `provenance` is `{job_id, source_url,
+artifact_sha, rules_hash, replayable}`, and a stamp the write path did not know
+is null. `job` is `{app, status, schedule_id, trigger_id, created_at}`, or null
+when there is no `job_id`, the id is not a uuid, or the queue no longer has
+that job. An unknown record is 404.
+
 Round 24 fixed the first arm: it used to also require the key to have a
 replayable revision. `rules_hash` answers *"did a RuleSet make a provenance claim
 about this record"*, which is a question about extraction, not about
