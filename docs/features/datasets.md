@@ -182,7 +182,11 @@ so cassettes and young bodies were an unlabelled residue and "why did this free
 so little" had no answer in the response. `days` defaults to the configured
 `artifact_retention_days`, so you can model a window the deployment has not
 enabled. The preview and the janitor call the **same** plan builder, so they cannot
-disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
+disagree. A `days` value that does not fit in a signed day count, or whose
+cutoff `Duration` cannot express, is `400` on the preview (the reason is the
+body) and a recorded failure on the janitor — the same check, so a wrapped
+`u64 as i64` cannot move the cutoff the other way. Both walk the whole artifact
+tree — on-demand only, never a hot path.
 
 ## Derived datasets (`/derived`)
 
