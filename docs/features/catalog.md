@@ -90,6 +90,9 @@ it is in the same product group but writes only its own datasets and never rebui
 
 `/catalog/health` answers "did this source run recently?"; `GET /sources` (see [resilient-extraction.md](resilient-extraction.md)) answers "was what it produced any good?" — the two are complementary and cross-link in their responses.
 
+- `GET /catalog/reconcile` is a dry run. It diffs `catalog/data-sources.toml` against the schedules table and writes nothing. The body is the plan plus `empty` and `auto_reconcile`: `{create, update, disable, orphan, covered_by_untagged, in_sync, empty, auto_reconcile}`. `create` is `{source_id, app, cron}`. `update` is `{schedule_id, app, from_cron, to_cron, re_enable}`. `disable` is `{schedule_id, app, reason}`. `orphan` is `{schedule_id, app, reason}` and is report-only. `covered_by_untagged` counts desired rows already served by a hand-made or code-seeded schedule, which the apply leaves alone. A malformed catalog is 500.
+- `POST /catalog/reconcile?force=` applies that plan. Untagged schedules are never written: every write is fenced on `managed_by = "catalog"`. Orphans are counted and not applied. The body is `{applied: {created, updated, disabled, orphans_untouched, errors}, plan}`. A plan that disables more than 3 schedules is 409 unless `force=true`. Re-applying a clean plan is a no-op.
+
 ## Drift enforcement
 
 Two tests in `crates/server/src/routes/mod.rs` embed the TOML at compile time (so they don't depend on the test's working directory) and fail on drift:
