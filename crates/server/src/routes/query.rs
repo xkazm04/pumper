@@ -91,6 +91,31 @@ fn parse_grant_date(value: &str, field: &str) -> Result<chrono::NaiveDate, ApiEr
     })
 }
 
+/// One closing-soon row. `days_left` is the whole-day distance from `today`,
+/// or JSON null when `close_date` is missing or not `YYYY-MM-DD`. The row is
+/// still returned: dropping it made `grants` shorter than the SQL page while
+/// `count` still included it.
+pub(crate) fn closing_soon_grant(key: &str, data: &Value, today: chrono::NaiveDate) -> Value {
+    let days_left = data
+        .get("close_date")
+        .and_then(Value::as_str)
+        .and_then(|close| chrono::NaiveDate::parse_from_str(close, "%Y-%m-%d").ok())
+        .map(|close| (close - today).num_days());
+    let mut grant = match data.as_object() {
+        Some(obj) => obj.clone(),
+        None => serde_json::Map::new(),
+    };
+    grant.insert("key".into(), json!(key));
+    grant.insert(
+        "days_left".into(),
+        match days_left {
+            Some(n) => json!(n),
+            None => Value::Null,
+        },
+    );
+    Value::Object(grant)
+}
+
 /// Translates the query params into store-level JSON predicates.
 fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
     use pumper_core::datasets::JsonFilter;
@@ -237,18 +262,13 @@ pub(crate) async fn closing_soon(
         )
         .await?;
 
-    // SQL already returns these soonest-first; just attach key + days_left.
+    // SQL already returns these soonest-first. Every row the query returned
+    // stays in the page: `count` was computed from the same filters, and a
+    // close_date that is not YYYY-MM-DD used to vanish here, so the page was
+    // shorter than both the cap and the count with nothing saying why.
     let grants: Vec<Value> = records
         .into_iter()
-        .filter_map(|r| {
-            let close = r.data.get("close_date").and_then(Value::as_str)?;
-            let close = chrono::NaiveDate::parse_from_str(close, "%Y-%m-%d").ok()?;
-            let days_left = (close - today).num_days();
-            let mut grant = r.data.as_object()?.clone();
-            grant.insert("key".into(), json!(r.key));
-            grant.insert("days_left".into(), json!(days_left));
-            Some(Value::Object(grant))
-        })
+        .map(|r| closing_soon_grant(&r.key, &r.data, today))
         .collect();
     Ok(Json(
         json!({ "days": days, "count": count, "grants": grants }),
@@ -592,5 +612,38 @@ pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<V
              (progress: GET /datahub/status → emissions.sync_running)"
                 .into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod closing_soon_tests {
+    use super::closing_soon_grant;
+    use chrono::NaiveDate;
+    use serde_json::json;
+
+    /// The anti-pattern: `filter_map` dropped a row whose `close_date` was not
+    /// `YYYY-MM-DD`. The SQL `count` still included it, so the page was a
+    /// silent short list.
+    #[test]
+    fn unparseable_close_date_stays_on_the_page() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let bad = closing_soon_grant("eu-sedia:1", &json!({ "close_date": "01/10/2026" }), today);
+        assert_eq!(bad["key"], "eu-sedia:1");
+        assert!(
+            bad["days_left"].is_null(),
+            "a bad date is null, not a missing row"
+        );
+        assert_eq!(bad["close_date"], "01/10/2026");
+
+        let good = closing_soon_grant(
+            "grants-gov:2",
+            &json!({ "close_date": "2026-10-01" }),
+            today,
+        );
+        assert_eq!(good["days_left"], 0);
+
+        let bare = closing_soon_grant("ca-grants:3", &json!("not-an-object"), today);
+        assert_eq!(bare["key"], "ca-grants:3");
+        assert!(bare["days_left"].is_null());
     }
 }

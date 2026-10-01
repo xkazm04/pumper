@@ -162,7 +162,7 @@ Dual-mode per the cursor convention: without `cursor=` ⇒ `{grants: [Record]}` 
 
 ### `GET /grants/closing-soon?days=`
 
-Live **open** grants whose `close_date` falls within `days` of today, **soonest first**. `days` defaults to **14** and is clamped to **1..=365**. Returns `{days, count, grants}`, where each grant is its unified `data` object plus `key` and `days_left` (0 = closes today). `count` is the full window total; `grants` is **capped at 200**. Sorting is by `close_date` rather than the store's `updated_at` order, so the window is read up to an internal bound of 1000 rows before it is sorted and truncated.
+Live **open** grants whose `close_date` falls within `days` of today, **soonest first**. `days` defaults to **14** and is clamped to **1..=365**. Returns `{days, count, grants}`, where each grant is its unified `data` object plus `key` and `days_left` (0 = closes today). A `close_date` that is missing or not `YYYY-MM-DD` stays on the page with `days_left` null. `count` is the full window total; `grants` is **capped at 200**. Sorting is by `close_date` rather than the store's `updated_at` order, so the window is read up to an internal bound of 1000 rows before it is sorted and truncated.
 
 This is **cross-source** — the pre-existing `closingSoon` digest in the grants-gov job artifact is federal-only and computed from raw API hits, so it never sees CA grants. It is **computed on read**, not materialized as a dataset: membership changes with the *calendar*, not with the data, so a snapshotted list would go stale between syncs even when nothing upstream changed. The corpus is small enough that a read view costs nothing to keep correct.
 
