@@ -1,0 +1,1 @@
+{"id":"optimize-2026-10-01","at":"2026-10-01T07:26:51Z","strategy":"optimize","path":".claude/scan-history/optimize-2026-10-01-ai-extraction-engines.jsonl","total":1,"emitted":0,"built":0,"declined":0,"descoped":0,"open":1,"status":"open","note":"Lane B, not dispatched (no --ab). Undelivered claude prompt returns Ok. Needs a ClaudeFailure variant in core."}
