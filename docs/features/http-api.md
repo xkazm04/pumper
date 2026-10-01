@@ -143,7 +143,7 @@ This route carries the larger **8 MiB** request-body ceiling (see [Request body 
 
 ## Grants query surface (`/grants`)
 
-A filtered read view over **`grants/unified`** — the cross-source corpus that `grants-gov` and `ca-grants` both normalize into (schema in [apps.md](apps.md)). Without it the corpus is reachable only through the generic dataset API, so consumers have to export everything and filter client-side. Both routes read **live records only** (a tombstoned `removed_at` row never appears).
+A filtered read view over **`grants/unified`** — the cross-source corpus that `grants-gov`, `ca-grants`, and `eu-sedia` normalize into (schema in [apps.md](apps.md)). Without it the corpus is reachable only through the generic dataset API, so consumers have to export everything and filter client-side. Both routes read **live records only** (a tombstoned `removed_at` row never appears).
 
 ### `GET /grants`
 
@@ -152,7 +152,7 @@ Every filter is optional and **ANDed**; with none set it lists the whole live co
 | Param | Semantics |
 | --- | --- |
 | `status` | Exact match on the normalized status: `open` \| `forecasted` \| `closed`. |
-| `source` | Exact match on the source app: `grants-gov` \| `ca-grants`. |
+| `source` | Exact match on the source app: `grants-gov` \| `ca-grants` \| `eu-sedia`. |
 | `agency` | **Case-insensitive substring** of the agency name (`agency=health` matches "National Institutes of Health"). `%`/`_` are literal, not wildcards. |
 | `closing_before` / `closing_after` | `close_date` on or before / on or after this date. `close_date` is canonical `YYYY-MM-DD`, so the comparison is lexicographic. **Records with no close date are excluded whenever either filter is set** — a forecasted grant with no deadline is not "closing before" anything. A non-`YYYY-MM-DD` value is `400 bad_request`. |
 | `min_award` | Keeps records whose **`award_ceiling` >= v OR `total_funding` >= v**. Sources report grant size inconsistently (a per-award ceiling vs. a program total), so matching either keeps the funder's largest published number in play. A record with both fields null never matches. Grants.gov's **Search2** API publishes no money at all (live-verified 2026-08-04: an `oppHits[]` entry carries only `id, number, title, agencyCode, agency, openDate, closeDate, oppStatus, docType, cfdaList`), so federal amounts do not come from the listing — they are joined in from the **`fetchOpportunity` detail corpus** (`grants/opportunity_details`), whose `synopsis` block does carry `awardFloor` / `awardCeiling` / `estimatedFunding`. A federal record therefore matches `min_award` **iff its detail record has been harvested and the agency actually published a figure**; the agency's literal `"none"` stays `Null` and never becomes a matching `0`. Coverage is the detail corpus, which the harvest fills incrementally (`harvestDetails`, **on by default since 2026-08-04**, see [apps.md](apps.md)) — an un-harvested or figure-less federal opportunity is honestly invisible to this filter. Because the harvest is delta-only, coverage grows **forward** from that date rather than retroactively: opportunities that never change are never re-fetched, so a corpus backfill remains a non-goal and federal `min_award` recall climbs day by day. |
