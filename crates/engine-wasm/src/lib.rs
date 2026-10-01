@@ -472,12 +472,54 @@ impl Plugins for WasmPluginHost {
     }
 }
 
+/// What [`open_plugin_dir`] found. `Absent` and `Unreadable` both yield an
+/// empty module list — the difference is that only the second is a failure.
+enum PluginDir {
+    /// `NotFound`. An optional plugins directory is allowed to not exist yet.
+    Absent,
+    /// Permission, or a file where a directory was named. Not "no plugins".
+    Unreadable(std::io::Error),
+    Entries(std::fs::ReadDir),
+}
+
+/// One door for both scanners. A missing directory stays quiet; every other
+/// open error is [`PluginDir::Unreadable`] so the caller can log it instead of
+/// booting as if the directory were empty.
+fn open_plugin_dir(dir: &Path) -> PluginDir {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => PluginDir::Entries(entries),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => PluginDir::Absent,
+        Err(err) => PluginDir::Unreadable(err),
+    }
+}
+
+/// A directory entry that could not be read is skipped and logged. `flatten`
+/// used to drop that error, so one unreadable name looked like a file that
+/// was never there.
+fn take_plugin_entry(entry: std::io::Result<std::fs::DirEntry>) -> Option<std::fs::DirEntry> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(err) => {
+            tracing::warn!("plugin directory entry unreadable: {err}");
+            None
+        }
+    }
+}
+
 fn load_dir(engine: &Engine, dir: &Path, probe: ProbeBudget) -> ModuleMap {
     let mut map = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return map;
+    let entries = match open_plugin_dir(dir) {
+        PluginDir::Entries(entries) => entries,
+        PluginDir::Absent => return map,
+        PluginDir::Unreadable(err) => {
+            tracing::warn!(dir = %dir.display(), "plugin directory unreadable: {err}");
+            return map;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Some(entry) = take_plugin_entry(entry) else {
+            continue;
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
             continue;
@@ -716,7 +758,8 @@ pub struct DynamicAppManifest {
 /// manifests, sorted by name. Modules that fail to compile, lack `describe`,
 /// trap, or return non-object JSON are skipped with a warning — a dynamic APP
 /// (unlike an extraction plugin) must self-describe to be listable at all. A
-/// missing/unreadable dir is simply empty. Each probe runs in a fresh
+/// missing dir is simply empty. An unreadable one is empty too, and logged —
+/// the two are not the same failure. Each probe runs in a fresh
 /// fuel-and-memory-limited store, so a hostile module can't spin discovery.
 ///
 /// Probes run under the DEFAULT `[plugins]` budget. Callers holding the live
@@ -739,11 +782,19 @@ pub fn discover_dynamic_apps_with(dir: &Path, cfg: &PluginConfig) -> Vec<Dynamic
             return Vec::new();
         }
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match open_plugin_dir(dir) {
+        PluginDir::Entries(entries) => entries,
+        PluginDir::Absent => return Vec::new(),
+        PluginDir::Unreadable(err) => {
+            tracing::warn!(dir = %dir.display(), "plugin directory unreadable: {err}");
+            return Vec::new();
+        }
     };
     let mut apps = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Some(entry) = take_plugin_entry(entry) else {
+            continue;
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
             continue;
@@ -890,6 +941,45 @@ fn measure(
         fuel_budget: Some(fuel),
         memory_bytes: Some(memory.data_size(&*store)),
         memory_cap_bytes: Some(max_memory),
+    }
+}
+
+#[cfg(test)]
+mod plugin_dir_tests {
+    use super::{open_plugin_dir, PluginDir};
+
+    /// The anti-pattern: `NotFound` and "this path is a file" both became an
+    /// empty plugin list, so a mis-set directory was indistinguishable from
+    /// one that had not been created yet.
+    #[test]
+    fn a_missing_plugin_dir_is_absence_not_a_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("pumper-plugin-dir-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(open_plugin_dir(&dir), PluginDir::Absent),
+            "a directory that was never created is an empty scan"
+        );
+    }
+
+    #[test]
+    fn a_file_where_a_plugin_dir_was_expected_is_unreadable_not_empty() {
+        let path =
+            std::env::temp_dir().join(format!("pumper-plugin-dir-file-{}", std::process::id()));
+        std::fs::write(&path, b"not a directory").expect("temp file");
+        let opened = open_plugin_dir(&path);
+        match opened {
+            PluginDir::Unreadable(err) => {
+                assert_ne!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "a file occupying the path is not a missing directory"
+                );
+            }
+            PluginDir::Absent => panic!("a file must not read as an absent plugin directory"),
+            PluginDir::Entries(_) => panic!("a file must not read as a directory listing"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
