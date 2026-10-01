@@ -873,7 +873,8 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         check_shim_argv, envelope_text, is_plain_model_id, parse_loose_json, tree_kill_argv,
-        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, MAX_SHIM_COMMAND_LINE,
+        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, CMD_HOSTILE,
+        MAX_SHIM_COMMAND_LINE,
     };
     use pumper_core::config::{ClaudeConfig, ClaudeRole};
     use pumper_core::ResearchRequest;
@@ -882,6 +883,19 @@ mod tests {
 
     fn argv(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The anti-pattern: the characters cmd.exe mangles lived in two lists,
+    /// `CMD_HOSTILE` and a copy in the refusal test. Adding a character to
+    /// only one of them shipped — the door and the measurement had drifted
+    /// apart with nothing to say so.
+    #[test]
+    fn cmd_hostile_is_exactly_the_measured_set_not_a_second_list() {
+        const MEASURED: &[char] = &['%', '&', '|', '<', '>', '^', '\n', '\r'];
+        assert_eq!(
+            CMD_HOSTILE, MEASURED,
+            "the shim refusal set and the measured cmd.exe set are one rule"
+        );
     }
 
     /// THE anti-pattern this guard exists for: cmd.exe re-parses the shim line,
