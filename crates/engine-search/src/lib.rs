@@ -107,6 +107,15 @@ async fn commit_and_reload(
     .map_err(|e| Error::App(format!("commit task panicked: {e}")))?
 }
 
+/// A failed background commit is the only signal that the uncommitted tail was
+/// not flushed. Both the interval arm and the shutdown arm report it — the
+/// shutdown arm is the last chance, so discarding its `Result` hid the loss.
+fn warn_commit_failure(result: Result<()>) {
+    if let Err(e) = result {
+        tracing::warn!("background search commit failed: {e}");
+    }
+}
+
 /// The background committer: commits pending `index()` writes on an interval, or
 /// sooner when woken (pending threshold crossed / explicit flush wake), and does a
 /// final commit on shutdown so a graceful stop doesn't drop the tail.
@@ -124,7 +133,10 @@ fn spawn_committer(
             tokio::select! {
                 _ = shutdown.notified() => {
                     if pending.load(Ordering::Relaxed) > 0 {
-                        let _ = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await;
+                        warn_commit_failure(
+                            commit_and_reload(writer.clone(), reader.clone(), pending.clone())
+                                .await,
+                        );
                     }
                     break;
                 }
@@ -134,10 +146,9 @@ fn spawn_committer(
             if pending.load(Ordering::Relaxed) == 0 {
                 continue;
             }
-            if let Err(e) = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await
-            {
-                tracing::warn!("background search commit failed: {e}");
-            }
+            warn_commit_failure(
+                commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await,
+            );
         }
     });
 }
