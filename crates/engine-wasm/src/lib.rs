@@ -479,7 +479,9 @@ enum PluginDir {
     Absent,
     /// Permission, or a file where a directory was named. Not "no plugins".
     Unreadable(std::io::Error),
-    Entries(std::fs::ReadDir),
+    /// Boxed: `ReadDir` is hundreds of bytes, and clippy rejects an enum
+    /// whose largest variant dwarfs `Absent` and `Unreadable`.
+    Entries(Box<std::fs::ReadDir>),
 }
 
 /// One door for both scanners. A missing directory stays quiet; every other
@@ -487,7 +489,7 @@ enum PluginDir {
 /// booting as if the directory were empty.
 fn open_plugin_dir(dir: &Path) -> PluginDir {
     match std::fs::read_dir(dir) {
-        Ok(entries) => PluginDir::Entries(entries),
+        Ok(entries) => PluginDir::Entries(Box::new(entries)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => PluginDir::Absent,
         Err(err) => PluginDir::Unreadable(err),
     }
