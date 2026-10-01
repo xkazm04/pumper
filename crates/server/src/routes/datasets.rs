@@ -613,6 +613,17 @@ fn file_component(raw: &str) -> String {
     }
 }
 
+/// `Content-Disposition` for a dataset export. The dataset name arrives on the
+/// URL, and [`file_component`] is the same flattening the pre-delete export
+/// already applies before a name becomes a filename. A raw interpolation lets
+/// a quote or semicolon add a second `filename=` parameter inside this header.
+fn export_content_disposition(dataset: &str, extension: &str) -> String {
+    format!(
+        "attachment; filename=\"{}.{extension}\"",
+        file_component(dataset)
+    )
+}
+
 #[utoipa::path(
     delete,
     path = "/datasets/{app}/{dataset}/records/{key}",
@@ -835,7 +846,7 @@ fn stream_export(
     include_removed: bool,
 ) -> Response {
     const BATCH: i64 = 1_000;
-    let filename = format!("attachment; filename=\"{dataset}.{}\"", format.extension());
+    let filename = export_content_disposition(&dataset, format.extension());
     let content_type = format.content_type();
     let stream = async_stream::stream! {
         match format {
@@ -1157,6 +1168,28 @@ mod cursor_arg_tests {
 #[cfg(test)]
 mod export_honesty_tests {
     use super::*;
+
+    /// The pre-delete export flattens a dataset name before it becomes a
+    /// filename. The download header used to interpolate the raw name, so a
+    /// quote added a second `filename=` parameter in the same header.
+    #[test]
+    fn export_filename_flattens_disposition_metacharacters() {
+        let header = export_content_disposition("q\"; filename=\"injected", "csv");
+        assert_eq!(
+            header.matches("filename=").count(),
+            1,
+            "one filename parameter, got {header}"
+        );
+        assert!(
+            !header.contains('\n') && !header.contains('\r'),
+            "no header break, got {header}"
+        );
+        assert_eq!(
+            header.chars().filter(|c| *c == '"').count(),
+            2,
+            "the quotes are only the filename delimiters, got {header}"
+        );
+    }
 
     fn record(key: &str) -> pumper_core::Record {
         let now = chrono::Utc::now();
