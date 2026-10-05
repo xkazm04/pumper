@@ -47,13 +47,35 @@ impl ClaudeSpend {
     ///   what it spent, and the ledger has to show *that a paid call vanished
     ///   unmetered* rather than show nothing at all.
     /// - **Nothing ran** (`Spawn`) → `None`. No process, no spend, and a row
-    ///   would be noise claiming otherwise.
+    ///   would be noise claiming otherwise. `Spawn` is the *only* class that
+    ///   earns silence, and it means it literally: the refusal happened before
+    ///   `cmd.spawn()`.
+    /// - **Everything else** → `$0` under `failed_spend_unreported (<class>)`.
+    ///   A child existed, so money may have moved; the row says the amount is
+    ///   unknown rather than claiming it was free.
+    ///
+    /// **The match is deliberately exhaustive, member by member.** It used to
+    /// end in a `(None, class)` catch-all, which meant a new member silently
+    /// inherited a neighbour's ledger row instead of forcing the one decision
+    /// that matters — *does this ending leave a cost row, and saying what?* The
+    /// compile error a new member now causes here is the gate.
     pub fn ledger_event(&self) -> Option<(f64, String)> {
-        match (self.cost_usd, self.class) {
-            (Some(cost), class) => Some((cost, format!("failed_spend ({})", class.as_str()))),
-            (None, ClaudeFailure::Timeout) => Some((0.0, "unmetered_timeout".to_string())),
-            (None, ClaudeFailure::Spawn) => None,
-            (None, class) => Some((0.0, format!("failed_spend_unreported ({})", class.as_str()))),
+        if let Some(cost) = self.cost_usd {
+            return Some((cost, format!("failed_spend ({})", self.class.as_str())));
+        }
+        match self.class {
+            ClaudeFailure::Spawn => None,
+            ClaudeFailure::Timeout => Some((0.0, "unmetered_timeout".to_string())),
+            ClaudeFailure::NonZeroExit
+            | ClaudeFailure::CliError
+            | ClaudeFailure::Unparseable
+            | ClaudeFailure::PromptUndelivered
+            | ClaudeFailure::WaitFailed
+            | ClaudeFailure::Interrupted
+            | ClaudeFailure::PipeFailure => Some((
+                0.0,
+                format!("failed_spend_unreported ({})", self.class.as_str()),
+            )),
         }
     }
 }
@@ -77,9 +99,51 @@ pub enum ClaudeFailure {
     CliError,
     /// stdout was not a parseable envelope, so nothing can be read from it.
     Unparseable,
+    /// The prompt never reached the child: the write to its stdin failed, the
+    /// EOF that ends the prompt failed, or the task doing both did. The CLI
+    /// then reads an empty question and answers it — exiting 0 with a valid,
+    /// *billed* envelope — so this ending looks exactly like success and is
+    /// the most expensive one to miss. A fact about **pumper**, not the model.
+    PromptUndelivered,
+    /// `child.wait()` itself returned an io error, so the run's own exit is
+    /// unknown. Distinct from [`Timeout`](Self::Timeout) because no deadline
+    /// elapsed and nothing was killed: reporting it as a timeout writes
+    /// `unmetered_timeout`, i.e. the ledger asserting a paid call vanished.
+    WaitFailed,
+    /// The process was ended by a signal rather than by exiting — on unix,
+    /// `ExitStatus::code() == None`. Distinct from
+    /// [`NonZeroExit`](Self::NonZeroExit), whose doc ("the process exited
+    /// non-zero") is simply not true of a signalled process, and whose stdout
+    /// is far likelier to hold a complete envelope.
+    Interrupted,
+    /// A pipe the host needs was missing or failed **after** a successful
+    /// spawn: no stdin/stdout/stderr handle on a live child, an io error
+    /// mid-drain (which yields a TRUNCATED buffer that must never be parsed as
+    /// a whole envelope), or a drain task that did not finish. The child is
+    /// running and may be spending, so unlike [`Spawn`](Self::Spawn) this
+    /// leaves a ledger row.
+    PipeFailure,
 }
 
 impl ClaudeFailure {
+    /// Every member, in declaration order.
+    ///
+    /// Kept honest by the inventory test in this file's `tests` module, which
+    /// reads the `enum` out of this very source file: a member added to the
+    /// enum and not to this slice fails there, rather than quietly shrinking
+    /// whatever iterates over the vocabulary.
+    pub const ALL: &'static [ClaudeFailure] = &[
+        ClaudeFailure::Spawn,
+        ClaudeFailure::Timeout,
+        ClaudeFailure::NonZeroExit,
+        ClaudeFailure::CliError,
+        ClaudeFailure::Unparseable,
+        ClaudeFailure::PromptUndelivered,
+        ClaudeFailure::WaitFailed,
+        ClaudeFailure::Interrupted,
+        ClaudeFailure::PipeFailure,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ClaudeFailure::Spawn => "spawn",
@@ -87,6 +151,10 @@ impl ClaudeFailure {
             ClaudeFailure::NonZeroExit => "nonzero_exit",
             ClaudeFailure::CliError => "is_error",
             ClaudeFailure::Unparseable => "unparseable",
+            ClaudeFailure::PromptUndelivered => "prompt_undelivered",
+            ClaudeFailure::WaitFailed => "wait_failed",
+            ClaudeFailure::Interrupted => "interrupted",
+            ClaudeFailure::PipeFailure => "pipe_failure",
         }
     }
 }
@@ -943,6 +1011,176 @@ mod tests {
             );
             assert!(detail.contains(class.as_str()), "class missing: {detail}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The closed vocabulary — EXPECTED-diff inventory
+    // -----------------------------------------------------------------------
+
+    /// Every `ClaudeFailure` member, in declaration order, with the `as_str()`
+    /// the ledger's `detail` column is built from and the row an **unreported**
+    /// spend of that class must leave.
+    ///
+    /// This is the whole vocabulary of "how a Claude call ended", and it is
+    /// load-bearing twice over: `ClaudeSpend::ledger_event` derives a
+    /// `cost_events` row from the member, and `docs/features/fetching.md`
+    /// publishes those `detail` strings to operators. Renaming a member's
+    /// `as_str()` silently reclassifies every future row; adding a member
+    /// without deciding its row is how a live child ends up with no row at all.
+    ///
+    /// `None` means **no cost row** — legitimate for exactly one member.
+    const EXPECTED_CLAUDE_FAILURES: &[(&str, &str, Option<&str>)] = &[
+        ("Spawn", "spawn", None),
+        ("Timeout", "timeout", Some("unmetered_timeout")),
+        (
+            "NonZeroExit",
+            "nonzero_exit",
+            Some("failed_spend_unreported (nonzero_exit)"),
+        ),
+        (
+            "CliError",
+            "is_error",
+            Some("failed_spend_unreported (is_error)"),
+        ),
+        (
+            "Unparseable",
+            "unparseable",
+            Some("failed_spend_unreported (unparseable)"),
+        ),
+        (
+            "PromptUndelivered",
+            "prompt_undelivered",
+            Some("failed_spend_unreported (prompt_undelivered)"),
+        ),
+        (
+            "WaitFailed",
+            "wait_failed",
+            Some("failed_spend_unreported (wait_failed)"),
+        ),
+        (
+            "Interrupted",
+            "interrupted",
+            Some("failed_spend_unreported (interrupted)"),
+        ),
+        (
+            "PipeFailure",
+            "pipe_failure",
+            Some("failed_spend_unreported (pipe_failure)"),
+        ),
+    ];
+
+    /// The member names actually declared in `enum ClaudeFailure`, read out of
+    /// this source file.
+    ///
+    /// Comments are stripped first, deliberately: this file *documents* the
+    /// vocabulary at length, and a doc line naming a member that does not
+    /// exist (or an attribute between two that do) must not read as a
+    /// declaration.
+    fn declared_claude_failures() -> Vec<String> {
+        let src = include_str!("error.rs");
+        let body = src
+            .split_once("pub enum ClaudeFailure {")
+            .expect("the enum is declared in this file")
+            .1
+            .split_once("\n}")
+            .expect("the enum is closed")
+            .0;
+        body.lines()
+            .map(|l| l.split("//").next().unwrap_or(l).trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('*'))
+            .map(|l| l.trim_end_matches(',').to_string())
+            .collect()
+    }
+
+    /// THE anti-pattern (`model-call-outcome-integrity` /
+    /// *elimination-reasons-are-a-closed-vocabulary*): a new way for a run to
+    /// end gets folded into whichever existing member is nearest, because it is
+    /// rare and because nothing forces the question. Four of them had been, and
+    /// since `ledger_event()` matches on the member, each was a mislabelled
+    /// *spend*: a failed `wait()` syscall reported as `Timeout` wrote
+    /// `unmetered_timeout`, the ledger asserting that a paid call vanished.
+    ///
+    /// The member list, its wire strings and its ledger rows are therefore
+    /// pinned together. Adding a member fails this test until its row is
+    /// declared, and `ledger_event`'s match is exhaustive member by member so
+    /// the compiler fails first.
+    #[test]
+    fn claude_failure_is_a_closed_vocabulary_with_a_ledger_row_each() {
+        let declared = declared_claude_failures();
+        let expected_names: Vec<String> = EXPECTED_CLAUDE_FAILURES
+            .iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            declared, expected_names,
+            "enum ClaudeFailure and EXPECTED_CLAUDE_FAILURES have drifted. A new member is a \
+             new ledger vocabulary entry AND a new row in docs/features/fetching.md — declare \
+             both here before shipping it"
+        );
+
+        let listed: Vec<&str> = ClaudeFailure::ALL.iter().map(|c| c.as_str()).collect();
+        let expected_strs: Vec<&str> = EXPECTED_CLAUDE_FAILURES
+            .iter()
+            .map(|(_, s, _)| *s)
+            .collect();
+        assert_eq!(
+            listed, expected_strs,
+            "ClaudeFailure::ALL does not match the declared members in order — something \
+             iterating the vocabulary is silently skipping a class"
+        );
+
+        let distinct: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            listed.len(),
+            "two members share an as_str(), so their cost_events rows are indistinguishable: \
+             {listed:?}"
+        );
+
+        for ((name, as_str, unreported), class) in
+            EXPECTED_CLAUDE_FAILURES.iter().zip(ClaudeFailure::ALL)
+        {
+            assert_eq!(class.as_str(), *as_str, "{name}");
+            assert_eq!(
+                ClaudeSpend::unreported(*class)
+                    .ledger_event()
+                    .map(|(cost, detail)| {
+                        assert_eq!(
+                            cost, 0.0,
+                            "{name}: an unknown spend is not a metered amount"
+                        );
+                        detail
+                    })
+                    .as_deref(),
+                *unreported,
+                "{name}: wrong (or missing) cost_events row for a failure that reported no cost"
+            );
+            assert_eq!(
+                ClaudeSpend::reported(*class, 0.5).ledger_event(),
+                Some((0.5, format!("failed_spend ({as_str})"))),
+                "{name}: money the CLI DID report must reach the ledger whatever the class"
+            );
+        }
+    }
+
+    /// The one member that earns silence earns it for a stated reason, and the
+    /// reason is "no process exists". Anything post-spawn leaves a row, because
+    /// a child that is running may be spending — a missing pipe handle on a
+    /// live child used to write nothing at all.
+    #[test]
+    fn only_a_run_that_never_started_writes_no_row() {
+        let silent: Vec<&str> = ClaudeFailure::ALL
+            .iter()
+            .filter(|c| ClaudeSpend::unreported(**c).ledger_event().is_none())
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(
+            silent,
+            vec!["spawn"],
+            "a class other than `spawn` is writing NO cost row. Every other member means a \
+             child existed, and a silent ledger for a live child reads identically to a call \
+             that was never made"
+        );
     }
 
     /// Only the Claude engine reports spend; asking anything else must not
