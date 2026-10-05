@@ -204,6 +204,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
         .routes(routes!(set_schedule_budget))
+        .routes(routes!(schedule_runs))
         .routes(routes!(list_records, delete_dataset_route))
         .routes(routes!(delete_record_route))
         .routes(routes!(export_records))
@@ -547,6 +548,11 @@ mod api_spec_tests {
         "DELETE /schedules/{id}",
         "POST /schedules/{id}/enabled",
         "POST /schedules/{id}/budget",
+        // The non-fire ledger (0047 `schedule_runs`). Read-only, and the
+        // twin of `GET /triggers/{id}/runs` below: one row per tick verdict
+        // INCLUDING the negatives, which is the half of "why did my
+        // schedule not run?" that had no answer outside the server log.
+        "GET /schedules/{id}/runs",
         "GET /datasets/{app}/{dataset}",
         "GET /datasets/{app}/{dataset}/export",
         "GET /datasets/{app}/{dataset}/duplicates",
