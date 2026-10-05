@@ -398,43 +398,18 @@ mod catalog_tests {
     /// test's working directory.
     const CATALOG_TOML: &str = include_str!("../../../../catalog/data-sources.toml");
 
-    /// Registered apps deliberately absent from the catalog, each for a documented
-    /// reason. Kept explicit so a NEW in-scope source app can't be silently omitted
-    /// — adding one that isn't listed here fails the coverage check below. Reasons:
-    ///  - generic tooling / engines, not a data *source*: `crawl`, `extractor`,
-    ///    `plugin`, `readable`, `research`, `watch`, `transact` (an on-demand
-    ///    dry-run browser-flow executor, not a data source), and `provisioner` (an
-    ///    on-demand compiler that *proposes* catalog rows for human review —
-    ///    it deliberately never appears in the catalog it writes proposals for,
-    ///    has no schedule, and its output is always `status = "planned"`).
-    ///  - `hackernews`: an example/template app, not a production pipeline.
-    ///  - sibling-product consumers outside this catalog's grant/labor scope, same
-    ///    rationale the `census-*` docs already state ("a separate Ledgerline
-    ///    consumer from the grant pipeline"): the Ledgerline trades apps
-    ///    (`census-density`, `census-nonemp`, `homewyse-pricing`, `state-tax`,
-    ///    `trade-wages`, `valuation-multiples`), the Counterbill medical app
-    ///    (`cms-fee-schedule`), and the tender-radar procurement app
-    ///    (`smlouvy-dump-watch` — a Czech Registr smluv dump-index watcher).
-    const CATALOG_EXEMPT: &[&str] = &[
-        "census-density",
-        "census-nonemp",
-        "cms-fee-schedule",
-        "crawl",
-        "extractor",
-        "hackernews",
-        "homewyse-pricing",
-        "plugin",
-        "provisioner",
-        "readable",
-        "research",
-        "smlouvy-dump-watch",
-        "state-tax",
-        "trade-wages",
-        "transact",
-        "peer",
-        "valuation-multiples",
-        "watch",
-    ];
+    /// Registered apps deliberately absent from the catalog.
+    ///
+    /// **Single-sourced** from `registry::NON_SOURCE_APPS`, which carries a
+    /// reason per entry. This list used to be a second, independent roster here
+    /// — and it had drifted into an 18-entry scope argument that exempted nine
+    /// apps which DO publish datasets (the census/trades/CMS/Czech consumers),
+    /// so ONBOARDING §10 passed while a third of the registry was invisible to
+    /// governance. Two hand-kept rosters is one too many; the reasons live with
+    /// the roster and `registry::catalog_coverage_tests` gates both directions.
+    fn catalog_exempt() -> Vec<&'static str> {
+        crate::registry::non_source_app_names()
+    }
 
     fn catalog() -> Catalog {
         Catalog::parse(CATALOG_TOML).expect("catalog/data-sources.toml parses")
@@ -524,7 +499,7 @@ mod catalog_tests {
             .map(|s| s.app.as_str())
             .filter(|a| !a.is_empty())
             .collect();
-        let exempt: BTreeSet<&str> = CATALOG_EXEMPT.iter().copied().collect();
+        let exempt: BTreeSet<&str> = catalog_exempt().into_iter().collect();
         let missing: Vec<&str> = registered()
             .iter()
             .map(|a| a.name())
@@ -533,7 +508,7 @@ mod catalog_tests {
         assert!(
             missing.is_empty(),
             "registered apps missing from catalog/data-sources.toml (add an entry, or add to \
-             CATALOG_EXEMPT if it isn't a data source): {missing:?}"
+             registry::NON_SOURCE_APPS if it isn't a data source at all): {missing:?}"
         );
     }
 }

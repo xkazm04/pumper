@@ -70,8 +70,32 @@ The window is `Source::freshness_window_secs(grace)` — the *same* expression `
 
 `ContractsStatus` (`crates/core/src/catalog.rs`) is now that difference, and it is reported in two places:
 
-- **At boot**, one line from `main::log_contract_observability`: `error!` naming the parse error and its consequence when the catalog will not load, `info!` with `declared`/`enforce` when it will. Nothing blocks — visibility only.
-- **On `GET /sources`**, as the `contracts` object: `{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, reason?}`. `enforce_observed: false` beside `enforce_configured: true` means the catalog would not parse and nothing is being checked. `declared: 0` with `catalog_ok: true` means enforcement is real but has nothing to judge. The older top-level `contracts_enforce` is unchanged and remains the *configured* value.
+- **At boot**, one line from `main::log_contract_observability`: `error!` naming the parse error and its consequence when the catalog will not load, and otherwise `info!` with `ContractsStatus::coverage_line()` — `N of M live sources contracted; K of R registered apps have no source row` — plus the structured `declared`/`live_sources`/`registered`/`sourced`/`enforce` fields. Nothing blocks — visibility only.
+- **On `GET /sources`**, as the `contracts` object: `{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, live_sources, uncontracted_sources?, registered?, sourced?, uncovered_apps?, reason?}`. `enforce_observed: false` beside `enforce_configured: true` means the catalog would not parse and nothing is being checked. `declared: 0` with `catalog_ok: true` means enforcement is real but has nothing to judge. The older top-level `contracts_enforce` is unchanged and remains the *configured* value.
+
+### The denominator: `declared` was a numerator
+
+`declared` on its own cannot be read. Nothing distinguished "12 declared" from "12 of 30", and the worse gap was invisible in the other direction: a registered app with no `[[source]]` row at all gets no cron, no staleness window, no `required_fields` and no contract verdict, and the surface reported a number that looked fine. `ContractsStatus` now carries both fractions and, crucially, **both lists by name**:
+
+| field | question it answers |
+| --- | --- |
+| `declared` of `live_sources` | how much of the catalog carries a publish-time floor |
+| `uncontracted_sources` | **which** live rows declare no `[source.contract]` — the catalog sees them, it just cannot judge them |
+| `sourced` of `registered` | how many of the apps this binary runs the catalog has heard of |
+| `uncovered_apps` | **which** registered apps no live row serves at all — a different and worse condition than the row above |
+
+Two rules the shape encodes:
+
+- **Only `live` rows count.** A `planned` row declares an intent, not a watched pipeline; counting it as coverage would be the same overstatement `declared` made.
+- **An unreadable catalog OMITS the three list/count fields rather than reporting `[]`/`0`.** Fail-open on gating is deliberate; fail-open on *reporting* would say "nothing is uncovered" at the exact moment nothing is known. `catalog_error` still explains.
+
+Apps on `registry::NON_SOURCE_APPS` are never reported uncovered. That roster is nine **tool** apps — `crawl`, `extractor`, `peer`, `plugin`, `provisioner`, `readable`, `research`, `transact`, `watch` — each with the reason it can never have an upstream to declare (`transact` is the clearest case: it writes no dataset at all, so there is nothing for a contract or a staleness window to attach to). **"It belongs to a sibling product" is not a reason.** That argument had exempted nine apps that do publish datasets (`cms-fee-schedule`, `census-density`, `census-nonemp`, `hackernews`, `homewyse-pricing`, `smlouvy-dump-watch`, `state-tax`, `trade-wages`, `valuation-multiples`); they now carry rows, and `registry::catalog_coverage_tests::the_roster_never_exempts_an_app_that_publishes_a_dataset` names all nine so the exemption cannot be re-granted.
+
+### ONBOARDING §10 is a gate, not a sentence
+
+`registry::catalog_coverage_tests::the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster` is the EXPECTED-diff. Adding an app with neither a live `[[source]]` row nor a `NON_SOURCE_APPS` entry fails **by name**; so does a roster entry for an app that has since grown a row, so a carve-out cannot outlive its reason. `routes::catalog_tests` reads the same roster rather than keeping a second copy — it used to hold its own 18-entry list, which is how the drift accumulated unnoticed.
+
+The nine back-filled rows deliberately carry **no `[source.contract]` block**. A contract is a publish-time floor, and a required-field set inferred from reading the code rather than from a live-verified payload is how a wrong floor starts blocking real deliveries. They appear in `uncontracted_sources` — visible and judgeable — and each gains its contract when its shape is live-verified, exactly as `census-bfs` and `census-nesd` did. Seven of them declare no `schedule()`, so their `cron` is empty, which the cron-equality check requires in both directions.
 
 **Virtual namespaces are watchable before their first record.** `trades` joins `grants` as a virtual
 namespace in `registry::VIRTUAL_NAMESPACES`: no app is called `trades`, and five apps

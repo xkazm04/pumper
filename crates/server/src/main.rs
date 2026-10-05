@@ -203,11 +203,18 @@ fn log_contract_observability(status: &ContractsStatus) {
              contracts.enforce_observed = false"
         );
     } else if status.declared > 0 || status.enforce_configured {
+        // The fraction, not the bare count: `declared = 12` reads as coverage
+        // and is a numerator. `coverage_line` states both denominators — live
+        // sources, and registered apps with no source row at all.
         tracing::info!(
             declared = status.declared,
+            live_sources = status.live_sources,
+            registered = status.registered.unwrap_or(0),
+            sourced = status.sourced.unwrap_or(0),
             enforce = status.enforce_configured,
             reason = status.reason.as_deref().unwrap_or(""),
-            "declared data contracts loaded from the catalog"
+            "{}",
+            status.coverage_line()
         );
     }
 }
@@ -240,7 +247,11 @@ async fn run() -> anyhow::Result<()> {
     // Say what declared-contract enforcement can actually be observed to do,
     // once, before the first job runs. Never blocking: the publish seam is
     // deliberately fail-open on an unreadable catalog, so this is visibility.
-    log_contract_observability(&ContractsStatus::load(state.config.contracts.enforce).1);
+    let registered = registry::app_names();
+    let exempt = registry::non_source_app_names();
+    log_contract_observability(
+        &ContractsStatus::load_with_apps(state.config.contracts.enforce, &registered, &exempt).1,
+    );
 
     // Seed code-declared schedules into the DB (idempotent) so they become
     // editable rows the scheduler and API share.

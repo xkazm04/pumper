@@ -61,9 +61,19 @@ pub(crate) struct SourcesQuery {
             `enforcing: false` means verdicts are recorded but nothing is gated. \
             `contracts_enforce` is the configured `[contracts] enforce`; `contracts` \
             (`{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, \
+            live_sources, uncontracted_sources?, registered?, sourced?, uncovered_apps?, \
             reason?}`) is what enforcement can be **observed** to do — `enforce_observed: false` \
             beside `enforce_configured: true` means the catalog would not parse, so the \
-            publish seam fails open and checks nothing. `contract` is the latest \
+            publish seam fails open and checks nothing. \
+            `declared` of `live_sources` and `sourced` of `registered` are the two coverage \
+            fractions `declared` alone could not state: `uncontracted_sources` NAMES the live \
+            catalog rows that declare no `[source.contract]`, and `uncovered_apps` NAMES the \
+            registered apps no live catalog row serves at all (so no cron, no staleness window \
+            and no contract can attach to them) — a different and worse condition. Apps on the \
+            server's declared non-source roster (generic tooling such as `watch`, `crawl`, \
+            `extractor`, and `transact`, which writes no dataset) are never reported uncovered. \
+            When the catalog will not parse the three list/count fields are **omitted, not \
+            empty**: an unreadable catalog must never read as full coverage.             `non_source_apps` is that roster itself (`[{app, reason}]`), so an empty             `uncovered_apps` can be READ rather than taken on trust. `contract` is the latest \
             declared-contract verdict (`{verdict: pass|warn|block, violations, job_id, \
             checked_at, age_secs, stale, stale_reason?, ...}`) for sources with a \
             `[source.contract]` catalog block that have run since boot; verdicts are held in \
@@ -95,7 +105,13 @@ pub(crate) async fn list_sources(
     // the freshness window to age it against, and it is the only thing that knows
     // the source is still live. Loaded fail-open, exactly like the worker seam —
     // an unreadable catalog degrades the rendering, it never 500s this table.
-    let (catalog, contracts) = ContractsStatus::load(state.config.contracts.enforce);
+    // Joined against the app registry, not just the catalog: `declared` alone
+    // is a numerator over an unstated denominator, and the operator cannot get
+    // the missing half without diffing registry.rs against the TOML by hand.
+    let registered = crate::registry::app_names();
+    let exempt = crate::registry::non_source_app_names();
+    let (catalog, contracts) =
+        ContractsStatus::load_with_apps(state.config.contracts.enforce, &registered, &exempt);
     let windows = verdict_windows(catalog.as_ref(), super::query::CATALOG_STALE_GRACE);
     let now = chrono::Utc::now();
     let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
@@ -121,6 +137,11 @@ pub(crate) async fn list_sources(
         // what is actually being observed.
         "contracts_enforce": state.config.contracts.enforce,
         "contracts": contracts,
+        // `uncovered_apps: []` is only readable beside the roster that made it
+        // empty: an operator must be able to see WHICH apps were deliberately
+        // excluded and why, or a clean coverage report is just an unexplained
+        // claim. Rendered from the one roster the gate reads.
+        "non_source_apps": crate::registry::non_source_roster(),
         "count": sources.len(),
         "unmonitored": unmonitored,
         "sources": sources,
@@ -1186,6 +1207,98 @@ mod tests {
         let ok = serde_json::to_value(ContractsStatus::of(&Catalog::default(), true))
             .expect("serializes");
         assert_eq!(ok["enforce_observed"], json!(true));
+    }
+
+    /// The shipped catalog, embedded so the check does not depend on the test's
+    /// working directory.
+    const CATALOG_TOML: &str = include_str!("../../../../catalog/data-sources.toml");
+
+    /// **The card's acceptance case, against the real tree.** `GET /sources`
+    /// renders `ContractsStatus` joined against the app registry the binary
+    /// actually runs, so the body carries the denominator and NAMES what is
+    /// unwatched. Before this join the body said `declared: 12` and an operator
+    /// could only get the missing list by diffing `registry.rs` against a
+    /// 900-line TOML by hand.
+    #[test]
+    fn the_sources_body_names_every_registered_app_the_catalog_does_not_know() {
+        let catalog = Catalog::parse(CATALOG_TOML).expect("the shipped catalog parses");
+        let registered = crate::registry::app_names();
+        let exempt = crate::registry::non_source_app_names();
+        let body = serde_json::to_value(ContractsStatus::of_with_apps(
+            &catalog,
+            true,
+            &registered,
+            &exempt,
+        ))
+        .expect("serializes");
+
+        // The fraction, both halves present and consistent.
+        assert_eq!(body["registered"], json!(registered.len()));
+        assert!(
+            body["live_sources"].as_u64().unwrap() >= body["declared"].as_u64().unwrap(),
+            "declared is a numerator over live_sources: {body}"
+        );
+        assert_eq!(
+            body["uncovered_apps"],
+            json!([]),
+            "every registered app either has a live [[source]] row or a declared              NON_SOURCE_APPS reason: {}",
+            body["uncovered_apps"]
+        );
+        assert_eq!(
+            body["sourced"], body["registered"],
+            "full app coverage means sourced == registered: {body}"
+        );
+
+        // `uncontracted_sources` is a DIFFERENT list, and the three contracted
+        // trades/labour sources must appear in neither.
+        let uncontracted: Vec<&str> = body["uncontracted_sources"]
+            .as_array()
+            .expect("named, not just counted")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for id in ["mpsv-vpm", "mpsv-ispv", "state-licensing"] {
+            assert!(
+                !uncontracted.contains(&id),
+                "'{id}' declares a [source.contract] and must not be reported uncontracted"
+            );
+        }
+        assert!(
+            !uncontracted.is_empty(),
+            "the rows added without a contract block are reported here, not hidden"
+        );
+    }
+
+    /// Tooling apps are never reported uncovered, and `transact` is the case
+    /// that proves the roster is about having no upstream at all: it writes no
+    /// dataset, so no contract or staleness window could attach to it.
+    #[test]
+    fn a_declared_non_source_app_is_never_reported_uncovered() {
+        let catalog = Catalog::parse(CATALOG_TOML).expect("the shipped catalog parses");
+        let registered = crate::registry::app_names();
+        let exempt = crate::registry::non_source_app_names();
+        let uncovered = pumper_core::uncovered_apps(&registered, &exempt, &catalog.sourced_apps());
+        for tool in [
+            "watch",
+            "readable",
+            "research",
+            "extractor",
+            "plugin",
+            "crawl",
+            "peer",
+            "provisioner",
+            "transact",
+        ] {
+            assert!(
+                exempt.contains(&tool),
+                "'{tool}' has no single upstream source and belongs on the roster"
+            );
+            assert!(!uncovered.contains(&tool.to_string()), "'{tool}' uncovered");
+        }
+        // Without the roster the same tools WOULD be reported — the exemption
+        // is doing real work, not padding the list.
+        let unexempted = pumper_core::uncovered_apps(&registered, &[], &catalog.sourced_apps());
+        assert!(unexempted.contains(&"transact".to_string()));
     }
 }
 
