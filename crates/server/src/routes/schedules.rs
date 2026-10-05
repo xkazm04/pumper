@@ -91,8 +91,11 @@ pub(crate) struct ScheduleRunsQuery {
 ///   so it is the only place that fact can live.
 /// - **skipped** — a retirement skip and a misfire skip wrote the identical two
 ///   columns on the schedule row, so they could not be told apart in the store.
-///   `reason` now does it, and `missed` carries the count `skipped_count` flattens
-///   to +1 whether four firings were eaten or four hundred.
+///   `reason` now does it. `missed` carries the per-occurrence count:
+///   `skipped_count` does accumulate it, but as a lifetime total with no window
+///   and no reason, so four firings eaten in one tick and one eaten in each of
+///   four ticks are indistinguishable -- and so are a retirement skip and a
+///   misfire skip.
 /// - **failed** — a per-schedule storage error inside the pass was an aggregate
 ///   counter and one log line; the schedule that silently did nothing could not
 ///   be named.

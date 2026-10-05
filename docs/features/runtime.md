@@ -178,7 +178,7 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 | `reason` | **the `health` word above, read verbatim** off the one `scheduler::admit()` verdict. `null` only when admission never ran (a storage failure inside the step), where `detail` is the answer |
 | `due_at` | the firing this row is about, projected with the same reference rule `next_run` uses |
 | `job_id` | the job enqueued — or, for `held`, the job still **holding the slot**, which is the one the operator has to go look at |
-| `missed` | firings advanced past by `misfire_policy = "skip"`. The number that used to exist only inside a log line while `skipped_count` moved by +1 whether four firings were eaten or four hundred |
+| `missed` | firings advanced past by `misfire_policy = "skip"`, **per occurrence**. `schedules.skipped_count` does accumulate this number (it is `skipped_count + missed`, not `+ 1`) — but as a *lifetime total with no window and no reason*, so four firings eaten in one tick and one eaten in each of four ticks are the same `4`, and so are a retirement skip and a misfire skip. The row is what separates them |
 | `detail` | free text: an error message, the retired dataset, the collapsed backlog size |
 
 The three silences it ends:
