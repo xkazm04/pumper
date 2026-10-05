@@ -23,10 +23,11 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just fmt` / `just fmt-check` | `cargo fmt` / `cargo fmt --check` — CI gate |
 | `just flake-check` | the quarantine register as a gate — expiry, ceiling, and both reconciliation directions; 0 clean / 2 findings / **3 cannot check** |
 | `just flake-report` | register size **with its trend**, age of the oldest entry, and the labelled set with its full predicate |
-| `just harness-test` | the fixture suites that prove `flake-check`, `lane-certify` and `disk-check` can still go red |
+| `just harness-test` | the fixture suites that prove every gate in `scripts/ci/gates.json` can still go red, plus `gate-inventory.test.mjs` which reconciles this recipe, `just inventory`, `just ci` and `.github/workflows/ci.yml` against that registry |
+| `just mcp-gate-parity` | the MCP gated-tool vocabulary as a gate: one spelling at all three sites; 0 clean / 2 drift / **3 cannot check**. `just inventory` only ever ran its fixtures |
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
-| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |
@@ -50,6 +51,17 @@ Everything runs **from the repo root**: the `.env` loader and the default
 `cargo run -p pumper-server` errors with *"could not determine which binary to
 run"*. The two maintenance binaries must run with the **server stopped** (Tantivy
 holds an exclusive writer lock; `reindex` rewrites derived columns).
+
+**The gate registry.** [`scripts/ci/gates.json`](scripts/ci/gates.json) is the
+single enumeration of this repo's node gates — a gate being any script that
+exports `EXIT_CANNOT_CHECK`, the repo's own definition of "three outcomes,
+three exit codes". Each entry names the script, its fixture suite, the justfile
+recipe and CI step that run each of them, and the exit codes the suite must
+assert **against a spawned process**. `scripts/ci/gate-inventory.test.mjs` is the
+EXPECTED-diff inventory test that holds every projection to it: an unregistered
+gate, a gate missing from CI, a gate whose cannot-check branch no test has ever
+observed, and a recipe line belonging to no gate all go red there. **Add a gate by
+appending one object to `gates`** — never reflow the file.
 
 Config is `config.toml`, or `$PUMPER_CONFIG`; every key is optional (defaults in
 `crates/core/src/config.rs`).

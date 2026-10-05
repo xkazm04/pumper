@@ -329,6 +329,12 @@ for (const gate of GATES) {
         `${gate.key} runs locally and not on the merge pipeline, which makes it ` +
         'a courtesy and not a gate.',
     );
+    // The step NAME is not the step. A renamed-but-gutted step would otherwise
+    // pass the line above, which is the same silence this file exists to deny.
+    assert.ok(
+      CI_YML.includes(`node ${posix(gate.script)}`),
+      `ci.yml names a step "${gate.ciStep}" but never runs ${gate.script}`,
+    );
   });
 
   test(`${gate.key}_fixture_suite_runs_locally_and_on_the_binding_rung`, () => {
