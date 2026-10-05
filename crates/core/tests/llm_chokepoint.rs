@@ -199,6 +199,166 @@ fn no_app_crate_can_name_the_researcher_not_even_by_field() {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2b — the Claude engine's failure vocabulary has ONE owner
+// ---------------------------------------------------------------------------
+
+/// The functions in `crates/engine-claude/src/` that may still mint a
+/// `ClaudeFailure` of their own, as `<file>::<fn>`.
+///
+/// **Why an allow-list and not "zero sites".** A classifier of how a *run*
+/// ended cannot speak for a run that never began. Every entry below refuses
+/// **before `cmd.spawn()`**, so `ClaudeFailure::Spawn` — "nothing ran, so
+/// nothing was spent", and `ledger_event() == None` — is literally true of it.
+/// Derived one by one from the engine's own control flow:
+///
+/// - `lib.rs::resolve` — an unknown `[claude.roles]` name, and a model id that
+///   is not a plain token. Both refuse while building the argv.
+/// - `lib.rs::workdir` — `create_dir_all` of `[claude] isolation_dir` failed;
+///   there is nowhere to run.
+/// - `lib.rs::command` — the cmd.exe shim refusal (`check_shim_argv`), raised
+///   while assembling the command line.
+/// - `lib.rs::write` — `ScratchFile::write`, the system-prompt file the CLI is
+///   handed by path.
+/// - `lib.rs::research` — **exactly one** permitted site: `cmd.spawn()` itself
+///   failed, which is the last ending before a child exists.
+///
+/// Everything AFTER that spawn is a run ending, and a run ending belongs to
+/// `outcome.rs::classify`. Adding a site to any other function — or a second
+/// one to `research` — fails this test, which is the point: the mapping from
+/// "what happened" to "which class, and therefore which ledger row" must have
+/// one owner, not eleven.
+const EXPECTED_CLAUDE_FAILURE_SITES: &[&str] = &[
+    "lib.rs::command",
+    "lib.rs::research",
+    "lib.rs::resolve",
+    "lib.rs::workdir",
+    "lib.rs::write",
+];
+
+/// How many times each allow-listed function may construct one. A count, not a
+/// boolean, so a new refusal smuggled into an existing pre-spawn function is
+/// still visible.
+const EXPECTED_CLAUDE_FAILURE_SITE_COUNTS: &[(&str, usize)] = &[
+    ("lib.rs::command", 1),
+    ("lib.rs::research", 1),
+    ("lib.rs::resolve", 2),
+    ("lib.rs::workdir", 1),
+    ("lib.rs::write", 1),
+];
+
+/// The name in `fn <name>`, if this line declares a function.
+fn declared_fn(line: &str) -> Option<String> {
+    let head = line.split("//").next().unwrap_or(line);
+    let after = head.split_once("fn ")?.1;
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Every `Error::claude(` / `Error::claude_spent(` construction in the Claude
+/// engine's shipped sources, as `<file>::<enclosing fn>` with its count.
+///
+/// `outcome.rs` is excluded by design — it is the owner. Comments are stripped
+/// before matching: a file that *talks about* the rule above code that breaks
+/// it must not pass.
+fn claude_failure_sites() -> std::collections::BTreeMap<String, usize> {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    rust_sources(
+        &root.join("crates").join("engine-claude").join("src"),
+        &mut files,
+    );
+
+    let mut found = std::collections::BTreeMap::new();
+    for file in files {
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == "outcome.rs" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut enclosing = "<file scope>".to_string();
+        let mut in_tests = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                continue;
+            }
+            if trimmed.starts_with("mod tests") || trimmed.contains("cfg(test)") {
+                in_tests = true;
+            }
+            if let Some(f) = declared_fn(line) {
+                enclosing = f;
+            }
+            // `in_tests` is deliberately one-way: everything after the engine's
+            // `#[cfg(test)] mod tests` is a test, and a test may construct any
+            // error it likes to assert on it.
+            if in_tests {
+                continue;
+            }
+            let code = line.split("//").next().unwrap_or(line);
+            let hits = code.matches("Error::claude(").count()
+                + code.matches("Error::claude_spent(").count();
+            if hits > 0 {
+                *found.entry(format!("{name}::{enclosing}")).or_insert(0) += hits;
+            }
+        }
+    }
+    found
+}
+
+/// THE anti-pattern: eleven call sites each picking, by hand, which of five
+/// `ClaudeFailure` members best describes what just happened — and
+/// `ClaudeSpend::ledger_event()` deriving a `cost_events` row from that pick.
+/// Four of the eleven picked a member whose own doc comment contradicts the
+/// fact (a `wait()` syscall error reported as `Timeout`, i.e. `$0` under
+/// `unmetered_timeout`: the ledger asserting that a *paid* call vanished). A
+/// wrong class is a wrong spend record, so the mapping gets one owner.
+#[test]
+fn every_run_ending_is_classified_in_one_place_not_at_eleven_call_sites() {
+    let found = claude_failure_sites();
+    let expected: BTreeSet<String> = EXPECTED_CLAUDE_FAILURE_SITES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let seen: BTreeSet<String> = found.keys().cloned().collect();
+
+    let new_sites: Vec<_> = seen.difference(&expected).collect();
+    assert!(
+        new_sites.is_empty(),
+        "NEW ClaudeFailure construction site(s) outside the classifier. A post-spawn run \
+         ending belongs in `crates/engine-claude/src/outcome.rs::classify` — building the \
+         error by hand is how a host fault (a failed wait, a panicked drain task, a prompt \
+         that never arrived) gets labelled as a model failure and billed as one. If the new \
+         site genuinely refuses BEFORE `cmd.spawn()`, justify it and add it to \
+         EXPECTED_CLAUDE_FAILURE_SITES: {new_sites:?}"
+    );
+    let gone: Vec<_> = expected.difference(&seen).collect();
+    assert!(
+        gone.is_empty(),
+        "EXPECTED_CLAUDE_FAILURE_SITES lists pre-spawn refusals that no longer exist — \
+         remove them: {gone:?}"
+    );
+
+    let expected_counts: Vec<(String, usize)> = EXPECTED_CLAUDE_FAILURE_SITE_COUNTS
+        .iter()
+        .map(|(k, n)| (k.to_string(), *n))
+        .collect();
+    let actual_counts: Vec<(String, usize)> = found.into_iter().collect();
+    assert_eq!(
+        actual_counts, expected_counts,
+        "the number of pre-spawn refusals changed — a run ending must not be smuggled into \
+         a function that is allow-listed for refusing before the process exists"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The three guarantees the chokepoint exists for
 // ---------------------------------------------------------------------------
 
