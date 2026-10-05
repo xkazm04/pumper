@@ -4,7 +4,7 @@ High-concurrency frontier crawler (`crawl()` in core; exposed as the `crawl` app
 
 ## CrawlConfig (app params)
 
-`seeds` (required unless `mode:"revisit"`), `max_pages` (50), `max_depth` (2), `concurrency` (16, max 64), `max_pages_per_host` (null = unlimited; per-host page cap for host-fair multi-seed crawls), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `mode` (`"revisit"` → incremental recrawl, see below), `discover` (false; revisit-only link-following opt-in), `revisit_budget` (null = every seed; revisit-only cap on how many known pages are fetched this run, spent on the highest due-score URLs), `min_due_score` (0; revisit-only, skips seeds whose probability-changed-since-last-check falls below it — skipped seeds are counted in `skipped_not_due`).
+`seeds` (required unless `mode:"revisit"`), `max_pages` (50), `max_depth` (2), `concurrency` (16, max 64), `max_pages_per_host` (null = unlimited; per-host page cap for host-fair multi-seed crawls), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `mode` (`"revisit"` → incremental recrawl, see below), `discover` (false; revisit-only link-following opt-in), `revisit_budget` (null = every seed; revisit-only cap on how many known pages are fetched this run, spent on the highest due-score URLs), `min_due_score` (0; revisit-only, skips seeds whose probability-changed-since-last-check falls below it — those seeds are counted in `skipped_not_due`), `plan` (false; revisit-only preview — see *Revisit planning*).
 
 There is **no `checkpoint` param**. Resume is automatic and per job — see *Durable resume* below.
 
@@ -78,7 +78,30 @@ Crawl tallies: `crawled, kept, skipped_duplicates, skipped_robots, skipped_filte
 
 Link graph: `edges_dataset, edges_written` (rows the store actually wrote — new + changed, **not** the row count offered), `edges_unchanged` (no-op upserts), `edges_dropped_out_degree` (links past the per-page out-degree cap), `edges_deduped` (within-run duplicates), `edges_untracked` (edges written after the 200k in-memory tracking budget was spent — see *Bounded memory*), `top_linked`, and `top_linked_complete` (`false` once `edges_untracked > 0`, i.e. the ranking covers only the run's first 200,000 distinct edges).
 
-Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`), plus the learned-cadence frontier's `skipped_not_due` (seeds not fetched because they scored below `min_due_score` or ranked past `revisit_budget`) and `cadence_updates` (304 cadence-counter merges written).
+Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`), the learned-cadence frontier's two skip counters, and `cadence_updates` (304 cadence-counter merges written).
+
+**The two skips are different questions.** `skipped_not_due` counts seeds whose due score fell **below `min_due_score`** — the threshold was the binding constraint, so the tuning action is to lower it. `skipped_over_budget` counts due seeds that ranked **past `revisit_budget`** — the budget was binding, so the action is to raise it (or accept that the corpus is being covered a slice at a time). Before this split both causes incremented `skipped_not_due`, so one number stood for two opposite actions; consumers reading only `skipped_not_due` keep working, but it now means strictly the threshold case.
+
+### Revisit planning (`plan: true`)
+
+`POST /jobs {app:"crawl", params:{mode:"revisit", plan:true, ...}}` answers "what would this run fetch?" **without fetching or writing anything**: it loads the same live `pages` records a real revisit loads, scores them with the same learned cadence, and returns the selection. It is revisit-only — `plan: true` without `mode:"revisit"` fails the job with an `Error::App` rather than quietly running a real fetching crawl.
+
+The preview and the run call **one** function (`pumper_core::plan_revisit`), so they cannot report different selections; a parity test in `crates/apps/crawl/tests/revisit_plan.rs` pins that, and another pins that a plan fetches zero URLs and writes zero `pages` revisions.
+
+A plan returns its own shape (also declared in `output_shape`):
+
+| key | meaning |
+| --- | --- |
+| `plan` | always `true` — how a consumer tells the two shapes apart |
+| `revisit` | always `true` (a plan is revisit-only) |
+| `seeds_known` | live `pages` records considered (capped at 10k, as a real run is) |
+| `would_fetch` | how many would actually be fetched |
+| `skipped_not_due` / `skipped_over_budget` | the same two counters a real run reports |
+| `cutoff_due_score` | the due score of the last seed the budget still affords (`null` if nothing was selected) — the waterline to set `min_due_score` against |
+| `min_due_score` / `revisit_budget` | the inputs echoed back |
+| `due_score_histogram` | ten 0.1-wide bins over **every** known seed's due score (`1.0` folds into the last) — the distribution the two knobs are compared against |
+| `by_host` | would-fetch count per host |
+| `oldest_checked` | up to 10 selected URLs, longest-unchecked first, as `{url, due_score, last_checked_at}` |
 
 Per-page detail is queried from the `pages` dataset, not returned inline (memory-bounded). The app's `output_shape` on `GET /apps` lists every always-present key, and an inventory test (`crates/apps/crawl/tests/result_contract.rs`) fails if the two ever drift apart.
 

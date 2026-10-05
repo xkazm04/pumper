@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use pumper_core::datasets::Provenance;
 use pumper_core::{
-    crawl, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord, Datasets, Error,
-    HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource, Result,
-    RevisitCadence, RevisitSeed, ScrapeApp,
+    crawl, plan_revisit, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord,
+    Datasets, Error, HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource,
+    Result, RevisitCadence, RevisitPlan, RevisitSeed, ScoredSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -259,7 +259,8 @@ const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, 
      sitemap_seeded, failed, failed_by_host, skipped_botwall, robots_fetch_failures, \
      checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining, pages_dataset, \
      pages_new, pages_changed, pages_unchanged, revisit, revisited, unchanged_304, \
-     skipped_not_due, cadence_updates, changed, new, gone, versions_archived, \
+     skipped_not_due, skipped_over_budget, cadence_updates, changed, new, gone, \
+     versions_archived, \
      reliability_hosts, edges_dataset, edges_written, edges_unchanged, \
      edges_dropped_out_degree, edges_deduped, edges_untracked, top_linked, \
      top_linked_complete} — crawl tallies plus the `pages` \
@@ -267,23 +268,127 @@ const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, 
      `top_linked_complete: false` — additionally \
      carries a `warnings` array naming what was cut. Bodies land in the job's artifact dir, \
      changed revisions also as revision-suffixed copies recorded in `page_versions`, and the \
-     link graph streams into the `edges` dataset (key `{from_url}|{to_url}`).";
+     link graph streams into the `edges` dataset (key `{from_url}|{to_url}`). \
+     Plan mode (`plan: true`, revisit-only) instead returns \
+     {plan, revisit, seeds_known, would_fetch, skipped_not_due, skipped_over_budget, \
+     cutoff_due_score, min_due_score, revisit_budget, due_score_histogram, by_host, \
+     oldest_checked} — the selection a revisit run WOULD make, computed from the \
+     stored cadence of every live `pages` record, with zero fetches and zero writes.";
+
+/// The marker [`plan_output_shape_keys`] slices [`OUTPUT_SHAPE`] at. The run
+/// shape's prose already contains braces (`{from_url}|{to_url}`), so the plan
+/// block cannot be found as "the second brace block" — it is found by name.
+const PLAN_SHAPE_MARKER: &str = "Plan mode (`plan: true`, revisit-only) instead returns ";
 
 /// The always-present result keys named by [`OUTPUT_SHAPE`] — everything inside
 /// its leading brace block. Lives beside the string it parses so the inventory
 /// test cannot drift from the format.
 pub fn output_shape_keys() -> Vec<&'static str> {
-    let Some(open) = OUTPUT_SHAPE.find('{') else {
+    leading_key_block(OUTPUT_SHAPE)
+}
+
+/// The keys a `plan: true` run returns, as declared in [`OUTPUT_SHAPE`]'s
+/// plan-mode block. A second shape on the same app needs the same
+/// both-direction inventory diff as the first, or the preview's contract drifts
+/// exactly the way the run's did.
+pub fn plan_output_shape_keys() -> Vec<&'static str> {
+    match OUTPUT_SHAPE.find(PLAN_SHAPE_MARKER) {
+        Some(at) => leading_key_block(&OUTPUT_SHAPE[at..]),
+        None => Vec::new(),
+    }
+}
+
+/// The comma-separated keys of the first `{...}` block in `shape`.
+fn leading_key_block(shape: &'static str) -> Vec<&'static str> {
+    let Some(open) = shape.find('{') else {
         return Vec::new();
     };
-    let Some(close) = OUTPUT_SHAPE[open..].find('}').map(|i| open + i) else {
+    let Some(close) = shape[open..].find('}').map(|i| open + i) else {
         return Vec::new();
     };
-    OUTPUT_SHAPE[open + 1..close]
+    shape[open + 1..close]
         .split(',')
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .collect()
+}
+
+/// Refuses `plan: true` outside `mode: "revisit"`.
+///
+/// The anti-pattern: a `plan` key the app does not understand in a fresh-crawl
+/// run would be silently ignored, and the operator who asked what WOULD happen
+/// would instead pay for it happening. Planning only means anything against the
+/// learned-cadence frontier, so anywhere else it is an error, not a no-op.
+fn refuse_plan_outside_revisit(plan: bool, revisit: bool) -> Result<()> {
+    if plan && !revisit {
+        return Err(Error::App(
+            "param 'plan' is revisit-only: set mode:\"revisit\" to preview the \
+             seed selection, or drop 'plan' to run a real crawl"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Buckets every known seed's due score into ten 0.1-wide bins, `[0.0,0.1)`
+/// first and `1.0` folded into the last.
+///
+/// This is the distribution `min_due_score` and `revisit_budget` are being
+/// compared against, and until now nothing anywhere showed it: the two knobs
+/// were free-form numbers whose only feedback was spending a crawl.
+fn due_score_histogram(scored: &[ScoredSeed]) -> Vec<usize> {
+    let mut bins = vec![0usize; 10];
+    for s in scored {
+        let idx = ((s.due_score * 10.0) as usize).min(9);
+        bins[idx] += 1;
+    }
+    bins
+}
+
+/// The selected seeds that have gone longest without a check (never-checked
+/// first), capped at [`PLAN_OLDEST_CHECKED`] — the concrete URLs a run would
+/// spend its budget on, so the plan is auditable and not just a count.
+fn oldest_checked(plan: &RevisitPlan) -> Vec<Value> {
+    let mut rows: Vec<&ScoredSeed> = plan.selected().iter().collect();
+    rows.sort_by_key(|s| s.seed.cadence.last_checked_at.unwrap_or(i64::MIN));
+    rows.into_iter()
+        .take(PLAN_OLDEST_CHECKED)
+        .map(|s| {
+            json!({
+                "url": s.seed.url,
+                "due_score": s.due_score,
+                "last_checked_at": s.seed.cadence.last_checked_at,
+            })
+        })
+        .collect()
+}
+
+/// How many of the plan's selected URLs are named individually. Enough to
+/// recognise the shape of the selection; not an echo of a 10,000-seed corpus
+/// into a job result.
+const PLAN_OLDEST_CHECKED: usize = 10;
+
+/// Renders a [`RevisitPlan`] as the `plan: true` job result.
+///
+/// Purely a projection of the plan core computed: no scoring, no filtering and
+/// no ranking happens here. That is the whole point — a preview that runs its
+/// own evaluator is a gate watching a proxy, green on the day it is written and
+/// silently wrong afterwards.
+fn render_plan(plan: &RevisitPlan, min_due_score: f64, revisit_budget: Option<usize>) -> Value {
+    json!({
+        "plan": true,
+        "revisit": true,
+        "seeds_known": plan.scored.len(),
+        "would_fetch": plan.would_fetch,
+        "skipped_not_due": plan.skipped_not_due,
+        "skipped_over_budget": plan.skipped_over_budget,
+        "cutoff_due_score": plan.cutoff_due_score,
+        "min_due_score": min_due_score,
+        "revisit_budget": revisit_budget,
+        "due_score_histogram": due_score_histogram(&plan.scored),
+        "by_host": plan.by_host,
+        "oldest_checked": oldest_checked(plan),
+    })
 }
 
 /// How often a running crawl commits what it has learned about the hosts it is
@@ -937,7 +1042,10 @@ impl ScrapeApp for Crawl {
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
          conditional GETs; \"discover\": true opts into link-following; \
          \"revisit_budget\" + \"min_due_score\" spend the budget on the URLs \
-         most likely changed, per learned per-URL change cadence)}. \
+         most likely changed, per learned per-URL change cadence; \
+         \"plan\": true previews that selection — what would be fetched, the \
+         due-score distribution and the budget cutoff — fetching and writing \
+         nothing)}. \
          Frontier state is checkpointed durably per job: an interrupted, reaped, \
          or shutdown-suspended crawl resumes where it left off on its next attempt. \
          Changed pages are archived into the `page_versions` dataset (key \
@@ -995,6 +1103,10 @@ impl ScrapeApp for Crawl {
                         "minimum": 0,
                         "maximum": 1,
                         "description": "Revisit mode: skip seeds whose probability-changed-since-last-check falls below this (0 = fetch all; skipped seeds are counted in skipped_not_due)."
+                    },
+                    "plan": {
+                        "type": "boolean",
+                        "description": "Revisit mode only: preview the seed selection (what revisit_budget/min_due_score would fetch, with the due-score distribution) and return without fetching or writing anything. Refused outside mode:\"revisit\"."
                     }
                 },
                 "additionalProperties": true
@@ -1038,6 +1150,12 @@ impl ScrapeApp for Crawl {
         // Revisit mode seeds the frontier from the `pages` dataset, so `seeds` is
         // optional there (it stays required for a normal fresh crawl).
         let revisit = ctx.params.get("mode").and_then(Value::as_str) == Some("revisit");
+        let plan_only = ctx
+            .params
+            .get("plan")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        refuse_plan_outside_revisit(plan_only, revisit)?;
         let seeds = str_array("seeds");
         if seeds.is_empty() && !revisit {
             return Err(Error::App(
@@ -1109,6 +1227,26 @@ impl ScrapeApp for Crawl {
                 .map(|s| s.clamp(0.0, 1.0))
                 .unwrap_or(0.0),
         };
+
+        // Preview branch: answer "what would this run fetch?" from the same
+        // stored cadence data the run reads, through the same selection
+        // function the run uses, and return BEFORE anything is constructed that
+        // could fetch or write. The `plan` reads `pages`; it never upserts.
+        if plan_only {
+            let source = DatasetPageSource {
+                datasets: ctx.datasets.clone(),
+                app: ctx.app.clone(),
+                limit: REVISIT_SEED_LIMIT,
+                seed_data: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let plan = plan_revisit(
+                source.seeds().await,
+                cfg.min_due_score,
+                cfg.revisit_budget,
+                chrono::Utc::now().timestamp(),
+            );
+            return Ok(render_plan(&plan, cfg.min_due_score, cfg.revisit_budget));
+        }
 
         // Per-page fingerprints stream into the `pages` dataset as the crawl
         // runs (key = canonical URL), so crawled pages become queryable/diffable
@@ -1247,9 +1385,13 @@ impl ScrapeApp for Crawl {
             "revisit": revisit,
             "revisited": stats.revisited,
             "unchanged_304": stats.unchanged_304,
-            // Learned-cadence frontier accounting (M07): seeds skipped as
-            // not-due / over-budget, and 304 cadence-counter merges written.
+            // Learned-cadence frontier accounting (M07): seeds skipped
+            // because they scored below the threshold, and 304 cadence-counter
+            // merges written.
             "skipped_not_due": stats.skipped_not_due,
+            // ...and the OTHER skip reason, told apart from it: one says lower
+            // `min_due_score`, the other says raise `revisit_budget`.
+            "skipped_over_budget": stats.skipped_over_budget,
             "cadence_updates": counts.cadence_updates.load(Ordering::Relaxed),
             // `changed`/`new` = live pages re-fingerprinted / first-seen this run.
             "changed": pages_changed,
