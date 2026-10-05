@@ -219,7 +219,7 @@ The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file a
 
 ## Job receipt
 
-`GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job) and `trigger_hops` (the jobs this run's outcome enqueued).
+`GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job), `trigger_hops` (the jobs this run's outcome enqueued) and `coverage` (what it wrote vs what it declared — see below).
 
 **Honest nulls, and an `unknown[]` list that names every gap in the caller's words** — nothing is inferred, averaged or back-filled. The structural gaps it reports:
 - `stages: null` for a job that predates migration 0034, failed before its fan-out, or hasn't finished — and the message says which.
@@ -229,6 +229,34 @@ The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file a
 - `trigger_hops` reads `jobs.source_job_id` (migration 0035); hops enqueued before it are not recoverable.
 
 Every join is an index seek on the job id — a receipt is a per-job audit view, not a metrics query, and it must not slow down as the corpus grows.
+
+### `coverage` — what the run wrote vs what it declared
+
+A run declares the namespaces it puts records under in its result's `index_datasets`; the worker turns that into `run_indexed_apps(job.app, index_specs)` and scopes the hook batch (`load_run_changes`) and the saved-search pass by it. A namespace the run writes but never declares is therefore reachable by **no** watch, dataset trigger or saved search scoped to it — silently, with the job green. That class has bitten twice (`ca-grants` writing `grants/unified`, `peer` writing `peer_<origin>/<dataset>`), and both times a human found it after shipping.
+
+The receipt now diffs the two populations, which both already existed and were never compared:
+
+```json
+"coverage": {
+  "declared": ["mpsv-vpm", "cz-labour"],
+  "declared_datasets": [{ "app": "cz-labour", "dataset": "salary_gap" }],
+  "undeclared": [{ "app": "cz-labour", "dataset": "skill_demand" }],
+  "complete": true
+}
+```
+
+- `declared` — `run_indexed_apps(job.app, index_specs)`: the job's own app first, then the virtual apps its result names.
+- `declared_datasets` — the exact `index_datasets` specs. A declared **app** does not launder an undeclared **dataset** inside it: per-record search documents are minted per spec, so an unnamed dataset is unsearchable even in a namespace that is otherwise reachable.
+- `undeclared` — every `(app, dataset)` the run's revisions carry that is **outside the job's own app** and not named by a spec. Deduplicated and sorted. The worker logs one `WARN` per entry at the end of a successful run, naming the job, the app and the namespace.
+- `complete` — whether the diff may be trusted at all.
+
+A write under the job's **own** app is never reported: an app owns its namespace and writes plenty of internal datasets there (`mpsv-vpm` alone deliberately excludes eight from indexing). Flagging those would make the signal fire on every run, and a signal that is always on is not a signal.
+
+**Known gaps.**
+- The observed set comes from the `job_id` provenance stamp (migration 0030), the same source as `changes`. A write path that does not stamp a job id is invisible here.
+- When the receipt cannot see the run's writes it says so rather than reporting a clean bill: `complete: false` plus a named reason in `unknown[]`. Two causes, never collapsed — the job is not `succeeded` (its writes are not final), or no revision carries its stamp at all (“wrote nothing” and “wrote unstamped” are one picture from here). **An empty `undeclared` with `complete: false` is not a pass.**
+- The check is a report, not a gate: it runs after the fan-out, a store error is warned and dropped, and nothing here can change a job outcome.
+
 
 ## AppContext (what a running app gets)
 

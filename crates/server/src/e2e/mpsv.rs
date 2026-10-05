@@ -70,19 +70,30 @@ impl ScrapeApp for LabourProducer {
         // `indexed_datasets_exclude_the_high_cardinality_and_identity_less_tables`
         // lists as excluded: a real app starting to write it is exactly the
         // move nothing in this repo noticed.
+        // Stamped with this job's id, exactly as the real app does for its
+        // cross-namespace writes (`upsert_many_stamped(GAP_APP, .., Some(&job_prov))`
+        // — `ctx.upsert` can only write under `job.app`, so a virtual namespace
+        // has to carry the provenance explicitly). Unstamped writes are
+        // invisible to every job-scoped audit read, the receipt included.
+        let job_prov = pumper_core::datasets::Provenance {
+            job_id: Some(ctx.job_id.to_string()),
+            ..Default::default()
+        };
         if ctx.params.get("rogue").and_then(Value::as_bool) == Some(true) {
             ctx.datasets
-                .upsert(
+                .upsert_stamped(
                     ROGUE_APP,
                     ROGUE_DATASET,
                     CELL,
                     &json!({ "title": "undeclared skill demand", "cycle": cycle }),
+                    None,
+                    Some(&job_prov),
                 )
                 .await?;
         }
         for (app, dataset) in app_mpsv_vpm::INDEXED_DATASETS {
             ctx.datasets
-                .upsert(
+                .upsert_stamped(
                     app,
                     dataset,
                     CELL,
@@ -90,6 +101,8 @@ impl ScrapeApp for LabourProducer {
                         "title": format!("CZ-ISCO 5223 MZDOVA — {dataset} cycle {cycle}"),
                         "cycle": cycle,
                     }),
+                    None,
+                    Some(&job_prov),
                 )
                 .await?;
         }
