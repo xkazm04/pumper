@@ -1,8 +1,17 @@
 //! `GET /datasets/doctor` — the store integrity report.
 //!
-//! This route only **gathers** facts; [`pumper_core::doctor::diagnose`] decides
+//! This route only **gathers** facts; [`pumper_core::doctor::examine`] decides
 //! what is worth saying about them, and that split is what lets the "a clean
 //! store reports nothing" property be tested without a database.
+//!
+//! **It also declares what it did not gather.** Two of the nine checks can be
+//! unable to run from here — `skip_artifacts=true` drops the body sweep
+//! entirely, and [`MAX_BODIES_CHECKED`] bounds it — so the route states which
+//! [`ArtifactScan`] it performed instead of handing `diagnose` an empty
+//! `missing_bodies` that reads exactly like a clean one. The verdict is then
+//! `incomplete` rather than `clean`, which is the whole point: the cheapest
+//! request used to be the one that examined least and still answered
+//! `healthy: true`.
 //!
 //! **Read-only.** Every query is a `SELECT`, every filesystem touch is a `stat`,
 //! and nothing here writes, repairs or prunes — the report tells you what to run,
@@ -17,7 +26,7 @@ use serde_json::{json, Value};
 use utoipa::IntoParams;
 
 use pumper_core::doctor::{
-    diagnose, DatasetCoverage, MissingBody, SearchFacts, StoreFacts, TableGrowth,
+    examine, ArtifactScan, DatasetCoverage, MissingBody, SearchFacts, StoreFacts, TableGrowth,
     UNBOUNDED_GROWTH_DAYS,
 };
 
@@ -78,6 +87,12 @@ async fn search_facts(state: &AppState) -> Result<SearchFacts, ApiError> {
 pub(crate) struct DoctorQuery {
     /// Skip the artifact-tree walk and the per-revision body checks. Use on a
     /// very large archive when only the SQL-side checks are wanted.
+    ///
+    /// It makes the report **incomplete, not clean**: `missing_artifact_bodies`
+    /// comes back `unverifiable` with this flag named as the reason, the
+    /// top-level `verdict` is `incomplete`, and `healthy` is therefore `false`
+    /// however healthy the SQL side is. That is the point — the cheapest way to
+    /// get a green used to be the request that examined least.
     skip_artifacts: Option<bool>,
 }
 
@@ -86,7 +101,10 @@ pub(crate) struct DoctorQuery {
     path = "/datasets/doctor",
     tag = "datasets",
     params(DoctorQuery),
-    responses((status = 200, description = "Read-only store integrity report: `findings` (each \
+    responses((status = 200, description = "Read-only store integrity report: `verdict` \
+        (`clean` | `findings` | `incomplete`, worst-of over the check roster), `healthy` \
+        (= `verdict == clean`), `checks` (every check the doctor can run, each `clean`, \
+        `findings` or `unverifiable` with the reason it could not run), `findings` (each \
         with a concrete remediation; EMPTY on a healthy store), plus descriptive `schema` \
         (applied/pending/ahead migration versions and table drift against the chain this \
         binary carries), `coverage`, \
@@ -148,9 +166,25 @@ pub(crate) async fn datasets_doctor(
     // what the tree costs per app (the numbers that make retention's decisions
     // inspectable).
     let mut artifacts = json!({ "scanned": false });
-    if !skip_artifacts {
+    if skip_artifacts {
+        // Declared, not left silent: the check cannot fire, so it reports
+        // `unverifiable` and the verdict is `incomplete`.
+        facts.artifacts = ArtifactScan::Skipped;
+    } else {
+        // The denominator first, so a sweep stopped by the ceiling can say how
+        // much of the store it did not look at instead of reporting a green
+        // over it.
+        let replayable_total = ds.replayable_revision_count().await?;
         let claims = ds.replayable_revisions(MAX_BODIES_CHECKED).await?;
         facts.replayable_checked = claims.len() as i64;
+        facts.artifacts = if facts.replayable_checked < replayable_total {
+            ArtifactScan::Truncated {
+                checked: facts.replayable_checked,
+                replayable: replayable_total,
+            }
+        } else {
+            ArtifactScan::Complete
+        };
         let root = state.storage.artifacts_dir.clone();
         let (missing, usage) = tokio::task::spawn_blocking(move || {
             let missing: Vec<MissingBody> = claims
@@ -184,13 +218,14 @@ pub(crate) async fn datasets_doctor(
             "scanned": true,
             "root": state.storage.artifacts_dir.display().to_string(),
             "bodies_checked": facts.replayable_checked,
+            "replayable_total": replayable_total,
             "check_limit": MAX_BODIES_CHECKED,
             "per_app": usage,
             "total_bytes": usage.iter().map(|a| a.bytes).sum::<u64>(),
         });
     }
 
-    let findings = diagnose(&facts);
+    let report = examine(&facts);
     let instrument = state.storage.instrument();
     let store = store_report(
         &instrument.snapshot(),
@@ -203,8 +238,16 @@ pub(crate) async fn datasets_doctor(
     Ok(Json(json!({
         "read_only": true,
         "generated_at": now.to_rfc3339(),
-        "healthy": findings.is_empty(),
-        "findings": findings,
+        // Worst-of over the roster, three-valued: `clean` (every check ran and
+        // found nothing), `findings` (something to act on), `incomplete`
+        // (nothing wrong was found AND at least one check could not run). The
+        // boolean survives for existing readers and now means `verdict ==
+        // clean`, so it can no longer answer `true` over a check that never
+        // ran — `checks[]` names which one and why.
+        "verdict": report.verdict,
+        "healthy": report.is_clean(),
+        "checks": report.checks,
+        "findings": report.findings,
         "artifacts": artifacts,
         "schema": facts.schema,
         "search": facts.search,

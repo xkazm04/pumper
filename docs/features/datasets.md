@@ -289,14 +289,65 @@ is a `SELECT`, every filesystem touch is a `stat`; it reports and never repairs,
 so you can always tell whether the store was healthy or merely healed. It performs
 **full scans** (`record_revisions`, `records`, the whole artifact tree), so it is
 an on-demand operator tool — never on a hot path, never on a timer.
-`skip_artifacts=true` drops the tree walk and the per-body checks.
+`skip_artifacts=true` drops the tree walk and the per-body checks — and says so
+in the verdict (below).
 
-**A healthy store returns `findings: []` and `healthy: true`.** Descriptive
-numbers that are not problems live outside `findings` (`coverage`, `tables`,
-`artifacts`), because a report that always says something gets ignored.
+**A healthy store returns `findings: []`, `verdict: "clean"` and
+`healthy: true`.** Descriptive numbers that are not problems live outside
+`findings` (`coverage`, `tables`, `artifacts`), because a report that always says
+something gets ignored.
 
 Each finding carries a concrete remediation — the binary to run, the config key
 to set, the route to call — never a bare count, plus up to 10 examples.
+
+### The verdict, and the check roster
+
+`verdict` is a **worst-of rollup over every check the doctor can run**, and it is
+three-valued, because "nothing is wrong" and "nothing was looked at" are
+different answers:
+
+| `verdict` | meaning |
+| --- | --- |
+| `clean` | every check in the roster ran and found nothing |
+| `findings` | at least one check raised a finding (outranks `incomplete` — it carries a remediation) |
+| `incomplete` | nothing wrong was found **and** at least one check could not run |
+
+`healthy` is retained and is exactly `verdict == "clean"`. It used to be
+`findings.is_empty()`, which answered `true` over a check that never ran — the
+cheapest request (`?skip_artifacts=true`) was the one that examined least and
+still came back green.
+
+`checks[]` is the roster: one entry per check, always all nine, in the order
+below.
+
+```json
+{ "check": "missing_artifact_bodies",
+  "outcome": "unverifiable",
+  "reason": "skip_artifacts=true dropped the artifact tree walk, so no replayable revision's body was stat'd — re-request GET /datasets/doctor without skip_artifacts to verify this check" }
+```
+
+`outcome` is `clean`, `findings`, or `unverifiable` with a `reason`. The summary
+never travels without the roster, so `incomplete` always names the member that
+could not run and why. The reasons a check comes back `unverifiable`:
+
+| check | `unverifiable` when |
+| --- | --- |
+| `missing_artifact_bodies` | `skip_artifacts=true`; or the sweep hit its `check_limit` of 5,000 revisions (the reason states `N of M replayable revisions stat'd`, and `artifacts.replayable_total` is the denominator) |
+| `search_index_empty` | `[search] enabled = true` but `doc_count` could not be read |
+| `schema_drift` | the schema ledger was not consulted |
+| `unbounded_table_growth` | no table's growth was gathered |
+
+A **disabled** search index (`[search] enabled = false`) is `clean`, never
+`unverifiable`: a deliberately absent subsystem is not an unexamined one, and
+counting it as "could not look" would make every search-less store permanently
+un-green. The other five checks read `SELECT`s this route always issues
+together, so no request can leave one of them ungathered; they are therefore
+only ever `clean` or `findings`.
+
+A check that found something while its input was *also* partial reports
+`findings`, not `unverifiable` — it concluded something actionable, and the
+partiality stays visible in the finding's own `N of M` summary and in the
+`artifacts` block.
 
 | Check | Fires when | Remediation |
 | --- | --- | --- |
@@ -309,7 +360,10 @@ to set, the route to call — never a bare count, plus up to 10 examples.
 | `stale_rebuild_tables` | a `*_new` table-rebuild scaffold survived in `sqlite_master` | restore from backup and re-run migrations; do not drop it by hand |
 | `search_index_empty` | `[search] enabled = true`, the index holds **0 documents**, and the store holds at least one live record | `search-backfill -- --all` with the server stopped ([search.md](search.md)) |
 
-`artifacts.per_app` reports files and bytes on disk per app — the numbers that
+`artifacts` reports `scanned`, and when it ran, `bodies_checked`,
+`replayable_total` and `check_limit` — the fraction behind the body check, so a
+partial green is quantifiable rather than merely flagged. `artifacts.per_app`
+reports files and bytes on disk per app — the numbers that
 make the retention decisions above inspectable. `search` reports
 `{enabled, doc_count, live_records}` — the numbers behind the search finding,
 so the verdict is inspectable without a second request. `doc_count` is `null`
