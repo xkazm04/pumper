@@ -94,7 +94,7 @@ a token. Nothing to migrate, no cold-start snapshot forced.
 
 ## Public surface
 
-- `createPumperSync(config) → { run(): Promise<SyncResult> }` — the mirror. Config:
+- `createPumperSync(config) → { run(opts?): Promise<SyncResult>, status(): Promise<SyncStatus> }` — the mirror. Config:
   `dataset`, `filter?`, `watermark`, `sink`, `map?`, `batchSize?` (default 500),
   `baseUrl?` (default `$PUMPER_URL` → `http://127.0.0.1:8088`), `timeoutMs?`,
   `maxBytes?`, `onProgress?`, `signal?`.
@@ -113,6 +113,65 @@ a token. Nothing to migrate, no cold-start snapshot forced.
 watermark, anomalies?, stalled? }`. `anomalies` counts feed items the SDK
 refused to apply and `stalled` is true when the drain stopped at one instead of
 reaching the end of the feed — see § Known gaps.
+
+### Reporting: what a run read, and what it did not write
+
+`SyncResult` additionally carries `pagesRead`, `revisionsSeen`, `applied` and
+`skipped: { droppedByMap, nullPostImage, supersededDuplicate }`. All are
+optional to read and nothing above changed shape.
+
+They exist because `{ upserted: 0 }` was ambiguous. A feed with nothing new, a
+`map` that returns null for every record, and a page of superseded duplicates
+all produced the same four numbers. `revisionsSeen - upserted - tombstoned` is
+now accounted for item by item:
+
+- `droppedByMap` — the consumer's `map` returned null. The commonest wiring
+  mistake a new consumer makes, and previously indistinguishable from success.
+- `nullPostImage` — a non-`removed` revision with `data: null`. This is the
+  same event `anomalies` counts and it stalls the page (§ Known gaps); the
+  field only gives the anomaly a name.
+- `supersededDuplicate` — a later revision for the same key **in the same
+  page** replaced this one. Page-local by construction: the drain checkpoints
+  per page, so a key that reappears on a later page is re-applied
+  idempotently, not held back. On the ascending feed the LAST revision for a
+  key in a page is its newest, and that is the one applied.
+
+`onProgress` fires once per applied page (snapshot: once per sink flush) and
+now carries `page`, `revisionsSeen` and the running `skipped` counts, so the
+drop rate of a long backlog is visible while it drains.
+
+### `status()` — asking without writing
+
+`sync.status() → { mode, watermark, newestRevisionAt, lagSeconds, upToDate,
+pendingAtLeast }` answers "is a still cursor health or lag?" with **no sink
+call and no watermark write**. It costs at most two one-shot feed reads: the
+head (`order=desc&limit=1`) and, when a position is stored, one forward probe
+page from it.
+
+- `mode` is what `run()` would do next — `snapshot` when nothing is stored.
+- `lagSeconds` is whole seconds between the watermark's stamp and the feed
+  head, floored at 0 (a negative lag is a clock artefact, not information);
+  `null` on a cold start or an empty feed.
+- `pendingAtLeast` is a **lower bound** — one probe page, so it saturates at
+  `batchSize`. `null` on a cold start, where the pending population is the
+  whole dataset and the feed cannot say.
+- `upToDate` requires both an empty probe and a head that is not ahead. A cold
+  start is never up to date.
+
+### `run({ dryRun: true })` — rehearsing the first production run
+
+The dry run walks the **identical** code path with one substitution — a
+counting no-op sink — and skips every watermark write. `applied` is `false` and
+every other field, including the watermark it *would* have stored, equals what
+the real run reports. That equality is pinned by
+`clients/typescript/test/sync-report.test.ts`
+(`dry_run_writes_nothing_and_reports_exactly_what_the_real_run_reports`): a
+preview that computed its answer a different way would be a gate watching a
+proxy.
+
+The counts are what the SDK would hand the sink. A sink that writes fewer rows
+than it is given (its own dedupe, its own filter) returns a lower number on the
+real run, and the dry run cannot know that.
 
 ## Data model
 
@@ -149,3 +208,12 @@ watermark row.
   caller's scheduler retry.
 - **TypeScript only** so far — a Rust/Python twin would generate off the same
   OpenAPI spec.
+- **`pendingAtLeast` is a lower bound,** not a backlog size: `status()` reads
+  one forward probe page and the number saturates at `batchSize`. There is no
+  cheap exact pending count on the change feed.
+- **A dry run cannot model a lossy sink.** It reports what the SDK would hand
+  the sink; a sink that acknowledges fewer rows than it is given diverges from
+  the preview on exactly those rows.
+- **`skipped.supersededDuplicate` is page-local.** A key repeated across two
+  pages is applied twice (idempotently) and counted once per page, because the
+  per-page checkpoint means the earlier page is already durable.

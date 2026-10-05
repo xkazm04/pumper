@@ -62,6 +62,40 @@ trigger). It is safe to call concurrently-per-dataset only once; the watermark
 advances after the sink commits, so a crash re-processes idempotently (upsert by
 key) rather than skipping.
 
+### Seeing what it did — and what it would do
+
+`upserted: 0` on its own cannot tell you whether the feed was idle or whether
+your `map` discarded every record. The report names every revision it read and
+did not write:
+
+```ts
+const r = await sync.run();
+// { mode, upserted, tombstoned, watermark, pagesRead, revisionsSeen, applied,
+//   anomalies, stalled,
+//   skipped: { droppedByMap, nullPostImage, supersededDuplicate } }
+if (r.skipped?.droppedByMap === r.revisionsSeen && r.revisionsSeen > 0) {
+  throw new Error("the mapper is dropping everything");  // not an idle feed
+}
+```
+
+Two non-mutating entry points sit beside it:
+
+```ts
+// How far behind am I? No sink call, no watermark write.
+const s = await sync.status();
+// { mode, watermark, newestRevisionAt, lagSeconds, upToDate, pendingAtLeast }
+
+// What would a run do? Identical code path, counting no-op sink, no checkpoint.
+const preview = await sync.run({ dryRun: true });
+// preview.applied === false; every other field equals the real run's.
+```
+
+`pendingAtLeast` is a lower bound (one forward probe page, so it saturates at
+`batchSize`), and `lagSeconds` is null on a cold start where there is no
+position to measure from. `onProgress` fires once per applied page with the
+running totals and the running `skipped` counts, so a long backlog is visible
+while it drains.
+
 ### Replacing Wellspring's `pumper.ts`
 
 The current adapter (`src/features/grant-ingest/sources/pumper.ts`) mirrors three
@@ -101,12 +135,21 @@ Zero runtime dependencies (global `fetch` + WebStreams; Node ≥ 20).
 
 ## Known gaps
 
-- **Watermark boundary.** `since` is an exclusive lower bound at micro-second
-  resolution; a new revision landing at the *exact* micro-second of the stored
-  watermark could be skipped. Negligible at Pumper's job cadence, but real —
-  re-run a snapshot (clear the watermark) if you ever suspect a gap.
+- ~~**Watermark boundary.** A new revision landing at the exact micro-second of
+  the stored watermark could be skipped. Negligible at Pumper's job cadence.~~
+  **Fixed, and "negligible" was wrong** — the population at one stamp is a whole
+  `upsert_many` chunk (up to 500 revisions), not one revision. The watermark is
+  now the keyset position `<created_at>|<rowid>`. See
+  [docs/features/sdk-typescript.md](../../docs/features/sdk-typescript.md).
 - **Wire types are hand-written**, mirroring `crates/core/src/datasets.rs`. If
   the record/revision shapes change, regenerate against `GET /openapi.json`.
-- **No built-in retry/backoff** on a failed page — a throw aborts the run and
-  leaves the watermark unadvanced, so the next run resumes from the same point.
-  Wrap `.run()` in your scheduler's retry if you want automatic recovery.
+- **No built-in retry/backoff** on a failed page — a throw aborts the run. The
+  pages that already landed keep their checkpoint, so the next run resumes at
+  the failed page rather than at the top of the feed. Wrap `.run()` in your
+  scheduler's retry if you want automatic recovery.
+- **`pendingAtLeast` is a lower bound, not a backlog size.** `status()` reads
+  one forward probe page, so the number saturates at `batchSize`; there is no
+  cheap exact count on the feed.
+- **A dry run reports what the SDK would hand the sink,** not what the sink
+  would acknowledge. A sink that writes fewer rows than it is given reports its
+  own lower number on the real run.

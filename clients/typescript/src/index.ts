@@ -25,5 +25,8 @@ export type {
   SyncMode,
   SyncResult,
   SyncProgress,
+  SyncRunOptions,
+  SyncSkipped,
+  SyncStatus,
   MapContext,
 } from "./types.js";
