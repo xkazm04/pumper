@@ -69,26 +69,10 @@ pub(crate) async fn job_receipt(
 
     // ── cost ────────────────────────────────────────────────────────────────
     let events = state.costs.job_events(id).await?;
-    let mut by_engine: BTreeMap<String, (i64, f64)> = BTreeMap::new();
-    for e in &events {
-        let slot = by_engine.entry(e.engine.clone()).or_insert((0, 0.0));
-        slot.0 += 1;
-        slot.1 += e.cost_usd;
+    let (cost, floor_note) = cost_block(&events, job.budget_usd);
+    if let Some(note) = floor_note {
+        unknown.push(note);
     }
-    let total_usd: f64 = events.iter().map(|e| e.cost_usd).sum();
-    let cost = json!({
-        "total_usd": total_usd,
-        "calls": events.len(),
-        "budget_usd": job.budget_usd,
-        "by_engine": by_engine.into_iter().map(|(engine, (calls, cost_usd))| {
-            json!({ "engine": engine, "calls": calls, "cost_usd": cost_usd })
-        }).collect::<Vec<_>>(),
-        // Which peer nodes this run's fetches actually left from. `by_engine`
-        // says "http" whether a body came off this machine or a peer in another
-        // country, which is precisely the thing the remote fabric exists to
-        // change — so a run that used it has to be able to show it.
-        "egress": egress_by_node(&events),
-    });
     if events.is_empty() {
         // What an empty ledger actually means. The previous wording here said
         // "free tiers (http, cached, replayed) do not write ledger rows" — which
@@ -251,6 +235,41 @@ pub(crate) async fn job_receipt(
     })))
 }
 
+/// The receipt's `cost` block, plus the one `unknown[]` line the money owes
+/// the reader when the total is a floor rather than a price (`None` when the
+/// total is exact — an exact total must not be footnoted, because a footnote on
+/// every receipt is a footnote on none).
+///
+/// Extracted from the handler so the arithmetic this document publishes is
+/// testable without a database, and so there is ONE place where the receipt's
+/// money is shaped.
+fn cost_block(
+    events: &[pumper_core::CostEvent],
+    budget_usd: Option<f64>,
+) -> (Value, Option<String>) {
+    let mut by_engine: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    for e in events {
+        let slot = by_engine.entry(e.engine.clone()).or_insert((0, 0.0));
+        slot.0 += 1;
+        slot.1 += e.cost_usd;
+    }
+    let total_usd: f64 = events.iter().map(|e| e.cost_usd).sum();
+    let cost = json!({
+        "total_usd": total_usd,
+        "calls": events.len(),
+        "budget_usd": budget_usd,
+        "by_engine": by_engine.into_iter().map(|(engine, (calls, cost_usd))| {
+            json!({ "engine": engine, "calls": calls, "cost_usd": cost_usd })
+        }).collect::<Vec<_>>(),
+        // Which peer nodes this run's fetches actually left from. `by_engine`
+        // says "http" whether a body came off this machine or a peer in another
+        // country, which is precisely the thing the remote fabric exists to
+        // change — so a run that used it has to be able to show it.
+        "egress": egress_by_node(events),
+    });
+    (cost, None)
+}
+
 /// Which remote-fabric nodes served this run's fetches, `{node: calls}`, sorted
 /// by node. Empty when nothing left through a peer — including every run on a
 /// deployment with `[remote]` off, which is the overwhelmingly common case.
@@ -394,9 +413,138 @@ async fn read_artifacts(dir: &std::path::Path) -> std::io::Result<Option<(Value,
 
 #[cfg(test)]
 mod tests {
-    use super::{egress_by_node, egress_nodes, stage_gap_reason, wall_ms};
+    use super::{cost_block, egress_by_node, egress_nodes, stage_gap_reason, wall_ms};
+    use crate::routes::jobs::{certainty_fields, roll_up};
     use chrono::{Duration, Utc};
+    use pumper_core::costs::SpendCertainty;
     use pumper_core::{CostEvent, Job, JobStatus};
+    use serde_json::json;
+
+    /// One priced call on the ledger, with the certainty the engine reported.
+    fn priced(engine: &str, cost_usd: f64, spend_certainty: SpendCertainty) -> CostEvent {
+        CostEvent {
+            job_id: uuid::Uuid::nil().to_string(),
+            app: "fake".into(),
+            engine: engine.into(),
+            url: None,
+            cost_usd,
+            spend_certainty,
+            detail: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Acceptance 1. The receipt's `cost` block carries the certainty the
+    /// ledger row already holds. A run that spent $0.30 and then had a call
+    /// killed mid-generation is NOT a $0.30 run.
+    #[test]
+    fn a_receipt_whose_total_is_a_floor_publishes_the_counts_that_make_it_one() {
+        let events = [
+            priced("claude", 0.30, SpendCertainty::Billed),
+            priced("claude", 0.0, SpendCertainty::Unmetered),
+        ];
+        let (cost, _) = cost_block(&events, None);
+        assert_eq!(cost["billed_usd"], json!(0.30));
+        assert_eq!(cost["unmetered_calls"], json!(1));
+        assert_eq!(cost["unknown_calls"], json!(0));
+        assert_eq!(cost["total_certainty"], json!("at_least"));
+    }
+
+    /// Acceptance 2. The module's own doctrine — "a number this server cannot
+    /// know is `null` and the reason is named in `unknown[]`" — applied to the
+    /// one number it used to exempt.
+    #[test]
+    fn a_floored_total_names_its_reason_in_unknown_rather_than_passing_as_a_price() {
+        let events = [
+            priced("claude", 0.30, SpendCertainty::Billed),
+            priced("claude", 0.0, SpendCertainty::Unmetered),
+        ];
+        let note = cost_block(&events, None).1.expect("a floor is footnoted");
+        assert!(note.starts_with("cost:"), "{note}");
+        assert!(note.contains("unmetered"), "{note}");
+        assert!(
+            note.contains("at least") || note.contains("floor"),
+            "the note has to say the total is a lower bound: {note}"
+        );
+    }
+
+    /// Acceptance 3. Over-labelling is its own dishonesty: an exact total must
+    /// not be footnoted, because a footnote on every receipt is a footnote on
+    /// none.
+    #[test]
+    fn an_exact_total_is_not_footnoted() {
+        let events = [
+            priced("claude", 0.30, SpendCertainty::Billed),
+            priced("http", 0.0, SpendCertainty::Free),
+        ];
+        let (cost, note) = cost_block(&events, None);
+        assert_eq!(cost["total_certainty"], json!("exact"));
+        assert_eq!(note, None, "{note:?}");
+        // An empty ledger is exact too — zero calls is zero uncertainty.
+        assert_eq!(cost_block(&[], None).1, None);
+    }
+
+    /// Acceptance 4. The receipt and `GET /jobs/{id}/costs` show the same job's
+    /// money on two screens. The four-tuple is asserted equal across the two
+    /// surfaces, so they cannot drift apart again.
+    #[test]
+    fn the_receipt_and_the_costs_endpoint_cannot_disagree_about_one_jobs_money() {
+        for events in [
+            vec![],
+            vec![priced("claude", 0.30, SpendCertainty::Billed)],
+            vec![
+                priced("claude", 0.30, SpendCertainty::Billed),
+                priced("claude", 0.0, SpendCertainty::Unmetered),
+                priced("claude", 0.0, SpendCertainty::Unknown),
+                priced("http", 0.0, SpendCertainty::Free),
+            ],
+        ] {
+            let (cost, _) = cost_block(&events, None);
+            let from_costs_endpoint = certainty_fields(&roll_up(&events));
+            for (key, value) in &from_costs_endpoint {
+                assert_eq!(&cost[key], value, "{key} differs between the two surfaces");
+            }
+        }
+    }
+
+    /// Acceptance 5. The change is additive: every field the block published
+    /// before keeps its exact value, `total_usd` included, in both the exact
+    /// and the floored case. No consumer breaks.
+    ///
+    /// The goldens are written out by hand rather than re-folded from the
+    /// events — a test that recomputes the number it is pinning pins nothing.
+    #[test]
+    fn the_blocks_existing_fields_are_byte_identical_after_the_change() {
+        let exact = vec![
+            priced("claude", 0.30, SpendCertainty::Billed),
+            priced("http", 0.0, SpendCertainty::Free),
+        ];
+        let floored = vec![
+            priced("claude", 0.30, SpendCertainty::Billed),
+            priced("claude", 0.0, SpendCertainty::Unmetered),
+        ];
+        let cases = [
+            (
+                exact,
+                json!([
+                    { "engine": "claude", "calls": 1, "cost_usd": 0.30 },
+                    { "engine": "http", "calls": 1, "cost_usd": 0.0 },
+                ]),
+            ),
+            (
+                floored,
+                json!([{ "engine": "claude", "calls": 2, "cost_usd": 0.30 }]),
+            ),
+        ];
+        for (events, by_engine) in cases {
+            let (cost, _) = cost_block(&events, Some(1.0));
+            assert_eq!(cost["total_usd"], json!(0.30));
+            assert_eq!(cost["calls"], json!(2));
+            assert_eq!(cost["budget_usd"], json!(1.0));
+            assert_eq!(cost["by_engine"], by_engine);
+            assert_eq!(cost["egress"], json!([]));
+        }
+    }
 
     fn event(detail: Option<&str>) -> CostEvent {
         CostEvent {

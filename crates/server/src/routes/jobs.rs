@@ -499,17 +499,13 @@ pub(crate) async fn job_costs(
     });
     let (cost_per_fresh_record, unavailable) = fresh_record_cost(&roll, fresh);
     let headroom = budget_headroom(job.budget_usd, roll.billed_usd);
-    Ok(Json(json!({
+    let mut body = json!({
         "job_id": id,
         "app": job.app,
         // Kept for compatibility, and it is the SAME number as `billed_usd`:
         // the sum of what we can price. Read `total_certainty` before
         // treating either as the bill.
         "total_usd": roll.billed_usd,
-        "billed_usd": roll.billed_usd,
-        "unmetered_calls": roll.unmetered_calls,
-        "unknown_calls": roll.unknown_calls,
-        "total_certainty": roll.total_certainty(),
         "calls": events.len(),
         "fresh_records": fresh,
         "cost_per_fresh_record_usd": cost_per_fresh_record,
@@ -518,7 +514,9 @@ pub(crate) async fn job_costs(
         "budget_remaining_usd": headroom,
         "budget_remaining_certainty": headroom_certainty(roll.uncertain_calls()),
         "events": events,
-    })))
+    });
+    merge_certainty_fields(&mut body, &roll);
+    Ok(Json(body))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -760,6 +758,30 @@ impl CostRollup {
     }
 }
 
+/// The four fields every surface that publishes a cost-ledger total owes its
+/// reader: the money we can price, the two counts that make it a floor, and the
+/// one word that says which it is.
+///
+/// A `Map` rather than four `json!` lines at each call site, because four lines
+/// copied to a second surface is exactly how `GET /jobs/{id}/costs` and
+/// `GET /jobs/{id}/receipt` came to answer differently about the same job.
+pub(crate) fn certainty_fields(roll: &CostRollup) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("billed_usd".into(), json!(roll.billed_usd));
+    out.insert("unmetered_calls".into(), json!(roll.unmetered_calls));
+    out.insert("unknown_calls".into(), json!(roll.unknown_calls));
+    out.insert("total_certainty".into(), json!(roll.total_certainty()));
+    out
+}
+
+/// Folds [`certainty_fields`] into an object a surface is about to publish.
+/// A non-object is left alone rather than silently replaced.
+pub(crate) fn merge_certainty_fields(body: &mut Value, roll: &CostRollup) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.extend(certainty_fields(roll));
+    }
+}
+
 /// Splits a job's cost events into [`CostRollup`].
 pub(crate) fn roll_up(events: &[CostEvent]) -> CostRollup {
     let mut out = CostRollup::default();
@@ -810,6 +832,190 @@ pub(crate) fn budget_headroom(budget_usd: Option<f64>, billed_usd: f64) -> Optio
     budget_usd
         .filter(|b| b.is_finite())
         .map(|b| (b - billed_usd).max(0.0))
+}
+
+/// Every place in the server crate that turns `cost_events.cost_usd` into a
+/// user-visible number, enumerated — the EXPECTED-diff idiom this repo uses to
+/// enforce a convention (`routes/mod.rs`), because a convention stated only in
+/// a doc comment is a convention until the next surface is written.
+///
+/// The rule: a cost total is published with its certainty, and the only code
+/// allowed to produce one is `pumper_core::costs::roll_up` (per-event) or a
+/// `CostSummary` row (per-group, which carries the counts itself). A new
+/// hand-rolled `map(|e| e.cost_usd).sum()` adds a line here and fails the build.
+#[cfg(test)]
+mod cost_sum_inventory {
+    use std::path::{Path, PathBuf};
+
+    /// Sites that sum `cost_usd`, as `"<path>: <line>"`, sorted.
+    ///
+    /// Both survivors fold **`CostSummary`** rows, not raw events: the group
+    /// already carries `unmetered_calls` / `unknown_calls` and `GET /economics`
+    /// publishes them beside the money. Nothing here may sum a `CostEvent`.
+    const EXPECTED: &[&str] = &[
+        "routes/economics.rs: e.claude_cost_usd += c.cost_usd;",
+        "routes/economics.rs: e.cost_usd += c.cost_usd;",
+        "routes/jobs.rs: let total: f64 = summary.iter().map(|s| s.cost_usd).sum();",
+    ];
+
+    /// Reduces a source file to the code a reader would call *executable*:
+    /// `//` line comments and `/* */` blocks removed, and every string
+    /// literal's CONTENTS blanked while its quotes stay.
+    ///
+    /// Both halves are load-bearing. A gate that matches inside comments passes
+    /// a file that merely TALKS about the rule above code that breaks it. A gate
+    /// that matches inside string literals red-lines on its own error message —
+    /// and a gate that treats `"https://x"` as the start of a comment blinds
+    /// itself to the rest of the line.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        let (mut in_string, mut in_block) = (false, false);
+        while let Some(c) = chars.next() {
+            if in_block {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block = false;
+                }
+                continue;
+            }
+            if in_string {
+                match c {
+                    // A `\n` inside a literal must not become a real newline in
+                    // the stripped text, or half a literal lands on its own line.
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => {
+                        in_string = false;
+                        out.push(c);
+                    }
+                    '\n' => out.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_string = true;
+                    out.push(c);
+                }
+                '/' if chars.peek() == Some(&'/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    in_block = true;
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Does this (comment-stripped) line accumulate `cost_usd` into a total?
+    fn sums_cost_usd(line: &str) -> bool {
+        line.contains("cost_usd")
+            && (line.contains("+=")
+                || line.contains(".sum(")
+                || line.contains(".sum::")
+                || line.contains(".fold("))
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable source dir") {
+            let path = entry.expect("readable entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn every_cost_total_in_this_crate_goes_through_the_shared_rollup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        files.sort();
+
+        let mut found: Vec<String> = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&root)
+                .expect("under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).expect("readable source file");
+            for line in code_only(&src).lines() {
+                let line = line.trim();
+                if sums_cost_usd(line) {
+                    found.push(format!("{rel}: {line}"));
+                }
+            }
+        }
+        found.sort();
+
+        let expected: Vec<String> = EXPECTED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            found, expected,
+            "a cost total is summed somewhere this inventory does not know about. If it folds \
+             CostEvent rows it must call pumper_core::costs::roll_up — a bare \
+             `map(|e| e.cost_usd).sum()` drops spend_certainty and republishes a floor as a \
+             price. If it folds CostSummary rows (which carry the counts), add it to EXPECTED."
+        );
+    }
+
+    /// Seeded violation: the matcher must go red on a real hand-rolled sum and
+    /// must NOT go red on a comment that merely quotes one, nor on the error
+    /// message of this very gate.
+    #[test]
+    fn the_matcher_reads_code_not_the_comment_above_it_nor_its_own_prose() {
+        let talks_about_it = code_only(
+            "// let total: f64 = events.iter().map(|e| e.cost_usd).sum();
+let x = 1;
+",
+        );
+        assert!(
+            !talks_about_it.lines().any(sums_cost_usd),
+            "a comment quoting the anti-pattern is not the anti-pattern: {talks_about_it:?}"
+        );
+
+        // A block comment spanning the anti-pattern is still not the code.
+        let blocked = code_only(
+            "/* acc += e.cost_usd; */ let x = 1;
+",
+        );
+        assert!(!blocked.lines().any(sums_cost_usd), "{blocked:?}");
+
+        // Neither is a string literal that names it — which is how this gate
+        // avoids flagging its own EXPECTED list and its own failure message.
+        let quoted = code_only(
+            "let msg = \"acc += e.cost_usd;\";
+",
+        );
+        assert!(!quoted.lines().any(sums_cost_usd), "{quoted:?}");
+
+        // The real thing, with a trailing comment and with a URL on the line:
+        // stripping either must not hide the sum.
+        let does_it = code_only(
+            "let total: f64 = events.iter().map(|e| e.cost_usd).sum(); // honest
+",
+        );
+        assert!(does_it.lines().any(sums_cost_usd), "{does_it:?}");
+        let with_url = code_only(
+            "log(\"https://x/y\"); let t: f64 = v.iter().map(|e| e.cost_usd).sum();
+",
+        );
+        assert!(with_url.lines().any(sums_cost_usd), "{with_url:?}");
+        assert!(code_only("acc += e.cost_usd;").lines().any(sums_cost_usd));
+    }
 }
 
 #[cfg(test)]
