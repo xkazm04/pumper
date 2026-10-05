@@ -42,12 +42,21 @@
 //! # The lever, not just the label
 //!
 //! A verdict nobody acts on is the defect that produced
-//! [`crate::completeness`]. So the verdict is wired to the write:
-//! [`Verdict::derived_paths`] hands a monitor the [`DerivedPaths`] its upsert
-//! should declare, and a cosmetic verdict declares every path that moved —
-//! which makes the change-detection hash identical to the stored one, so the
-//! record body is rewritten and **no revision is appended**. No revision, no
-//! watch firing, no webhook, no 03:00 page about a reflowed whitespace block.
+//! [`crate::completeness`], where five apps computed a coverage number and one
+//! consulted it. So the declaration is wired to the write:
+//! [`Sensitivity::derived_paths`] hands a monitor the [`DerivedPaths`] its
+//! upsert narrows the change-detection hash by, from the same list the judge
+//! strips before measuring. A path that is noise to the judge is noise to the
+//! store, by construction rather than by two call sites agreeing.
+//!
+//! What a monitor does with a `Cosmetic` verdict is then its own write
+//! decision, and the one thing it must NOT be is a per-run narrowing: the
+//! stored hash was taken over whatever the previous write declared, so
+//! narrowing only on the runs you want suppressed compares a narrow hash
+//! against a wide one and reports `changed` — the exact opposite of the intent.
+//! `watch` instead holds the baseline record and refreshes only the verdict,
+//! which leaves the hash input byte-identical and appends no revision. No
+//! revision, no watch firing, no webhook, no 03:00 page about a reflow.
 
 use serde_json::{json, Value};
 
@@ -144,6 +153,21 @@ impl Sensitivity {
     /// The declared noise paths.
     pub fn noise_paths(&self) -> &[String] {
         &self.noise
+    }
+
+    /// **The lever.** The declared noise paths as the [`DerivedPaths`] the
+    /// monitor's upsert should narrow its change-detection hash by — one
+    /// declaration serving both the judgment and the write, so the two can
+    /// never disagree about what is noise.
+    ///
+    /// Deliberately a property of the SENSITIVITY and not of the verdict. A
+    /// per-verdict narrowing is a trap: the stored hash was taken over
+    /// whatever the *previous* write declared, so narrowing only on the runs
+    /// you want suppressed compares a narrow hash against a wide one and
+    /// reports `changed` — the opposite of the intent. The derived set has to
+    /// be constant for one producer.
+    pub fn derived_paths(&self) -> DerivedPaths {
+        DerivedPaths::new(self.noise.clone())
     }
 
     /// The distance at or below which a change is cosmetic.
@@ -278,26 +302,6 @@ impl Verdict {
         self.significance.is_news()
     }
 
-    /// The [`DerivedPaths`] the monitor's upsert should declare.
-    ///
-    /// **This is the lever.** A cosmetic verdict declares every path that
-    /// moved, so the change-detection hash equals the stored one: the record
-    /// body is rewritten (readers stay fresh) and no revision is appended, so
-    /// no subscribed watch, trigger or webhook fires. `always` is the monitor's
-    /// own computed-not-observed paths, declared whatever the verdict.
-    pub fn derived_paths<I, S>(&self, always: I) -> DerivedPaths
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let mut paths: Vec<String> = always.into_iter().map(Into::into).collect();
-        if !self.is_news() {
-            paths.extend(self.moved_paths.iter().cloned());
-            paths.extend(self.noise_paths_moved.iter().cloned());
-        }
-        DerivedPaths::new(paths)
-    }
-
     /// The `materiality` block a monitor reports and stores.
     pub fn to_value(&self) -> Value {
         json!({
@@ -313,15 +317,181 @@ impl Verdict {
 }
 
 /// **The judgment.** One signal plus one sensitivity is one verdict.
-pub fn judge(_signal: &Signal, _sensitivity: &Sensitivity) -> Verdict {
-    // STUB — replaced by the real judgment in the implementation commit.
+///
+/// Two gates, in this order:
+///
+/// 1. **Declared noise alone** — every path that moved is declared noise, so
+///    after stripping there is nothing left to measure. [`Significance::Cosmetic`]
+///    with distance `0`, and the reason names the paths.
+/// 2. **Magnitude** — the SimHash Hamming distance between the two
+///    noise-stripped fingerprints, read against the sensitivity's two bounds.
+///
+/// A first sighting short-circuits both: there is no prior fingerprint, so
+/// there is no magnitude, and the verdict is [`Significance::Structural`] with
+/// `None` for the distance rather than a fabricated `0` (which would read as
+/// "nothing changed" about a record nobody has ever seen).
+pub fn judge(signal: &Signal, sensitivity: &Sensitivity) -> Verdict {
+    let (previous_sim, current_sim, moved_paths, noise_paths_moved) =
+        match (&signal.previous, &signal.current) {
+            // Two records: the paths and the fingerprints both come from the
+            // values, with the declared noise stripped from each first — the
+            // same narrowing `DerivedPaths` applies to the write's hash.
+            (Some(previous), Some(current)) => {
+                let (moved, noise_moved) = partition_moved(previous, current, sensitivity);
+                (
+                    Some(simhash_value(&sensitivity.strip(previous))),
+                    simhash_value(&sensitivity.strip(current)),
+                    moved,
+                    noise_moved,
+                )
+            }
+            // Bodies or bare fingerprints: the caller supplies both, and names
+            // the moved paths itself if it knows them.
+            _ => (
+                signal.previous_sim,
+                signal.current_sim,
+                signal.moved_hint.clone().unwrap_or_default(),
+                Vec::new(),
+            ),
+        };
+
+    let Some(previous_sim) = previous_sim else {
+        return Verdict {
+            significance: Significance::Structural,
+            distance: None,
+            weight: 1.0,
+            moved_paths,
+            noise_paths_moved,
+            reason: "first sighting — no prior fingerprint to discount against".into(),
+        };
+    };
+
+    let distance = hamming(previous_sim, current_sim);
+    let weight = ramp(distance, sensitivity);
+
+    // Gate 1: only declared noise moved. Reported ahead of the distance check
+    // because the reason an operator needs is the PATH, not the arithmetic —
+    // and because a monitor that keeps landing here has a record that restates
+    // the clock rather than the content.
+    //
+    // Only reachable when the caller handed over the values, because only then
+    // does "no substantive path moved" mean anything. A bare fingerprint pair
+    // (the crawler) carries no paths and goes straight to the magnitude.
+    if signal.previous.is_some() && moved_paths.is_empty() {
+        let reason = if noise_paths_moved.is_empty() {
+            "nothing moved".to_string()
+        } else {
+            format!(
+                "only declared-noise path(s) moved: {}",
+                noise_paths_moved.join(", ")
+            )
+        };
+        return Verdict {
+            significance: Significance::Cosmetic,
+            distance: Some(distance),
+            weight,
+            moved_paths,
+            noise_paths_moved,
+            reason,
+        };
+    }
+
+    // Gate 2: magnitude.
+    let (significance, reason) = if distance <= sensitivity.cosmetic_at_or_below {
+        (
+            Significance::Cosmetic,
+            format!(
+                "the fingerprint moved {distance} bit(s) — at or below the cosmetic ceiling of {}",
+                sensitivity.cosmetic_at_or_below
+            ),
+        )
+    } else if distance >= sensitivity.structural_at_or_above {
+        (
+            Significance::Structural,
+            format!(
+                "the fingerprint moved {distance} bit(s) — at or above {}, so this may not be the \
+                 same document",
+                sensitivity.structural_at_or_above
+            ),
+        )
+    } else {
+        (
+            Significance::Material,
+            format!(
+                "the fingerprint moved {distance} bit(s), between the cosmetic ceiling of {} and \
+                 the structural bound of {}",
+                sensitivity.cosmetic_at_or_below, sensitivity.structural_at_or_above
+            ),
+        )
+    };
+
     Verdict {
-        significance: Significance::Material,
-        distance: None,
-        weight: 1.0,
-        moved_paths: Vec::new(),
-        noise_paths_moved: Vec::new(),
-        reason: "stub".into(),
+        significance,
+        distance: Some(distance),
+        weight,
+        moved_paths,
+        noise_paths_moved,
+        reason,
+    }
+}
+
+/// The change magnitude in `[0,1]`: `0.0` at or below the cosmetic ceiling,
+/// ramping linearly to `1.0` at the structural bound. The arithmetic
+/// [`crate::crawl::change_weight`] has always returned, now stated once.
+fn ramp(distance: u32, sensitivity: &Sensitivity) -> f64 {
+    if distance <= sensitivity.cosmetic_at_or_below {
+        return 0.0;
+    }
+    let span = sensitivity.structural_at_or_above - sensitivity.cosmetic_at_or_below;
+    (f64::from(distance - sensitivity.cosmetic_at_or_below) / f64::from(span)).min(1.0)
+}
+
+/// Splits the paths that differ between two records into `(substantive,
+/// declared noise)`. Walks objects, so a nested block reports as
+/// `history.stats` — the same `.`-separated addressing [`DerivedPaths`] uses.
+fn partition_moved(
+    previous: &Value,
+    current: &Value,
+    sensitivity: &Sensitivity,
+) -> (Vec<String>, Vec<String>) {
+    let mut moved = Vec::new();
+    collect_moved(previous, current, String::new(), &mut moved);
+    let (noise, substantive): (Vec<String>, Vec<String>) = moved
+        .into_iter()
+        .partition(|path| sensitivity.noise.iter().any(|n| n == path));
+    (substantive, noise)
+}
+
+/// Appends every `.`-separated path at which the two values differ. Two objects
+/// recurse; anything else compares whole, so a moved array reports as its own
+/// path rather than per index.
+fn collect_moved(previous: &Value, current: &Value, prefix: String, out: &mut Vec<String>) {
+    match (previous, current) {
+        (Value::Object(a), Value::Object(b)) => {
+            let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match (a.get(key), b.get(key)) {
+                    (Some(x), Some(y)) => collect_moved(x, y, path, out),
+                    // Appeared or vanished: the path itself moved.
+                    _ => out.push(path),
+                }
+            }
+        }
+        _ if previous != current => out.push(if prefix.is_empty() {
+            // Two non-object values compared whole — a monitor judging bare
+            // scalars. Named rather than pushed as an empty string.
+            "<record>".to_string()
+        } else {
+            prefix
+        }),
+        _ => {}
     }
 }
 
@@ -447,32 +617,18 @@ mod tests {
         assert!(v.reason().contains("first sighting"), "{}", v.reason());
     }
 
-    /// The lever: a cosmetic verdict declares the moved paths derived, so the
-    /// write's change-detection hash is the stored one and no revision is
-    /// appended. A material verdict declares only the monitor's own computed
-    /// paths, so the revision — and the alert — happens.
+    /// The lever: one declaration serves the judgment and the write, so the
+    /// paths the judge ignores are exactly the paths the change-detection hash
+    /// ignores. Two lists would be two answers again.
     #[test]
-    fn a_cosmetic_verdict_declares_the_moved_paths_derived_a_material_one_does_not() {
-        let cosmetic = judge(
-            &Signal::records(&doc(OLD_DOC), &doc(REFLOWED)),
-            &Sensitivity::default(),
-        );
-        let paths = cosmetic.derived_paths(["materiality"]);
-        assert!(
-            paths.paths().contains(&"markdown".to_string()),
-            "{paths:?} must withhold the revision"
-        );
+    fn the_declared_noise_is_the_same_set_the_write_narrows() {
+        let s = Sensitivity::default().noise(["fetched_at", "materiality"]);
+        assert_eq!(s.noise_paths(), ["fetched_at", "materiality"]);
+        assert_eq!(s.derived_paths().paths(), s.noise_paths());
 
-        let material = judge(
-            &Signal::records(&doc(OLD_DOC), &doc(NEW_DOC)),
-            &Sensitivity::default(),
-        );
-        let paths = material.derived_paths(["materiality"]);
-        assert_eq!(
-            paths.paths(),
-            ["materiality"],
-            "a material change must still append its revision"
-        );
+        // And an empty declaration is the byte-identical default — the whole
+        // safety argument for putting this on a shared write path.
+        assert!(Sensitivity::default().derived_paths().is_empty());
     }
 
     /// Inverted bounds would make every change structural. The constructor

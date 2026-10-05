@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{HttpClient, HttpRequest};
-use crate::simhash::{hamming, simhash};
+use crate::materiality;
+use crate::simhash::simhash;
 use crate::Result;
 
 const MAX_FRONTIER: usize = 100_000;
@@ -166,25 +167,27 @@ const CADENCE_EWMA_ALPHA: f64 = 0.3;
 /// due score of 1.0 (a baseline must be established).
 const DEFAULT_CADENCE_PRIOR_SECS: f64 = 7.0 * 86_400.0;
 
-/// SimHash Hamming distances at or below this are boilerplate churn (rotating
-/// ads, counters, timestamps) — same scale as the crawler's default
-/// `dedup_distance = 3` for "near-identical page".
-const BOILERPLATE_DISTANCE: u32 = 3;
-
 /// Grades how much a page really changed from the SimHash Hamming distance
 /// between the old and new body fingerprints: `0.0` at or below
-/// [`BOILERPLATE_DISTANCE`] (cosmetic churn must not look hot), ramping
-/// linearly to `1.0` at distance 16 (a solidly different document). An unknown
-/// old fingerprint (0) grades as a full change — no evidence to discount it.
+/// [`materiality::COSMETIC_AT_OR_BELOW`] (cosmetic churn must not look hot),
+/// ramping linearly to `1.0` at [`materiality::STRUCTURAL_AT_OR_ABOVE`] (a
+/// solidly different document). An unknown old fingerprint (`0`) grades as a
+/// full change — no evidence to discount it.
+///
+/// **This function is the crawler's view of one shared judgment, not a second
+/// copy of it.** It was the only correct answer to "is this change news?" in
+/// the whole tree, sitting in `core` with no monitor reaching for it while four
+/// apps invented their own; [`crate::materiality`] is now its home and this is
+/// the thin delegation that keeps the crawler's call site reading in the
+/// crawler's own units. The ceiling, the bound and the ramp live there once.
 pub fn change_weight(old_simhash: u64, new_simhash: u64) -> f64 {
-    if old_simhash == 0 {
-        return 1.0;
-    }
-    let d = hamming(old_simhash, new_simhash);
-    if d <= BOILERPLATE_DISTANCE {
-        return 0.0;
-    }
-    (f64::from(d - BOILERPLATE_DISTANCE) / f64::from(16 - BOILERPLATE_DISTANCE)).min(1.0)
+    materiality::judge(
+        // `0` is the crawler's stored sentinel for "never fingerprinted", which
+        // `Signal::fingerprints` reads as the first sighting it is.
+        &materiality::Signal::fingerprints(Some(old_simhash), new_simhash),
+        &materiality::Sensitivity::default(),
+    )
+    .weight()
 }
 
 /// Probability this URL has changed since its last check, under a Poisson
@@ -2102,6 +2105,9 @@ async fn seed_from_sitemaps(
 mod tests {
     use super::*;
     use crate::engine::HttpResponse;
+    // The banded-index tests verify the true Hamming distance themselves; the
+    // crawler's own code reaches it only through `materiality::judge` now.
+    use crate::simhash::hamming;
     use std::sync::Mutex as SyncMutex;
 
     #[test]

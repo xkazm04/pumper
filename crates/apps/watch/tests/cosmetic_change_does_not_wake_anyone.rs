@@ -108,16 +108,22 @@ async fn a_reordered_page_appends_no_revision_so_no_watch_fires() {
         "the cosmetic run appended a revision — every subscribed watch just fired"
     );
 
-    // ...and the record body still refreshed, so readers are not stuck on the
-    // stale text. Withholding the revision is not withholding the write.
+    // ...and the record HOLDS its baseline: the stored body is the last one
+    // worth telling someone about, so the next run's magnitude is measured
+    // against that and a page drifting a bit per run eventually crosses the
+    // bound instead of being cosmetic forever against a creeping baseline.
     let rec = datasets
         .get("watch", "pages", URL)
         .await
         .expect("get")
         .expect("record");
-    assert_ne!(
+    assert_eq!(
         rec.data["content_sha256"], first_sha,
-        "the stored body must track the live page"
+        "a cosmetic run must hold the baseline, not advance it"
+    );
+    assert_eq!(
+        rec.data["materiality"]["significance"], "cosmetic",
+        "but the verdict about the LIVE body is refreshed on the record"
     );
 }
 
