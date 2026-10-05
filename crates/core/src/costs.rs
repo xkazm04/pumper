@@ -84,6 +84,67 @@ impl CostSummary {
     }
 }
 
+/// One job's ledger, split by what we actually know about the money — the
+/// per-EVENT counterpart of [`CostSummary`], which is the per-GROUP one.
+///
+/// **The anti-pattern this replaces** was a single line —
+/// `let total: f64 = events.iter().map(|e| e.cost_usd).sum();` — which treated
+/// `$0`-because-free and `$0`-because-the-run-was-killed as the same number.
+/// A job that burned to its ceiling and was killed reported
+/// `{"total_usd": 0.0, "calls": 1}`, byte-identical to a job that served one
+/// free cache hit, and `cost_per_fresh_record_usd` then divided that zero by
+/// the record count and published a confident `$0.00` ROI that `GET /economics`
+/// advises budgets from.
+///
+/// **Why it lives in core rather than in the route that first needed it.** It
+/// began as a `pub(crate)` helper inside one route module, so the second
+/// surface in the same crate — the job receipt — wrote its own sum and dropped
+/// the certainty. Registry technique `measurement-honesty/lower-bound-disclosure`:
+/// declare the bound at the source of truth, not at the render site; a bound
+/// documented only in the component that draws it survives exactly until the
+/// second consumer appears.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CostRollup {
+    /// Sum of the money we can price. Never presented without its certainty.
+    pub billed_usd: f64,
+    /// Calls that WERE billed and whose amount is unreadable.
+    pub unmetered_calls: usize,
+    /// Calls where even "was this billed?" has no answer.
+    pub unknown_calls: usize,
+}
+
+impl CostRollup {
+    /// Calls whose `cost_usd` is a floor rather than a price.
+    pub fn uncertain_calls(&self) -> i64 {
+        (self.unmetered_calls + self.unknown_calls) as i64
+    }
+
+    /// `"exact"` or `"at_least"` — how `billed_usd` must be read.
+    pub fn total_certainty(&self) -> &'static str {
+        total_certainty(self.uncertain_calls())
+    }
+}
+
+/// Splits a job's cost events into [`CostRollup`].
+///
+/// Takes an iterator rather than a slice so a caller that has already grouped
+/// its events — the receipt's per-engine breakdown — can roll each group up
+/// through this one function instead of folding `cost_usd` by hand.
+pub fn roll_up<'a>(events: impl IntoIterator<Item = &'a CostEvent>) -> CostRollup {
+    let mut out = CostRollup::default();
+    for e in events {
+        match e.spend_certainty {
+            SpendCertainty::Unmetered => out.unmetered_calls += 1,
+            SpendCertainty::Unknown => out.unknown_calls += 1,
+            // `Billed` carries the real amount; `Free` carries a real zero.
+            // Both are prices, so both are summable.
+            SpendCertainty::Billed | SpendCertainty::Free => {}
+        }
+        out.billed_usd += e.cost_usd;
+    }
+    out
+}
+
 /// A job's running spend total, held in the job's `AppContext`.
 ///
 /// The pre-flight budget check runs on every metered call, and reading spend

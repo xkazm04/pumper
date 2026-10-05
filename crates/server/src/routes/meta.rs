@@ -638,6 +638,27 @@ fn cost_metrics(rows: &[pumper_core::CostSummary]) -> String {
             entry.app, entry.engine, entry.cost_usd
         ));
     }
+    // The companion series that makes the gauge above answerable. Without it a
+    // month of unmetered failures reads as a flat, reassuring spend line: the
+    // money is a LOWER BOUND and these rows already carry the counts saying so.
+    out.push_str(
+        "# HELP pumper_cost_uncertain_calls Calls in this group whose bill could not be read \
+         (unmetered + unknown). Non-zero means the matching pumper_cost_usd is a floor, not a \
+         price — see GET /costs?certainty=unmetered\n\
+         # TYPE pumper_cost_uncertain_calls gauge\n",
+    );
+    for entry in rows {
+        // Explicit zero, never an absent series: a clean group and a group that
+        // was never scraped must not look the same to an alert — the discipline
+        // pumper_remote_egress_fetches and pumper_checkpoint_failures_total
+        // already keep in this module.
+        out.push_str(&format!(
+            "pumper_cost_uncertain_calls{{app=\"{}\",engine=\"{}\"}} {}\n",
+            entry.app,
+            entry.engine,
+            entry.uncertain_calls()
+        ));
+    }
     out
 }
 
