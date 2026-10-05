@@ -159,6 +159,13 @@
         "crates/core/src/plugin.rs",
         "crates/server/src/registry.rs"
       ]
+    },
+    {
+      "_note": "The shared change-materiality judge: `is this change news?` for every monitor. Its user-visible surface is the `materiality` block each monitor reports (and that `watch` stores on the record), plus the distance bounds — all of which datasets.md answers for, beside the DerivedPaths seam the judge's declared noise feeds.",
+      "doc": "docs/features/datasets.md",
+      "sourceGlobs": [
+        "crates/core/src/materiality.rs"
+      ]
     }
   ]
 }
