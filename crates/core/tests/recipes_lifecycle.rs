@@ -52,11 +52,13 @@ fn fixture() -> ApiRecipe {
 /// Reads the two lifecycle columns straight out of the table, so a test asserts
 /// on stored state rather than on what an accessor chooses to surface.
 async fn row_state(pool: &SqlitePool, id: &str) -> (i64, Option<String>, Option<String>) {
-    sqlx::query_as("SELECT consecutive_failures, retired_at, last_failure_at FROM api_recipes WHERE id = ?1")
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .expect("recipe row")
+    sqlx::query_as(
+        "SELECT consecutive_failures, retired_at, last_failure_at FROM api_recipes WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("recipe row")
 }
 
 // ── case 1: the missing rung ─────────────────────────────────────────────────
@@ -90,8 +92,14 @@ async fn a_failing_candidate_retires_instead_of_being_picked_forever() {
     // The tenth strike retires it.
     recipes.record_failure(&id, 3).await.unwrap();
     let (failures, retired_at, _) = row_state(&store.storage.pool(), &id).await;
-    assert_eq!(failures, 10, "retirement keeps the evidence, it does not reset");
-    assert!(retired_at.is_some(), "the 10th strike must stamp retired_at");
+    assert_eq!(
+        failures, 10,
+        "retirement keeps the evidence, it does not reset"
+    );
+    assert!(
+        retired_at.is_some(),
+        "the 10th strike must stamp retired_at"
+    );
 
     // And the whole point: it is gone from selection, both ways.
     assert!(
@@ -103,7 +111,10 @@ async fn a_failing_candidate_retires_instead_of_being_picked_forever() {
     // Further strikes do not re-stamp or crash.
     recipes.record_failure(&id, 3).await.unwrap();
     let (_, again, _) = row_state(&store.storage.pool(), &id).await;
-    assert_eq!(again, retired_at, "retired_at is stamped once, not rewritten");
+    assert_eq!(
+        again, retired_at,
+        "retired_at is stamped once, not rewritten"
+    );
 }
 
 /// `retire_after = 0` disables the new rung entirely: today's behaviour, byte
@@ -142,7 +153,10 @@ async fn a_validated_recipe_demotes_to_candidate_and_is_not_retired() {
     );
 
     let (failures, retired_at, _) = row_state(&store.storage.pool(), &id).await;
-    assert_eq!(failures, 0, "demotion resets the counter, exactly as before");
+    assert_eq!(
+        failures, 0,
+        "demotion resets the counter, exactly as before"
+    );
     assert!(
         retired_at.is_none(),
         "demotion is not retirement — the row stays a candidate"
@@ -341,11 +355,13 @@ async fn the_0046_backfill_retires_over_threshold_candidates_exactly_once() {
     let mut old_candidate = fixture();
     old_candidate.url_template = "https://example.test/api/zombie?page={page}".into();
     let zombie = recipes.upsert(&old_candidate).await.unwrap();
-    sqlx::query("UPDATE api_recipes SET consecutive_failures = 50, retired_at = NULL WHERE id = ?1")
-        .bind(&zombie)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE api_recipes SET consecutive_failures = 50, retired_at = NULL WHERE id = ?1",
+    )
+    .bind(&zombie)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let healthy = recipes.upsert(&fixture()).await.unwrap();
     recipes.set_validated(&healthy, true).await.unwrap();
@@ -362,7 +378,10 @@ async fn the_0046_backfill_retires_over_threshold_candidates_exactly_once() {
     assert_eq!(zf, 50, "the back-fill must not touch consecutive_failures");
     assert!(z1.is_some(), "an over-threshold candidate is retired");
     assert_eq!(hf, 1, "the validated row's counter is untouched");
-    assert!(h1.is_none(), "a validated row is never retired by the back-fill");
+    assert!(
+        h1.is_none(),
+        "a validated row is never retired by the back-fill"
+    );
 
     // Second pass: idempotent, and it does not re-stamp.
     sqlx::query(backfill_sql()).execute(&pool).await.unwrap();
@@ -454,7 +473,10 @@ async fn a_retired_recipe_costs_the_fetcher_no_outbound_request() {
     assert!(
         out.trace.iter().any(|t| t.tier.as_str() == "api_recipe"),
         "control: the tier traces, got {:?}",
-        out.trace.iter().map(|t| t.tier.as_str()).collect::<Vec<_>>()
+        out.trace
+            .iter()
+            .map(|t| t.tier.as_str())
+            .collect::<Vec<_>>()
     );
 
     // The change: retire it, and the tier costs nothing at all.
@@ -472,7 +494,10 @@ async fn a_retired_recipe_costs_the_fetcher_no_outbound_request() {
     assert!(
         !out.trace.iter().any(|t| t.tier.as_str() == "api_recipe"),
         "a retired recipe must not even leave a tier trace: {:?}",
-        out.trace.iter().map(|t| t.tier.as_str()).collect::<Vec<_>>()
+        out.trace
+            .iter()
+            .map(|t| t.tier.as_str())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         http.other_calls.load(Ordering::SeqCst),
