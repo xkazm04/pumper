@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use crate::events::JobEvent;
 use crate::routes::error::{
-    default_limit, keyset_cursor, parse_cursor, parse_since, ApiError, MAX_ATTEMPTS_CAP,
+    default_limit, keyset_cursor, parse_cursor, parse_rfc3339_param, parse_since, ApiError,
+    MAX_ATTEMPTS_CAP,
 };
 use crate::state::AppState;
 
@@ -184,6 +185,22 @@ pub(crate) async fn enqueue_job(
 pub(crate) struct ListQuery {
     app: Option<String>,
     status: Option<String>,
+    /// The schedule that enqueued the job (`jobs.schedule_id`, migration 0012).
+    /// The run history `GET /schedules` only ever showed one row of.
+    schedule_id: Option<String>,
+    /// The trigger hop that enqueued the job (`jobs.trigger_id`, 0014).
+    trigger_id: Option<String>,
+    /// The dedup target (`jobs.target_key`, 0041). Deliberately NOT scoped to
+    /// an app: a target is shared across apps, which is the whole point of it.
+    target_key: Option<String>,
+    /// Inclusive RFC-3339 lower bound on `created_at`.
+    since: Option<String>,
+    /// **Exclusive** RFC-3339 upper bound on `created_at`, so adjacent windows
+    /// partition rather than overlap.
+    until: Option<String>,
+    /// `status` — answer `{total, counts}` from one `GROUP BY` over the same
+    /// filters instead of the rows themselves.
+    rollup: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
     /// Opaque keyset cursor. Presence (even empty, for page 1) switches the
@@ -191,17 +208,71 @@ pub(crate) struct ListQuery {
     cursor: Option<String>,
 }
 
-#[utoipa::path(
-    get,
-    path = "/jobs",
-    tag = "jobs",
-    params(ListQuery),
-    responses((status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset."))
-)]
-pub(crate) async fn list_jobs(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Result<Json<Value>, ApiError> {
+/// Every query param `GET /jobs` understands — the inventory
+/// [`unknown_list_params`] refuses against, and the list its refusal prints.
+///
+/// It is a declared constant rather than something derived from `ListQuery`
+/// because serde has no runtime field list; the paired test
+/// `an_unknown_query_param_is_refused_not_dropped` walks BOTH directions (every
+/// name here is accepted, three near-misses are refused), which is what keeps
+/// the two in step.
+pub(crate) const JOB_LIST_PARAMS: &[&str] = &[
+    "app",
+    "status",
+    "schedule_id",
+    "trigger_id",
+    "target_key",
+    "since",
+    "until",
+    "rollup",
+    "limit",
+    "cursor",
+];
+
+/// The query-string keys this endpoint does not understand, in the order they
+/// appeared.
+///
+/// Why this exists at all: `ListQuery` is a plain serde `Deserialize`, and
+/// serde **silently drops** a field it has no slot for. Before the lineage
+/// params landed, `?schedule_id=S` therefore answered `200` with the
+/// *unfiltered* list — an operator who assumed the obvious param existed got a
+/// wrong answer wearing a right answer's status code. Adding the five params
+/// fixes the five; refusing the unknown closes the class, so the next
+/// `?scheduleId=` or `?source_job_id=` is a 400 the caller can act on instead
+/// of a plausible lie.
+///
+/// Keys only — a value is never inspected and never echoed, so a refusal
+/// cannot reflect caller-supplied content back. `?x` with no `=` counts as the
+/// key `x`; a bare `&` contributes nothing.
+pub(crate) fn unknown_list_params(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split('&')
+        .map(|pair| pair.split('=').next().unwrap_or(""))
+        .filter(|key| !key.is_empty() && !JOB_LIST_PARAMS.contains(key))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `?rollup=` is a closed vocabulary of one. A typo must be a 400, not a
+/// silent fall-through to the row list — the same posture `parse_removed` and
+/// `parse_feed_order` already take on this API.
+pub(crate) fn parse_rollup(raw: Option<&str>) -> Result<bool, ApiError> {
+    match raw {
+        None => Ok(false),
+        Some("status") => Ok(true),
+        Some(other) => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid 'rollup': '{other}' — the only rollup is 'status'"),
+        )),
+    }
+}
+
+/// `ListQuery` → the store's predicate set, with every value validated.
+///
+/// Extracted so the two response modes and the rollup cannot build three
+/// slightly different queries out of one request — the divergence that made
+/// `GET /datasets/{app}/{ds}` answer `trust=` three ways.
+pub(crate) fn job_query(query: &ListQuery) -> Result<pumper_core::storage::JobQuery, ApiError> {
     let status = query
         .status
         .as_deref()
@@ -210,12 +281,63 @@ pub(crate) async fn list_jobs(
                 .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("invalid status '{s}'")))
         })
         .transpose()?;
-    let limit = query.limit.clamp(1, 500);
-    let q = pumper_core::storage::JobQuery {
+    Ok(pumper_core::storage::JobQuery {
         app: query.app.clone(),
         status,
-        ..Default::default()
-    };
+        schedule_id: query.schedule_id.clone(),
+        trigger_id: query.trigger_id.clone(),
+        target_key: query.target_key.clone(),
+        since: parse_since(query.since.as_deref())?,
+        until: parse_rfc3339_param("until", query.until.as_deref())?,
+    })
+}
+
+/// `{total, counts}` out of the store's `(status, count)` rows.
+///
+/// `total` is summed from the same rows the counts come from, so the two halves
+/// of the answer cannot disagree. A status the window does not hold is
+/// **absent**, not `0`: five invented zeroes per response would make "no
+/// failures last night" and "no runs last night" read identically.
+pub(crate) fn rollup_body(counts: &[(String, i64)]) -> Value {
+    let total: i64 = counts.iter().map(|(_, n)| *n).sum();
+    let map: serde_json::Map<String, Value> = counts
+        .iter()
+        .map(|(status, n)| (status.clone(), json!(n)))
+        .collect();
+    json!({ "total": total, "counts": map })
+}
+
+#[utoipa::path(
+    get,
+    path = "/jobs",
+    tag = "jobs",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset. With `rollup=status`, `{total, counts}` from one GROUP BY over the same filters."),
+        (status = 400, description = "A query param this endpoint does not understand, an unparseable `since`/`until`, an unknown `status`, or a `rollup` other than `status`", body = Object),
+    )
+)]
+pub(crate) async fn list_jobs(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let unknown = unknown_list_params(raw.as_deref());
+    if !unknown.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown query param(s) {unknown:?} on GET /jobs — understood: {}",
+                JOB_LIST_PARAMS.join(", ")
+            ),
+        ));
+    }
+    let q = job_query(&query)?;
+    if parse_rollup(query.rollup.as_deref())? {
+        let counts = state.storage.status_counts_filtered(&q).await?;
+        return Ok(Json(rollup_body(&counts)));
+    }
+    let limit = query.limit.clamp(1, 500);
     let Some(cursor) = &query.cursor else {
         let jobs = state.storage.list(&q, limit).await?;
         return Ok(Json(json!(jobs)));
@@ -588,6 +710,112 @@ pub(crate) async fn cost_summary(
         "total_certainty": total_certainty(unmetered + unknown),
         "by_app_engine": summary,
     })))
+}
+
+#[cfg(test)]
+mod list_query_tests {
+    use super::{parse_rollup, rollup_body, unknown_list_params, JOB_LIST_PARAMS};
+    use serde_json::json;
+
+    /// The anti-pattern: serde drops a field it has no slot for, so a query
+    /// param this endpoint cannot honour used to come back as a 200 with the
+    /// *unfiltered* list. Every near-miss of a real param is the shape that
+    /// actually bites.
+    #[test]
+    fn a_near_miss_of_a_real_param_is_not_silently_dropped() {
+        for raw in [
+            "scheduleId=S",
+            "schedule=S",
+            "Schedule_Id=S",
+            "source_job_id=x",
+            "app=a&scheduleid=S",
+            "limit=10&foo",
+        ] {
+            assert!(
+                !unknown_list_params(Some(raw)).is_empty(),
+                "'{raw}' holds a param GET /jobs cannot honour and must be refused, \
+                 not answered with an unfiltered list"
+            );
+        }
+    }
+
+    /// The other direction, which is what keeps the inventory honest: a guard
+    /// that refuses everything would pass the test above. Every name the
+    /// endpoint declares must still be accepted, in every position.
+    #[test]
+    fn every_declared_param_is_accepted() {
+        for name in JOB_LIST_PARAMS {
+            assert!(
+                unknown_list_params(Some(&format!("{name}=x"))).is_empty(),
+                "'{name}' is in JOB_LIST_PARAMS and must be understood"
+            );
+        }
+        let all: Vec<String> = JOB_LIST_PARAMS.iter().map(|p| format!("{p}=x")).collect();
+        assert!(unknown_list_params(Some(&all.join("&"))).is_empty());
+        // No query string at all, and an empty one, are both fine.
+        assert!(unknown_list_params(None).is_empty());
+        assert!(unknown_list_params(Some("")).is_empty());
+        assert!(unknown_list_params(Some("&&")).is_empty());
+    }
+
+    /// Keys only: a value is never inspected, so a value that happens to look
+    /// like a param name cannot be mistaken for one — and nothing the caller
+    /// supplied is echoed back out of a value.
+    #[test]
+    fn only_keys_are_inspected_never_values() {
+        assert!(unknown_list_params(Some("app=nonsense=more")).is_empty());
+        assert_eq!(
+            unknown_list_params(Some("cursor=a&b")),
+            vec!["b".to_string()],
+            "a second pair is a second KEY, not part of the first value"
+        );
+        assert_eq!(
+            unknown_list_params(Some("nope=app")),
+            vec!["nope".to_string()],
+            "the OFFENDING KEY is what comes back, not the value beside it"
+        );
+    }
+
+    /// `rollup` is a closed vocabulary of one; a typo is the caller's mistake,
+    /// not a silent fall-through to the row list (which would answer a
+    /// completely different question with a 200).
+    #[test]
+    fn rollup_is_a_closed_vocabulary_not_a_fall_through() {
+        assert!(!parse_rollup(None).expect("absent is fine"));
+        assert!(parse_rollup(Some("status")).expect("the one rollup"));
+        for bad in ["Status", "statuses", "state", "", "status "] {
+            let Err(err) = parse_rollup(Some(bad)) else {
+                panic!("'{bad}' must not parse as a rollup")
+            };
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                err.1.contains("rollup") && err.1.contains("status"),
+                "the refusal must name the param and the one legal value: {}",
+                err.1
+            );
+        }
+    }
+
+    /// `total` is summed from the very rows the counts come from, so the two
+    /// halves of one answer cannot disagree — and a status the window does not
+    /// hold is ABSENT rather than an invented zero.
+    #[test]
+    fn rollup_total_is_summed_from_its_own_counts_and_zeroes_are_not_invented() {
+        let body = rollup_body(&[("failed".into(), 3), ("succeeded".into(), 12)]);
+        assert_eq!(
+            body,
+            json!({"total": 15, "counts": {"failed": 3, "succeeded": 12}})
+        );
+        assert!(
+            body["counts"].get("queued").is_none(),
+            "an unheld status is absent: {body}"
+        );
+        assert_eq!(
+            rollup_body(&[]),
+            json!({"total": 0, "counts": {}}),
+            "an empty window is a total of zero over no counts, not an error"
+        );
+    }
 }
 
 #[cfg(test)]

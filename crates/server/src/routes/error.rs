@@ -228,18 +228,29 @@ pub(crate) fn lock_advisory<'a, T>(
     }
 }
 
+/// Parses an optional RFC-3339 date query param, naming the param it refused.
+///
+/// One function for every date param on the API: a caller who mistyped `until`
+/// must be told `until`, and a second copy of this three-line parse is exactly
+/// how one surface comes to answer `400 invalid 'since'` for a bad `until`.
+pub(crate) fn parse_rfc3339_param(
+    name: &'static str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    raw.map(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid '{name}': {e}")))
+    })
+    .transpose()
+}
+
 /// Parses an optional RFC-3339 `since` query param. A malformed value is the
 /// client's mistake, so it is a 400 — not the blanket 500 a bare `?` would give.
 pub(crate) fn parse_since(
     since: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
-    since
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
-        })
-        .transpose()
+    parse_rfc3339_param("since", since)
 }
 
 pub(crate) fn default_limit() -> i64 {
