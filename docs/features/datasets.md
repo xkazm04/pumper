@@ -314,6 +314,32 @@ reindex` will rewrite, so running the remediation clears the finding.
 > it is empty on every correctly-migrated database, which
 > `the_triggers_rebuild_scaffold_does_not_survive_migration` pins.
 
+## Migration 0046 — `api_recipes` gains two lifecycle columns
+
+Additive and nullable, so the chain stays zero-downtime:
+
+| column | meaning |
+| --- | --- |
+| `retired_at` | `NULL` = live (candidate or validated); stamped = **retired**, and a retired recipe is invisible to `best_for_host` at every opt-in level. Reversible — `POST /recipes/{id}/revive` clears it. |
+| `last_failure_at` | when the most recent strike landed, so `GET /recipes` can show *when* a recipe started failing and not only how often. Cleared by a successful replay. |
+
+**The back-fill, and the three guards on it.** A candidate already past the
+shipping `[recipes] retire_after` (10) was being replayed on every fetch of its
+host before the rung existed, so it retires on arrival rather than needing ten
+more live strikes. The `UPDATE` is guarded on `retired_at IS NULL` (idempotent,
+and a second pass never re-stamps), on `validated = 0` (a validated recipe takes
+the *other* rung — `max_failures` demotes it to candidate first — so retiring one
+here would skip its demotion), and it writes **nothing** to
+`consecutive_failures`: the strike count is the evidence an operator reads
+before deciding to revive, and a back-fill that reset it would retire the row
+and erase the reason in the same statement. All three are pinned by
+`crates/core/tests/recipes_lifecycle.rs`, which executes the shipped SQL read
+out of the migration file itself rather than a paraphrase of it.
+
+`api_recipes` is **not** in `prune_ledgers` and still has no `DELETE` anywhere
+in the tree. That is deliberate: retirement is the terminal state and it is
+reversible. See [fetching.md § The recipe lifecycle](fetching.md#the-recipe-lifecycle-candidate--validated--retired).
+
 ## Known gaps
 
 - **Duplicate scan** uses banded SimHash bucketing (`simhash::BandedIndex`, shared with the crawler's near-dup gate): candidates come from `distance + 1` contiguous bit-bands and are then verified by exact Hamming, so the pair set, the `MAX_DUP_PAIRS`=10,000 cap and the result ordering are identical to the all-pairs scan it replaced. Bands are `64 / (distance + 1)` bits wide, so **the index turns banding off above distance 5** and verifies against a plain walk — same answers, linear candidate generation. At the distance every real caller uses (3: the `/duplicates` default and grants `link_duplicates`) a 50k-record scan measured **~0.8s vs ~23s** for the all-pairs sweep.
