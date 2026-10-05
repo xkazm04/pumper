@@ -54,6 +54,9 @@ impl HttpClient for RecordingHttp {
 /// A headless state whose engine set carries `http` as its HTTP engine and
 /// whose `[remote]` is configured by `remote`.
 async fn proxy_state(http: Arc<dyn HttpClient>, remote: RemoteConfig) -> (AppState, TempStore) {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("fetch-proxy-e2e").await;
     let mut config = Config::default();
     config.storage.database_path = store.path().join("pumper.db");

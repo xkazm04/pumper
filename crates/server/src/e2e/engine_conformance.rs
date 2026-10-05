@@ -184,6 +184,9 @@ fn http_engine_with_retries(store: &TempStore) -> Arc<HttpEngine> {
 /// wiring. A new engine now has to state its answer here, in review, once.
 #[tokio::test]
 async fn every_production_http_client_answers_the_same_battery() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance").await;
     let origin = binary_origin().await;
     let bytes_url = format!("{origin}/artifact.zip");
@@ -257,6 +260,9 @@ async fn every_production_http_client_answers_the_same_battery() {
 /// nothing failing first.
 #[tokio::test]
 async fn whatever_sits_at_engineset_http_can_fetch_bytes() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance-wiring").await;
     let origin = binary_origin().await;
     let http = http_engine(&store);
@@ -326,6 +332,9 @@ fn refused_flow() -> TransactRequest {
 /// trait's, not one implementor's: a flow refusal fails ONCE.
 #[tokio::test]
 async fn a_flow_refusal_fails_once_instead_of_burning_the_retry_ladder() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance-flows").await;
     let browsers: Vec<(&str, Arc<dyn Browser>)> = vec![
         // The trait default — what every non-opted-in engine inherits.
@@ -379,6 +388,9 @@ const UNSAFE_PROFILE: &str = "portal login";
 /// rather than appearing by accident.
 #[tokio::test]
 async fn a_deterministic_profile_refusal_fails_once_on_every_seam() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance-profile").await;
     let browser = BrowserEngine::new(
         &pumper_core::config::BrowserConfig::default(),
@@ -455,6 +467,9 @@ async fn a_deterministic_profile_refusal_fails_once_on_every_seam() {
 /// it as a real profile, indistinguishable from one not logged in yet.
 #[tokio::test]
 async fn an_absent_profile_is_marked_on_the_response_and_never_invents_a_profile() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance-absent-profile").await;
     let vault = store.path().join("profiles");
     let http = http_engine(&store);
@@ -509,6 +524,9 @@ const REFUSED_URL: &str = DEAD_URL;
 /// the refused-connection row would mean a resolver blip now fails a job.
 #[tokio::test]
 async fn a_deterministic_transport_refusal_fails_once_on_every_seam() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("engine-conformance-transport").await;
     let http = http_engine_with_retries(&store);
 
@@ -663,6 +681,9 @@ fn production_http_clients() -> BTreeMap<String, ()> {
 /// this whole direction exists to end.
 #[test]
 fn every_production_http_client_is_in_the_battery_or_exempt_with_a_reason() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     // ── in the battery ───────────────────────────────────────────────────────
     const IN_BATTERY: &[&str] = &[
         "crates/engine-http/src/lib.rs::HttpEngine",
@@ -722,6 +743,9 @@ fn every_production_http_client_is_in_the_battery_or_exempt_with_a_reason() {
 /// serves binary bodies before updating this test.
 #[test]
 fn the_server_still_wires_the_binary_capable_engine_at_engineset_http() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let state_rs = workspace_root().join("crates/server/src/state.rs");
     let text = std::fs::read_to_string(&state_rs).expect("read state.rs");
     let joined: String = text

@@ -42,6 +42,7 @@ use pumper_core::{PluginHook, Plugins, Trigger, TriggerPluginHooks};
 use pumper_engine_wasm::WasmPluginHost;
 use serde_json::{json, Value};
 
+use super::harness::{timed_claim_holds, Claim};
 use crate::triggers::{
     apply_plugin_hooks, external_trigger_obj, host_owned_overrides, predicate_verdict, HookSlot,
 };
@@ -243,6 +244,9 @@ const TRANSFORM_OUTPUTS: &[(&str, &str)] = &[
 /// A real `WasmPluginHost` over a private temp dir holding every fixture in
 /// this file. One host per test so parallel tests do not share a directory.
 fn host(tag: &str) -> Arc<dyn Plugins> {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let dir = std::env::temp_dir().join(format!("pumper-hook-stages-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("fixture dir");
@@ -335,8 +339,16 @@ async fn the_predicate_stage_answers_or_records_across_the_verdict_grammar() {
 
         let started = Instant::now();
         let verdict = apply_plugin_hooks(plugins.as_ref(), &t, obj.clone()).await;
-        let elapsed = started.elapsed().as_millis();
-        if elapsed > WALL_CEILING_MS {
+        // Counted rather than asserted per case (one slow case is noise; a
+        // population of them is a finding), but still routed through the
+        // harness so the breach carries its figures into the failure footer.
+        if !timed_claim_holds(
+            "a fuel-bounded predicate call stays inside its wall-clock ceiling",
+            Claim::AtMost {
+                measured_ms: started.elapsed().as_millis() as f64,
+                limit_ms: WALL_CEILING_MS as f64,
+            },
+        ) {
             over_budget += 1;
         }
 
@@ -485,7 +497,13 @@ async fn the_transform_stage_restamps_or_records_including_behind_a_stopped_pred
 
         let started = Instant::now();
         let verdict = apply_plugin_hooks(plugins.as_ref(), &t, obj.clone()).await;
-        if started.elapsed().as_millis() > WALL_CEILING_MS {
+        if !timed_claim_holds(
+            "a fuel-bounded transform call stays inside its wall-clock ceiling",
+            Claim::AtMost {
+                measured_ms: started.elapsed().as_millis() as f64,
+                limit_ms: WALL_CEILING_MS as f64,
+            },
+        ) {
             over_budget += 1;
         }
 

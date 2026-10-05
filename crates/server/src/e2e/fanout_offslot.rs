@@ -18,7 +18,7 @@ use pumper_core::{
 };
 use serde_json::json;
 
-use super::harness::{test_state_indexed, wait_status, FakeApp, WorkerLoop};
+use super::harness::{test_state_indexed, timed_claim, wait_status, Claim, FakeApp, WorkerLoop};
 
 /// A search index that takes `delay` to accept a batch, and counts batches.
 /// Everything else is `NoSearch`.
@@ -122,10 +122,19 @@ async fn a_slow_index_no_longer_holds_a_scrape_permit() {
     // 40ms ≈ 120ms. Asserting only a 2× improvement leaves generous headroom
     // for a loaded CI box while still failing if the fan-out creeps back onto
     // the permit.
-    assert!(
-        offslot_ms * 2 < inline_ms,
-        "moving the fan-out off the permit must at least halve the drain time; \
-         inline {inline_ms}ms vs off-slot {offslot_ms}ms"
+    // Through `timed_claim` because the margin is the decision: a failure at
+    // 1.97x of a required 2.00x is a loaded box and one at 0.4x is a
+    // regression, and a bare `assert!` renders those identically. This test was
+    // written down as load-flaky in .perfect/Perfect/sessions/2026-08-04-2.md
+    // and is still on the blocking path, so the one thing a reader needs is how
+    // close it came.
+    timed_claim(
+        "moving the fan-out off the worker permit at least halves the drain",
+        Claim::SpeedupAtLeast {
+            fast_ms: offslot_ms as f64,
+            slow_ms: inline_ms as f64,
+            factor: 2.0,
+        },
     );
 }
 
@@ -167,15 +176,21 @@ async fn off_slot_fanout_still_completes_and_records_its_stage_timings() {
         "the scrape stage is always measured"
     );
     let index_ms = stages.index_ms.expect("the index stage ran");
-    assert!(
-        index_ms >= 50,
-        "the index stage must account for the index's own latency, got {index_ms}ms"
+    timed_claim(
+        "the index stage accounts for the index's own latency",
+        Claim::AtLeast {
+            measured_ms: index_ms as f64,
+            floor_ms: 50.0,
+        },
     );
     assert!(stages.alerts_ms.is_some(), "the alert stage ran");
     let total = stages.total_ms.expect("total is always closed");
-    assert!(
-        total >= index_ms,
-        "total ({total}ms) must cover the stages it contains ({index_ms}ms)"
+    timed_claim(
+        "the total covers the stages it contains",
+        Claim::AtLeast {
+            measured_ms: total as f64,
+            floor_ms: index_ms as f64,
+        },
     );
 }
 
@@ -206,6 +221,7 @@ async fn shutdown_drains_in_flight_fanout_instead_of_dropping_it() {
     // The row goes terminal the moment the completion lands — i.e. while the
     // fan-out is still running on the pool. Shutting down here is exactly the
     // race the drain has to cover.
+    let armed = std::time::Instant::now();
     wait_status(
         &state,
         job.id,
@@ -213,11 +229,25 @@ async fn shutdown_drains_in_flight_fanout_instead_of_dropping_it() {
         Duration::from_secs(30),
     )
     .await;
+    let to_terminal = armed.elapsed();
+    // The precondition, stated as the measurement it actually is. The old
+    // message here read "...or this test isn't exercising the race", which
+    // under a parallel cargo run sends the reader off to rewrite a test that
+    // was right: the real cause is a scheduler stall that let the 400ms index
+    // finish first. The figures say which it was.
+    timed_claim(
+        "the job reaches its terminal state inside the index's 400ms window",
+        Claim::AtMost {
+            measured_ms: to_terminal.as_millis() as f64,
+            limit_ms: 400.0,
+        },
+    );
     assert_eq!(
         batches.load(Ordering::SeqCst),
         0,
-        "the job must reach its terminal state BEFORE the index finishes, or this \
-         test isn't exercising the race"
+        "the index finished before the job went terminal ({to_terminal:?} to terminal, \
+         400ms index), so the drain race is not being exercised — on a loaded box read \
+         this as a scheduler stall, not as a flaw in the test's design"
     );
 
     worker_loop.shutdown(&state, Duration::from_secs(30)).await;

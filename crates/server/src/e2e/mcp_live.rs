@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
 
-use super::harness::{test_state, FakeApp};
+use super::harness::{test_state, timed_claim, Claim, FakeApp};
 use crate::events::JobEvent;
 use crate::mcp::handle_rpc;
 use crate::state::AppState;
@@ -229,10 +229,12 @@ async fn wait_job_times_out_at_the_config_cap_and_resolves_on_terminal_event() {
     assert_eq!(out["timed_out"], true);
     assert_eq!(out["waited_secs"], 1);
     assert_eq!(out["status"], "queued");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "cap must bound the wait: {:?}",
-        started.elapsed()
+    timed_claim(
+        "the server-side cap bounds a 999s wait_job request",
+        Claim::AtMost {
+            measured_ms: started.elapsed().as_millis() as f64,
+            limit_ms: 5_000.0,
+        },
     );
 
     // A terminal transition on the bus resolves the wait early.

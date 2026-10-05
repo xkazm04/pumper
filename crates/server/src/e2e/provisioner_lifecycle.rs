@@ -93,6 +93,9 @@ fn scripted_researcher() -> Arc<ScriptedResearcher> {
 /// A headless state with the real `provisioner` app registered and
 /// [`ListingHost`] + [`scripted_researcher`] wired as its engines.
 async fn lifecycle_state(proposal_max_age_secs: u64) -> (AppState, TempStore) {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("provisioner-lifecycle-e2e").await;
     let mut config = Config::default();
     config.storage.database_path = store.path().join("pumper.db");
