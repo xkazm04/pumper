@@ -769,11 +769,15 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // spend must still count toward the ceiling. Fail-open per the worker
     // convention — an unreadable ledger must not block the run, it only means
     // this attempt starts its accounting from zero.
-    let spent_seed = match state.costs.job_total(job.id).await {
-        Ok(total) => total,
+    //
+    // Seeded as a `JobSpend`, not a bare `f64`: prior attempts' *unreadable*
+    // bills count against the ceiling too, and a retry that forgot them would
+    // hand a job that spent unmeasurable money a clean, confident headroom.
+    let spent_seed = match state.costs.job_spend(job.id).await {
+        Ok(spend) => spend,
         Err(e) => {
             warn!(job = %job.id, "cost ledger read failed, seeding spend at 0: {e}");
-            0.0
+            pumper_core::costs::JobSpend::default()
         }
     };
     // Held past the run: the sink is the only place that knows a checkpoint did
@@ -798,7 +802,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         // M26: a `cost:pause` DataHub tag on the app's datasets forces $0 —
         // the budget governor then serves free tiers only (reversible pause).
         budget_usd: crate::datahub::effective_budget(&state, &job.app, job.budget_usd),
-        spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
+        spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::from_spend(
+            spent_seed,
+            state.config.costs.budget_imputation,
+        )),
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
