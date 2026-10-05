@@ -1316,6 +1316,11 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     // to DataHub. Off-slot (on this pool) and fail-open — a down GMS never
     // touches jobs, and a shutdown drains or loudly counts the emission
     // rather than dropping it.
+    // Did this run write where it never said it would? Both populations were
+    // already computed — `index_specs` is the declaration, the run's own
+    // revision log is the observation — and nothing diffed them. Fail-open and
+    // purely a report: it runs after the fan-out and cannot touch the outcome.
+    report_undeclared_writes(&state, &job, &index_specs).await;
     crate::datahub::on_job_success(&state, &job, index_specs).await;
 
     // Stamp where the wall-clock went before the terminal event, so the event
@@ -1923,7 +1928,7 @@ fn watch_covers_entry(watch: &pumper_core::Watch, app: &str, dataset: &str) -> b
 ///
 /// Order-preserving and de-duplicated (job app first); empty app names are
 /// dropped, since an empty namespace matches nothing.
-fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<String> {
+pub(crate) fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<String> {
     let mut apps: Vec<String> = Vec::with_capacity(1 + index_specs.len());
     for app in std::iter::once(job_app).chain(index_specs.iter().map(|(a, _)| a.as_str())) {
         if !app.is_empty() && !apps.iter().any(|seen| seen == app) {
@@ -1931,6 +1936,73 @@ fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<Stri
         }
     }
     apps
+}
+
+/// The `(app, dataset)` pairs a run actually WROTE that its own declaration
+/// does not name — the diff this repo computed neither half of until now.
+///
+/// **The two populations already existed.** `run_indexed_apps` /
+/// `index_dataset_specs` are what the run DECLARED; `Storage::job_revision_counts`
+/// (`WHERE job_id = ?1 GROUP BY app, dataset`) is what it OBSERVABLY wrote.
+/// Nothing diffed them, so a namespace written and not declared was found only
+/// by a human noticing — twice so far (`ca-grants` writing `grants/unified`,
+/// `peer` writing `peer_<origin>/<dataset>`; see `load_run_changes`).
+///
+/// **Why a write under `job_app` is never undeclared.** An app owns its own
+/// namespace and writes plenty of internal datasets there (`mpsv-vpm` alone has
+/// eight it deliberately excludes from indexing). Flagging those would make the
+/// signal fire on every run, and a signal that is always on is not a signal.
+/// A VIRTUAL namespace is different: it is a declaration contract, and the only
+/// thing that puts a record in reach of a watch, a dataset trigger or a saved
+/// search scoped to it is the run naming it. So the rule is: outside `job_app`,
+/// the exact `(app, dataset)` pair must be declared.
+///
+/// Deduplicated and sorted, so the receipt does not shuffle between reads.
+pub(crate) fn undeclared_write_namespaces(
+    observed: &[(String, String)],
+    job_app: &str,
+    declared_specs: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in observed {
+        let (app, dataset) = pair;
+        if app == job_app {
+            continue;
+        }
+        if declared_specs.iter().any(|(a, d)| a == app && d == dataset) {
+            continue;
+        }
+        if out.iter().any(|(a, d)| a == app && d == dataset) {
+            continue;
+        }
+        out.push(pair.clone());
+    }
+    out.sort();
+    out
+}
+
+/// Logs one WARN per namespace this run wrote and did not declare. Fail-open in
+/// the strict sense: a store error is warned and dropped, and NOTHING here can
+/// change the job outcome — this is a report about a run that already happened.
+async fn report_undeclared_writes(state: &AppState, job: &Job, index_specs: &[(String, String)]) {
+    let counts = match state.storage.job_revision_counts(job.id).await {
+        Ok(counts) => counts,
+        Err(e) => {
+            warn!(job = %job.id, app = %job.app, "write-coverage check skipped: {e}");
+            return;
+        }
+    };
+    let observed: Vec<(String, String)> = counts
+        .iter()
+        .map(|c| (c.app.clone(), c.dataset.clone()))
+        .collect();
+    for (app, dataset) in undeclared_write_namespaces(&observed, &job.app, index_specs) {
+        warn!(
+            job = %job.id, job_app = %job.app, %app, %dataset,
+            "undeclared write: this run wrote `{app}/{dataset}`, a namespace outside its own              app that its result's `index_datasets` does not name. Those records get no              per-record search document, and unless another spec declares `{app}` they are              out of reach of every watch and dataset trigger too. See              GET /jobs/{job_id}/receipt -> coverage.undeclared",
+            job_id = job.id
+        );
+    }
 }
 
 /// Whether a saved search's `app` filter covers a run that indexed under
@@ -3348,6 +3420,91 @@ mod saved_search_scope_tests {
             run_indexed_apps("grants", &specs),
             vec!["grants".to_string()],
             "job app equal to the virtual app collapses to one entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_coverage_tests {
+    use super::undeclared_write_namespaces;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, d)| (a.to_string(), d.to_string()))
+            .collect()
+    }
+
+    /// The anti-pattern this guards: a detector that flags **every write whose
+    /// app is not `job.app`**. That would fire on every `peer` pull, every
+    /// `ca-grants` run and every MPSV run — all of which write outside their
+    /// job app on purpose and SAY SO. A signal that is always on is not one.
+    #[test]
+    fn undeclared_write_namespaces_not_every_write_outside_job_app() {
+        // The card's base case: `b/y` is outside the job app and undeclared.
+        assert_eq!(
+            undeclared_write_namespaces(&pairs(&[("a", "x"), ("b", "y")]), "a", &[]),
+            pairs(&[("b", "y")])
+        );
+        // Declaring it is what makes it not rogue — this is the control.
+        assert_eq!(
+            undeclared_write_namespaces(
+                &pairs(&[("a", "x"), ("b", "y")]),
+                "a",
+                &pairs(&[("b", "y")])
+            ),
+            Vec::<(String, String)>::new()
+        );
+        // Nothing written, nothing reported.
+        assert_eq!(
+            undeclared_write_namespaces(&[], "a", &pairs(&[("b", "y")])),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// An app's own namespace is its own business: `mpsv-vpm` writes eight
+    /// datasets it deliberately keeps out of `INDEXED_DATASETS`, and none of
+    /// them is a coverage defect. Only a VIRTUAL namespace is a contract.
+    #[test]
+    fn a_runs_own_app_is_never_undeclared_however_many_datasets_it_writes() {
+        let observed = pairs(&[
+            ("mpsv-vpm", "vacancy_samples"),
+            ("mpsv-vpm", "employers"),
+            ("mpsv-vpm", "region_agg"),
+        ]);
+        assert!(
+            undeclared_write_namespaces(&observed, "mpsv-vpm", &[]).is_empty(),
+            "the job app owns its namespace; indexing it is a separate decision"
+        );
+    }
+
+    /// The real shape of the defect: a declared virtual app, an UNDECLARED
+    /// dataset inside it. `cz-labour` is named by the run; `skill_demand` is
+    /// not, so its records get no per-record document and no operator who
+    /// subscribed to the namespace learns they exist.
+    #[test]
+    fn a_declared_app_does_not_launder_an_undeclared_dataset() {
+        let declared = pairs(&[("cz-labour", "salary_gap"), ("mpsv-vpm", "region_agg")]);
+        let observed = pairs(&[
+            ("cz-labour", "salary_gap"),
+            ("cz-labour", "skill_demand"),
+            ("mpsv-vpm", "region_agg"),
+        ]);
+        assert_eq!(
+            undeclared_write_namespaces(&observed, "mpsv-vpm", &declared),
+            pairs(&[("cz-labour", "skill_demand")])
+        );
+    }
+
+    /// `job_revision_counts` groups by `(app, dataset, change)`, so one dataset
+    /// with new + changed + removed rows arrives three times. A receipt that
+    /// listed it three times would read as three defects.
+    #[test]
+    fn one_rogue_dataset_is_reported_once_however_many_change_kinds_it_has() {
+        let observed = pairs(&[("g", "u"), ("g", "u"), ("g", "u"), ("f", "t")]);
+        assert_eq!(
+            undeclared_write_namespaces(&observed, "src", &[]),
+            pairs(&[("f", "t"), ("g", "u")]),
+            "deduplicated, and sorted so the receipt is stable between reads"
         );
     }
 }
