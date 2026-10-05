@@ -134,6 +134,22 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let schedule_runs = column_names(&pool, "schedule_runs").await;
+    for col in [
+        "schedule_id", // 0047 schedule decision ledger
+        "outcome",     // 0047 what the tick did
+        "reason",      // 0047 WHY, in the admission vocabulary
+        "due_at",      // 0047 the firing the row is about
+        "job_id",      // 0047 the job fired, or the one holding the slot
+        "missed",      // 0047 the misfire count the log line threw away
+        "detail",      // 0047 free-text context
+    ] {
+        assert!(
+            schedule_runs.contains(col),
+            "schedule_runs lost column `{col}`: {schedule_runs:?}"
+        );
+    }
+
     let triggers = column_names(&pool, "triggers").await;
     for col in [
         "filters",      // 0021 external triggers

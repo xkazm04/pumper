@@ -58,6 +58,7 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "rules_versions",
     "saved_search_seen",
     "saved_searches",
+    "schedule_runs",
     "schedules",
     "source_rulesets",
     "source_runs",

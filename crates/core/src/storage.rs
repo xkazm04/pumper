@@ -1574,6 +1574,129 @@ impl Storage {
         Ok(())
     }
 
+    // ---- Schedule decision ledger (migration 0047) --------------------------
+
+    /// Records ONE schedule decision. Callers are fail-open, exactly like
+    /// [`Storage::record_trigger_run`]: a decision that could not be recorded
+    /// must never hold up the firing it describes, so this returns the error
+    /// rather than acting on it.
+    ///
+    /// This is the ledger `record_schedule_skip` above could never be: that one
+    /// writes two reason-free columns on the schedule row, so a retirement skip
+    /// and a misfire skip are byte-identical in the store, the overlap hold
+    /// cannot be written at all (it would move the cron reference past the very
+    /// firing the guard promised to keep due), and a per-schedule failure inside
+    /// the pass has nowhere to land. A row here moves nothing.
+    pub async fn record_schedule_run(&self, run: &NewScheduleRun<'_>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, outcome, reason, due_at, job_id, \
+             missed, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(&id)
+        .bind(run.schedule_id)
+        .bind(run.outcome)
+        .bind(run.reason)
+        .bind(run.due_at.map(ts))
+        .bind(run.job_id)
+        .bind(run.missed as i64)
+        .bind(run.detail)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Keyset page of one schedule's decisions, newest first. `after` is the
+    /// previous page's last (created_at, id).
+    ///
+    /// The pass heartbeat ([`SCHEDULE_PASS_ID`]) is never one of these: it is a
+    /// fact about the reconcile loop, not about a schedule, and no real
+    /// schedule id can collide with `*`.
+    pub async fn list_schedule_runs_page(
+        &self,
+        schedule_id: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<ScheduleRun>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<ScheduleRunRow> = sqlx::query_as(
+            "SELECT id, schedule_id, outcome, reason, due_at, job_id, missed, detail, \
+             created_at FROM schedule_runs \
+             WHERE schedule_id = ?1 \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(schedule_id)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ScheduleRun::try_from).collect()
+    }
+
+    /// Drops decisions older than `days`; `0` = never prune. Called from the
+    /// worker's reaper tick, like [`Storage::prune_trigger_runs`] — the ledger
+    /// is diagnostic (one row per non-idle decision per tick, negatives
+    /// included), so it is bounded by default rather than by an operator knob.
+    ///
+    /// **The heartbeat is exempt.** It is one upserted row whose whole value is
+    /// its age: a loop wedged for longer than the retention window is exactly
+    /// the case the operator is asking about, and pruning the stale heartbeat
+    /// would delete the evidence of the wedge it exists to prove — turning the
+    /// answer back into "nothing was due".
+    pub async fn prune_schedule_runs(&self, days: u64) -> Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query("DELETE FROM schedule_runs WHERE created_at < ?1 AND schedule_id <> ?2")
+                .bind(ts(cutoff(days)))
+                .bind(SCHEDULE_PASS_ID)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// Stamps the scheduler's pass heartbeat: the reconcile loop completed a
+    /// pass at `at`.
+    ///
+    /// **One row, upserted in place** — deliberately not one row per pass. An
+    /// append-only heartbeat on a 15-second tick writes ~5,700 rows a day, and
+    /// the trigger ledger already shows what that costs: a once-per-process fact
+    /// written as an ordinary row paginates out of reach of the newest-first
+    /// page it was meant to be read from. A fixed primary key makes the ledger's
+    /// size independent of the tick rate, and makes "when did a pass last
+    /// complete?" a point read.
+    pub async fn mark_schedule_pass(&self, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, outcome, missed, created_at) \
+             VALUES (?1, ?2, ?3, 0, ?4) \
+             ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at",
+        )
+        .bind(SCHEDULE_PASS_HEARTBEAT_ID)
+        .bind(SCHEDULE_PASS_ID)
+        .bind(SCHEDULE_OUTCOME_PASS)
+        .bind(ts(at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// When the reconcile loop last completed a pass, or `None` if it never has
+    /// since this store was created. `None` and "long ago" are both answers the
+    /// in-memory `last_pass` could never give the API.
+    pub async fn schedule_pass_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT created_at FROM schedule_runs WHERE id = ?1")
+                .bind(SCHEDULE_PASS_HEARTBEAT_ID)
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.as_deref().map(parse_ts).transpose()
+    }
+
     pub async fn delete_schedule(&self, id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM schedules WHERE id = ?1")
             .bind(id)
@@ -1871,6 +1994,27 @@ impl Storage {
         );
         let rows: Vec<JobRow> = sqlx::query_as(&sql)
             .bind(trigger_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
+    /// The jobs one schedule actually enqueued, newest first — its lineage, the
+    /// twin of [`Storage::jobs_by_trigger`].
+    ///
+    /// Deliberately a narrow, indexed reader rather than a predicate bolted onto
+    /// the `GET /jobs` list query: the decision ledger answers "what did this
+    /// schedule DECIDE", and this answers "what did it RUN", and the two are
+    /// read side by side on one endpoint. The general queue filter is a separate
+    /// surface and stays free for one.
+    pub async fn jobs_by_schedule(&self, schedule_id: &str, limit: i64) -> Result<Vec<Job>> {
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE schedule_id = ?1 \
+             ORDER BY created_at DESC LIMIT ?2"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(schedule_id)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
@@ -3768,6 +3912,129 @@ impl TryFrom<TriggerRunRow> for TriggerRun {
             dataset: r.dataset,
             event_id: r.event_id,
             job_id: r.job_id,
+            detail: r.detail,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+// ---- Schedule decision ledger (migration 0047) ------------------------------
+
+/// One recorded schedule decision: what a reconcile tick concluded about one
+/// schedule, fires and non-fires alike.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleRun {
+    pub id: String,
+    /// The schedule the decision is about, or [`SCHEDULE_PASS_ID`] for the pass
+    /// heartbeat.
+    pub schedule_id: String,
+    /// One of [`SCHEDULE_OUTCOMES`] — the scheduler's own `StepOutcome`.
+    pub outcome: String,
+    /// WHY, in the admission vocabulary the fire path and `GET /schedules`
+    /// already share (`health`: `ok` | `disabled` | `invalid_cron` |
+    /// `unregistered_app` | `invalid_params` | `retired` | `overlapping`).
+    /// `None` when admission never ran — a storage failure inside the step,
+    /// where `detail` carries the error instead.
+    pub reason: Option<String>,
+    /// The firing this row is about.
+    pub due_at: Option<DateTime<Utc>>,
+    /// The job enqueued, or (for `held`) the job still holding the slot.
+    pub job_id: Option<String>,
+    /// Firings advanced past by `misfire_policy = "skip"`.
+    pub missed: i64,
+    /// Free-text context: an error message, the retired dataset, the collapsed
+    /// backlog size.
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The `schedule_id` a row carries when it is about the reconcile LOOP rather
+/// than about one schedule — the pass heartbeat. `*` cannot collide with a real
+/// schedule id (a UUID), and `list_schedule_runs_page` is keyed on the column,
+/// so the heartbeat never appears in a schedule's own page.
+pub const SCHEDULE_PASS_ID: &str = "*";
+
+/// Primary key of the single upserted heartbeat row. Fixed, so a pass costs an
+/// UPDATE rather than an INSERT — see [`Storage::mark_schedule_pass`].
+pub const SCHEDULE_PASS_HEARTBEAT_ID: &str = "scheduler-pass";
+
+/// The heartbeat row's `outcome`.
+pub const SCHEDULE_OUTCOME_PASS: &str = "pass";
+
+/// Every value `schedule_runs.outcome` may take. The API documents these as the
+/// decision vocabulary, so the list is a contract, not a hint.
+///
+/// These are the scheduler's own `StepOutcome` words, with two deliberate
+/// differences:
+///
+/// - `Idle` has no word. An idle tick writes NO row — one row per schedule per
+///   tick for doing nothing is the one write rate this table must not have.
+/// - `SkippedAndFired` has no word either, because it is two facts with
+///   different `missed` and different `job_id`, and collapsing them is exactly
+///   what `skipped_count` already did wrong. That tick writes a `skipped` row
+///   carrying its missed count AND a `fired` row carrying its job.
+///
+/// `failed` is the step error `PassTally::absorb` used to turn into a bare
+/// counter; `pass` belongs to the heartbeat alone.
+pub const SCHEDULE_OUTCOMES: &[&str] = &[
+    // A job was enqueued.
+    "fired",
+    // `misfire_policy = "skip"` advanced past missed firings, or an admission
+    // gate (retirement) declined the firing. `reason` tells the two apart —
+    // before this table they were byte-identical in the schedule row.
+    "skipped",
+    // The overlap guard held the firing; the same firing stays due. `job_id` is
+    // the run that owns the slot.
+    "held",
+    // A door gate refused the row and NOTHING was recorded on the schedule, so
+    // fixing the row makes the firing happen.
+    "refused",
+    // The step itself failed (a per-schedule storage error). The pass continued;
+    // this schedule silently did nothing, and `detail` says why.
+    "failed",
+    // The reconcile loop completed a pass. Written against `SCHEDULE_PASS_ID`
+    // only, as ONE upserted row.
+    "pass",
+];
+
+/// Insert shape for [`Storage::record_schedule_run`]. Borrowed and `Default`ing
+/// so each decision point names only the fields it actually knows.
+#[derive(Debug, Default)]
+pub struct NewScheduleRun<'a> {
+    pub schedule_id: &'a str,
+    pub outcome: &'a str,
+    pub reason: Option<&'a str>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub job_id: Option<&'a str>,
+    pub missed: usize,
+    pub detail: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ScheduleRunRow {
+    id: String,
+    schedule_id: String,
+    outcome: String,
+    reason: Option<String>,
+    due_at: Option<String>,
+    job_id: Option<String>,
+    missed: i64,
+    detail: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ScheduleRunRow> for ScheduleRun {
+    type Error = Error;
+
+    fn try_from(r: ScheduleRunRow) -> Result<ScheduleRun> {
+        Ok(ScheduleRun {
+            id: r.id,
+            schedule_id: r.schedule_id,
+            outcome: r.outcome,
+            reason: r.reason,
+            due_at: r.due_at.as_deref().map(parse_ts).transpose()?,
+            job_id: r.job_id,
+            missed: r.missed,
             detail: r.detail,
             created_at: parse_ts(&r.created_at)?,
         })
