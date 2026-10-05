@@ -38,6 +38,38 @@ It is **producer-facing only — no HTTP API change** — and narrows exactly on
 
 **One-time transition cost, by design.** Records whose stored hash was computed over the full value re-hash the first time their producer adopts the seam, so they report `changed` **once** — bounded by the number of records carrying the declared path (for eu-sedia: `historyJoined`, the joined Horizon topics) — and settle from then on. Budget one noisy run per adopting producer, not a corpus rewrite.
 
+### Materiality — one verdict for "is this change news?" (`pumper_core::materiality`)
+
+`new | changed | unchanged` is an **identity** answer: the sha256 moved, or it did not. It cannot say *how far*, so it cannot say no. That left every monitor to invent its own magnitude rule, and five of them did — `watch` had none at all and reported the raw `ChangeKind` to every subscribed webhook, `connector-api-watch` had two (an empty line diff plus a Claude severity ladder), `plugin`'s observatory declared `DerivedPaths`, `hackernews` had none, and `crawl::change_weight` had the only correct one, in `core`, reached by nobody.
+
+`crates/core/src/materiality.rs` is that judgment, once:
+
+```rust
+use pumper_core::materiality::{self, Sensitivity, Signal};
+
+let verdict = materiality::judge(
+    &Signal::records(&previous, &current),      // or ::bodies(a, b) / ::fingerprints(prev, cur)
+    &Sensitivity::default().noise(["fetched_at"]),
+);
+verdict.is_news()                               // false for Cosmetic
+```
+
+| field | meaning |
+| --- | --- |
+| `significance` | `cosmetic` (bytes moved, content did not) \| `material` \| `structural` (may not be the same document) |
+| `distance` | SimHash Hamming distance between the two noise-stripped fingerprints; `null` for a first sighting, never a fabricated `0` |
+| `weight` | the magnitude in `[0,1]`: `0.0` at or below the cosmetic ceiling, `1.0` at the structural bound. This is exactly what `crawl::change_weight` returns — it **delegates** here rather than keeping a second copy of the ramp |
+| `moved_paths` / `noise_paths_moved` | which record paths differ, split by the declared noise |
+| `reason` | one line an operator can read, naming the path or the bit count — never the bare word "changed" |
+
+Bounds are data (`Sensitivity::new(cosmetic_at_or_below, structural_at_or_above)`, default `3` / `16`, inverted bounds clamped), because a monitor over a handful of tokens moves more bits per real change than one over a whole page.
+
+**The declared noise is the same list the write narrows.** `Sensitivity::derived_paths()` hands the monitor the `DerivedPaths` for its upsert, so a path that is noise to the judge is noise to the change-detection hash by construction. It is deliberately a property of the *sensitivity* and not of the verdict: the stored hash was taken over whatever the previous write declared, so narrowing only on the runs you want suppressed compares a narrow hash against a wide one and reports `changed` — the opposite of the intent. The derived set must be constant for one producer.
+
+**Acting on a `Cosmetic` verdict** is then the monitor's own write decision. `watch` holds its baseline record and refreshes only the `materiality` block, which leaves the hash input byte-identical, so no revision is appended and nothing subscribed fires — see [apps.md](apps.md#watch). No HTTP API change; the verdict travels in each monitor's job result and (for `watch`) on the record.
+
+**Known gap:** the store's own per-revision SimHash (`records.sim`, computed on every upsert since migration 0004) is still not exposed on the public `Revision` struct, so a consumer cannot read the magnitude of a change it did not produce. `watch` works around it by storing its own whole-body fingerprint; the other monitors cannot.
+
 ## Trust
 
 Records and revisions carry a `trust` stamp recording how much the write is stood behind: `stable`, `provisional` (written while its source was degrading) or `quarantined`. Stamping comes from extraction health — see [resilient-extraction.md](resilient-extraction.md) — and only happens when `[resilience] enforce = true`.
