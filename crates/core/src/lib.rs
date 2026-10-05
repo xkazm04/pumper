@@ -109,8 +109,8 @@ pub use tiers::{
 pub use vcr::{Cassette, CassetteEntry, Recorder, Vcr};
 
 pub use catalog::{
-    Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable, PlanOrphan,
-    PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
+    uncovered_apps, Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable,
+    PlanOrphan, PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
 };
 pub use completeness::{judge, Completeness, Disposition, Expectation, Verdict};
 pub use config::Config;

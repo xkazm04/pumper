@@ -602,3 +602,226 @@ mod completeness_inventory_tests {
         );
     }
 }
+
+// ---- The catalog denominator -------------------------------------------------
+//
+// `ONBOARDING.md` §10 says adding an app REQUIRES its `[[source]]` row in
+// `catalog/data-sources.toml`. For most of this registry's life that rule was
+// a sentence, and nine registered apps missed it. The roster below plus
+// `the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster` turn it
+// into a gate, and `pumper_core::uncovered_apps` renders the same join on
+// `GET /sources` so an operator never has to diff two files by hand.
+
+/// A registered app that deliberately has no `[[source]]` row.
+pub(crate) struct NonSourceApp {
+    /// The app's `name()`.
+    pub name: &'static str,
+    /// Why it is not a catalog source. An exemption without a reason is how a
+    /// roster becomes a dumping ground.
+    pub reason: &'static str,
+}
+
+/// Registered apps that are NOT data sources, each with its reason.
+///
+/// The bar is narrow on purpose: an app qualifies only when there is no single
+/// upstream to declare — generic tooling the caller points at a URL, or a
+/// control-plane app that writes nothing scheduled. "This source belongs to a
+/// sibling product" is NOT a reason; such an app still publishes a dataset on
+/// a cadence, and leaving it out is exactly the drift that made `declared: 12`
+/// unreadable. Every app here is one whose dataset no catalog row could ever
+/// describe.
+pub(crate) const NON_SOURCE_APPS: &[NonSourceApp] = &[
+    NonSourceApp {
+        name: "crawl",
+        reason: "generic multi-page crawler; the caller supplies the seed URL",
+    },
+    NonSourceApp {
+        name: "extractor",
+        reason: "generic rule-driven extractor; the caller supplies the page and the rules",
+    },
+    NonSourceApp {
+        name: "peer",
+        reason: "pulls from another Pumper instance into a caller-named namespace — \
+                 its upstream is whatever remote the job points at",
+    },
+    NonSourceApp {
+        name: "plugin",
+        reason: "runs a WASM guest from data/plugins/; the plugin, not the app, has the source",
+    },
+    NonSourceApp {
+        name: "provisioner",
+        reason: "an on-demand compiler that PROPOSES catalog rows for human review; it \
+                 deliberately never appears in the catalog it writes proposals for",
+    },
+    NonSourceApp {
+        name: "readable",
+        reason: "generic article extractor; the caller supplies the URL",
+    },
+    NonSourceApp {
+        name: "research",
+        reason: "generic Claude research runner; the caller supplies the question",
+    },
+    NonSourceApp {
+        name: "transact",
+        reason: "an on-demand dry-run browser-flow executor that writes no dataset at all \
+                 (no ctx.upsert/sync call in crates/apps/transact/src/lib.rs), so there is \
+                 nothing for a contract or a staleness window to attach to",
+    },
+    NonSourceApp {
+        name: "watch",
+        reason: "generic change watcher; the caller supplies the URL",
+    },
+];
+
+/// The roster as it is rendered on `GET /sources`: one `{app, reason}` object
+/// per entry, in declaration order.
+///
+/// The reasons exist to be READ. A `uncovered_apps: []` beside a roster nobody
+/// can see is an unexplained claim, and an exemption whose justification lives
+/// only in a source comment is how the previous 18-entry list drifted into a
+/// scope argument for nine publishing apps.
+pub(crate) fn non_source_roster() -> Value {
+    Value::Array(
+        NON_SOURCE_APPS
+            .iter()
+            .map(|e| json!({ "app": e.name, "reason": e.reason }))
+            .collect(),
+    )
+}
+
+/// The names on [`NON_SOURCE_APPS`], for the catalog join.
+pub(crate) fn non_source_app_names() -> Vec<&'static str> {
+    NON_SOURCE_APPS.iter().map(|e| e.name).collect()
+}
+
+/// Every registered app's `name()`.
+pub(crate) fn app_names() -> Vec<&'static str> {
+    apps().iter().map(|a| a.name()).collect()
+}
+
+#[cfg(test)]
+mod catalog_coverage_tests {
+    use super::{app_names, non_source_app_names, NON_SOURCE_APPS};
+    use pumper_core::Catalog;
+    use std::collections::BTreeSet;
+
+    /// Embedded at compile time so the check does not depend on the test's
+    /// working directory — the same trick `routes::catalog_tests` uses.
+    const CATALOG_TOML: &str = include_str!("../../../catalog/data-sources.toml");
+
+    fn catalog() -> Catalog {
+        Catalog::parse(CATALOG_TOML).expect("catalog/data-sources.toml parses")
+    }
+
+    /// **The gate.** ONBOARDING §10 as an EXPECTED-diff, reported in both
+    /// directions: an app with neither a live `[[source]]` row nor a
+    /// `NON_SOURCE_APPS` entry fails BY NAME, and a roster entry for an app
+    /// that has since grown a row fails too, so the exemption list cannot
+    /// outlive its reason.
+    #[test]
+    fn the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster() {
+        let catalog = catalog();
+        let sourced = catalog.sourced_apps();
+        let exempt = non_source_app_names();
+        let registered = app_names();
+
+        let uncovered = pumper_core::uncovered_apps(&registered, &exempt, &sourced);
+        assert!(
+            uncovered.is_empty(),
+            "registered app(s) with no live [[source]] row and no NON_SOURCE_APPS entry: \
+             {uncovered:?}. ONBOARDING §10: add the row to catalog/data-sources.toml, or \
+             add the app to NON_SOURCE_APPS with the reason it can never have one."
+        );
+
+        let redundant: Vec<&str> = exempt
+            .iter()
+            .copied()
+            .filter(|name| sourced.contains(name))
+            .collect();
+        assert!(
+            redundant.is_empty(),
+            "NON_SOURCE_APPS claims {redundant:?} can never have a catalog row, but the \
+             catalog now names them. Drop the exemption — a stale carve-out is how the \
+             roster stops meaning anything."
+        );
+    }
+
+    /// An exemption for an app nobody registers is dead weight that hides the
+    /// next real gap.
+    #[test]
+    fn every_roster_entry_is_a_registered_app_with_a_reason() {
+        let registered: BTreeSet<&str> = app_names().into_iter().collect();
+        for entry in NON_SOURCE_APPS {
+            assert!(
+                registered.contains(entry.name),
+                "NON_SOURCE_APPS names '{}', which is not a registered app",
+                entry.name
+            );
+            assert!(
+                entry.reason.len() > 20,
+                "NON_SOURCE_APPS entry '{}' has no real reason",
+                entry.name
+            );
+        }
+        let names: BTreeSet<&str> = NON_SOURCE_APPS.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names.len(),
+            NON_SOURCE_APPS.len(),
+            "NON_SOURCE_APPS has a duplicate entry"
+        );
+    }
+
+    /// The roster `GET /sources` renders must carry every entry WITH its
+    /// reason — `transact` specifically, because it writes no dataset at all
+    /// and is therefore the clearest case that the bar is "no upstream to
+    /// declare", not "out of scope".
+    #[test]
+    fn the_rendered_roster_carries_a_reason_for_every_entry() {
+        let rendered = super::non_source_roster();
+        let rows = rendered.as_array().expect("an array of {app, reason}");
+        assert_eq!(rows.len(), NON_SOURCE_APPS.len());
+        for row in rows {
+            assert!(row["app"].as_str().is_some_and(|a| !a.is_empty()), "{row}");
+            assert!(
+                row["reason"].as_str().is_some_and(|r| r.len() > 20),
+                "an exemption without a readable reason: {row}"
+            );
+        }
+        let transact = rows
+            .iter()
+            .find(|r| r["app"] == "transact")
+            .expect("transact is on the roster");
+        assert!(
+            transact["reason"].as_str().unwrap().contains("no dataset"),
+            "transact's reason must say it writes no dataset: {transact}"
+        );
+    }
+
+    /// The roster is a carve-out for tooling, not a scope argument. It must
+    /// never regrow into the "sibling-product consumer" exemption that hid
+    /// nine publishing apps from governance.
+    #[test]
+    fn the_roster_never_exempts_an_app_that_publishes_a_dataset() {
+        const NEVER_EXEMPT: &[&str] = &[
+            "census-density",
+            "census-nonemp",
+            "cms-fee-schedule",
+            "hackernews",
+            "homewyse-pricing",
+            "smlouvy-dump-watch",
+            "state-tax",
+            "trade-wages",
+            "valuation-multiples",
+        ];
+        let names: BTreeSet<&str> = NON_SOURCE_APPS.iter().map(|e| e.name).collect();
+        let regressed: Vec<&&str> = NEVER_EXEMPT
+            .iter()
+            .filter(|n| names.contains(**n))
+            .collect();
+        assert!(
+            regressed.is_empty(),
+            "{regressed:?} publish datasets and were exempted once already — they get a \
+             [[source]] row, not an exemption"
+        );
+    }
+}

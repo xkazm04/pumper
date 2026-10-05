@@ -800,3 +800,177 @@ hash = "string"
 markdown = "string"
 label = "string"
 engine = "string"
+
+# -----------------------------------------------------------------------------
+# ONBOARDING §10 back-fill: the nine registered apps that had no row.
+#
+# These nine all publish a dataset, and every one of them was exempted from the
+# coverage check as "a sibling-product consumer outside this catalog's scope" —
+# which meant no cron, no staleness window, no required_fields and no contract
+# verdict could ever attach to them, while `GET /sources` reported a `declared`
+# count that read like coverage. Scope is not a reason to be invisible to
+# governance; the catalog is the pipeline registry for every pipeline this
+# binary runs. The server-side gate is
+# `registry::catalog_coverage_tests::the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster`,
+# and the only remaining exemptions are the nine TOOL apps on
+# `registry::NON_SOURCE_APPS`, each with the reason it can never have an
+# upstream at all.
+#
+# `cron` must equal the app's `schedule()` EXACTLY in both directions
+# (`routes::catalog_tests::live_catalog_entries_map_to_registered_apps_with_matching_cron`),
+# so the seven apps that declare no `schedule()` carry an empty cron here —
+# they are on-demand pipelines, and a cron would ask the reconciler to invent a
+# schedule the app never asked for.
+#
+# No `[source.contract]` block on any of them, deliberately: a contract is a
+# publish-time FLOOR, and inventing a required-field set by reading the code
+# rather than from a live-verified payload is how a wrong floor starts blocking
+# real deliveries. They are reported in `contracts.uncontracted_sources` on
+# `GET /sources` — visible and judgeable, which is the point — and each gains
+# its contract when its shape is live-verified, exactly as census-bfs and
+# census-nesd did.
+# -----------------------------------------------------------------------------
+
+[[source]]
+id = "cms-fee-schedule"
+app = "cms-fee-schedule"
+market = "us"
+name = "CMS Physician Fee Schedule release watcher + PPRRVU corpus"
+url = "https://www.cms.gov/medicare/payment/fee-schedules/physician/pfs-relative-value-files"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "monthly"
+cron = "0 0 6 1 * *"
+status = "live"
+confidence = 4
+dataset = "releases"
+notes = "Counterbill's Medicare reference-price freshness signal. Detects the latest published Relative Value File release (RVU{YY}A/B/C/D, republished quarterly with an annual conversion-factor change) into `releases`, and on a NEW release downloads the ZIP, extracts the PPRRVU CSV and owns `fee_schedule` (one record per {hcpcs}[:{modifier}] with work/PE/MP RVUs + the conversion factor) plus `fee_schedule_changes` (release-over-release diff). A download/extract/parse failure NEVER fails the watch. Serves Counterbill, not the grant pipeline — cataloged anyway: a scheduled pipeline with no row gets no staleness window and no contract verdict."
+
+[[source]]
+id = "census-density"
+app = "census-density"
+market = "us"
+name = "Census County Business Patterns (trades establishment density)"
+url = "https://api.census.gov/data/2022/cbp"
+category = "market-stats"
+engine = "http"
+access = "api-key"
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "establishments"
+notes = "Establishment counts, employment and annual payroll for the trades NAICS per state (or county), upserted into `establishments`, joined against an ACS population/household base so the ranking is SATURATION (establishments per 10k) and not just absolute size. Serves Ledgerline's geographic launch ranking. Requires a free CENSUS_API_KEY (shared with census-nonemp); a keyless request 302s to a 200 HTML page rather than JSON, so a missing key looks like a parse failure. On-demand: the app declares no schedule() — CBP publishes annually and the vintage is a param."
+
+[[source]]
+id = "census-nonemp"
+app = "census-nonemp"
+market = "us"
+name = "Census Nonemployer Statistics (solo-trades density + receipts)"
+url = "https://api.census.gov/data/2022/nonemp"
+category = "market-stats"
+engine = "http"
+access = "api-key"
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "nonemployers"
+notes = "Nonemployer establishments (NESTAB) and total receipts (NRCPTOT, $1,000s) per trade NAICS by state, plus the derived average receipts per solo operator — the revenue benchmark for a one-person shop, which is Ledgerline's target market. Upserted into `nonemployers`. Disclosure-suppressed cells are DROPPED, never zeroed, so an absent state means 'not published', not zero. Free CENSUS_API_KEY (shared with census-density). On-demand: no schedule(); the vintage is a param and NES lags ~2y."
+
+[[source]]
+id = "homewyse-pricing"
+app = "homewyse-pricing"
+market = "us"
+name = "US trades service-pricing benchmarks (Claude research)"
+url = "local Claude CLI (web-verified agentic synthesis of cost guides; no upstream endpoint)"
+category = "market-stats"
+engine = "claude"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "pricing"
+notes = "Typical customer-facing prices for common pool/plumbing/electrical/HVAC/landscaping jobs — service-call fee, hourly labor rate, headline installs — as a low/median/high USD band, synthesized from cost guides (Homewyse, Angi, Thumbtack, HomeAdvisor) with web search + page fetch. Pricing is the weakest reference-data domain (no clean government API), which is exactly the 'no fixed crawler works' case the claude engine exists for. Upserted into `pricing`; also publishes into the trades/operator_economics virtual namespace. Costs real money per run (cost_class=claude), so it is deliberately on-demand with no cron."
+
+[[source]]
+id = "state-tax"
+app = "state-tax"
+market = "us"
+name = "US state + federal income-tax reference for solo operators (Claude research)"
+url = "local Claude CLI (web-verified agentic research; no upstream endpoint)"
+category = "registry"
+engine = "claude"
+access = "key-free"
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "tax"
+notes = "Per jurisdiction (50 states + DC) the individual income-tax structure a sole proprietor's business income is taxed under — type (none/flat/graduated), top marginal rate, top-bracket threshold — plus ONE federal record carrying the self-employment tax rate, the QBI deduction, the standard deduction and the section 179 limit. Grounds the forecast's state-tax set-aside, which excludes state tax when the operator's state has no data. All 52 jurisdictions come back in ONE metered call (finite, well-documented facts). Upserted into `tax`; also publishes into trades/operator_economics. Costs real money per run; no cron by design."
+
+[[source]]
+id = "valuation-multiples"
+app = "valuation-multiples"
+market = "us"
+name = "US home-services small-business valuation multiples (Claude research)"
+url = "local Claude CLI (web-verified agentic synthesis of broker data; no upstream endpoint)"
+category = "market-stats"
+engine = "claude"
+access = "key-free"
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "valuation"
+notes = "Per trade (plumbing, electrical, HVAC, landscaping, pool) the typical seller's-discretionary-earnings multiple — median plus a low/high band — and a revenue multiple, synthesized from business-broker sources (BizBuySell Insight, brokerage reports). Replaces the hardcoded per-trade SDE bands in the wealth/valuation read with sourced, refreshable multiples. BizBuySell is 403/Akamai-walled to a crawler and multiples live across paywalled broker reports, so agentic synthesis is the right tool; all five trades come back in ONE call. Upserted into `valuation`; also publishes into trades/operator_economics. Metered; no cron by design."
+
+[[source]]
+id = "trade-wages"
+app = "trade-wages"
+market = "us"
+name = "US tradesperson wage bands, BLS OEWS via Claude research"
+url = "https://www.bls.gov/oes/ (web-fetched during agentic research; the OEWS timeseries API returns no data for these series)"
+category = "labor-market"
+engine = "claude"
+access = "key-free"
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "wages"
+notes = "Per trade the BLS OEWS wage band — entry (10th pct) / median / experienced (90th pct), hourly and annual — plus the SOC occupation the figures come from and the national employment count. Grounds the 'what to pay your first hire' read. The authoritative route is dead-ended (the OEWS TIMESERIES API returns no data for these series and the QCEW slice endpoint 404s), so the agent web-fetches the current occupation figures from bls.gov/oes, the same way the tax pipeline pulled live rates. National by trade in ONE call; the trade universe comes from the governed trades/taxonomy registry. Upserted into `wages`; also publishes into trades/operator_economics. Metered; no cron by design."
+
+[[source]]
+id = "smlouvy-dump-watch"
+app = "smlouvy-dump-watch"
+market = "cz"
+name = "Registr smluv (Czech contract register) bulk-dump index watcher"
+url = "https://data.smlouvy.gov.cz/index.xml"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = "0 30 5 * * *"
+status = "live"
+confidence = 4
+dataset = "dumps"
+notes = "Parses the Ministry's authoritative dump index into one record per monthly bulk dump, keyed by the dump URL, carrying its sha1, byte size and generation timestamp, and SYNCS it as a full snapshot — so a consumer (tender-radar's Registr smluv ingest) learns precisely which dump is new or RE-GENERATED (a month's dump changes hash and size when late contracts land while its year/month stays the same) instead of the generic watch app's 'the page changed' fingerprint. A `dataset` trigger on on_change=fresh can fan a re-download of exactly the changed dumps. Deliberately never downloads the ~100 MB dumps; the heavy fetch belongs in the consuming app."
+
+[[source]]
+id = "hackernews"
+app = "hackernews"
+market = "us"
+name = "Hacker News front page (the template fetch-and-parse pipeline)"
+url = "https://news.ycombinator.com/"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 5
+dataset = "stories"
+notes = "The example/template app for classic fetch-and-parse use cases, upserting the front page into `stories` via the plain-HTTP engine. Cataloged not because the data is a product input but because it is a REGISTERED app that publishes a dataset: an app the catalog has never heard of is an app no cron, staleness window or contract verdict can attach to, and the template app is the one every new app gets copied from — leaving it uncataloged taught step four of ONBOARDING §10 as optional. Unrelated to `registry::AWAITING_THE_JUDGE`, which tracks whether an app reports a `completeness` verdict in its output_shape; a catalog row neither satisfies nor affects that ratchet."

@@ -418,6 +418,58 @@ impl Catalog {
     pub fn contracted(&self) -> impl Iterator<Item = &Source> {
         self.live().filter(|s| s.contract.is_some())
     }
+
+    /// Distinct non-empty `app` values named by **live** sources — the app
+    /// namespaces the catalog has actually heard of.
+    ///
+    /// Planned/blocked rows are excluded on purpose: a row that is not live
+    /// declares an intent, not a watched pipeline, so counting it as coverage
+    /// is the same overstatement `declared` made.
+    pub fn sourced_apps(&self) -> BTreeSet<&str> {
+        self.live()
+            .map(|s| s.app.as_str())
+            .filter(|a| !a.is_empty())
+            .collect()
+    }
+
+    /// Live source **ids** that declare no `[source.contract]` block — rows the
+    /// catalog knows about but can state no publish-time floor for.
+    ///
+    /// A different question from [`Catalog::uncovered_apps`]: this one is "the
+    /// catalog sees it but cannot judge it", that one is "the catalog has never
+    /// heard of it". Conflating them is what made `declared` unreadable.
+    pub fn uncontracted_sources(&self) -> Vec<String> {
+        self.live()
+            .filter(|s| s.contract.is_none())
+            .map(|s| s.id.clone())
+            .collect()
+    }
+}
+
+/// Registered apps that no **live** `[[source]]` row names, minus the declared
+/// exemptions — the denominator ONBOARDING §10 is about.
+///
+/// Free of `Catalog` on purpose: `pumper-core` cannot see the server's app
+/// registry (the dependency rule runs the other way), so the registered set and
+/// its exemptions arrive as data and the join lives here, where the catalog
+/// half already is.
+///
+/// Both inputs are treated as sets; the result is sorted and deduplicated so it
+/// is stable enough to assert on and to render in an API body.
+pub fn uncovered_apps(
+    registered: &[&str],
+    exempt: &[&str],
+    sourced: &BTreeSet<&str>,
+) -> Vec<String> {
+    let exempt: BTreeSet<&str> = exempt.iter().copied().collect();
+    registered
+        .iter()
+        .copied()
+        .filter(|name| !sourced.contains(name) && !exempt.contains(name))
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 /// What contract enforcement **can be observed to do right now**, as opposed to
@@ -447,6 +499,29 @@ pub struct ContractsStatus {
     /// Live sources declaring a `[source.contract]` block. `0` with a readable
     /// catalog means enforcement is real but has nothing to judge.
     pub declared: usize,
+    /// The denominator `declared` was always a numerator over: live
+    /// `[[source]]` rows. `declared` of `live_sources` is the coverage
+    /// fraction; the bare `declared` reads as coverage and is not.
+    pub live_sources: usize,
+    /// Live source ids with no `[source.contract]`, named. Omitted (not `[]`)
+    /// when the catalog would not parse — an unreadable catalog must never
+    /// report full coverage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncontracted_sources: Option<Vec<String>>,
+    /// How many apps the running binary registers. `None` when the caller did
+    /// not supply the registry (`pumper-core` cannot reach it itself).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered: Option<usize>,
+    /// Registered, non-exempt apps a live source row names. `sourced` of
+    /// `registered` is the ONBOARDING §10 coverage fraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sourced: Option<usize>,
+    /// Registered apps no live source row names and that are not on the
+    /// caller's declared exemption roster — named, because the count alone
+    /// still makes the operator diff two files by hand. Omitted (not `[]`)
+    /// when the catalog would not parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncovered_apps: Option<Vec<String>>,
     /// Why `enforce_observed` is not simply `enforce_configured`, or why an
     /// enabled enforcement has nothing to do. `None` when there is nothing to
     /// qualify.
@@ -459,36 +534,102 @@ impl ContractsStatus {
     /// Never fails: an unreadable catalog is *reported*, exactly as the worker
     /// seam treats it.
     pub fn load(enforce: bool) -> (Option<Catalog>, Self) {
+        Self::load_with_apps(enforce, &[], &[])
+    }
+
+    /// [`ContractsStatus::load`], told which apps the binary actually registers
+    /// and which of them are declared non-sources, so the report can carry the
+    /// app-coverage half too. An empty `registered` means "not supplied".
+    pub fn load_with_apps(
+        enforce: bool,
+        registered: &[&str],
+        exempt: &[&str],
+    ) -> (Option<Catalog>, Self) {
         match Catalog::load() {
             Ok(catalog) => {
-                let status = Self::of(&catalog, enforce);
+                let status = Self::of_with_apps(&catalog, enforce, registered, exempt);
                 (Some(catalog), status)
             }
             Err(e) => (None, Self::unreadable(e.to_string(), enforce)),
         }
     }
 
-    /// The status of a catalog that parsed.
+    /// The status of a catalog that parsed, without the app-registry half.
     pub fn of(catalog: &Catalog, enforce: bool) -> Self {
+        Self::of_with_apps(catalog, enforce, &[], &[])
+    }
+
+    /// The status of a catalog that parsed, joined against the registered apps.
+    ///
+    /// `registered` empty means the caller had no registry to offer, and the
+    /// app-coverage fields stay `None` — distinct from "every app is covered",
+    /// which is `Some(vec![])`.
+    pub fn of_with_apps(
+        catalog: &Catalog,
+        enforce: bool,
+        registered: &[&str],
+        exempt: &[&str],
+    ) -> Self {
         let declared = catalog.contracted().count();
-        let reason = if !enforce {
-            Some(
+        let live_sources = catalog.live().count();
+        let sourced_apps = catalog.sourced_apps();
+        let uncovered =
+            (!registered.is_empty()).then(|| uncovered_apps(registered, exempt, &sourced_apps));
+        let covered = uncovered.as_ref().map(|u| registered.len() - u.len());
+        let uncontracted = catalog.uncontracted_sources();
+
+        let mut qualifiers: Vec<String> = Vec::new();
+        if !enforce {
+            qualifiers.push(
                 "[contracts] enforce = false: verdicts are recorded and surfaced, nothing is gated"
                     .to_string(),
-            )
+            );
         } else if declared == 0 {
-            Some("no live catalog source declares a [source.contract] block".to_string())
-        } else {
-            None
-        };
+            qualifiers
+                .push("no live catalog source declares a [source.contract] block".to_string());
+        }
+        if !uncontracted.is_empty() {
+            qualifiers.push(format!(
+                "{} of {live_sources} live sources declare no [source.contract]",
+                uncontracted.len()
+            ));
+        }
+        if let Some(u) = uncovered.as_ref() {
+            if !u.is_empty() {
+                qualifiers.push(format!(
+                    "{} registered app(s) publish under no live catalog source: {}",
+                    u.len(),
+                    u.join(", ")
+                ));
+            }
+        }
+
         Self {
             enforce_configured: enforce,
             enforce_observed: enforce,
             catalog_ok: true,
             catalog_error: None,
             declared,
-            reason,
+            live_sources,
+            uncontracted_sources: Some(uncontracted),
+            registered: (!registered.is_empty()).then_some(registered.len()),
+            sourced: covered,
+            uncovered_apps: uncovered,
+            reason: (!qualifiers.is_empty()).then(|| qualifiers.join("; ")),
         }
+    }
+
+    /// The one-line coverage summary the boot log prints: both fractions, so
+    /// the state is visible without an HTTP call.
+    pub fn coverage_line(&self) -> String {
+        let apps = match (self.sourced, self.registered) {
+            (Some(s), Some(r)) => format!("; {} of {r} registered apps have no source row", r - s),
+            _ => String::new(),
+        };
+        format!(
+            "{} of {} live sources contracted{apps}",
+            self.declared, self.live_sources
+        )
     }
 
     /// The status of a catalog that would not load — the case the whole type
@@ -501,6 +642,15 @@ impl ContractsStatus {
             catalog_ok: false,
             catalog_error: Some(error.clone()),
             declared: 0,
+            // Omitted, never `[]`: a catalog that would not parse knows of no
+            // sources and no apps, and reporting empty lists there reads as
+            // "nothing is uncovered" — the exact inversion this type exists to
+            // prevent. Fail-open on gating, never fail-open on reporting.
+            live_sources: 0,
+            uncontracted_sources: None,
+            registered: None,
+            sourced: None,
+            uncovered_apps: None,
             reason: Some(format!(
                 "catalog unreadable ({error}): the publish seam skips contract evaluation for \
                  every job, so no contract is being checked"
@@ -904,6 +1054,137 @@ mod tests {
         let empty = ContractsStatus::of(&Catalog::default(), true);
         assert!(empty.enforce_observed && empty.declared == 0);
         assert!(empty.reason.unwrap().contains("no live catalog source"));
+    }
+
+    /// The toml the coverage cases read: two live sources naming two apps,
+    /// one of them contracted, plus a planned row that must not count as
+    /// coverage.
+    fn coverage_toml() -> &'static str {
+        r#"
+            [[source]]
+            id = "contracted"
+            app = "grants-gov"
+            dataset = "opportunities"
+            name = "Contracted"
+            status = "live"
+            [source.contract]
+            required_fields = ["id"]
+
+            [[source]]
+            id = "bare"
+            app = "cordis"
+            name = "Live, no contract"
+            status = "live"
+
+            [[source]]
+            id = "someday"
+            app = "state-tax"
+            name = "Planned, not watched"
+            status = "planned"
+        "#
+    }
+
+    /// The anti-pattern: `declared: 12` is a numerator with no denominator, so
+    /// nothing can tell "12 declared" from "12 of 30". The fraction and the two
+    /// NAMED lists are the fix — and they answer different questions, so they
+    /// must not be one list.
+    #[test]
+    fn coverage_names_the_denominator_not_just_the_declared_count() {
+        let registered = ["grants-gov", "cordis", "state-tax", "watch"];
+        let exempt = ["watch"];
+        let s = ContractsStatus::of_with_apps(&cat(coverage_toml()), true, &registered, &exempt);
+
+        assert_eq!(s.declared, 1, "one live row carries a contract");
+        assert_eq!(
+            s.live_sources, 2,
+            "the planned row is not a watched pipeline"
+        );
+        assert_eq!(
+            s.uncontracted_sources.as_deref(),
+            Some(&["bare".to_string()][..]),
+            "a live row with no [source.contract] is NAMED, not just counted"
+        );
+        assert_eq!(s.registered, Some(4));
+        assert_eq!(s.sourced, Some(3), "two sourced apps plus the exempt one");
+        // state-tax has only a PLANNED row, so the catalog watches nothing for
+        // it — the exact overstatement counting planned rows would produce.
+        assert_eq!(
+            s.uncovered_apps.as_deref(),
+            Some(&["state-tax".to_string()][..])
+        );
+        let reason = s.reason.expect("partial coverage is reportable");
+        assert!(reason.contains("state-tax"), "{reason}");
+        assert!(reason.contains("1 of 2 live sources"), "{reason}");
+    }
+
+    /// `uncovered_apps: []` has to be REACHABLE, or the field is decoration.
+    #[test]
+    fn full_coverage_reports_an_empty_list_not_a_missing_one() {
+        let registered = ["grants-gov", "cordis", "watch"];
+        let s = ContractsStatus::of_with_apps(&cat(coverage_toml()), true, &registered, &["watch"]);
+        assert_eq!(s.uncovered_apps, Some(Vec::new()));
+        assert_eq!(s.sourced, Some(3));
+        let body = serde_json::to_value(&s).expect("serialises");
+        assert_eq!(body["uncovered_apps"], serde_json::json!([]));
+    }
+
+    /// Fail-open on GATING, never fail-open on REPORTING: a catalog that will
+    /// not parse omits the lists. `[]` there would read as "nothing is
+    /// uncovered", which is the inversion of the truth.
+    #[test]
+    fn an_unreadable_catalog_omits_the_lists_rather_than_reporting_none_uncovered() {
+        let broken = ContractsStatus::unreadable("expected `=`, found `!`", true);
+        assert_eq!(broken.uncovered_apps, None);
+        assert_eq!(broken.uncontracted_sources, None);
+        assert_eq!(broken.registered, None);
+        assert_eq!(broken.sourced, None);
+        let body = serde_json::to_value(&broken).expect("serialises");
+        assert!(
+            body.get("uncovered_apps").is_none(),
+            "an unreadable catalog must not render uncovered_apps at all: {body}"
+        );
+        assert!(body.get("uncontracted_sources").is_none(), "{body}");
+        assert!(
+            body["catalog_error"].is_string(),
+            "the error still explains"
+        );
+    }
+
+    /// A caller with no registry gets the source half and NO app half — which
+    /// must be distinguishable from "every app is covered".
+    #[test]
+    fn no_registry_supplied_is_not_the_same_as_full_app_coverage() {
+        let s = ContractsStatus::of_with_apps(&cat(coverage_toml()), true, &[], &[]);
+        assert_eq!(s.uncovered_apps, None, "unknown, not empty");
+        assert_eq!(s.registered, None);
+        assert_eq!(s.live_sources, 2, "the source half is still reported");
+    }
+
+    /// The boot line prints the fractions, not the bare count.
+    #[test]
+    fn the_coverage_line_states_both_denominators() {
+        let registered = ["grants-gov", "cordis", "state-tax", "watch"];
+        let s = ContractsStatus::of_with_apps(&cat(coverage_toml()), true, &registered, &["watch"]);
+        assert_eq!(
+            s.coverage_line(),
+            "1 of 2 live sources contracted; 1 of 4 registered apps have no source row"
+        );
+        // Without a registry the app clause is simply absent, never "0 of 0".
+        let bare = ContractsStatus::of_with_apps(&cat(coverage_toml()), true, &[], &[]);
+        assert_eq!(bare.coverage_line(), "1 of 2 live sources contracted");
+    }
+
+    /// The join is a free function so the server can call it directly; it must
+    /// be order-independent and deduplicated.
+    #[test]
+    fn uncovered_apps_is_sorted_deduplicated_and_exemption_aware() {
+        let sourced: BTreeSet<&str> = ["cordis"].into_iter().collect();
+        let got = uncovered_apps(
+            &["zebra", "cordis", "alpha", "zebra", "watch"],
+            &["watch"],
+            &sourced,
+        );
+        assert_eq!(got, vec!["alpha".to_string(), "zebra".to_string()]);
     }
 
     #[test]
