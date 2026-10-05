@@ -466,3 +466,139 @@ mod manifest_tests {
         }
     }
 }
+#[cfg(test)]
+mod completeness_inventory_tests {
+    use super::apps;
+    use std::collections::BTreeSet;
+
+    /// The word an app puts in its declared `output_shape` once its
+    /// completeness floor became a VERDICT rather than a private const.
+    const VERDICT_MARKER: &str = "completeness";
+    /// The legacy vocabulary: every floor written before the judge existed
+    /// described itself as a `floor` in the block it reported.
+    const LEGACY_FLOOR_MARKER: &str = "floor";
+
+    /// **EXACTLY** the apps that route a completeness floor through
+    /// `pumper_core::completeness`. Pinned as a set rather than a count, so a
+    /// market-data app that is added — or one that quietly stops reporting its
+    /// verdict — fails this test BY NAME instead of drifting.
+    ///
+    /// That naming is the durable change of this round: the silent-partial-
+    /// success defect had been fixed four times by four authors, in four
+    /// vocabularies, and generalised zero times. The guard that stops a fifth
+    /// private fix is a list that cannot be out of date.
+    const JUDGED: [&str; 8] = [
+        "homewyse-pricing",
+        "mpsv-ispv",
+        "mpsv-vpm",
+        "smlouvy-dump-watch",
+        "state-licensing",
+        "state-tax",
+        "trade-wages",
+        "valuation-multiples",
+    ];
+
+    /// The ONE app that still judges its floor privately. It is listed, not
+    /// tolerated: `the_un_judged_list_only_ever_shrinks` fails the moment it
+    /// routes through the judge, which forces the entry out rather than letting
+    /// a permanent exemption accumulate.
+    ///
+    /// Out of this round's write set on purpose — `hackernews` is the generic
+    /// template app, not a market-data one, and its parsed/seen share over a
+    /// fixed-size front page moves with its own change.
+    const AWAITING_THE_JUDGE: [&str; 1] = ["hackernews"];
+
+    fn shape_of(name: &str) -> String {
+        apps()
+            .iter()
+            .find(|a| a.name() == name)
+            .unwrap_or_else(|| panic!("'{name}' is not a registered app — the list is stale"))
+            .manifest()
+            .output_shape
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The EXPECTED-diff, reported in both directions so neither a new app nor
+    /// a silently-dropped verdict can slide past.
+    #[test]
+    fn the_apps_that_declare_a_verdict_are_exactly_the_listed_ones() {
+        let found: BTreeSet<String> = apps()
+            .iter()
+            .filter(|a| {
+                a.manifest()
+                    .output_shape
+                    .unwrap_or("")
+                    .contains(VERDICT_MARKER)
+            })
+            .map(|a| a.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = JUDGED.iter().map(|n| n.to_string()).collect();
+        let added: Vec<&String> = found.difference(&expected).collect();
+        let gone: Vec<&String> = expected.difference(&found).collect();
+        assert!(
+            added.is_empty() && gone.is_empty(),
+            "the completeness inventory drifted. App(s) newly declaring a verdict: \
+             {added:?} — add them to JUDGED. Listed app(s) that no longer declare one: \
+             {gone:?} — a verdict that vanished is how the silent-partial-success \
+             defect comes back."
+        );
+    }
+
+    /// **The ratchet.** An app that still describes a `floor` in the legacy
+    /// vocabulary must also report the verdict that floor produces. Computing
+    /// the judgment and discarding it is the exact shape four of five apps
+    /// shipped: a 1-of-5 run was a green job carrying a string in `warnings[]`
+    /// that nothing reads.
+    #[test]
+    fn an_app_that_declares_a_floor_also_declares_its_verdict() {
+        for app in apps() {
+            let name = app.name();
+            if AWAITING_THE_JUDGE.contains(&name) {
+                continue;
+            }
+            let shape = app.manifest().output_shape.unwrap_or("");
+            if !shape.contains(LEGACY_FLOOR_MARKER) {
+                continue;
+            }
+            assert!(
+                shape.contains(VERDICT_MARKER),
+                "app '{name}' declares a completeness floor but no `{VERDICT_MARKER}` \
+                 block — it computes the judgment and throws it away. Judge it with \
+                 `pumper_core::completeness` and report `completeness` in its \
+                 output_shape."
+            );
+        }
+    }
+
+    /// Every judged app must be registered, and every app named in either list
+    /// must exist — a hand-kept list that outlives its apps is a lie.
+    #[test]
+    fn every_listed_app_is_registered() {
+        for name in JUDGED.iter().chain(AWAITING_THE_JUDGE.iter()) {
+            assert!(
+                !shape_of(name).is_empty(),
+                "app '{name}' declares no output_shape at all, so nothing can be \
+                 asserted about its verdict"
+            );
+        }
+    }
+
+    /// The exemption list is a countdown, not a carve-out: once an app routes
+    /// through the judge, leaving it here is itself the failure.
+    #[test]
+    fn the_un_judged_list_only_ever_shrinks() {
+        for name in AWAITING_THE_JUDGE {
+            assert!(
+                !shape_of(name).contains(VERDICT_MARKER),
+                "app '{name}' now declares `{VERDICT_MARKER}`, so it is no longer \
+                 awaiting the judge — drop it from AWAITING_THE_JUDGE"
+            );
+        }
+        assert!(
+            AWAITING_THE_JUDGE.len() <= 1,
+            "the un-judged floor list grew; a new app must route through \
+             `pumper_core::completeness`, not join the exemption"
+        );
+    }
+}
