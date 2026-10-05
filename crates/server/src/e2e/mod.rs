@@ -42,6 +42,7 @@ mod request_panics;
 mod requeue_policy;
 mod router;
 mod schedule_budget;
+mod schedule_decisions;
 mod schedule_misfire;
 mod schedule_truth;
 mod scheduler_overlap;
