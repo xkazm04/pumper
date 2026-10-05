@@ -31,7 +31,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `retired` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -61,12 +61,13 @@ pub(crate) async fn list_schedules(
 /// and a `health` reason so "why isn't this firing?" is answerable over the API
 /// instead of only in server logs.
 ///
-/// `health` is derived from the same conditions the scheduler checks — and for
-/// the overlap condition from the same read and the same predicate
-/// (`scheduler::latest_run` → `run_holds_slot`), not a second interpretation of
-/// a second query. The previous arrangement had exactly that second
-/// interpretation, and it reported `ok` for schedules the scheduler had already
-/// stopped firing (see `run_holds_slot`).
+/// `health` is not derived here at all: it is the fire path's own admission
+/// verdict (`scheduler::admit` → `ScheduleAdmission::health`), read verbatim.
+/// This file used to re-derive it in a second if/else chain, and that copy
+/// drifted — it knew five of the scheduler's six gates and never learned about
+/// retirement, so a schedule the scheduler had stopped firing answered `ok`.
+/// `scheduler::health_and_guard_share_one_predicate` fails if any gate is
+/// re-answered below.
 async fn enrich_schedules(
     state: &AppState,
     schedules: Vec<Schedule>,
@@ -83,34 +84,20 @@ async fn enrich_schedules(
                 )
             })?;
         let (last_job_id, last_status) = (last.job_id, last.status);
-        // Precedence mirrors the scheduler's own short-circuits: a disabled or
-        // mis-configured schedule never reaches the overlap check.
-        let health = if !schedule.enabled {
-            "disabled"
-        } else if next_run.is_none() {
-            // project_next_run only returns None on an unparseable/exhausted cron.
-            "invalid_cron"
-        } else if !state.registry.contains_key(&schedule.app) {
-            "unregistered_app"
-        } else if crate::scheduler::validate_schedule_params(
-            &state.registry,
-            &schedule.app,
-            &schedule.params,
-        )
-        .is_err()
-        {
-            // The scheduler skips this row at the fire step; say so here rather
-            // than reporting "ok" for a schedule that will never enqueue again.
-            // Derived (not stored) on purpose: it is computed by the SAME
-            // function the fire path calls, so fixing the row clears the marker
-            // in the same instant the scheduler starts firing it again — a
-            // stored flag would have to be un-set by somebody.
-            "invalid_params"
-        } else if last.holds_slot {
-            "overlapping"
-        } else {
-            "ok"
-        };
+        // ONE verdict, the fire path's own, with its own declared precedence.
+        // Derived (not stored) on purpose: fixing the row — valid params again,
+        // the source restored out of `retired` — clears the marker in the same
+        // instant the scheduler starts firing it again, where a stored flag
+        // would have to be un-set by somebody.
+        let health = crate::scheduler::admit(state, &schedule)
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to decide the schedule's admission: {e}"),
+                )
+            })?
+            .health();
         let mut value = serde_json::to_value(&schedule).unwrap_or_else(|_| json!({}));
         if let Value::Object(map) = &mut value {
             map.insert("next_run".into(), json!(next_run));

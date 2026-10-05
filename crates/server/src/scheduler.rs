@@ -323,47 +323,56 @@ pub(crate) async fn reconcile_one(
         Action::SkipThenFire { missed } => (missed, 0, true),
     };
 
-    // ---- Door gates ---------------------------------------------------------
-    // These apply to EVERY acting branch, `skip` included. A `skip` schedule on
+    // ---- Admission: ONE verdict, from the one vocabulary --------------------
+    // Every gate below is composed by [`admit`], and `GET /schedules` reads the
+    // SAME call — so "why isn't this firing?" has exactly one authority. The
+    // gates apply to EVERY acting branch, `skip` included: a `skip` schedule on
     // an unregistered app used to accrue `skipped_count` forever while
     // `GET /schedules` reported `health: "unregistered_app"` — the row "ate"
-    // firings that could never have run in the first place, and the count of
-    // eaten firings said work had been dropped when none was ever runnable.
-    // Refusing without recording keeps ONE contract for both policies: fixing
-    // the row makes it fire, because nothing advanced while it was broken.
-    if !state.registry.contains_key(&schedule.app) {
-        warn!(
-            id = %schedule.id, app = %schedule.app,
-            "schedule references unregistered app; neither firing nor recording a skip advance"
-        );
-        return Ok(StepOutcome::Refused);
-    }
-    // Door parity: a schedule whose effective params fail the app's declared
-    // schema is REFUSED, not enqueued — the same 422 the HTTP door answers,
-    // moved to the only place a legacy row can still be caught. Neither
-    // `last_run` nor `last_skipped_at` is touched, so fixing the row makes the
-    // schedule fire again instead of having silently eaten firings.
-    // Visible on `GET /schedules` as `health: "invalid_params"`.
-    let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
-        Ok(params) => params,
-        Err(msg) => {
+    // firings that could never have run in the first place. Refusing without
+    // recording keeps ONE contract for both policies: fixing the row makes it
+    // fire, because nothing advanced while it was broken.
+    let verdict = admit(state, schedule).await?;
+    // `Some(params)` once the row is admitted; `None` only on the overlap
+    // verdict, which is decided AFTER the misfire policy (below) exactly as it
+    // always was.
+    let params = match verdict {
+        ScheduleAdmission::Disabled => {
+            // Unreachable from the pass (it filters disabled rows) and caught
+            // again at fire time against the LIVE row — see `still_firable`.
+            info!(id = %schedule.id, app = %schedule.app, "schedule is disabled; not enqueuing");
+            return Ok(StepOutcome::Refused);
+        }
+        ScheduleAdmission::InvalidCron => {
+            warn!(id = %schedule.id, cron = %schedule.cron, "schedule cron has no next firing");
+            return Ok(StepOutcome::Refused);
+        }
+        ScheduleAdmission::UnregisteredApp => {
             warn!(
                 id = %schedule.id, app = %schedule.app,
-                "schedule params fail the app's declared schema; neither firing nor recording a \
-                 skip advance (GET /schedules shows health=invalid_params): {msg}"
+                "schedule references unregistered app; neither firing nor recording a skip advance"
             );
             return Ok(StepOutcome::Refused);
         }
-    };
-
-    // Retirement: an extractor schedule over a retired source is skipped, not
-    // fired. Read from the STORED state, not the enforced one — retirement is a
-    // scheduling decision, not a data gate, so it holds in soak mode too. The
-    // state is read on every tick, so `POST /sources/{id}/state` back to any
-    // other state resumes the schedule at its next firing.
-    if let Some(dataset) = retirement_dataset(&schedule.app, &params) {
-        let stored = state.health.state(&schedule.app, &dataset).await;
-        if schedule_blocked_by_retirement(&schedule.app, &params, stored) {
+        // Door parity: a schedule whose effective params fail the app's
+        // declared schema is REFUSED, not enqueued — the same 422 the HTTP door
+        // answers, moved to the only place a legacy row can still be caught.
+        // Neither `last_run` nor `last_skipped_at` is touched, so fixing the row
+        // makes the schedule fire again instead of having silently eaten
+        // firings.
+        ScheduleAdmission::InvalidParams { reason } => {
+            warn!(
+                id = %schedule.id, app = %schedule.app,
+                "schedule params fail the app's declared schema; neither firing nor recording a \
+                 skip advance (GET /schedules shows health=invalid_params): {reason}"
+            );
+            return Ok(StepOutcome::Refused);
+        }
+        // Retirement: an extractor schedule over a retired source is skipped,
+        // not fired. The state is read on every tick, so
+        // `POST /sources/{id}/state` back to any other state resumes the
+        // schedule at its next firing.
+        ScheduleAdmission::Retired { dataset } => {
             let eaten = missed + collapsed + usize::from(fires);
             info!(
                 id = %schedule.id, app = %schedule.app, dataset = %dataset, eaten,
@@ -376,7 +385,9 @@ pub(crate) async fn reconcile_one(
                 .await?;
             return Ok(StepOutcome::Skipped);
         }
-    }
+        ScheduleAdmission::Overlapping => None,
+        ScheduleAdmission::Fire { params } => Some(params),
+    };
 
     if !fires {
         info!(
@@ -396,14 +407,13 @@ pub(crate) async fn reconcile_one(
     // Overlap guard: don't stack a second run while the previous one
     // is still queued/running. last_run is NOT touched, so the missed
     // firing stays due and fires on the first tick after it finishes.
-    // The SAME read + predicate `GET /schedules` reports as
-    // `health: "overlapping"` — see `latest_run`. Nothing is recorded here, the
-    // skip advance included: recording it would move the reference past the very
-    // firing the guard just promised to keep due.
-    if latest_run(state, &schedule.id).await?.holds_slot {
+    // Nothing is recorded here, the skip advance included: recording it would
+    // move the reference past the very firing the guard just promised to keep
+    // due.
+    let Some(params) = params else {
         info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
         return Ok(StepOutcome::Held);
-    }
+    };
 
     // Fire-time re-check against the LIVE row rather than the pass's snapshot —
     // see `still_firable`.
@@ -458,6 +468,114 @@ pub(crate) async fn reconcile_one(
         .record_schedule_skip(&schedule.id, now, missed)
         .await?;
     Ok(StepOutcome::SkippedAndFired)
+}
+
+/// The admission verdict for ONE firing of ONE schedule: exactly one value,
+/// from one closed vocabulary, produced by [`admit`] and read by **both** the
+/// fire path ([`reconcile_one`]) and `GET /schedules`
+/// (`routes::schedules::enrich_schedules`).
+///
+/// The anti-pattern this replaces: the scheduler decided six separate times
+/// whether a firing may happen, each decision an early return, and the read
+/// side answered the operator's "why isn't this firing?" with a *second*
+/// if/else chain that reproduced five of them. The copy drifted — retirement
+/// landed on the fire path with no health branch at all, so a schedule that ate
+/// a firing every tick reported `health: "ok"` beside a confident future
+/// `next_run`. Per-gate guards cannot fix that (there was one, for overlap);
+/// the vocabulary itself has to be the shared thing.
+///
+/// Registry: `admission-queue/admission-vocabulary` — "one gate, one
+/// vocabulary", law `one-authority-per-vocabulary`.
+///
+/// **Declaration order is the precedence**, highest gate first. The serialized
+/// `health` string of each variant is its name in snake_case
+/// ([`ScheduleAdmission::health`]), and the set of them is pinned against the
+/// `GET /schedules` OpenAPI description by
+/// `admission_variants_and_the_published_health_values_are_one_list` — a
+/// seventh gate cannot land without the API learning its name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScheduleAdmission {
+    /// The row is switched off. Outranks everything: a disabled schedule's cron
+    /// is never even parsed.
+    Disabled,
+    /// The cron is unparseable or has no future firing, so there is nothing to
+    /// admit. Only reachable by editing the row — the create door refuses it.
+    InvalidCron,
+    /// No app of this name is registered in this binary.
+    UnregisteredApp,
+    /// The effective params fail the app's declared schema. Carries the door's
+    /// own pointer-path message for the log line.
+    InvalidParams { reason: String },
+    /// An `extractor` schedule whose source is retired. Carries the dataset so
+    /// the operator is told which source to restore.
+    Retired { dataset: String },
+    /// This schedule's own most recent run is still queued/running, so the next
+    /// firing is held back rather than stacked.
+    Overlapping,
+    /// Admitted. Carries the validated effective params, so the fire path does
+    /// not re-run the gate it just passed.
+    Fire { params: Value },
+}
+
+impl ScheduleAdmission {
+    /// The `health` string `GET /schedules` publishes for this verdict. The one
+    /// producer — nothing else may spell these.
+    pub(crate) fn health(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::InvalidCron => "invalid_cron",
+            Self::UnregisteredApp => "unregistered_app",
+            Self::InvalidParams { .. } => "invalid_params",
+            Self::Retired { .. } => "retired",
+            Self::Overlapping => "overlapping",
+            // `Fire` is the absence of a reason not to fire, and the API has
+            // always called that `ok`.
+            Self::Fire { .. } => "ok",
+        }
+    }
+}
+
+/// The ONE admission decision for a schedule, composed from every gate in
+/// declared precedence order and answering with exactly one
+/// [`ScheduleAdmission`].
+///
+/// Read-only: it writes nothing and records nothing, so the read side can call
+/// it per request and the fire path can act on it. That is also why the verdict
+/// is *derived* rather than stored — restoring a retired source clears
+/// `health: "retired"` on the very next read, with nobody having to un-set a
+/// flag.
+pub(crate) async fn admit(
+    state: &AppState,
+    schedule: &Schedule,
+) -> anyhow::Result<ScheduleAdmission> {
+    if !schedule.enabled {
+        return Ok(ScheduleAdmission::Disabled);
+    }
+    // The same projection `GET /schedules` reports as `next_run`, so "no next
+    // firing" and "null next_run" can never disagree.
+    if project_next_run(schedule).is_none() {
+        return Ok(ScheduleAdmission::InvalidCron);
+    }
+    if !state.registry.contains_key(&schedule.app) {
+        return Ok(ScheduleAdmission::UnregisteredApp);
+    }
+    let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
+        Ok(params) => params,
+        Err(reason) => return Ok(ScheduleAdmission::InvalidParams { reason }),
+    };
+    // Read from the STORED state, not the enforced one — retirement is a
+    // scheduling decision, not a data gate, so it holds in soak mode too.
+    if let Some(dataset) = retirement_dataset(&schedule.app, &params) {
+        let stored = state.health.state(&schedule.app, &dataset).await;
+        if schedule_blocked_by_retirement(&schedule.app, &params, stored) {
+            return Ok(ScheduleAdmission::Retired { dataset });
+        }
+    }
+    // The same read and the same predicate on both sides — see `latest_run`.
+    if latest_run(state, &schedule.id).await?.holds_slot {
+        return Ok(ScheduleAdmission::Overlapping);
+    }
+    Ok(ScheduleAdmission::Fire { params })
 }
 
 /// The only app whose schedules retirement can stop: its sources are
@@ -1174,17 +1292,36 @@ mod tests {
             .collect()
     }
 
-    /// `Foo` -> `foo`, `InvalidCron` -> `invalid_cron`: the one spelling rule
-    /// between a variant and the `health` string it publishes.
-    fn snake(variant: &str) -> String {
-        let mut out = String::new();
-        for (i, c) in variant.chars().enumerate() {
-            if c.is_uppercase() && i > 0 {
-                out.push('_');
-            }
-            out.extend(c.to_lowercase());
-        }
-        out
+    /// The `(variant, health string)` pairs declared by
+    /// `ScheduleAdmission::health` — the only producer of those strings, read
+    /// out of the source so that a variant with no arm is a parse the test can
+    /// see rather than a silent omission.
+    fn declared_health_arms(scheduler: &str) -> Vec<(String, String)> {
+        let block = scheduler
+            .split_once("fn health(&self) -> &'static str {")
+            .expect("scheduler.rs declares ScheduleAdmission::health")
+            .1
+            .split_once("\n        }")
+            .expect("the match block is closed")
+            .0;
+        block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("Self::"))
+            .filter_map(|l| l.split_once("=> \""))
+            .map(|(lhs, rhs)| {
+                let variant = lhs
+                    .split([' ', '{', '('])
+                    .next()
+                    .expect("an arm names its variant")
+                    .to_string();
+                let health = rhs
+                    .split_once('"')
+                    .expect("the arm's string literal is closed")
+                    .0
+                    .to_string();
+                (variant, health)
+            })
+            .collect()
     }
 
     /// The `health` values the `GET /schedules` OpenAPI description publishes,
@@ -1309,22 +1446,93 @@ mod tests {
     fn admission_variants_and_the_published_health_values_are_one_list() {
         let scheduler = non_test_source("scheduler.rs");
         let route = non_test_source("routes/schedules.rs");
-        let mut declared: Vec<String> = declared_admission_variants(&scheduler)
-            .iter()
-            .map(|v| snake(v))
-            .collect();
+        let arms = declared_health_arms(&scheduler);
         assert!(
-            declared.len() >= 6,
-            "implausibly few admission variants parsed: {declared:?}"
+            arms.len() >= 6,
+            "implausibly few health arms parsed: {arms:?}"
         );
-        let mut published = published_health_values(&route);
+
+        // Every declared variant publishes a name...
+        let mut named: Vec<String> = arms.iter().map(|(v, _)| v.clone()).collect();
+        let mut declared = declared_admission_variants(&scheduler);
+        named.sort();
         declared.sort();
+        assert_eq!(
+            named, declared,
+            "a ScheduleAdmission variant has no `health` arm, so the API cannot \
+             name the gate that produced it"
+        );
+
+        // ...and the API publishes exactly those names, no more.
+        let mut health: Vec<String> = arms.into_iter().map(|(_, h)| h).collect();
+        let mut published = published_health_values(&route);
+        health.sort();
         published.sort();
         assert_eq!(
-            declared, published,
+            health, published,
             "the admission vocabulary and the `health` values GET /schedules \
              publishes have drifted apart"
         );
+    }
+
+    /// The runtime half of the vocabulary guard: the source scan above reads
+    /// the DECLARATION, this one reads the only producer of the strings. One
+    /// sample of every variant, in declaration order, so the precedence the
+    /// doc comment states is also asserted.
+    #[test]
+    fn every_declared_variant_has_exactly_one_health_string() {
+        let samples = [
+            ScheduleAdmission::Disabled,
+            ScheduleAdmission::InvalidCron,
+            ScheduleAdmission::UnregisteredApp,
+            ScheduleAdmission::InvalidParams {
+                reason: "/a: nope".into(),
+            },
+            ScheduleAdmission::Retired {
+                dataset: "extracted".into(),
+            },
+            ScheduleAdmission::Overlapping,
+            ScheduleAdmission::Fire {
+                params: Value::Null,
+            },
+        ];
+        let declared = declared_admission_variants(&non_test_source("scheduler.rs"));
+        assert_eq!(
+            samples.len(),
+            declared.len(),
+            "a variant was added to the enum but not to this sample set: {declared:?}"
+        );
+        // Declaration order IS the precedence order the doc comment states.
+        assert_eq!(
+            declared,
+            vec![
+                "Disabled",
+                "InvalidCron",
+                "UnregisteredApp",
+                "InvalidParams",
+                "Retired",
+                "Overlapping",
+                "Fire",
+            ],
+            "the declared precedence changed; `admit` and the docs must change with it"
+        );
+        let health: Vec<&str> = samples.iter().map(ScheduleAdmission::health).collect();
+        assert_eq!(
+            health,
+            vec![
+                "disabled",
+                "invalid_cron",
+                "unregistered_app",
+                "invalid_params",
+                "retired",
+                "overlapping",
+                "ok",
+            ]
+        );
+        let mut uniq: Vec<&str> = health.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), health.len(), "two verdicts share one name");
     }
 
     #[test]
@@ -1335,8 +1543,16 @@ mod tests {
             declared_admission_variants(fake),
             vec!["Disabled", "InvalidCron", "Fire"]
         );
-        assert_eq!(snake("UnregisteredApp"), "unregistered_app");
-        assert_eq!(snake("Fire"), "fire");
+        let fake_health = "fn health(&self) -> &'static str {\n        match self {\n            \
+                           Self::Disabled => \"disabled\",\n            Self::Fire { .. } => \
+                           \"ok\",\n        }\n    }\n";
+        assert_eq!(
+            declared_health_arms(fake_health),
+            vec![
+                ("Disabled".to_string(), "disabled".to_string()),
+                ("Fire".to_string(), "ok".to_string()),
+            ]
+        );
         assert_eq!(
             published_health_values("and `health` (`ok` | `disabled` | `retired`) - so a"),
             vec!["ok", "disabled", "retired"]
