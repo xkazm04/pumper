@@ -587,3 +587,125 @@ fn prose_is_not_a_call_site_and_a_wrapped_chain_still_is() {
         vec!["state.health.enforced_state".to_string()]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Arming has exactly one predicate
+// ---------------------------------------------------------------------------
+
+/// Every place in the workspace's *source* that reads `[resilience]
+/// enforce_sources`, as `<repo-relative path>` → occurrences.
+///
+/// **Why this guard and not a sentence in a doc.** The whole value of
+/// `enforcement_armed` is that there is ONE expression between config and an
+/// enforcement consequence. The way that rots is a second reader: some later
+/// call site asks `cfg.enforce_sources.contains(..)` inline, with slightly
+/// different matching (a prefix, a case fold, a trimmed entry), and arming now
+/// means two things depending on which consumer you ask. That divergence is
+/// silent and it is the optimistic direction again — a source the operator
+/// believes is unarmed being gated by the reader that matched loosely.
+///
+/// So the list of readers is pinned. `config.rs` declares and defaults the key;
+/// `detect.rs` holds the three pure functions over it; `store.rs` is the only
+/// consumer, and it is exactly three expressions (the short-circuit, the
+/// per-source gate, and the preview's view of the posture). Everything else —
+/// the four worker gates, the health routes, `app.rs`, every app — reaches
+/// arming through `enforced_state`/`enforcing_any`/`armed`, which is why
+/// `every_enforced_state_consumer_is_named_in_the_preview_inventory` above did
+/// not have to change for this feature.
+///
+/// Adding a row means adding a reader. Before you do: can the call site use
+/// `Resilience::armed` instead? It almost certainly can.
+const ENFORCE_SOURCES_READERS: &[(&str, usize)] = &[
+    // Declaration + default.
+    ("crates/core/src/config.rs", 2),
+    // The three pure predicates: `enforcement_armed`,
+    // `enforcement_armed_anywhere`, `unseen_armed_sources` — parameter and body
+    // for each.
+    ("crates/core/src/resilience/detect.rs", 6),
+    // The only consumer: `enforcing_any`, `armed_source`, `arming`.
+    ("crates/core/src/resilience/store.rs", 3),
+];
+
+/// This file names the key in its own prose and literals.
+const SELF_PATH_ARMING: &str = "crates/core/tests/enforcement_preview.rs";
+
+fn enforce_sources_readers() -> std::collections::BTreeMap<String, usize> {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    rust_sources(&root.join("crates"), &mut files);
+
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Tests are free to set the key; this pins who READS it in the product.
+        if rel == SELF_PATH_ARMING || !rel.contains("/src/") {
+            continue;
+        }
+        let n = scannable_source(&text).matches("enforce_sources").count();
+        if n > 0 {
+            found.insert(rel, n);
+        }
+    }
+    found
+}
+
+#[test]
+fn enforcement_armed_is_the_only_predicate_between_config_and_a_consequence() {
+    let found = enforce_sources_readers();
+    let expected: std::collections::BTreeMap<&str, usize> =
+        ENFORCE_SOURCES_READERS.iter().copied().collect();
+
+    let added: Vec<String> = found
+        .iter()
+        .filter(|(f, n)| expected.get(f.as_str()).is_none_or(|e| *n > e))
+        .map(|(f, n)| format!("{f} x{n} (declared: {:?})", expected.get(f.as_str())))
+        .collect();
+    assert!(
+        added.is_empty(),
+        "NEW reader(s) of `[resilience] enforce_sources`: {added:?}. Arming must have exactly \
+         one predicate — `resilience::detect::enforcement_armed`, fronted by `cfg.enabled` in \
+         `Resilience::armed`. A second reader with its own matching rule makes `armed` mean two \
+         different things depending on which consumer is asked, and the divergence is silent. \
+         Use `Resilience::armed` / `armed_source` / `enforcing_any` instead; if you genuinely \
+         need a new reader, add a row here and say why."
+    );
+
+    let gone: Vec<String> = expected
+        .iter()
+        .filter(|(f, n)| found.get(**f).is_none_or(|a| a < n))
+        .map(|(f, n)| format!("{f} x{n} (actual: {:?})", found.get(*f)))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "ENFORCE_SOURCES_READERS over-counts: a reader was removed (fine) but the inventory \
+         still claims it: {gone:?}"
+    );
+}
+
+/// The scanner must not count the prose that documents arming — every file
+/// above explains the rule in a doc comment directly over code that uses it.
+#[test]
+fn arming_prose_is_not_a_reader_and_a_wrapped_call_still_is() {
+    assert_eq!(
+        scannable_source("/// `enforce_sources` arms one source\n// cfg.enforce_sources\n")
+            .matches("enforce_sources")
+            .count(),
+        0
+    );
+    assert_eq!(
+        scannable_source(
+            "        super::detect::enforcement_armed(\n            self.cfg.enforce,\n            \
+             &self.cfg.enforce_sources,\n        )\n"
+        )
+        .matches("enforce_sources")
+        .count(),
+        1
+    );
+}

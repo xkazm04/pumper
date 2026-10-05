@@ -758,10 +758,65 @@ impl Resilience {
         self.store.is_some()
     }
 
-    /// Whether verdicts are allowed to gate anything. `false` is the shipping
-    /// default: compute and store everything, change nothing.
+    /// Whether the **fleet-wide** flip is on: `[resilience] enforce`, which
+    /// arms every source at once.
+    ///
+    /// This is narrower than it used to be, and the narrowing is the point.
+    /// `enforce` is no longer the only way a source gets armed, so a caller
+    /// asking "is anything being gated" wants [`enforcing_any`](Self::enforcing_any)
+    /// and a caller asking about one source wants [`armed`](Self::armed). This
+    /// answers only the configured fleet-wide intent — which is what a startup
+    /// log line and the `enforcing` field of the health routes report.
     pub fn enforcing(&self) -> bool {
         self.cfg.enabled && self.cfg.enforce
+    }
+
+    /// Whether ANY source is armed — the cheap short-circuit.
+    ///
+    /// The four worker gates and the health routes ask this before walking a
+    /// per-pair loop, so soak mode (`enforce = false`, empty `enforce_sources`)
+    /// stays what it has always been: zero health reads on the write path, not
+    /// one read per dataset per job that always answers `Healthy`.
+    pub fn enforcing_any(&self) -> bool {
+        self.cfg.enabled
+            && super::detect::enforcement_armed_anywhere(
+                self.cfg.enforce,
+                &self.cfg.enforce_sources,
+            )
+    }
+
+    /// Whether enforcement is armed for this one source.
+    ///
+    /// `cfg.enabled` fronts the predicate deliberately and must stay in front
+    /// of it: `enforce = false` is no longer an absolute kill switch now that a
+    /// list can arm sources without it, so the absolute off has to survive
+    /// somewhere, and that somewhere is `enabled = false`.
+    pub fn armed(&self, app: &str, dataset: &str) -> bool {
+        self.armed_source(&super::source_id(app, dataset))
+    }
+
+    /// [`armed`](Self::armed) by source id, for callers that already hold one
+    /// (the health routes render rows keyed by id).
+    pub fn armed_source(&self, source_id: &str) -> bool {
+        self.cfg.enabled
+            && super::detect::enforcement_armed(
+                self.cfg.enforce,
+                &self.cfg.enforce_sources,
+                source_id,
+            )
+    }
+
+    /// The arming posture as the preview reports it: what is armed, and which
+    /// configured entries are redundant. Built here so `cfg.enabled` fronts the
+    /// preview's view of arming exactly as it fronts the gate's.
+    pub fn arming(&self) -> super::preview::Arming {
+        if !self.cfg.enabled {
+            return super::preview::Arming::default();
+        }
+        super::preview::Arming {
+            enforce: self.cfg.enforce,
+            sources: self.cfg.enforce_sources.clone(),
+        }
     }
 
     pub fn store(&self) -> Option<&HealthStore> {
@@ -799,10 +854,16 @@ impl Resilience {
         }
     }
 
-    /// The state that governs enforcement: always `Healthy` while `enforce` is
-    /// off, so soak mode cannot gate anything even by accident.
+    /// The state that governs enforcement: always `Healthy` for a source that
+    /// is not armed, so an unarmed source cannot be gated even by accident.
+    ///
+    /// This is the one place arming is decided. The signature always carried
+    /// the source identity and used to throw it away; now [`armed`](Self::armed)
+    /// consults it, and every one of the enforcement consumers inventoried by
+    /// `every_enforced_state_consumer_is_named_in_the_preview_inventory`
+    /// becomes per-source without moving a single call site.
     pub async fn enforced_state(&self, app: &str, dataset: &str) -> SourceState {
-        if !self.enforcing() {
+        if !self.armed(app, dataset) {
             return SourceState::Healthy;
         }
         self.state(app, dataset).await

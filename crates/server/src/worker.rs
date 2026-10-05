@@ -1595,12 +1595,13 @@ fn group_by_app_dataset(
 ///
 /// Per-dataset rather than per-job: one app can serve several datasets, and a
 /// break in one must not silence the others. A no-op unless
-/// `[resilience] enforce` is on.
+/// `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
 async fn suppress_unhealthy(
     state: &AppState,
     by_dataset: &mut HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
-    if !state.health.enforcing() {
+    if !state.health.enforcing_any() {
         return;
     }
     // The app comes from the batch key, not from the job: a run can write under
@@ -1626,7 +1627,7 @@ async fn suppress_unhealthy(
 /// judged on. The one read those gates share, so the enforcement preview's
 /// inventory sees one call site for all of them.
 ///
-/// Empty while `[resilience] enforce` is off: soak mode reads nothing and gates
+/// Empty while nothing is armed: soak mode reads nothing and gates
 /// nothing, and an absent pair reads as "not suppressed" in every predicate
 /// below, exactly like `Unknown` does.
 async fn enforced_states(
@@ -1634,7 +1635,7 @@ async fn enforced_states(
     pairs: Vec<(String, String)>,
 ) -> HashMap<(String, String), SourceState> {
     let mut out = HashMap::new();
-    if !state.health.enforcing() {
+    if !state.health.enforcing_any() {
         return out;
     }
     for pair in pairs {
@@ -1714,13 +1715,14 @@ fn pushable_view_deltas(
 /// [`pushable_view_deltas`] with the sources resolved: from each delta's own
 /// snapshot, or — for a `removed` delta, which carries none — from the view
 /// record it tombstoned (tombstoning keeps the row's data). A no-op that reads
-/// nothing unless `[resilience] enforce` is on.
+/// nothing unless `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
 async fn gate_view_deltas(
     state: &AppState,
     search_id: &str,
     changes: Vec<pumper_core::Revision>,
 ) -> Vec<pumper_core::Revision> {
-    if !state.health.enforcing() {
+    if !state.health.enforcing_any() {
         return changes;
     }
     let mut sources = Vec::with_capacity(changes.len());
@@ -1769,9 +1771,10 @@ fn echo_withheld_by(
 /// and the index is a derived artifact a later healthy run refills. Withholding
 /// every doc also withholds the `_job` sweep, so the last trusted snapshot
 /// stays findable. Fail-open on a read failure, and a no-op unless
-/// `[resilience] enforce` is on.
+/// `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
 async fn echo_index_withheld(state: &AppState, job: &Job) -> bool {
-    if !state.health.enforcing() {
+    if !state.health.enforcing_any() {
         return false;
     }
     let Some(store) = state.health.store() else {

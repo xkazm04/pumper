@@ -67,6 +67,88 @@ pub const CONSEQUENCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// How much of the fleet enforcement is armed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmedScope {
+    /// `[resilience] enforce = true`: every source, including ones added after
+    /// the config was written.
+    All,
+    /// `enforce = false` with a non-empty `enforce_sources`: exactly the listed
+    /// sources.
+    Some,
+    /// The shipping default. Nothing is gated and nothing is read on the write
+    /// path.
+    None,
+}
+
+/// The arming posture a preview is reported against: which sources enforcement
+/// is allowed to act on right now.
+///
+/// Carries the configured list rather than a boolean, because "what would
+/// `enforce = true` do to my fleet" and "what is being enforced right now" stop
+/// being the same question the moment arming is per-source — and a preview that
+/// cannot tell them apart is a leaflet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Arming {
+    /// `[resilience] enforce`, already ANDed with `enabled` by the caller.
+    pub enforce: bool,
+    /// `[resilience] enforce_sources`, verbatim.
+    pub sources: Vec<String>,
+}
+
+impl Arming {
+    /// Everything armed — the fleet-wide flip.
+    pub fn all() -> Self {
+        Self {
+            enforce: true,
+            sources: Vec::new(),
+        }
+    }
+
+    /// Exactly these sources armed.
+    pub fn only(sources: &[&str]) -> Self {
+        Self {
+            enforce: false,
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Whether one source is armed. Delegates to the single predicate in
+    /// [`super::detect::enforcement_armed`] — this type reports arming, it does
+    /// not define it.
+    pub fn armed(&self, source_id: &str) -> bool {
+        super::detect::enforcement_armed(self.enforce, &self.sources, source_id)
+    }
+
+    /// Whether any source at all is armed.
+    pub fn anywhere(&self) -> bool {
+        super::detect::enforcement_armed_anywhere(self.enforce, &self.sources)
+    }
+
+    pub fn scope(&self) -> ArmedScope {
+        if self.enforce {
+            ArmedScope::All
+        } else if self.sources.is_empty() {
+            ArmedScope::None
+        } else {
+            ArmedScope::Some
+        }
+    }
+
+    /// Configured entries that are doing nothing because `enforce = true`
+    /// already arms everything. Reported, not silently honoured in either
+    /// direction: the list cannot narrow arming, and an operator who thinks it
+    /// can has to be told.
+    pub fn redundant(&self) -> &[String] {
+        if self.enforce {
+            &self.sources
+        } else {
+            &[]
+        }
+    }
+}
+
 /// Why the replayed state moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
