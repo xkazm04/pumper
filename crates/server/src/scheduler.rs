@@ -1111,22 +1111,102 @@ mod tests {
     /// re-deriving `queued`/`running` for itself. A second hand-rolled status
     /// match anywhere in the schedules surface is how the two drifted apart in
     /// the first place.
+    /// The NON-test half of one server source file.
+    ///
+    /// A source-scanning test that reads its own module matches its own
+    /// needles: every "this string must be absent" assertion is then trivially
+    /// false, and every "must be present" one trivially true — an inventory
+    /// guard that cannot fail is worse than none, because it reads as coverage.
+    fn non_test_source(name: &str) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let body =
+            std::fs::read_to_string(src.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        body.split("#[cfg(test)]")
+            .next()
+            .expect("split yields the pre-test-module source")
+            .to_string()
+    }
+
+    /// The body of `enrich_schedules` alone — the health derivation, without
+    /// the create/enable doors in the same file, which legitimately ask the
+    /// registry their own questions.
+    fn enrich_schedules_body(route: &str) -> String {
+        let after = route
+            .split_once("async fn enrich_schedules")
+            .expect("routes/schedules.rs still defines enrich_schedules")
+            .1;
+        let body = after
+            .split_once("\n#[derive(")
+            .expect("enrich_schedules is followed by the next top-level item")
+            .0
+            .to_string();
+        assert!(
+            body.len() < route.len() / 2,
+            "the slice is supposed to be one function, not most of the file"
+        );
+        body
+    }
+
+    /// Every variant name declared by the `ScheduleAdmission` enum, in source
+    /// order. Scanned rather than enumerated in Rust so that the *declaration*
+    /// is the one list: a variant added to the enum and nowhere else fails
+    /// here, which is the whole point of a closed admission vocabulary.
+    fn declared_admission_variants(scheduler: &str) -> Vec<String> {
+        let block = scheduler
+            .split_once("pub(crate) enum ScheduleAdmission {")
+            .expect("scheduler.rs declares `pub(crate) enum ScheduleAdmission`")
+            .1
+            .split_once("\n}")
+            .expect("the enum declaration is closed")
+            .0;
+        block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+            .map(|l| {
+                l.split(['{', '(', ','])
+                    .next()
+                    .expect("a variant line has a name")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+            .collect()
+    }
+
+    /// `Foo` -> `foo`, `InvalidCron` -> `invalid_cron`: the one spelling rule
+    /// between a variant and the `health` string it publishes.
+    fn snake(variant: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in variant.chars().enumerate() {
+            if c.is_uppercase() && i > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        }
+        out
+    }
+
+    /// The `health` values the `GET /schedules` OpenAPI description publishes,
+    /// parsed out of the `#[utoipa::path]` attribute itself.
+    fn published_health_values(route: &str) -> Vec<String> {
+        let after = route
+            .split_once("`health` (")
+            .expect("the GET /schedules description still enumerates `health`")
+            .1;
+        let list = after
+            .split_once(')')
+            .expect("the enumeration is parenthesised")
+            .0;
+        list.split('|')
+            .map(|v| v.trim().trim_matches('`').to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    }
+
     #[test]
     fn health_and_guard_share_one_predicate() {
-        // Only the NON-test half of each file is scanned. A source-scanning test
-        // that reads its own module matches its own needles: every "this string
-        // must be absent" assertion is then trivially false, and every "must be
-        // present" one trivially true — an inventory guard that cannot fail is
-        // worse than none, because it reads as coverage.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let code = |name: &str| {
-            let body =
-                std::fs::read_to_string(src.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-            body.split("#[cfg(test)]")
-                .next()
-                .expect("split yields the pre-test-module source")
-                .to_string()
-        };
+        let code = non_test_source;
         let scheduler = code("scheduler.rs");
         let route = code("routes/schedules.rs");
         assert!(
@@ -1171,6 +1251,95 @@ mod tests {
             !scheduler.contains(existential_twin),
             "the existential overlap query is back; it is what wedged schedules \
              on `POST /jobs/retry`"
+        );
+
+        // One gate, one vocabulary. The overlap predicate above is ONE of the
+        // admission gates; guarding only that one is what let the retirement
+        // gate land in the fire path with no health branch at all. So the whole
+        // verdict is the shared thing now: `enrich_schedules` reads `admit` and
+        // may not re-answer ANY gate for itself.
+        let enrich = enrich_schedules_body(&route);
+        assert!(
+            enrich.contains("crate::scheduler::admit("),
+            "the health derivation must read the one admission verdict"
+        );
+        assert!(
+            scheduler.contains("admit(state, schedule).await?"),
+            "the fire path must reach its answer through the same `admit` call"
+        );
+        for gate in [
+            "registry.contains_key",
+            "validate_schedule_params",
+            "schedule_blocked_by_retirement",
+            "retirement_dataset",
+            "holds_slot",
+        ] {
+            assert!(
+                !enrich.contains(gate),
+                "enrich_schedules re-derives the `{gate}` gate instead of reading \
+                 the one admission verdict — exactly the drift that made a \
+                 retired source report health=ok"
+            );
+        }
+    }
+
+    /// The guard above can only work if its slicing does. Drives both slicers
+    /// and asserts they cut where they claim to.
+    #[test]
+    fn the_admission_guard_can_actually_fail() {
+        let route = non_test_source("routes/schedules.rs");
+        let enrich = enrich_schedules_body(&route);
+        assert!(
+            route.contains("registry.contains_key"),
+            "the create door legitimately asks the registry — so a whole-file \
+             scan could never have expressed this rule"
+        );
+        assert!(!enrich.contains("fn create_schedule"));
+        assert!(
+            enrich.contains("next_run"),
+            "the slice is the right function"
+        );
+    }
+
+    /// One vocabulary, published once. Every variant the admission enum
+    /// declares must appear in the `GET /schedules` OpenAPI description, and
+    /// the description may publish nothing the enum cannot produce — so a
+    /// seventh gate cannot land without the API learning its name.
+    #[test]
+    fn admission_variants_and_the_published_health_values_are_one_list() {
+        let scheduler = non_test_source("scheduler.rs");
+        let route = non_test_source("routes/schedules.rs");
+        let mut declared: Vec<String> = declared_admission_variants(&scheduler)
+            .iter()
+            .map(|v| snake(v))
+            .collect();
+        assert!(
+            declared.len() >= 6,
+            "implausibly few admission variants parsed: {declared:?}"
+        );
+        let mut published = published_health_values(&route);
+        declared.sort();
+        published.sort();
+        assert_eq!(
+            declared, published,
+            "the admission vocabulary and the `health` values GET /schedules \
+             publishes have drifted apart"
+        );
+    }
+
+    #[test]
+    fn the_variant_scanner_can_actually_fail() {
+        let fake = "pub(crate) enum ScheduleAdmission {\n    /// doc\n    Disabled,\n    \
+                    InvalidCron,\n    Fire { params: Value },\n}\n";
+        assert_eq!(
+            declared_admission_variants(fake),
+            vec!["Disabled", "InvalidCron", "Fire"]
+        );
+        assert_eq!(snake("UnregisteredApp"), "unregistered_app");
+        assert_eq!(snake("Fire"), "fire");
+        assert_eq!(
+            published_health_values("and `health` (`ok` | `disabled` | `retired`) - so a"),
+            vec!["ok", "disabled", "retired"]
         );
     }
 
