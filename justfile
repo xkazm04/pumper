@@ -161,6 +161,7 @@ harness-test:
     node --test scripts/ci/lane-certify.test.mjs
     node --test scripts/ci/disk-check.test.mjs
     node --test scripts/ci/gate-inventory.test.mjs
+    node --test scripts/ci/quality-report.test.mjs
 
 # Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
 # through the recorder (so the --ignored set finally accumulates history), then
@@ -241,6 +242,27 @@ ci: fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake
 # Prove the doc-sync hook still fires: runs its fixture suite.
 doc-sync:
     node --test scripts/docs/check-doc-sync.test.mjs
+
+# The whole posture in one run. `just ci` is a dependency chain and `just` aborts
+# at the first non-zero rung, so one red gate hides every other verdict until you
+# fix it and re-run the ladder. This runs every gate in scripts/ci/gates.json in
+# its NON-MUTATING mode, continues past every failure, and prints one table:
+# gate, verdict, the one-line finding, and the exact command that fixes it.
+#
+# Four verdicts, four columns, and CANNOT CHECK is its own — a broken instrument
+# counted as clean is the failure every gate header in this repo warns about and
+# nothing aggregated. NOT WIRED is a registered gate with no report mode: it gets
+# a row rather than vanishing, and reddens the run unless gates.json declares why
+# that rung is waived.
+#
+# Read-only: disk-check runs --no-prune. Three outcomes, three exit codes — 0
+# every gate clean, 2 some gate has findings, 3 some instrument could not be run.
+# Deliberately NOT a dependency of `ci`: every row's gate already blocks there on
+# its own rung, and running the suite twice to print it once is not a posture.
+#
+# Every gate's verdict and its remedy, in one table.
+quality:
+    node scripts/ci/quality-report.mjs
 
 # --- maintenance -------------------------------------------------------------
 

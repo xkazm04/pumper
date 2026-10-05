@@ -301,20 +301,26 @@ jobs:
           node --test scripts/ci/lane-certify.test.mjs
           node --test scripts/ci/disk-check.test.mjs
           node --test scripts/ci/gate-inventory.test.mjs
-      # Register size WITH its trend and the age of the oldest entry, published
-      # wherever the suite's health is published — a size with no trend is a
-      # number, and a register growing monotonically is deletion with a slower
-      # fuse. Lane health goes in the same summary so "never green" is visible
-      # to whoever is already looking at the board.
-      - name: Publish harness health
+          node --test scripts/ci/quality-report.test.mjs
+      # The published posture, as a PROJECTION of scripts/ci/gates.json rather
+      # than a hand-walked subset of it. What was here before named two of the
+      # five gates — flake-check and lane-certify, each with `|| true` — so
+      # disk-check and mcp-gate-parity contributed nothing to the summary and a
+      # cannot-check in either of the two named ones was invisible as well. One
+      # table now, every registered gate in it, CANNOT CHECK counted in its own
+      # column, and a runnable remedy on every red row.
+      #
+      # Non-blocking on purpose, and `if: always()` on purpose: every row's gate
+      # has its own blocking rung in this same job, so failing here would red the
+      # job twice for one cause — and the summary is most worth having precisely
+      # on the runs where a rung above already failed.
+      - name: Quality posture
         if: ${{ !cancelled() }}
         run: |
           {
-            echo '## Test harness health'
-            echo '```'
-            node scripts/ci/flake-check.mjs --report || true
-            node scripts/ci/lane-certify.mjs --report || true
-            echo '```'
+            echo '## Quality posture'
+            echo
+            node scripts/ci/quality-report.mjs --markdown || true
           } >> "$GITHUB_STEP_SUMMARY"
 
   # The long lanes: nightly and on demand, never on a per-change gate.

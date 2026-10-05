@@ -72,6 +72,43 @@
       "blocksCi": false,
       "exits": [0, 2, 3],
       "verdictWaived": "A Stop hook that judges ONE transcript handed to it on stdin; there is no standing tree to run it against, so the fixture suite IS the rung. Run `node scripts/docs/check-doc-sync.mjs <transcript>.jsonl` to replay one by hand."
+    },
+    {
+      "key": "quality-report",
+      "script": "scripts/ci/quality-report.mjs",
+      "test": "scripts/ci/quality-report.test.mjs",
+      "recipe": "quality",
+      "fixtureRecipes": ["harness-test"],
+      "ciStep": "Quality posture",
+      "ciFixtureStep": "Harness gate fixtures",
+      "blocksCi": false,
+      "exits": [0, 2, 3]
     }
-  ]
+  ],
+  "_reportDoc": "`reportModes` is how a gate joins the posture table that `just quality` (scripts/ci/quality-report.mjs) prints. Keyed by gate key; a gate with NO entry, or an entry with no `command`, still gets a row -- NOT WIRED -- because an inexpressible condition must still enumerate. `command` is argv, spawned with the repo root as cwd, and MUST be the gate's non-mutating mode (disk-check therefore carries --no-prune: the posture is read-only by construction). `remedy` is the command a human runs when that row is red -- refusal-names-a-reachable-remedy, asserted by quality-report.test.mjs to start with `just` or `node` and to name only paths that resolve inside this repo. `self: true` marks the reporter's own entry, which is the one row it must never emit.",
+  "reportModes": {
+    "flake-check": {
+      "command": ["node", "scripts/ci/flake-check.mjs"],
+      "remedy": "node scripts/ci/flake-check.mjs --report"
+    },
+    "lane-certify": {
+      "command": ["node", "scripts/ci/lane-certify.mjs"],
+      "remedy": "node scripts/ci/lane-certify.mjs --report"
+    },
+    "disk-check": {
+      "command": ["node", "scripts/ci/disk-check.mjs", "--no-prune"],
+      "remedy": "just disk-prune"
+    },
+    "mcp-gate-parity": {
+      "command": ["node", "scripts/ci/mcp-gate-parity.mjs"],
+      "remedy": "node scripts/ci/mcp-gate-parity.mjs"
+    },
+    "check-doc-sync": {
+      "remedy": "node --test scripts/docs/check-doc-sync.test.mjs"
+    },
+    "quality-report": {
+      "self": true,
+      "remedy": "node --test scripts/ci/quality-report.test.mjs"
+    }
+  }
 }

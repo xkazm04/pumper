@@ -44,6 +44,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
 | `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |
 | `just datahub-preview [port]` | `GET /datahub/governance/preview` — what the DataHub governance poll would do right now, writes nothing (server RUNNING) |
+| `just quality` | the whole posture in one run — `node scripts/ci/quality-report.mjs`: every gate in `scripts/ci/gates.json` in its **non-mutating** mode, one table of gate / verdict / finding / **remedy**, and a footer counting clean / findings / **cannot-check** / not wired in four separate columns. Continues past every red row (`just ci` aborts at the first), exits with the worst verdict, mutates nothing. `--markdown` is what the CI step summary publishes |
 | `just smoke [args]` | `pwsh -File scripts/smoke.ps1` — boots the real binary against a scratch config, drives one real job end-to-end, and curls the doctor/retention/enforcement-preview/openapi/receipt surfaces; PASS/FAIL/SKIP per check, tears down after itself |
 
 `--bin pumper` is **required**: the `pumper-server` package ships three binaries
@@ -62,6 +63,13 @@ EXPECTED-diff inventory test that holds every projection to it: an unregistered
 gate, a gate missing from CI, a gate whose cannot-check branch no test has ever
 observed, and a recipe line belonging to no gate all go red there. **Add a gate by
 appending one object to `gates`** — never reflow the file.
+
+The same file carries `reportModes`: per gate, the **non-mutating** argv
+`just quality` spawns and the remedy it prints when that row is red. A gate with
+no entry there still gets a row (`NOT WIRED`) rather than disappearing from the
+posture, and that row reddens the run unless the gate's entry declares a
+`verdictWaived`. Register the gate, declare its report mode, and both the table
+and the CI step summary pick it up with no second list anywhere.
 
 Config is `config.toml`, or `$PUMPER_CONFIG`; every key is optional (defaults in
 `crates/core/src/config.rs`).
