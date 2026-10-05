@@ -43,10 +43,15 @@ pub(crate) struct SourcesQuery {
     tag = "sources",
     params(SourcesQuery),
     responses(
-        (status = 200, description = "`{enabled, enforcing, contracts_enforce, contracts, count, \
+        (status = 200, description = "`{enabled, enforcing, enforcing_any, enforce_sources, \
+            contracts_enforce, contracts, count, \
             unmonitored, sources: [{id, app, dataset, state, degradation_score, state_since, \
-            last_verdict, tripped_of_last3, monitored, ..., contract?, active_rules_hash, \
+            last_verdict, tripped_of_last3, monitored, armed, ..., contract?, active_rules_hash, \
             repairable, repairable_reason}]}`. \
+            `enforcing` is the fleet-wide `[resilience] enforce` flip; `enforcing_any` is true \
+            when anything at all is armed (the flip, or a non-empty `enforce_sources`, which is \
+            echoed verbatim). Each row's `armed` says whether THAT source's verdicts are acting \
+            on anything right now — a quarantined row with `armed: false` is still soaking. \
             `active_rules_hash` is the source's active ruleset head (null = not enrolled). \
             `repairable: false` carries exactly one `repairable_reason` (`not an extractor \
             source`, `inline rules` = no ruleset head, or `no pinned bodies`); \
@@ -125,6 +130,11 @@ pub(crate) async fn list_sources(
                     let window = window_for(windows.as_ref(), &s.id);
                     map.insert("contract".into(), verdict_with_age(v, window, now));
                 }
+                // Per row, because arming is per source now. Without it the
+                // table shows a quarantined source beside a fleet-wide
+                // `enforcing: false` and the operator cannot tell whether that
+                // verdict is acting on anything.
+                map.insert("armed".into(), json!(state.health.armed_source(&s.id)));
                 insert_repair_fields(map, &s.app, facts.get(&s.id));
             }
             row
@@ -132,7 +142,17 @@ pub(crate) async fn list_sources(
         .collect();
     Ok(Json(json!({
         "enabled": true,
+        // The fleet-wide flip, unchanged in name and meaning...
         "enforcing": state.health.enforcing(),
+        // ...and the finer answer beside it: whether anything is armed at all,
+        // and which sources the config named. `GET /enforcement/preview`
+        // reports the same posture per source with its counts.
+        "enforcing_any": state.health.enforcing_any(),
+        // Read through `Resilience::arming`, not off the config: arming has one
+        // home, and `enabled = false` has to front this rendering exactly as it
+        // fronts the gate. `enforcement_armed_is_the_only_predicate_between_\
+        // config_and_a_consequence` is the guard that keeps it that way.
+        "enforce_sources": state.health.arming().sources,
         // Configured intent, kept for compatibility; `contracts` beside it is
         // what is actually being observed.
         "contracts_enforce": state.config.contracts.enforce,
@@ -157,8 +177,10 @@ pub(crate) async fn list_sources(
     tag = "sources",
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
     responses(
-        (status = 200, description = "`{source, contract, runs, fields, invariants, \
-            statistical_coverage}`. `source` carries `active_rules_hash`, `repairable` and \
+        (status = 200, description = "`{source, contract, armed, runs, fields, invariants, \
+            statistical_coverage}`. `armed` is whether enforcement is armed on THIS source \
+            (`[resilience] enforce`, or its id in `enforce_sources`); the `enforcing` field \
+            beside it is the fleet-wide flip alone. `source` carries `active_rules_hash`, `repairable` and \
             `repairable_reason` exactly as the `/sources` rows do. `contract` is the latest declared-contract verdict with its \
             own `age_secs`/`stale`/`stale_reason?` attached (null when none recorded since boot); \
             `fields` pairs the latest run's per-field sketch with its baseline; \
@@ -227,6 +249,10 @@ pub(crate) async fn get_source(
         "source": source_row,
         "contract": contract,
         "enforcing": state.health.enforcing(),
+        // Whether THIS source's verdicts are acting on anything. On a detail
+        // view the fleet-wide flag alone is the wrong answer to the only
+        // question the reader has.
+        "armed": state.health.armed_source(&id),
         "statistical_coverage": coverage,
         "runs": runs,
         "fields": fields,
@@ -300,11 +326,22 @@ pub(crate) struct EnforcementPreviewQuery {
     tag = "sources",
     params(EnforcementPreviewQuery),
     responses(
-        (status = 200, description = "`{enforcing, ready, not_ready: [{id, state, gates, since}], \
-            unmonitored, totals, sources: [{id, state, gates, live_state, monitored, \
+        (status = 200, description = "`{enforcing, armed, enforce_sources, redundant_sources, \
+            armed_unseen, ready, not_ready: [{id, state, gates, since}], \
+            unmonitored, totals, consequences: {armed, soaking}, \
+            sources: [{id, armed, state, gates, live_state, monitored, \
             window_opens_at, window_opens_in, runs_replayed, unjudged_runs, \
             transitions: [{at, from, to, cause, verdict, score, diagnosis, reasons, gates}], \
             consequences}]}`. \
+            `armed` is `all` (`[resilience] enforce = true`), `some` (a non-empty \
+            `enforce_sources`) or `none` (the shipping default). Per source, `armed: true` means \
+            its `consequences` describe what IS happening and `false` means what WOULD happen — \
+            which is why the fleet rollup is split into `consequences.armed` and \
+            `consequences.soaking` as well as summed into `totals`. Arming one source moves \
+            exactly that source's counts from `soaking` to `armed`. A list set beside \
+            `enforce = true` is redundant, never a restriction, and is echoed under \
+            `redundant_sources`; a list entry matching no replayed source is named under \
+            `armed_unseen`, so a typo cannot look like a successful rollout. \
             `ready: true` means no source's current state gates anything, so flipping \
             `[resilience] enforce` would change nothing about the next run; `not_ready` names \
             the sources that make it false. Counts are **runs and the documents in them**, \
@@ -320,7 +357,7 @@ pub(crate) async fn enforcement_preview(
     let store = health_store(&state)?;
     let preview = pumper_core::preview_fleet(
         store,
-        state.health.enforcing(),
+        &state.health.arming(),
         query.app.as_deref(),
         preview_runs(query.runs),
         query.limit.unwrap_or(500).clamp(1, 500),

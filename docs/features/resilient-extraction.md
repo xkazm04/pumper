@@ -42,11 +42,19 @@
 | Repair engine: inversion, Claude proposals, validation gates, promotion (§6, §8.1–8.3) | **not built** |  |
 | `resilience-eval` mutation harness, canary source (§10.9, §12) | **not built** |  |
 
-`[resilience] enforce = false` ships as the default: every verdict is computed and
-stored, nothing is gated. That is §12.6's soak mode, and it is the state the
+`[resilience] enforce = false` with an empty `enforce_sources` ships as the
+default: every verdict is computed and stored, nothing is gated, and nothing is
+read on the write path. That is §12.6's soak mode, and it is the state the
 system is in until an operator reads `GET /sources` and decides otherwise —
 or, before deciding, asks `GET /enforcement/preview` (§8.5) what turning it on
 *would* have done.
+
+**Arming is per source** (§9). `enforce = true` arms the whole fleet at once,
+which is a fleet-wide precondition for a risk that is per source; the preview
+answers per source, so the control is per source too. Add one source id to
+`enforce_sources`, leave the rest soaking, and the next preview reads back
+`armed: true` for it with its counts under `consequences.armed`. Disarming is
+deleting a line.
 
 ---
 
@@ -1366,7 +1374,8 @@ into the live dataset, which is the same code path and produces proper revisions
      view, so that pair always reads `healthy`. That pair also goes through `suppress_unhealthy`
      as a backstop.
 
-   With `enforce = false`, all of the above behaves exactly as before.
+   For a source nothing has armed (`enforce = false` and its id absent from
+   `enforce_sources`), all of the above behaves exactly as before.
 3. **A degrading source must never poison the search index.** `index_datasets`
    handling skips a suppressed source. Because indexing is now delta-driven from
    the change feed, the skipped revisions are simply picked up by the next healthy
@@ -1534,13 +1543,15 @@ GET    /repairs/{id}                               # candidates, scores, reject 
 ### 8.5 Enforcement preview — what would have happened
 
 `GET /enforcement/preview` (`just enforcement-preview [app]`) answers the only
-question that gates flipping `enforce`: *what would this have done to my fleet?*
+question that gates arming enforcement: *what would this have done to my fleet?*
+— and, since arming is per source (§9), it also answers *what is it doing
+right now*, per source, with the two never summed into one number.
 
-It works because soak mode is a no-op strictly **downstream**. `observe` judges
-every run, moves the source's state and writes the verdict, the score and the
-self-explaining `reasons` to `source_runs` **regardless** of `enforce`; the one
-thing `enforce` changes is that `Resilience::enforced_state` answers `Healthy` to
-the four consumers that gate on it. So the ladder in the database is already the
+It works because an unarmed source is a no-op strictly **downstream**. `observe`
+judges every run, moves the source's state and writes the verdict, the score and
+the self-explaining `reasons` to `source_runs` **regardless** of arming; the one
+thing arming changes is that `Resilience::enforced_state` answers `Healthy` to
+the consumers that gate on it. So the ladder in the database is already the
 ladder enforcement would have walked, and a preview is a *replay of stored rows*:
 
 - **It re-judges nothing.** Every verdict, score and state reported is the one
@@ -1600,14 +1611,22 @@ Response shape:
 ```
 GET /enforcement/preview?app=&runs=&limit=
 {
-  "enforcing": false,          # true => this describes what DID happen
+  "enforcing": false,          # the fleet-wide [resilience] enforce flip, alone
+  "armed": "none",             # "all" (the flip) | "some" (a list) | "none" (the default)
+  "enforce_sources": [],       # the configured list, echoed verbatim as the server loaded it
+  "redundant_sources": [],     # list entries that do nothing because enforce = true arms all
+  "armed_unseen": [],          # list entries matching no replayed source — i.e. a typo
   "ready": false,              # no source's current state gates anything
   "not_ready": [ { "id", "state", "gates": [...], "since": <transition> } ],
   "unmonitored": ["app/dataset"],   # never cleared the cohort floor: weak evidence,
                                     #   but gates nothing, so it does not block readiness
-  "totals": { "diverted_writes": {"runs","docs"}, ... },
+  "totals": { "diverted_writes": {"runs","docs"}, ... },   # every source, armed or not
+  "consequences": {            # the same sum, split by whether it is happening
+    "armed":   { "diverted_writes": {"runs","docs"}, ... },   # IS being gated
+    "soaking": { "diverted_writes": {"runs","docs"}, ... }    # WOULD be gated
+  },
   "sources": [ {
-    "id", "state", "gates", "live_state", "monitored",
+    "id", "armed", "state", "gates", "live_state", "monitored",
     "runs_replayed", "unjudged_runs", "window_opens_at", "window_opens_in",
     "transitions": [ { "at","from","to","cause","verdict","score","diagnosis","reasons","gates" } ],
     "consequences": { ... }
@@ -1618,6 +1637,25 @@ GET /enforcement/preview?app=&runs=&limit=
 `live_state` is the `sources` row as `GET /sources` serves it. It differs from
 the replayed `state` only when something outside the run history moved it, and is
 surfaced so the preview can never quietly disagree with the health table.
+
+**`totals` vs `consequences`.** `totals` is unchanged: every replayed source
+summed, armed or not. `consequences` splits that same sum, because once arming
+is per source a single rollup would add a number describing the past to a number
+describing a hypothesis and present the sum as a fact. Arming one source moves
+exactly that source's counts from `soaking` to `armed` and changes no other
+number — pinned by
+`arming_one_source_moves_only_that_source_from_soaking_to_armed`.
+
+**`armed_unseen` is why a typo cannot pass for a rollout.** A misspelt entry
+arms nothing, and a fleet where nothing is armed looks exactly like a fleet that
+is already fine. The entries are judged against the sources this replay actually
+saw, so a `?app=` filter or a `limit` can also put a real source in there — the
+field says *unseen*, not *unknown to the server*.
+
+**Known gap.** The preview reports the arming posture the *server process*
+loaded. `enforce_sources` is read at boot like every other config key, so a
+source added to the file is not armed until a restart; the field exists so that
+the posture in effect is readable rather than inferred from the file on the box.
 
 Metrics (cardinality-capped — per-field series limited to the worst 10 fields per
 source, because `/metrics` is scraped and label explosion is a real cost):
@@ -1642,7 +1680,10 @@ are the two halves of source liveness and neither subsumes the other.
 ```toml
 [resilience]
 enabled                 = true
-enforce                 = false    # false = compute verdicts, gate nothing (soak mode, §12.6)
+enforce                 = false    # true = arm EVERY source. false = soak mode (§12.6) unless
+                                   #   enforce_sources names one
+enforce_sources         = []       # source ids armed while enforce = false (§9), e.g.
+                                   #   ["extractor/hn-items"]. Empty = nothing armed.
 min_cohort_docs         = 30
 window_runs             = 20
 degrade_score           = 0.6
@@ -1680,8 +1721,45 @@ required — see the `ClaudeConfig` note in `harness-learnings.md`), and
 `min_cohort_docs ≥ 5`, `holdout_min_docs ≥ 5`, `fetch_ok_floor ∈ (0,1]`,
 `recovery_runs > 0` (zero would let a quarantined source release itself on the
 first run that merely failed to trip).
-`enabled = false` is a complete no-op; `enforce = false` computes everything and
-gates nothing, which is the shipping default (§12.6).
+`enabled = false` is a complete no-op; `enforce = false` with an empty
+`enforce_sources` computes everything and gates nothing, which is the shipping
+default (§12.6).
+
+**Arming, per source.** `enforce_sources` is a list of `"<app>/<dataset>"` ids,
+matched verbatim, mirroring `auto_retire` — which has been per-source opt-in
+since it shipped, for the same reason, over a *more* destructive consequence
+(retirement stops scheduling the source entirely; enforcement at worst diverts
+writes into a shadow dataset every existing tool already reads).
+
+| `enabled` | `enforce` | `enforce_sources` | armed |
+|---|---|---|---|
+| `false` | anything | anything | **nothing**. The absolute off, and it fronts every other key. |
+| `true` | `true` | anything | **every source**, including ones added later. A list beside it is redundant, never a restriction, and is reported as `redundant_sources`. |
+| `true` | `false` | `["extractor/hn-items"]` | **exactly those ids.** Everything else keeps soaking. |
+| `true` | `false` | `[]` | **nothing** — the shipping default, byte for byte. |
+
+An unset allowlist means **none**, never all: nobody who has not named a source
+has asked for that source to be gated. `enforce = true` keeps its old meaning
+exactly, so no existing deployment's behaviour moves, and a list can only widen
+arming from nothing — it can never narrow it from all.
+
+There is exactly **one** predicate between the config and any consequence:
+`resilience::detect::enforcement_armed(enforce, enforce_sources, source_id)`,
+fronted by `cfg.enabled` in `Resilience::armed`. `Resilience` is the only type
+that reads the list, and that is a scanned guard rather than a convention —
+`enforcement_armed_is_the_only_predicate_between_config_and_a_consequence`
+(`crates/core/tests/enforcement_preview.rs`) fails on a second reader anywhere
+in `crates/*/src/**`, because a second reader with its own matching rule (a
+prefix, a case fold, a trimmed entry) would make "armed" mean two things
+depending on which consumer you ask.
+
+Everything downstream became per-source without moving: the gate lives inside
+`enforced_state`, which always received `(app, dataset)` and used to discard it,
+so all nine inventoried consumers (§8.5) are per-source and none was edited.
+`Resilience::enforcing()` still answers about the fleet-wide flip alone;
+`enforcing_any()` is the cheap short-circuit the four worker gates take, which
+keeps "nothing armed" a zero-read no-op instead of one health read per dataset
+per job.
 
 ### 9.1 Cost governance, summarised
 
@@ -1928,6 +2006,12 @@ then read `source_runs`:
 
 Enforcement flips on per-source, not fleet-wide, starting with the highest-volume
 rule-backed sources where cohorts are large and the statistics are strongest.
+**This is now the mechanism and not just the plan**: `[resilience]
+enforce_sources` (§9) arms one id at a time, `GET /enforcement/preview` reports
+`armed` per source with `consequences.armed` / `consequences.soaking` beside it,
+and the four-week soak above is therefore a per-source precondition instead of a
+fleet-wide one. The FPR bar is read per source and the arming decision taken per
+source, which is the only way a bar over 39 catalogued sources is ever met.
 
 ### 12.7 Standing regression
 

@@ -15,7 +15,7 @@
 
 use pumper_core::config::ResilienceConfig;
 use pumper_core::extract::{CoercionStatus, DocReport, FieldStatus};
-use pumper_core::resilience::preview::{preview_fleet, TransitionCause};
+use pumper_core::resilience::preview::{preview_fleet, ArmedScope, Arming, TransitionCause};
 use pumper_core::resilience::store::Resilience;
 use pumper_core::testing::TempStore;
 use pumper_core::{doc_signals, FetchHealth, ObservedDoc, RunReport, SourceState};
@@ -180,7 +180,7 @@ async fn a_preview_replays_the_ladder_the_detector_actually_walked() {
     let health = Resilience::new(store.storage.pool(), &cfg());
     history(&health).await;
 
-    let preview = preview_fleet(health.store().unwrap(), health.enforcing(), None, 60, 500)
+    let preview = preview_fleet(health.store().unwrap(), &health.arming(), None, 60, 500)
         .await
         .expect("preview");
 
@@ -253,7 +253,7 @@ async fn a_fleet_that_is_not_ready_names_the_sources_that_are_not() {
         observe(&health, &broken()).await;
     }
 
-    let preview = preview_fleet(health.store().unwrap(), false, None, 60, 500)
+    let preview = preview_fleet(health.store().unwrap(), &Arming::default(), None, 60, 500)
         .await
         .expect("preview");
     assert!(!preview.ready);
@@ -293,7 +293,7 @@ async fn a_preview_leaves_the_store_byte_identical() {
     let before_rows = dump(&store.storage.pool()).await;
     let before_bytes = db_bytes(&store);
 
-    let preview = preview_fleet(health.store().unwrap(), false, None, 1000, 500)
+    let preview = preview_fleet(health.store().unwrap(), &Arming::default(), None, 1000, 500)
         .await
         .expect("preview");
     // The preview really did read something — a no-op that touched nothing would
@@ -592,8 +592,9 @@ fn prose_is_not_a_call_site_and_a_wrapped_chain_still_is() {
 // Arming has exactly one predicate
 // ---------------------------------------------------------------------------
 
-/// Every place in the workspace's *source* that reads `[resilience]
-/// enforce_sources`, as `<repo-relative path>` → occurrences.
+/// Every place in the workspace's *source* that reads the configured
+/// `[resilience] enforce_sources` list, as `<repo-relative path>` →
+/// occurrences.
 ///
 /// **Why this guard and not a sentence in a doc.** The whole value of
 /// `enforcement_armed` is that there is ONE expression between config and an
@@ -604,30 +605,47 @@ fn prose_is_not_a_call_site_and_a_wrapped_chain_still_is() {
 /// silent and it is the optimistic direction again — a source the operator
 /// believes is unarmed being gated by the reader that matched loosely.
 ///
-/// So the list of readers is pinned. `config.rs` declares and defaults the key;
-/// `detect.rs` holds the three pure functions over it; `store.rs` is the only
-/// consumer, and it is exactly three expressions (the short-circuit, the
-/// per-source gate, and the preview's view of the posture). Everything else —
-/// the four worker gates, the health routes, `app.rs`, every app — reaches
-/// arming through `enforced_state`/`enforcing_any`/`armed`, which is why
+/// So the readers are pinned, and the needle is a **config access**
+/// ([`CONFIG_READ_NEEDLES`]) rather than the bare identifier. The first draft of
+/// this guard matched `enforce_sources` anywhere and went red on the preview's
+/// own response field and on the OpenAPI prose that documents it — a response
+/// key named after a config key is not a second reader of it, and a matcher
+/// that cannot tell those apart is a matcher nobody will keep.
+///
+/// What is left is the real claim: `Resilience` is the only type that reads the
+/// list. `config.rs` declares it, `detect.rs` takes it as a parameter, and
+/// everything else — the four worker gates, the health routes, `app.rs`, every
+/// app — reaches arming through `enforced_state`/`enforcing_any`/`armed`/
+/// `arming`. That is why
 /// `every_enforced_state_consumer_is_named_in_the_preview_inventory` above did
-/// not have to change for this feature.
+/// not have to change for this feature at all.
 ///
 /// Adding a row means adding a reader. Before you do: can the call site use
 /// `Resilience::armed` instead? It almost certainly can.
 const ENFORCE_SOURCES_READERS: &[(&str, usize)] = &[
-    // Declaration + default.
-    ("crates/core/src/config.rs", 2),
-    // The three pure predicates: `enforcement_armed`,
-    // `enforcement_armed_anywhere`, `unseen_armed_sources` — parameter and body
-    // for each.
-    ("crates/core/src/resilience/detect.rs", 6),
-    // The only consumer: `enforcing_any`, `armed_source`, `arming`.
+    // The only consumer, and exactly three expressions: the cheap
+    // short-circuit (`enforcing_any`), the per-source gate (`armed_source`),
+    // and the posture the preview is rendered against (`arming`).
     ("crates/core/src/resilience/store.rs", 3),
 ];
 
+/// What counts as reading the configured list: an access through the config
+/// struct. A parameter named `enforce_sources` (that is `detect.rs`, which is
+/// handed the list and is the one place allowed to interpret it) and a response
+/// field of the same name are not reads of the config.
+const CONFIG_READ_NEEDLES: &[&str] = &["cfg.enforce_sources", "resilience.enforce_sources"];
+
 /// This file names the key in its own prose and literals.
 const SELF_PATH_ARMING: &str = "crates/core/tests/enforcement_preview.rs";
+
+/// Config reads of the arming list on one scannable (comment-free, joined)
+/// source text.
+fn config_reads(scannable: &str) -> usize {
+    CONFIG_READ_NEEDLES
+        .iter()
+        .map(|needle| scannable.matches(needle).count())
+        .sum()
+}
 
 fn enforce_sources_readers() -> std::collections::BTreeMap<String, usize> {
     let root = workspace_root();
@@ -648,7 +666,7 @@ fn enforce_sources_readers() -> std::collections::BTreeMap<String, usize> {
         if rel == SELF_PATH_ARMING || !rel.contains("/src/") {
             continue;
         }
-        let n = scannable_source(&text).matches("enforce_sources").count();
+        let n = config_reads(&scannable_source(&text));
         if n > 0 {
             found.insert(rel, n);
         }
@@ -689,23 +707,230 @@ fn enforcement_armed_is_the_only_predicate_between_config_and_a_consequence() {
     );
 }
 
-/// The scanner must not count the prose that documents arming — every file
-/// above explains the rule in a doc comment directly over code that uses it.
+/// The scanner must not count the prose that documents arming — every file it
+/// walks explains the rule in a doc comment directly over code that uses it —
+/// nor a response field that merely echoes the key's name, nor the parameter
+/// `detect.rs` is handed. It MUST count a rustfmt-wrapped config access.
 #[test]
-fn arming_prose_is_not_a_reader_and_a_wrapped_call_still_is() {
+fn arming_prose_and_a_response_field_are_not_config_reads() {
+    // Prose, including a commented-out config access.
     assert_eq!(
-        scannable_source("/// `enforce_sources` arms one source\n// cfg.enforce_sources\n")
-            .matches("enforce_sources")
-            .count(),
+        config_reads(&scannable_source(
+            "/// `enforce_sources` arms one source\n// cfg.enforce_sources.contains(id)\n"
+        )),
         0
     );
+    // The response field of the same name, and the struct literal that fills
+    // it from an already-resolved `Arming`.
     assert_eq!(
-        scannable_source(
+        config_reads(&scannable_source(
+            "    pub enforce_sources: Vec<String>,\n        enforce_sources: \
+             arming.sources.clone(),\n"
+        )),
+        0
+    );
+    // The pure predicate's parameter: handed the list, not reading the config.
+    assert_eq!(
+        config_reads(&scannable_source(
+            "pub fn enforcement_armed(enforce: bool, enforce_sources: &[String], id: &str) \
+             -> bool {\n    enforce || enforce_sources.iter().any(|s| s == id)\n}\n"
+        )),
+        0
+    );
+    // A real read, wrapped by rustfmt across four lines, is still one read.
+    assert_eq!(
+        config_reads(&scannable_source(
             "        super::detect::enforcement_armed(\n            self.cfg.enforce,\n            \
-             &self.cfg.enforce_sources,\n        )\n"
-        )
-        .matches("enforce_sources")
-        .count(),
+             &self.cfg\n                .enforce_sources,\n        )\n"
+        )),
         1
     );
+    // And the server's route-level shape, which must never appear.
+    assert_eq!(
+        config_reads(&scannable_source(
+            "    let n = state.config.resilience.enforce_sources.len();\n"
+        )),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arming, as the preview reports it
+// ---------------------------------------------------------------------------
+
+/// `observe`, but into a named dataset, so a test can build a two-source fleet.
+async fn observe_into(health: &Resilience, dataset: &'static str, docs: &[ObservedDoc]) {
+    health
+        .observe(
+            "extractor",
+            &RunReport {
+                job_id: Uuid::new_v4(),
+                dataset,
+                docs,
+                fetch: FetchHealth {
+                    attempted: docs.len() as u32,
+                    ok: docs.len() as u32,
+                    ..Default::default()
+                },
+                build_id: Some("test".into()),
+            },
+        )
+        .await
+        .expect("observe")
+        .expect("detection is enabled");
+}
+
+/// Two sources, both walked into quarantine, so arming is the only difference
+/// between them.
+async fn two_broken_sources(health: &Resilience) {
+    for dataset in ["products", "other"] {
+        for _ in 0..4 {
+            observe_into(health, dataset, &cohort(30, "price", ".price")).await;
+        }
+        for _ in 0..3 {
+            observe_into(health, dataset, &cohort(30, "amount", ".price")).await;
+        }
+    }
+}
+
+/// Case 6: arming one source moves exactly that source's counts from `soaking`
+/// to `armed`, and changes no other number.
+#[tokio::test]
+async fn arming_one_source_moves_only_that_source_from_soaking_to_armed() {
+    let store = TempStore::new("enforcement-preview-arm-one").await;
+    let health = Resilience::new(store.storage.pool(), &cfg());
+    two_broken_sources(&health).await;
+    let hstore = health.store().unwrap();
+
+    let soaking = preview_fleet(hstore, &Arming::default(), None, 60, 500)
+        .await
+        .expect("preview");
+    assert_eq!(soaking.armed, ArmedScope::None);
+    assert!(
+        soaking.sources.iter().all(|s| !s.armed),
+        "nothing armed: every source reports armed = false"
+    );
+    assert_eq!(
+        soaking.consequences.armed,
+        Default::default(),
+        "nothing is being gated, so the armed column must be empty"
+    );
+    assert_eq!(
+        soaking.consequences.soaking, soaking.totals,
+        "with nothing armed, soaking IS the total"
+    );
+    assert!(
+        soaking.totals.diverted_writes.runs > 0,
+        "the fixture must actually have consequences to split"
+    );
+
+    let armed = preview_fleet(
+        hstore,
+        &Arming::only(&["extractor/products"]),
+        None,
+        60,
+        500,
+    )
+    .await
+    .expect("preview");
+    assert_eq!(armed.armed, ArmedScope::Some);
+    assert_eq!(
+        armed.enforce_sources,
+        vec!["extractor/products".to_string()]
+    );
+    assert!(armed.redundant_sources.is_empty());
+    assert!(armed.armed_unseen.is_empty());
+    assert!(!armed.enforcing, "the fleet-wide flip is still off");
+
+    let products = armed
+        .sources
+        .iter()
+        .find(|s| s.id == "extractor/products")
+        .expect("products");
+    let other = armed
+        .sources
+        .iter()
+        .find(|s| s.id == "extractor/other")
+        .expect("other");
+    assert!(products.armed, "the named source is armed");
+    assert!(!other.armed, "its neighbour is not");
+
+    // The split is exactly the per-source numbers, and the total is unmoved:
+    // arming changes who is being gated, never what the replay counted.
+    assert_eq!(armed.consequences.armed, products.consequences);
+    assert_eq!(armed.consequences.soaking, other.consequences);
+    assert_eq!(
+        armed.totals, soaking.totals,
+        "arming a source must not change a single replayed count"
+    );
+}
+
+/// Case 4: `enforce = true` beside a list arms everything and says the list is
+/// doing nothing, rather than letting the list narrow a fleet that is already
+/// enforced.
+#[tokio::test]
+async fn the_flip_arms_everything_and_names_the_list_as_redundant() {
+    let store = TempStore::new("enforcement-preview-redundant").await;
+    let health = Resilience::new(store.storage.pool(), &cfg());
+    two_broken_sources(&health).await;
+
+    let arming = Arming {
+        enforce: true,
+        sources: vec!["extractor/products".to_string()],
+    };
+    let preview = preview_fleet(health.store().unwrap(), &arming, None, 60, 500)
+        .await
+        .expect("preview");
+
+    assert_eq!(preview.armed, ArmedScope::All);
+    assert!(preview.enforcing);
+    assert!(
+        preview.sources.iter().all(|s| s.armed),
+        "every source is armed under the flip, including the one the list omits"
+    );
+    assert_eq!(
+        preview.redundant_sources,
+        vec!["extractor/products".to_string()],
+        "the list is redundant under the flip, and the operator is told so"
+    );
+    assert_eq!(
+        preview.consequences.soaking,
+        Default::default(),
+        "nothing is soaking when everything is armed"
+    );
+    assert_eq!(preview.consequences.armed, preview.totals);
+}
+
+/// Case 5: a typo arms nothing, and arming nothing looks exactly like a fleet
+/// that is already fine — so the unmatched entry is named.
+#[tokio::test]
+async fn a_typo_in_the_arming_list_is_named_not_silently_ignored() {
+    let store = TempStore::new("enforcement-preview-typo").await;
+    let health = Resilience::new(store.storage.pool(), &cfg());
+    two_broken_sources(&health).await;
+
+    let preview = preview_fleet(
+        health.store().unwrap(),
+        &Arming::only(&["extractr/products", "extractor/other"]),
+        None,
+        60,
+        500,
+    )
+    .await
+    .expect("preview");
+
+    assert_eq!(
+        preview.armed_unseen,
+        vec!["extractr/products".to_string()],
+        "the typo is named; the entry that matched is not"
+    );
+    // And the real entry still worked: a reported typo must not be a reason to
+    // distrust the rest of the rollout.
+    let other = preview
+        .sources
+        .iter()
+        .find(|s| s.id == "extractor/other")
+        .expect("other");
+    assert!(other.armed);
+    assert_eq!(preview.consequences.armed, other.consequences);
 }
