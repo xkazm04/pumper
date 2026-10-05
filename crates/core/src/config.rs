@@ -1940,6 +1940,57 @@ mod tests {
         cfg.validate().expect("disabled refresher never binds");
     }
 
+    /// The rollback knob has to actually PARSE, or `off` is a promise in a doc.
+    ///
+    /// `off` restores the pre-imputation ceiling without a deploy, so a
+    /// deployment that needs it needs the TOML to be accepted; and an unknown
+    /// value must be a startup ERROR naming the vocabulary, because the one
+    /// failure mode worse than a tightened cap is a typo that silently
+    /// un-enforces it while the operator believes it is on.
+    #[test]
+    fn the_budget_imputation_knob_parses_and_a_typo_does_not_silently_disable_it() {
+        let on: Config = toml::from_str("").expect("an empty config is valid");
+        assert_eq!(
+            on.costs.budget_imputation,
+            BudgetImputation::WindowMean,
+            "the ceiling ships CHARGING for what it cannot price"
+        );
+        assert!(on.costs.budget_imputation.is_on());
+
+        let off: Config = toml::from_str(
+            "[costs]
+budget_imputation = \"off\"
+",
+        )
+        .expect("off must parse");
+        assert_eq!(off.costs.budget_imputation, BudgetImputation::Off);
+        assert!(!off.costs.budget_imputation.is_on());
+        assert_eq!(off.costs.budget_imputation.as_str(), "off");
+
+        let explicit: Config = toml::from_str(
+            "[costs]
+budget_imputation = \"window_mean\"
+",
+        )
+        .expect("the default spelling must parse too");
+        assert_eq!(
+            explicit.costs.budget_imputation,
+            BudgetImputation::WindowMean
+        );
+
+        let typo = toml::from_str::<Config>(
+            "[costs]
+budget_imputation = \"of\"
+",
+        )
+        .expect_err("a typo must not fall back to the permissive policy");
+        let msg = typo.to_string();
+        assert!(
+            msg.contains("window_mean") && msg.contains("off"),
+            "the refusal must name the vocabulary: {msg}"
+        );
+    }
+
     /// The defaults must be a completely inert retention posture: a deployment
     /// that never mentions `[storage]` deletes nothing at all.
     #[test]
