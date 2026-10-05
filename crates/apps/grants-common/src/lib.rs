@@ -1836,6 +1836,109 @@ fn end_of_ambiguous_day(d: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc.from_utc_datetime(&next.and_hms_opt(AMBIGUOUS_DEADLINE_UTC_HOUR, 0, 0).unwrap())
 }
 
+/// How much time is left on a published deadline, measured at the ONE canonical
+/// instant [`deadline_end_utc`] defines.
+///
+/// This type exists because three surfaces wanted the same countdown and each
+/// one derived it itself, so each one got a different answer: grants.gov's
+/// digest counted calendar days from `Utc::now().date_naive()`, and
+/// `GET /grants/closing-soon` compared printed date strings lexicographically.
+/// Both were ~12 hours out of step with `grants/unified` for the first half of
+/// every UTC day, and the disagreement always fell in the direction that hides
+/// claimable money: the grant closing today — the single most valuable row in
+/// an urgency view — was live in the corpus and absent from the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Countdown {
+    /// The canonical lapse instant, from [`deadline_end_utc`].
+    pub closes_at: chrono::DateTime<chrono::Utc>,
+    /// Whole hours of real time left; `0` once the deadline has lapsed, never
+    /// negative.
+    pub hours_left: i64,
+    /// Whole days left, counted in the deadline's own vocabulary (see
+    /// [`deadline_countdown`]); `0` once lapsed, never negative.
+    pub days_left: i64,
+    /// `now` is past [`Self::closes_at`]: this row is provably no longer
+    /// claimable, whatever its stored `status` still says.
+    ///
+    /// Not a redundant encoding of `hours_left == 0` — a deadline 40 minutes
+    /// away also has zero whole hours left and is still open.
+    pub lapsed: bool,
+}
+
+/// The countdown for one published deadline, or `None` when neither field
+/// parses — an unknown deadline is never a lapsed one, the same rule
+/// [`deadline_end_utc`] follows.
+///
+/// `days_left` splits on exactly the axis [`deadline_end_utc`] splits on,
+/// because that split *is* the difference between the two kinds of fact a
+/// source gave us:
+///
+/// - **Zoned** (`close_at` parsed): whole days of real time,
+///   `hours_left / 24`. SEDIA's `…T17:00:00Z` topic at 23:00Z the night before
+///   has eighteen hours and therefore **zero** days left, which is the number a
+///   user acts on. Counting the calendar would print "1 day" and be wrong by a
+///   working day.
+/// - **Date-only**: the calendar distance from today to the printed date,
+///   floored at 0. The twelve-hour anywhere-on-Earth tail inside `closes_at` is
+///   deliberate conservatism about an unknown timezone, not claim time we can
+///   promise, so it must not inflate the count. A grant printed for yesterday
+///   whose tail has not run out is `0` — claimable TODAY. This is bit-for-bit
+///   the definition grants.gov's digest already used, which is what makes it
+///   safe for the digest to call this function instead of its own arithmetic.
+pub fn deadline_countdown(
+    close_date: Option<&str>,
+    close_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Countdown> {
+    let closes_at = deadline_end_utc(close_date, close_at)?;
+    let hours_left = (closes_at - now).num_hours().max(0);
+    let days_left = if close_at.and_then(parse_instant).is_some() {
+        hours_left / 24
+    } else {
+        close_date
+            .and_then(parse_date)
+            .map(|d| (d - now.date_naive()).num_days().max(0))
+            .unwrap_or(0)
+    };
+    Some(Countdown {
+        closes_at,
+        hours_left,
+        days_left,
+        lapsed: now > closes_at,
+    })
+}
+
+/// The printed-date bounds `GET /grants/closing-soon` hands the store, derived
+/// from the canonical instant so the SQL set and [`deadline_countdown`] cannot
+/// disagree.
+///
+/// The upper bound is the plain calendar one, `today + days`. The lower bound
+/// is the whole trick. A printed date `D` is still claimable while
+/// `D+1T12:00:00Z` has not passed, so the set of still-claimable printed dates
+/// is `D >= today - 1` for the first twelve hours of the UTC day and
+/// `D >= today` after it. Stating the canonical set that way keeps the bound a
+/// **lexicographic text compare**, which is what lets the COUNT and the page
+/// share one predicate — the property that stops `count` and `grants` from
+/// disagreeing — while selecting the instant-correct rows.
+///
+/// It is a bound on *membership*, not a filter on lapse: a row whose zoned
+/// `close_at` ran out earlier today is still inside these bounds and is still
+/// returned, marked `lapsed`. Dropping a row the COUNT included is a bug this
+/// route has already had once.
+pub fn closing_window_bounds(now: chrono::DateTime<chrono::Utc>, days: i64) -> (String, String) {
+    use chrono::Timelike;
+    let today = now.date_naive();
+    let lower = if now.hour() < AMBIGUOUS_DEADLINE_UTC_HOUR {
+        today.pred_opt().unwrap_or(today)
+    } else {
+        today
+    };
+    (
+        lower.to_string(),
+        (today + chrono::Duration::days(days)).to_string(),
+    )
+}
+
 /// When a single published deadline string lapses, whatever shape it has:
 /// exact when it is zoned, conservatively end-of-ambiguous-day when it is a bare
 /// date. Used to order SEDIA's multi-stage cutoffs by real time.
