@@ -164,11 +164,13 @@ impl ScrapeApp for Cordis {
                  resumed_from, new, changed, unchanged, corpus, families, stats_new, \
                  stats_changed, cursor_next_page, cursor_next_offset, sweep, corpus_swept, \
                  warnings[]} — RCN-keyed projects in `projects`, per-topic-family rollups in \
-                 `topic_stats` (read by eu-sedia). `sweep` is `complete` (page arithmetic \
-                 proved the listing's end — only then does `corpus_swept` hold and the cursor \
-                 wrap), `capped` (stopped at maxProjects with corpus left) or `short_page` (a \
+                 `topic_stats` (read by eu-sedia). `sweep` is `complete` (the records \
+                 RECEIVED reach the listing's reported total — only then does `corpus_swept` \
+                 hold and the cursor wrap; the offset a page was REQUESTED at proves \
+                 nothing), `capped` (stopped at maxProjects with corpus left), `short_page` (a \
                  truncated page while the reported total says more remains: NOT the end, so \
-                 the cursor keeps its place and a warning is reported)",
+                 the cursor keeps its place and a warning is reported) or `unknown_total` \
+                 (records served under a reported total of 0, so coverage is unprovable)",
             ),
             cost_class: CostClass::Free,
         }
