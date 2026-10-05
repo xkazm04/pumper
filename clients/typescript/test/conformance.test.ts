@@ -189,3 +189,276 @@ test("incremental sync applies a 'changed' revision as upsert and a 'removed' on
   assert.equal(tombstones[0], "ca-grants|GR-0002");
   assert.equal(await watermark.get(dataset), result.watermark, "watermark persisted only after the sink commits");
 });
+
+// ---- Keyset watermark: the feed is a position, not a clock reading ---------
+//
+// `upsert_many` stamps every record in one 500-row chunk with ONE revision
+// `created_at` (docs/features/datasets.md § Conventions), so a watermark that
+// is a bare instant cannot name the boundary inside that chunk: resuming at
+// `created_at > S` drops every unread sibling of S. These tests pin the
+// forward keyset drain, its per-page checkpoint, and the legacy-value upgrade.
+
+import { parseWatermark, formatWatermark, normalizeStamp } from "../src/watermark.js";
+import { planPage } from "../src/sync.js";
+
+interface FeedPageJson {
+  items: PumperRevision[];
+  next_cursor: string | null;
+}
+
+/** A fake server that answers the ascending feed by keyset cursor: each page
+ *  is served to exactly the cursor that precedes it, so the SDK's resume path
+ *  is what selects the page, not a call counter. */
+function keysetFeed(startCursor: string, pages: FeedPageJson[]) {
+  const byCursor = new Map<string, FeedPageJson>();
+  let key = startCursor;
+  for (const page of pages) {
+    byCursor.set(key, page);
+    if (page.next_cursor === null) break;
+    key = page.next_cursor;
+  }
+  const requests: Array<{ cursor: string; order: string | null }> = [];
+  const fetchImpl: typeof fetch = (async (url: string | URL) => {
+    const q = new URL(String(url)).searchParams;
+    const cursor = q.get("cursor") ?? "";
+    requests.push({ cursor, order: q.get("order") });
+    const page = byCursor.get(cursor) ?? { items: [], next_cursor: null };
+    return new Response(JSON.stringify(page), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  return { fetch: fetchImpl, requests };
+}
+
+function recordingSink(throwOnCall?: number): SyncSink & { keys: string[]; calls: number } {
+  const state = {
+    keys: [] as string[],
+    calls: 0,
+    async upsert(records: Array<{ key: string; data: unknown }>) {
+      state.calls += 1;
+      if (state.calls === throwOnCall) throw new Error("sink is down");
+      for (const r of records) if (!state.keys.includes(r.key)) state.keys.push(r.key);
+      return records.length;
+    },
+    async tombstone(keys: string[]) {
+      for (const k of keys) {
+        const i = state.keys.indexOf(k);
+        if (i >= 0) state.keys.splice(i, 1);
+      }
+      return keys.length;
+    },
+  };
+  return state;
+}
+
+function revision(over: Partial<PumperRevision> = {}): PumperRevision {
+  return {
+    app: "grants",
+    dataset: "unified",
+    key: "k",
+    revision: 1,
+    change: "changed",
+    data: { n: 1 },
+    diff: null,
+    created_at: "2026-08-01T00:00:00.000000Z",
+    trust: "stable",
+    job_id: null,
+    source_url: null,
+    artifact_sha: null,
+    rules_hash: null,
+    ...over,
+  } as PumperRevision;
+}
+
+test("watermark token round-trips, and a legacy bare RFC3339 reads as position (stamp, 0)", () => {
+  assert.deepEqual(parseWatermark("2026-08-01T00:00:00.123456Z|41"), {
+    createdAt: "2026-08-01T00:00:00.123456Z",
+    rowid: 41,
+  });
+  assert.equal(formatWatermark({ createdAt: "2026-08-01T00:00:00.123456Z", rowid: 41 }), "2026-08-01T00:00:00.123456Z|41");
+  // The legacy form is the one every existing consumer store holds today. It
+  // must widen to a position that RE-reads the boundary stamp (rowid 0), never
+  // one that skips it — re-delivery is idempotent, loss is not.
+  assert.deepEqual(parseWatermark("2026-08-01T00:00:00Z"), {
+    createdAt: "2026-08-01T00:00:00.000000Z",
+    rowid: 0,
+  });
+  assert.equal(parseWatermark(null), null);
+  // Fixed-width micros, because the server compares these lexicographically.
+  assert.equal(normalizeStamp("2026-08-01T00:00:00Z"), "2026-08-01T00:00:00.000000Z");
+  assert.equal(normalizeStamp("2026-08-01T00:00:00.5Z"), "2026-08-01T00:00:00.500000Z");
+  assert.equal(normalizeStamp("2026-08-01T02:00:00+02:00"), "2026-08-01T00:00:00.000000Z");
+});
+
+test("planPage applies the last revision per key and drops nothing silently", () => {
+  const plan = planPage(
+    [
+      revision({ key: "a", data: { v: 1 } }),
+      revision({ key: "a", data: { v: 2 } }),
+      revision({ key: "b", change: "removed", data: null }),
+    ],
+    (raw: unknown) => raw,
+  );
+  assert.equal(plan.stalled, false);
+  assert.equal(plan.anomalies, 0);
+  assert.deepEqual(plan.upserts, [{ key: "a", data: { v: 2 } }]);
+  assert.deepEqual(plan.tombstones, ["b"]);
+});
+
+test("planPage stalls on a 'changed' revision with a null post-image instead of consuming the key", () => {
+  // The anti-pattern: `seen.add(key)` ran BEFORE the `data !== null` test, so a
+  // null post-image consumed the key for the whole run AND advanced the
+  // watermark past it — permanent, unsignalled divergence.
+  const plan = planPage([revision({ key: "a" }), revision({ key: "bad", data: null })], (raw: unknown) => raw);
+  assert.equal(plan.stalled, true, "the page must not be applied past the anomaly");
+  assert.equal(plan.anomalies, 1, "and it must be counted, not swallowed");
+  assert.deepEqual(plan.upserts, [], "nothing from the stalled page is applied");
+  assert.deepEqual(plan.tombstones, []);
+});
+
+test("a 'changed' revision with data:null does not upsert, does not consume the key, and does not advance the watermark", async () => {
+  const start = "2026-07-01T00:00:00.000000Z|0";
+  const feed = keysetFeed(start, [
+    { items: [revision({ key: "bad", data: null })], next_cursor: "2026-08-01T00:00:00.000000Z|9" },
+  ]);
+  const sink = recordingSink();
+  const watermark = memoryWatermark();
+  const dataset = { app: "grants", name: "unified" };
+  await watermark.set(dataset, start);
+
+  const result = await createPumperSync({
+    baseUrl: "http://example.invalid:1",
+    fetch: feed.fetch,
+    dataset,
+    watermark,
+    sink,
+    batchSize: 7,
+  }).run();
+
+  assert.deepEqual(sink.keys, [], "the key is never upserted");
+  assert.equal(result.stalled, true);
+  assert.equal(result.anomalies, 1);
+  assert.equal(
+    await watermark.get(dataset),
+    start,
+    "the watermark must not advance past a revision the SDK refused to apply",
+  );
+});
+
+test("a mid-run sink failure checkpoints the pages that DID land, and the next run resumes there", async () => {
+  const dataset = { app: "grants", name: "unified" };
+  const start = "2026-07-01T00:00:00.000000Z|0";
+  const page = (n: number, cursor: string | null): FeedPageJson => ({
+    items: Array.from({ length: 7 }, (_, i) => revision({ key: `p${n}-k${i}` })),
+    next_cursor: cursor,
+  });
+  const pages = [
+    page(1, "2026-08-01T00:00:00.000000Z|7"),
+    page(2, "2026-08-01T00:00:00.000000Z|14"),
+    { items: Array.from({ length: 3 }, (_, i) => revision({ key: `p3-k${i}` })), next_cursor: null },
+  ];
+  const feed = keysetFeed(start, pages);
+  const sink = recordingSink(2); // page 1 lands, page 2's upsert throws
+  const watermark = memoryWatermark();
+  await watermark.set(dataset, start);
+
+  const cfg = {
+    baseUrl: "http://example.invalid:1",
+    fetch: feed.fetch,
+    dataset,
+    watermark,
+    sink,
+    batchSize: 7,
+  };
+  await assert.rejects(() => createPumperSync(cfg).run(), /sink is down/);
+  assert.equal(
+    await watermark.get(dataset),
+    pages[0]!.next_cursor,
+    "page 1 applied, so page 1's position is the durable watermark — today nothing is written at all",
+  );
+  assert.equal(sink.keys.length, 7);
+
+  // Second run: pages 2-3 only, and the first page is never re-requested.
+  feed.requests.length = 0;
+  const second = await createPumperSync(cfg).run();
+  assert.equal(second.mode, "incremental");
+  assert.deepEqual(
+    feed.requests.map((r) => r.cursor),
+    [pages[0]!.next_cursor, pages[1]!.next_cursor],
+    "the second run starts from the stored position, not from the top of the feed",
+  );
+  assert.equal(sink.keys.length, 17, "7 + 7 + 3 keys, each exactly once");
+  assert.ok(
+    feed.requests.every((r) => r.order === "asc"),
+    "the drain is forward-ordered — that is what makes per-page checkpointing sound",
+  );
+});
+
+test("a legacy bare RFC3339 watermark keeps working, takes the incremental path, and is upgraded in place", async () => {
+  const dataset = { app: "grants", name: "unified" };
+  const legacy = "2026-07-01T00:00:00Z";
+  const feed = keysetFeed("2026-07-01T00:00:00.000000Z|0", [
+    { items: [revision({ key: "a" })], next_cursor: "2026-08-01T00:00:00.000000Z|3" },
+  ]);
+  const sink = recordingSink();
+  const watermark = memoryWatermark();
+  await watermark.set(dataset, legacy);
+
+  const result = await createPumperSync({
+    baseUrl: "http://example.invalid:1",
+    fetch: feed.fetch,
+    dataset,
+    watermark,
+    sink,
+    batchSize: 7,
+  }).run();
+
+  assert.equal(result.mode, "incremental", "a legacy value must NOT force a full re-snapshot");
+  assert.deepEqual(sink.keys, ["a"]);
+  const stored = await watermark.get(dataset);
+  assert.match(stored ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\|\d+$/, "upgraded in place to a position token");
+});
+
+// ---- The verifier: replay the feed the Rust store actually emitted ---------
+
+test("replaying the Rust-emitted shared-stamp feed across two runs loses no stamp-sibling", async () => {
+  // feed-shared-stamp.json is NOT hand-authored: it is written by
+  // crates/core/tests/change_feed_keyset.rs::shared_stamp_feed_fixture_is_emitted_from_a_real_store
+  // from a real Datasets store, two upsert_many chunks each sharing ONE
+  // revision created_at, paged so the boundaries cut through a stamp group.
+  // That is the shape a timestamp watermark cannot resume from.
+  const f = fixture<{
+    distinct_keys: number;
+    dataset: { app: string; name: string };
+    pages: FeedPageJson[];
+  }>("feed-shared-stamp.json");
+
+  const dataset = { app: f.dataset.app, name: f.dataset.name };
+  const start = "2026-01-01T00:00:00.000000Z|0";
+  const feed = keysetFeed(start, f.pages);
+  const sink = recordingSink(2); // run 1 dies partway, as a real consumer does
+  const watermark = memoryWatermark();
+  await watermark.set(dataset, start);
+
+  const cfg = {
+    baseUrl: "http://example.invalid:1",
+    fetch: feed.fetch,
+    dataset,
+    watermark,
+    sink,
+    batchSize: 7,
+  };
+  await assert.rejects(() => createPumperSync(cfg).run());
+  await createPumperSync(cfg).run();
+
+  assert.equal(
+    sink.keys.length,
+    f.distinct_keys,
+    "every key in the real store's feed reaches the sink — a timestamp watermark " +
+      "loses the siblings of the stamp the first run stopped inside",
+  );
+  const expected = new Set(f.pages.flatMap((p) => p.items.map((i) => i.key)));
+  assert.equal(expected.size, f.distinct_keys);
+  for (const k of expected) assert.ok(sink.keys.includes(k), `stamp-sibling '${k}' was lost`);
+});
