@@ -131,11 +131,17 @@ pub(crate) fn classify_error(outcome: RunOutcome) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{classify, classify_error, RunOutcome};
-    use pumper_core::error::ClaudeFailure;
+    use pumper_core::error::{ClaudeFailure, SpendCertainty};
 
     /// The class and the ledger row a run ending must produce, together —
     /// asserting the class alone would miss the half that costs money.
-    fn row(outcome: RunOutcome) -> (ClaudeFailure, Option<f64>, Option<(f64, String)>) {
+    fn row(
+        outcome: RunOutcome,
+    ) -> (
+        ClaudeFailure,
+        Option<f64>,
+        Option<(f64, SpendCertainty, String)>,
+    ) {
         let err = classify_error(outcome);
         let spend = err
             .claude_spend()
@@ -157,15 +163,24 @@ mod tests {
         assert_eq!(cost, None);
         assert_eq!(
             event,
-            Some((0.0, "failed_spend_unreported (wait_failed)".to_string())),
-            "a failed wait() must not claim a paid call vanished"
+            Some((
+                0.0,
+                SpendCertainty::Unknown,
+                "failed_spend_unreported (wait_failed)".to_string()
+            )),
+            "a failed wait() must not claim a paid call vanished — the typed certainty is \
+             `unknown`, not `unmetered`"
         );
 
         let timeout = row(RunOutcome::TimedOut("timed out after 600s".into()));
         assert_eq!(timeout.0, ClaudeFailure::Timeout);
         assert_eq!(
             timeout.2,
-            Some((0.0, "unmetered_timeout".to_string())),
+            Some((
+                0.0,
+                SpendCertainty::Unmetered,
+                "unmetered_timeout".to_string()
+            )),
             "the genuine timeout keeps the row that says a paid call vanished"
         );
         assert_ne!(
@@ -218,7 +233,11 @@ mod tests {
         assert_eq!(cost, Some(0.22));
         assert_eq!(
             event,
-            Some((0.22, "failed_spend (interrupted)".to_string()))
+            Some((
+                0.22,
+                SpendCertainty::Billed,
+                "failed_spend (interrupted)".to_string()
+            ))
         );
     }
 
@@ -236,7 +255,11 @@ mod tests {
             assert_eq!(class, ClaudeFailure::PipeFailure);
             assert_eq!(
                 event,
-                Some((0.0, "failed_spend_unreported (pipe_failure)".to_string())),
+                Some((
+                    0.0,
+                    SpendCertainty::Unknown,
+                    "failed_spend_unreported (pipe_failure)".to_string()
+                )),
                 "a child that IS running must leave a row: {why}"
             );
             assert!(
@@ -257,8 +280,13 @@ mod tests {
         ));
         assert_eq!(class, ClaudeFailure::Unparseable);
         assert_eq!(cost, None, "nothing readable reported a cost");
-        let (amount, detail) = event.expect("a run that answered leaves a row");
+        let (amount, certainty, detail) = event.expect("a run that answered leaves a row");
         assert_eq!(amount, 0.0);
+        assert_eq!(
+            certainty,
+            SpendCertainty::Unmetered,
+            "exit 0 means the model answered: the operator WAS billed, the amount is              merely unreadable"
+        );
         assert!(
             detail.starts_with("failed_spend_unreported"),
             "an unknown spend must not read as a metered $0: {detail}"
@@ -281,6 +309,7 @@ mod tests {
             event,
             Some((
                 0.0,
+                SpendCertainty::Unmetered,
                 "failed_spend_unreported (prompt_undelivered)".to_string()
             ))
         );

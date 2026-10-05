@@ -148,7 +148,7 @@ folklore. See
 | `revision_retention_days` | `record_revisions` past the window | the newest `revision_retention_keep_min` revisions of every record |
 | `artifact_retention_days` | bodies under `artifacts_dir` past the window | **any body a live record or a replayable revision still addresses**, plus VCR cassettes |
 | `artifact_retention_include_cassettes` | (flag) lets retention reclaim `cassette.ndjson` too | — |
-| `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling) |
+| `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling). Pruning is by age only and ignores `spend_certainty` (0045), so a pruned `unmetered` row takes the evidence that a paid call vanished with it — see [runtime.md](runtime.md#was-it-billed-unmetered-or-genuinely-free) |
 | `webhook_delivery_retention_days` | `delivered` rows in `webhook_deliveries` | `pending`/`failed` — the live retry queue and the replayable DLQ |
 | `webhook_dead_letter_retention_days` | `dead` rows (the exhausted DLQ tail) | as above |
 | `job_yield_retention_days` | `job_yield` (backs `GET /economics`) | — |

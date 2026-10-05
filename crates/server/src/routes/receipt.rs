@@ -405,6 +405,7 @@ mod tests {
             engine: "http".into(),
             url: Some("https://example.test/p".into()),
             cost_usd: 0.0,
+            spend_certainty: pumper_core::costs::SpendCertainty::Free,
             detail: detail.map(str::to_string),
             created_at: Utc::now(),
         }

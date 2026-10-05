@@ -156,8 +156,36 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - **Exhausting the budget is terminal, not retryable.** The refusal is a typed error (`Error::BudgetExhausted`), and the worker sends it straight to the permanent-fail path: the job goes to `failed` on the attempt that hit the ceiling, with its remaining `max_attempts` visibly un-burned (`attempts: 1 / max_attempts: 5`). Retrying could never have helped — a retry re-seeds the job's spend from the cost ledger (the money really was spent) and re-refuses on its first metered call, so the backoff ladder only delayed the same answer. Terminal budget failures still fire the normal terminal fan-out (callback, `failed` event, terminal triggers). **Only** the ceiling refusal is classified this way; engine, storage and ordinary app errors keep their full retry/backoff semantics. There is no top-up-and-resume flow: raise `budget_usd` and enqueue again.
 - **Schema drift is terminal too, and no longer looks like an outage.** The grants fleet refuses to write when an upstream listing response no longer parses — a renamed field, a changed envelope — and that refusal is now `Error::SourceDrift` rather than a generic `Error::App`. It is a pure function of one already-fetched response, and the request came from params frozen at enqueue, so attempt #2 asks the identical question, gets an identically shaped answer, and re-refuses in the identical place: a permanent upstream rename used to burn three attempts plus backoff on **every scheduled run, every day, indefinitely**. A source that is *down* is a different failure (`Error::Http`) and keeps its full retry ladder; the two used to be indistinguishable `Error::App`s in the job log. At the HTTP boundary it maps to **502**, not 500 — a source changing its schema is somebody else's failure, and this server refusing to write a corrupt corpus is it working correctly. The boundary is deliberately narrow: only **pre-write listing** refusals are terminal. Warn-only drift signals stay warnings, and a per-item degradation that aborts a *stage* rather than the job (grants-gov's detail stage) stays retryable — a partial harvest is a fact about one attempt, not about the contract.
 - **A governance pause is reported as a pause.** A DataHub `cost:pause` tag forces the job's budget to `$0` (see [datahub.md](datahub.md)), so the same refusal fires — but the stored `error` says the tag on `<app>`'s datasets is holding its paid work and that nothing was spent, instead of the misleading "job budget of $0.00 exhausted". A paused job's `GET /jobs/{id}/costs` total is `$0`.
-- APIs: `GET /jobs/{id}/costs` (events, total, cost-per-fresh-record), `GET /costs?app=&since=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
+- APIs: `GET /jobs/{id}/costs` (events, totals, certainty, cost-per-fresh-record), `GET /costs?app=&since=&certainty=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
 - Research cache: identical `ResearchRequest`s within `claude.research_cache_ttl_secs` (default 24h, 0 disables) are served from disk at zero cost, logged as `cache_hit (saved ~$X)` events. `resume_session` requests bypass.
+
+### Was it billed, unmetered, or genuinely free?
+
+`cost_usd = 0.0` used to carry four different facts and the only thing separating them was a *prefix of the free-text `detail` column*, which no endpoint selected, grouped or filtered on. A job that burned to its budget ceiling and was killed answered `GET /jobs/{id}/costs` with `{"total_usd": 0.0, "calls": 1}` — byte-identical to a job that served one free cache hit — and `cost_per_fresh_record_usd` then divided that zero by the record count and published a confident `$0.00` ROI that `GET /economics` recommends budgets from.
+
+Every `cost_events` row now carries a typed **`spend_certainty`** (migration 0045), a closed four-member vocabulary owned by `pumper_core::error::SpendCertainty`:
+
+| `spend_certainty` | Means | Written for |
+| --- | --- | --- |
+| `billed` | `cost_usd` **is** the bill, as the engine reported it. A reported `$0.00` is billed — it is a *known* amount. | a priced answer; any failure whose envelope still reported `total_cost_usd` (`failed_spend (<class>)`) |
+| `unmetered` | A paid call happened and `cost_usd` is **not** its bill. The `0.0` is a floor, never a price. | `Timeout` (killed mid-generation), `Unparseable` and `PromptUndelivered` (exit 0 — the model answered), `CliError` with no amount, and a success whose envelope omitted `total_cost_usd` (`cost_unreported`) |
+| `unknown` | A child existed and may have spent, and we cannot say whether it was billed **at all**. | `WaitFailed`, `PipeFailure`, `Interrupted`, `NonZeroExit` with no envelope |
+| `free` | No money moved. | cache hits, VCR replays, the http/browser tiers |
+
+**`unmetered` and `unknown` are deliberately not the same row.** Calling a failed `wait()` syscall or a broken pipe "unmetered" asserts *a paid call vanished* about a run that may never have reached the model — the exact claim the `WaitFailed`/`PipeFailure` classes were split out of `Timeout` to stop making. `ClaudeFailure::unreported_certainty()` decides it member by member, exhaustively, so a new failure class cannot inherit a neighbour's answer.
+
+What it buys on the surfaces:
+
+- `GET /jobs/{id}/costs` adds `billed_usd`, `unmetered_calls`, `unknown_calls` and `total_certainty` (`exact` | `at_least`). `total_usd` is kept and is the same number as `billed_usd`.
+- `cost_per_fresh_record_usd` is **`null`** for any job holding an uncertain call, with `cost_per_fresh_record_unavailable` naming which (`"unmetered_calls"` | `"unknown_calls"`). A price derived from a floor is not a price.
+- `GET /costs?certainty=unmetered` keeps only the (app, engine) groups holding at least one such call, with the group's whole picture; every group also reports `unmetered_calls` / `unknown_calls`.
+- `GET /economics` reports `unmetered_calls`, `unknown_calls` and `cost_certainty` per app-window, and a recommendation built from a floor says so in its `reason`.
+
+**The budget ceiling is unchanged.** `CostLedger::job_total` still sums `cost_usd` and only `cost_usd`, so an unmetered run still contributes `$0` to its own ceiling. What changed is that the number is now *labelled*: `GET /jobs/{id}/costs` reports `budget_remaining_usd` with `budget_remaining_certainty` of `at_most` whenever a floor went into it (spend is a lower bound, so headroom derived from it is an upper bound). Making the ceiling itself count uncertain calls is a separate, arguable decision — this change makes it arguable rather than invisible.
+
+**Back-fill.** 0045 derives `spend_certainty` for existing rows from their `detail` prefixes (`failed_spend (…)` → `billed`, `unmetered_timeout`/`cost_unreported` → `unmetered`, `failed_spend_unreported (…)` → `unmetered` or `unknown` by class, everything else by engine and amount). It is deterministic and replaying it is a no-op.
+
+**Known gaps.** `GET /jobs/{id}/receipt` still reports a bare `total_usd` with no certainty. The retention pruner and `pumper_cost_usd{app,engine}` ignore the column.
 
 ## Record & replay (VCR)
 

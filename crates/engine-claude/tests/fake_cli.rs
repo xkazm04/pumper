@@ -487,13 +487,18 @@ async fn a_prompt_that_never_reached_the_cli_is_not_a_billable_answer() {
         spend.cost_usd, None,
         "nothing the CLI printed in answer to an empty prompt is a spend we can vouch for"
     );
-    let (cost, detail) = spend
+    let (cost, certainty, detail) = spend
         .ledger_event()
         .expect("a child that ran leaves a ledger row");
     assert_eq!(cost, 0.0);
     assert!(
         detail.contains("prompt_undelivered"),
         "the ledger row must name the class: {detail}"
+    );
+    assert_eq!(
+        certainty,
+        pumper_core::costs::SpendCertainty::Unmetered,
+        "the CLI answered an empty question and was billed for it — the $0 is a          floor, and the typed column has to say so"
     );
 }
 

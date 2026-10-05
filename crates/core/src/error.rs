@@ -1,5 +1,95 @@
 use std::time::Duration;
 
+use serde::Serialize;
+
+/// What the ledger knows about whether a row's money actually moved — the
+/// closed vocabulary behind `cost_events.spend_certainty` (migration 0045).
+///
+/// **The anti-pattern.** `cost_usd = 0.0` carried four different facts and the
+/// only thing separating them was a prefix of the free-text `detail` column,
+/// which no endpoint selects, groups or filters on. A job that burned to its
+/// budget ceiling and was killed read, on every aggregate surface, exactly like
+/// a job that served one free cache hit — and `cost_per_fresh_record_usd`
+/// divided that zero by the record count and published a confident `$0.00`.
+///
+/// The distinction was already *computed*, by
+/// [`ClaudeSpend::ledger_event`]; it was discarded at the storage boundary. This type is the typed carrier so it survives to the API.
+///
+/// Registry: `cost-metering` / *usage-ledgers* (a ledger row is written once,
+/// at the only moment the full context exists, and the class taxonomy is a
+/// **closed vocabulary**), *spend-observability* (the anomaly an operator must
+/// notice within a day, not thirty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpendCertainty {
+    /// `cost_usd` **is** the bill, exactly as the engine reported it. A
+    /// reported `$0.00` is billed, not free: it is a known amount.
+    Billed,
+    /// A paid call happened and `cost_usd` is **not** its bill — the amount is
+    /// unreadable. A killed run, a clean exit whose stdout did not parse, a
+    /// prompt that never arrived and was answered anyway. `0.0` here is a
+    /// floor, never a price.
+    Unmetered,
+    /// A child existed and may have been spending, and we cannot say whether it
+    /// was billed at all: a failed `wait()` syscall, a broken pipe, a signal, a
+    /// non-zero exit with no envelope. Distinct from
+    /// [`Unmetered`](Self::Unmetered) because asserting "a paid call vanished"
+    /// about a call that may never have been paid for is its own lie — the one
+    /// the `WaitFailed`/`PipeFailure` classes were introduced to stop telling.
+    Unknown,
+    /// No money moved: a cache hit, a free engine tier, a VCR replay.
+    Free,
+}
+
+impl SpendCertainty {
+    /// Every member, in declaration order — pinned by the inventory test below.
+    pub const ALL: &'static [SpendCertainty] = &[
+        SpendCertainty::Billed,
+        SpendCertainty::Unmetered,
+        SpendCertainty::Unknown,
+        SpendCertainty::Free,
+    ];
+
+    /// The wire/column spelling. Must match migration 0045's `CASE` arms.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpendCertainty::Billed => "billed",
+            SpendCertainty::Unmetered => "unmetered",
+            SpendCertainty::Unknown => "unknown",
+            SpendCertainty::Free => "free",
+        }
+    }
+
+    /// Parses a column or query-parameter value. `None` for anything outside
+    /// the vocabulary — a filter nobody can satisfy is a 400, not an empty page.
+    pub fn parse(s: &str) -> Option<Self> {
+        SpendCertainty::ALL
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == s)
+    }
+
+    /// Whether this row's `cost_usd` is a **floor** rather than the whole bill.
+    /// The one question every aggregate surface has to ask before it divides.
+    pub fn is_uncertain(self) -> bool {
+        matches!(self, SpendCertainty::Unmetered | SpendCertainty::Unknown)
+    }
+
+    /// The certainty a plain metered call carries, inferred from its amount.
+    ///
+    /// This is the honest default for the seams that cannot fail *and* spend —
+    /// http/browser tiers, cache hits, VCR replays. A claude failure never
+    /// reaches here: it is classified by
+    /// [`crate::error::ClaudeSpend::ledger_event`] and metered explicitly.
+    pub fn from_amount(cost_usd: f64) -> Self {
+        if cost_usd > 0.0 {
+            SpendCertainty::Billed
+        } else {
+            SpendCertainty::Free
+        }
+    }
+}
+
 /// How a Claude-engine call failed, and **what it had already spent when it
 /// did**.
 ///
@@ -36,7 +126,14 @@ impl ClaudeSpend {
     }
 
     /// The cost event this failure must leave in the ledger, as
-    /// `(cost_usd, detail)` — or `None` when staying silent is honest.
+    /// `(cost_usd, spend_certainty, detail)` — or `None` when staying silent
+    /// is honest.
+    ///
+    /// The [`SpendCertainty`] is the half that reaches an API consumer
+    /// (migration 0045). It used to exist only as a *prefix of `detail`*, a
+    /// free-text column no endpoint selects, groups or filters on — so an
+    /// operator could read the distinction out of one row by eye and no
+    /// aggregate surface could read it at all.
     ///
     /// Three cases, deliberately distinguished (the anti-pattern is one silent
     /// `$0` that reads identically to "no call was made"):
@@ -54,18 +151,33 @@ impl ClaudeSpend {
     ///   A child existed, so money may have moved; the row says the amount is
     ///   unknown rather than claiming it was free.
     ///
+    /// **`unmetered` and `unknown` are not the same fact.** An exit-0 run whose
+    /// stdout did not parse, and a prompt that never arrived and was answered
+    /// anyway, both mean *the model answered and you were billed* — the amount
+    /// is merely unreadable. A failed `wait()`, a broken pipe, a signal or a
+    /// bare non-zero exit mean *a child existed and we cannot say whether it was
+    /// billed at all*. Collapsing the second group into `unmetered` is the very
+    /// lie [`ClaudeFailure::WaitFailed`] and [`ClaudeFailure::PipeFailure`] were
+    /// split out to stop telling, so it is
+    /// [`ClaudeFailure::unreported_certainty`] that decides, member by member.
+    ///
     /// **The match is deliberately exhaustive, member by member.** It used to
     /// end in a `(None, class)` catch-all, which meant a new member silently
     /// inherited a neighbour's ledger row instead of forcing the one decision
     /// that matters — *does this ending leave a cost row, and saying what?* The
     /// compile error a new member now causes here is the gate.
-    pub fn ledger_event(&self) -> Option<(f64, String)> {
+    pub fn ledger_event(&self) -> Option<(f64, SpendCertainty, String)> {
         if let Some(cost) = self.cost_usd {
-            return Some((cost, format!("failed_spend ({})", self.class.as_str())));
+            return Some((
+                cost,
+                SpendCertainty::Billed,
+                format!("failed_spend ({})", self.class.as_str()),
+            ));
         }
+        let certainty = self.class.unreported_certainty();
         match self.class {
             ClaudeFailure::Spawn => None,
-            ClaudeFailure::Timeout => Some((0.0, "unmetered_timeout".to_string())),
+            ClaudeFailure::Timeout => Some((0.0, certainty, "unmetered_timeout".to_string())),
             ClaudeFailure::NonZeroExit
             | ClaudeFailure::CliError
             | ClaudeFailure::Unparseable
@@ -74,6 +186,7 @@ impl ClaudeSpend {
             | ClaudeFailure::Interrupted
             | ClaudeFailure::PipeFailure => Some((
                 0.0,
+                certainty,
                 format!("failed_spend_unreported ({})", self.class.as_str()),
             )),
         }
@@ -155,6 +268,43 @@ impl ClaudeFailure {
             ClaudeFailure::WaitFailed => "wait_failed",
             ClaudeFailure::Interrupted => "interrupted",
             ClaudeFailure::PipeFailure => "pipe_failure",
+        }
+    }
+
+    /// What an **unreported** failure of this class means for the money, as
+    /// the typed [`SpendCertainty`] the `cost_events` row carries.
+    ///
+    /// Exhaustive member by member, for the same reason
+    /// [`ClaudeSpend::ledger_event`] is: a new ending must force the one
+    /// question that costs money — *was the operator billed for this?* — rather
+    /// than inherit a neighbour's answer.
+    ///
+    /// - [`Spawn`](Self::Spawn) → `Free`. Nothing ran. (It writes no row at
+    ///   all; the value exists so the vocabulary stays total.)
+    /// - [`Timeout`](Self::Timeout), [`Unparseable`](Self::Unparseable),
+    ///   [`CliError`](Self::CliError),
+    ///   [`PromptUndelivered`](Self::PromptUndelivered) → `Unmetered`. Each of
+    ///   these means the model **answered** — a run killed at its deadline had
+    ///   been generating until the kill; the other three exited 0 or returned a
+    ///   complete envelope. The call was billed; only the amount is unreadable.
+    /// - [`NonZeroExit`](Self::NonZeroExit),
+    ///   [`Interrupted`](Self::Interrupted), [`WaitFailed`](Self::WaitFailed),
+    ///   [`PipeFailure`](Self::PipeFailure) → `Unknown`. A child existed and may
+    ///   have been spending, but a bad argv, an instant signal or a failed
+    ///   `wait()` syscall are equally consistent with no API call at all.
+    ///   Calling these `unmetered` asserts a paid call vanished, which is
+    ///   precisely the claim the first two of them were split out to stop.
+    pub fn unreported_certainty(self) -> SpendCertainty {
+        match self {
+            ClaudeFailure::Spawn => SpendCertainty::Free,
+            ClaudeFailure::Timeout
+            | ClaudeFailure::CliError
+            | ClaudeFailure::Unparseable
+            | ClaudeFailure::PromptUndelivered => SpendCertainty::Unmetered,
+            ClaudeFailure::NonZeroExit
+            | ClaudeFailure::WaitFailed
+            | ClaudeFailure::Interrupted
+            | ClaudeFailure::PipeFailure => SpendCertainty::Unknown,
         }
     }
 }
@@ -860,7 +1010,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeFailure, ClaudeSpend, Error, PluginFailure};
+    use super::{ClaudeFailure, ClaudeSpend, Error, PluginFailure, SpendCertainty};
 
     /// The anti-pattern this variant replaces: every sandbox failure was an
     /// `Error::App(format!(...))`, so the observatory and the trigger ledger
@@ -964,8 +1114,12 @@ mod tests {
         assert_eq!(spend.cost_usd, Some(0.42));
         assert_eq!(
             spend.ledger_event(),
-            Some((0.42, "failed_spend (is_error)".to_string())),
-            "the ledger row must carry the real money AND name the failure class"
+            Some((
+                0.42,
+                SpendCertainty::Billed,
+                "failed_spend (is_error)".to_string()
+            )),
+            "the ledger row must carry the real money, its certainty AND the failure class"
         );
         assert!(
             !err.to_string().contains("0.42"),
@@ -981,7 +1135,12 @@ mod tests {
         let spend = ClaudeSpend::unreported(ClaudeFailure::Timeout);
         assert_eq!(
             spend.ledger_event(),
-            Some((0.0, "unmetered_timeout".to_string()))
+            Some((
+                0.0,
+                SpendCertainty::Unmetered,
+                "unmetered_timeout".to_string()
+            )),
+            "a killed run was generating when it died: billed, amount unreadable"
         );
     }
 
@@ -1001,10 +1160,14 @@ mod tests {
     #[test]
     fn unreadable_spend_is_labelled_not_silently_zero() {
         for class in [ClaudeFailure::NonZeroExit, ClaudeFailure::Unparseable] {
-            let (cost, detail) = ClaudeSpend::unreported(class)
+            let (cost, certainty, detail) = ClaudeSpend::unreported(class)
                 .ledger_event()
                 .expect("a run that happened is recorded");
             assert_eq!(cost, 0.0);
+            assert!(
+                certainty.is_uncertain(),
+                "{detail}: a $0 whose real amount is unreadable must not be typed as a price"
+            );
             assert!(
                 detail.starts_with("failed_spend_unreported"),
                 "an unknown spend must not read as a metered $0: {detail}"
@@ -1028,44 +1191,60 @@ mod tests {
     /// `as_str()` silently reclassifies every future row; adding a member
     /// without deciding its row is how a live child ends up with no row at all.
     ///
-    /// `None` means **no cost row** — legitimate for exactly one member.
-    const EXPECTED_CLAUDE_FAILURES: &[(&str, &str, Option<&str>)] = &[
-        ("Spawn", "spawn", None),
-        ("Timeout", "timeout", Some("unmetered_timeout")),
+    /// `None` means **no cost row** — legitimate for exactly one member. The
+    /// fourth column is the typed `spend_certainty` the row carries (0045),
+    /// which is the half an API consumer can group and filter on; pinning the
+    /// `detail` string alone is what let the distinction stay invisible to
+    /// every aggregate surface for as long as it did.
+    const EXPECTED_CLAUDE_FAILURES: &[(&str, &str, Option<&str>, SpendCertainty)] = &[
+        ("Spawn", "spawn", None, SpendCertainty::Free),
+        (
+            "Timeout",
+            "timeout",
+            Some("unmetered_timeout"),
+            SpendCertainty::Unmetered,
+        ),
         (
             "NonZeroExit",
             "nonzero_exit",
             Some("failed_spend_unreported (nonzero_exit)"),
+            SpendCertainty::Unknown,
         ),
         (
             "CliError",
             "is_error",
             Some("failed_spend_unreported (is_error)"),
+            SpendCertainty::Unmetered,
         ),
         (
             "Unparseable",
             "unparseable",
             Some("failed_spend_unreported (unparseable)"),
+            SpendCertainty::Unmetered,
         ),
         (
             "PromptUndelivered",
             "prompt_undelivered",
             Some("failed_spend_unreported (prompt_undelivered)"),
+            SpendCertainty::Unmetered,
         ),
         (
             "WaitFailed",
             "wait_failed",
             Some("failed_spend_unreported (wait_failed)"),
+            SpendCertainty::Unknown,
         ),
         (
             "Interrupted",
             "interrupted",
             Some("failed_spend_unreported (interrupted)"),
+            SpendCertainty::Unknown,
         ),
         (
             "PipeFailure",
             "pipe_failure",
             Some("failed_spend_unreported (pipe_failure)"),
+            SpendCertainty::Unknown,
         ),
     ];
 
@@ -1109,7 +1288,7 @@ mod tests {
         let declared = declared_claude_failures();
         let expected_names: Vec<String> = EXPECTED_CLAUDE_FAILURES
             .iter()
-            .map(|(name, _, _)| name.to_string())
+            .map(|(name, _, _, _)| name.to_string())
             .collect();
         assert_eq!(
             declared, expected_names,
@@ -1121,7 +1300,7 @@ mod tests {
         let listed: Vec<&str> = ClaudeFailure::ALL.iter().map(|c| c.as_str()).collect();
         let expected_strs: Vec<&str> = EXPECTED_CLAUDE_FAILURES
             .iter()
-            .map(|(_, s, _)| *s)
+            .map(|(_, s, _, _)| *s)
             .collect();
         assert_eq!(
             listed, expected_strs,
@@ -1137,17 +1316,21 @@ mod tests {
              {listed:?}"
         );
 
-        for ((name, as_str, unreported), class) in
+        for ((name, as_str, unreported, certainty), class) in
             EXPECTED_CLAUDE_FAILURES.iter().zip(ClaudeFailure::ALL)
         {
             assert_eq!(class.as_str(), *as_str, "{name}");
             assert_eq!(
                 ClaudeSpend::unreported(*class)
                     .ledger_event()
-                    .map(|(cost, detail)| {
+                    .map(|(cost, got, detail)| {
                         assert_eq!(
                             cost, 0.0,
                             "{name}: an unknown spend is not a metered amount"
+                        );
+                        assert_eq!(
+                            got, *certainty,
+                            "{name}: the cost_events row claims the wrong thing about the money"
                         );
                         detail
                     })
@@ -1156,11 +1339,82 @@ mod tests {
                 "{name}: wrong (or missing) cost_events row for a failure that reported no cost"
             );
             assert_eq!(
+                class.unreported_certainty(),
+                *certainty,
+                "{name}: unreported_certainty drifted from the pinned vocabulary"
+            );
+            assert_eq!(
                 ClaudeSpend::reported(*class, 0.5).ledger_event(),
-                Some((0.5, format!("failed_spend ({as_str})"))),
-                "{name}: money the CLI DID report must reach the ledger whatever the class"
+                Some((
+                    0.5,
+                    SpendCertainty::Billed,
+                    format!("failed_spend ({as_str})")
+                )),
+                "{name}: money the CLI DID report must reach the ledger whatever the class, \
+                 and a reported amount is BILLED whatever ended the run"
             );
         }
+
+        // The forbidden collapse, stated positively: the endings that were
+        // split out of `Timeout`/`NonZeroExit` precisely because they are NOT
+        // "a paid call vanished" must not be typed as `unmetered`.
+        for class in [
+            ClaudeFailure::WaitFailed,
+            ClaudeFailure::PipeFailure,
+            ClaudeFailure::Interrupted,
+            ClaudeFailure::NonZeroExit,
+        ] {
+            assert_eq!(
+                class.unreported_certainty(),
+                SpendCertainty::Unknown,
+                "{}: typing this `unmetered` asserts a paid call vanished for a run that may \
+                 never have reached the model — the exact claim this class was split out to stop",
+                class.as_str()
+            );
+        }
+        // …and the four that DID reach the model keep saying so.
+        for class in [
+            ClaudeFailure::Timeout,
+            ClaudeFailure::Unparseable,
+            ClaudeFailure::CliError,
+            ClaudeFailure::PromptUndelivered,
+        ] {
+            assert_eq!(
+                class.unreported_certainty(),
+                SpendCertainty::Unmetered,
+                "{}: the model answered, so the operator WAS billed — downgrading this to \
+                 `unknown` hides a real charge",
+                class.as_str()
+            );
+        }
+    }
+
+    /// The certainty vocabulary is closed too, and its spellings are the
+    /// `cost_events.spend_certainty` column values migration 0045 writes —
+    /// renaming one silently reclassifies every row and breaks `?certainty=`.
+    #[test]
+    fn spend_certainty_is_a_closed_vocabulary() {
+        const EXPECTED: &[&str] = &["billed", "unmetered", "unknown", "free"];
+        let listed: Vec<&str> = SpendCertainty::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            listed, EXPECTED,
+            "SpendCertainty drifted from the values migration 0045 back-fills and the \
+             `?certainty=` filter accepts — update BOTH, and docs/features/http-api.md"
+        );
+        for c in SpendCertainty::ALL {
+            assert_eq!(SpendCertainty::parse(c.as_str()), Some(*c));
+        }
+        assert_eq!(SpendCertainty::parse("maybe"), None);
+        // Only the two "do not trust this $0" members are uncertain.
+        let uncertain: Vec<&str> = SpendCertainty::ALL
+            .iter()
+            .filter(|c| c.is_uncertain())
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(uncertain, vec!["unmetered", "unknown"]);
+        // A plain metered call reads its certainty off the amount.
+        assert_eq!(SpendCertainty::from_amount(0.5), SpendCertainty::Billed);
+        assert_eq!(SpendCertainty::from_amount(0.0), SpendCertainty::Free);
     }
 
     /// The one member that earns silence earns it for a stated reason, and the

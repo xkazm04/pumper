@@ -13,7 +13,35 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+/// Re-exported here because the ledger is where it is read; it is DECLARED in
+/// `crate::error` beside `ClaudeSpend::ledger_event`, which is the one producer
+/// of a non-trivial value and is compiled without the `storage` feature.
+pub use crate::error::SpendCertainty;
 use crate::{Error, Result};
+
+/// How a **summed** total should be read, given how many of its rows carry a
+/// floor instead of a price: `"exact"` or `"at_least"`.
+///
+/// Extracted and named because three surfaces need the same sentence
+/// (`GET /jobs/{id}/costs`, `GET /costs`, `GET /economics`) and a hand-rolled
+/// ternary at each one is how two of them end up disagreeing.
+pub fn total_certainty(uncertain_calls: i64) -> &'static str {
+    if uncertain_calls > 0 {
+        "at_least"
+    } else {
+        "exact"
+    }
+}
+
+/// The mirror of [`total_certainty`] for remaining budget headroom. Spend is a
+/// lower bound, so the headroom derived from it is an **upper** bound: `"at_most"`.
+pub fn headroom_certainty(uncertain_calls: i64) -> &'static str {
+    if uncertain_calls > 0 {
+        "at_most"
+    } else {
+        "exact"
+    }
+}
 
 /// One metered engine call.
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +51,8 @@ pub struct CostEvent {
     pub engine: String,
     pub url: Option<String>,
     pub cost_usd: f64,
+    /// Whether `cost_usd` is the bill, a floor, or nothing at all (0045).
+    pub spend_certainty: SpendCertainty,
     pub detail: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -33,7 +63,25 @@ pub struct CostSummary {
     pub app: String,
     pub engine: String,
     pub calls: i64,
+    /// Sum of `cost_usd` — the **billed** money only. With
+    /// `unmetered_calls + unknown_calls > 0` this is a floor, not a price.
     pub cost_usd: f64,
+    /// Calls in this group that were billed and whose amount is unreadable.
+    pub unmetered_calls: i64,
+    /// Calls in this group that may or may not have been billed at all.
+    pub unknown_calls: i64,
+}
+
+impl CostSummary {
+    /// Calls whose `cost_usd` is a floor rather than a price.
+    pub fn uncertain_calls(&self) -> i64 {
+        self.unmetered_calls + self.unknown_calls
+    }
+
+    /// `"exact"` or `"at_least"` for this group's `cost_usd`.
+    pub fn total_certainty(&self) -> &'static str {
+        total_certainty(self.uncertain_calls())
+    }
 }
 
 /// A job's running spend total, held in the job's `AppContext`.
@@ -99,6 +147,10 @@ impl CostLedger {
 
     /// Records one engine call. Never fails the caller's job over accounting —
     /// callers may ignore the Result, but the write itself is cheap and local.
+    /// One argument per column, as the other row-shaped inserts in this crate
+    /// are written (see `datasets.rs`): a parameter struct here would be a
+    /// second place for the column list to drift from the `INSERT`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
         job_id: Uuid,
@@ -106,17 +158,20 @@ impl CostLedger {
         engine: &str,
         url: Option<&str>,
         cost_usd: f64,
+        certainty: SpendCertainty,
         detail: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO cost_events (job_id, app, engine, url, cost_usd, detail, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO cost_events \
+             (job_id, app, engine, url, cost_usd, spend_certainty, detail, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(job_id.to_string())
         .bind(app)
         .bind(engine)
         .bind(url)
         .bind(cost_usd)
+        .bind(certainty.as_str())
         .bind(detail)
         .bind(ts(Utc::now()))
         .execute(&self.pool)
@@ -127,7 +182,7 @@ impl CostLedger {
     /// Everything one job spent, oldest first.
     pub async fn job_events(&self, job_id: Uuid) -> Result<Vec<CostEvent>> {
         let rows: Vec<CostEventRow> = sqlx::query_as(
-            "SELECT job_id, app, engine, url, cost_usd, detail, created_at \
+            "SELECT job_id, app, engine, url, cost_usd, spend_certainty, detail, created_at \
              FROM cost_events WHERE job_id = ?1 ORDER BY id",
         )
         .bind(job_id.to_string())
@@ -153,23 +208,49 @@ impl CostLedger {
         app: Option<&str>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<CostSummary>> {
-        let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(
-            "SELECT app, engine, COUNT(*), COALESCE(SUM(cost_usd), 0) FROM cost_events \
+        self.summary_filtered(app, since, None).await
+    }
+
+    /// [`Self::summary`] with a certainty filter: `Some(c)` keeps only the
+    /// (app, engine) groups holding **at least one** call of that certainty.
+    ///
+    /// The filter is a `HAVING`, not a `WHERE`, deliberately: an operator
+    /// asking "where is my unmetered spend" wants the affected group's *whole*
+    /// picture — its billed total alongside the calls that make that total a
+    /// floor — not a synthetic group containing only the bad rows.
+    pub async fn summary_filtered(
+        &self,
+        app: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        certainty: Option<SpendCertainty>,
+    ) -> Result<Vec<CostSummary>> {
+        let rows: Vec<(String, String, i64, f64, i64, i64)> = sqlx::query_as(
+            "SELECT app, engine, COUNT(*), COALESCE(SUM(cost_usd), 0), \
+             COALESCE(SUM(spend_certainty = 'unmetered'), 0), \
+             COALESCE(SUM(spend_certainty = 'unknown'), 0) \
+             FROM cost_events \
              WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR created_at > ?2) \
-             GROUP BY app, engine ORDER BY app, engine",
+             GROUP BY app, engine \
+             HAVING (?3 IS NULL OR SUM(spend_certainty = ?3) > 0) \
+             ORDER BY app, engine",
         )
         .bind(app)
         .bind(since.map(ts))
+        .bind(certainty.map(SpendCertainty::as_str))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(app, engine, calls, cost_usd)| CostSummary {
-                app,
-                engine,
-                calls,
-                cost_usd,
-            })
+            .map(
+                |(app, engine, calls, cost_usd, unmetered_calls, unknown_calls)| CostSummary {
+                    app,
+                    engine,
+                    calls,
+                    cost_usd,
+                    unmetered_calls,
+                    unknown_calls,
+                },
+            )
             .collect())
     }
 }
@@ -272,6 +353,7 @@ struct CostEventRow {
     engine: String,
     url: Option<String>,
     cost_usd: f64,
+    spend_certainty: String,
     detail: Option<String>,
     created_at: String,
 }
@@ -286,6 +368,11 @@ impl TryFrom<CostEventRow> for CostEvent {
             engine: r.engine,
             url: r.url,
             cost_usd: r.cost_usd,
+            // A value outside the vocabulary degrades to `Unknown`, never to
+            // `Free`: an unreadable certainty is exactly the case where
+            // claiming "no money moved" is the expensive mistake.
+            spend_certainty: SpendCertainty::parse(&r.spend_certainty)
+                .unwrap_or(SpendCertainty::Unknown),
             detail: r.detail,
             created_at: parse_ts(&r.created_at)?,
         })

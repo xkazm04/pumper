@@ -6,7 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::cache::ResearchCache;
-use crate::costs::{CostLedger, SpentTotal};
+use crate::costs::{CostLedger, SpendCertainty, SpentTotal};
 use crate::datasets::{ChangeKind, Datasets, DerivedPaths, Provenance, Record, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
 use crate::fetcher::{FetchOutcome, FetchRequest};
@@ -230,10 +230,45 @@ impl AppContext {
         cost_usd: f64,
         detail: Option<&str>,
     ) {
+        self.meter_with_certainty(
+            engine,
+            url,
+            cost_usd,
+            SpendCertainty::from_amount(cost_usd),
+            detail,
+        )
+        .await;
+    }
+
+    /// [`Self::meter`] for the one seam that knows something the amount does
+    /// not say: a `$0` row whose real bill is unreadable.
+    ///
+    /// [`Self::meter`] infers `billed`/`free` from the amount, which is exactly
+    /// right for every seam that can only succeed-and-know or be free (http,
+    /// browser, cache hits, VCR replay) and exactly wrong for a Claude run that
+    /// was killed mid-generation. Those arrive here with the certainty
+    /// [`ClaudeSpend::ledger_event`] decided, so the `$0` in the ledger is
+    /// labelled a floor rather than read as a price (migration 0045).
+    pub async fn meter_with_certainty(
+        &self,
+        engine: &str,
+        url: Option<&str>,
+        cost_usd: f64,
+        certainty: SpendCertainty,
+        detail: Option<&str>,
+    ) {
         self.spent_usd.add(cost_usd);
         if let Err(e) = self
             .costs
-            .record(self.job_id, &self.app, engine, url, cost_usd, detail)
+            .record(
+                self.job_id,
+                &self.app,
+                engine,
+                url,
+                cost_usd,
+                certainty,
+                detail,
+            )
             .await
         {
             tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
@@ -247,10 +282,12 @@ impl AppContext {
     /// Both metered seams call it: `research` (the chokepoint) and `fetch`
     /// (whose tier-3 spend rides out on the ladder's exhaustion error).
     async fn meter_failed_spend(&self, e: &Error, url: Option<&str>) {
-        let Some((cost, detail)) = e.claude_spend().and_then(|s| s.ledger_event()) else {
+        let Some((cost, certainty, detail)) = e.claude_spend().and_then(|s| s.ledger_event())
+        else {
             return;
         };
-        self.meter("claude", url, cost, Some(&detail)).await;
+        self.meter_with_certainty("claude", url, cost, certainty, Some(&detail))
+            .await;
     }
 
     /// Teaches the learned tier router about one fetch outcome for `host`: an
@@ -472,8 +509,9 @@ impl AppContext {
                 return Err(e);
             }
         };
-        let (cost, detail) = success_spend_event(out.cost_usd);
-        self.meter("claude", None, cost, detail).await;
+        let (cost, certainty, detail) = success_spend_event(out.cost_usd);
+        self.meter_with_certainty("claude", None, cost, certainty, detail)
+            .await;
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
@@ -781,17 +819,22 @@ fn fetch_cost_detail(outcome: &FetchOutcome) -> Option<String> {
 }
 
 /// The cost event a **successful** research answer must leave, as
-/// `(cost_usd, detail)`.
+/// `(cost_usd, spend_certainty, detail)`.
 ///
 /// An envelope with no `total_cost_usd` is not a free call — it is a call whose
 /// price we could not read (an older CLI, a changed envelope shape). Recording
 /// it as a bare `$0` makes it indistinguishable from a genuinely free cache hit,
 /// and silently under-counts the job's spend against its ceiling; the
-/// `cost_unreported` detail keeps the gap visible in the ledger.
-fn success_spend_event(cost_usd: Option<f64>) -> (f64, Option<&'static str>) {
+/// `cost_unreported` detail keeps the gap visible in the ledger, and the
+/// `Unmetered` certainty keeps it visible to an API consumer too — the model
+/// answered, so the operator WAS billed; only the amount is missing.
+///
+/// A reported `$0.00` stays `Billed`: a known zero and an unreadable zero are
+/// the two facts this whole column exists to separate.
+fn success_spend_event(cost_usd: Option<f64>) -> (f64, SpendCertainty, Option<&'static str>) {
     match cost_usd {
-        Some(cost) => (cost, None),
-        None => (0.0, Some("cost_unreported")),
+        Some(cost) => (cost, SpendCertainty::Billed, None),
+        None => (0.0, SpendCertainty::Unmetered, Some("cost_unreported")),
     }
 }
 
@@ -986,7 +1029,7 @@ pub trait ScrapeApp: Send + Sync {
 mod tests {
     use super::{
         budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, safe_path_segment,
-        success_spend_event, FetchOutcome,
+        success_spend_event, FetchOutcome, SpendCertainty,
     };
 
     fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
@@ -1048,7 +1091,16 @@ mod tests {
     /// case, and the one the budget clamp reads.
     #[test]
     fn a_priced_answer_meters_its_price() {
-        assert_eq!(success_spend_event(Some(0.37)), (0.37, None));
+        assert_eq!(
+            success_spend_event(Some(0.37)),
+            (0.37, SpendCertainty::Billed, None)
+        );
+        // A reported ZERO is a known amount, not a free call: the whole point
+        // of the typed column is that those two are different facts.
+        assert_eq!(
+            success_spend_event(Some(0.0)),
+            (0.0, SpendCertainty::Billed, None)
+        );
     }
 
     /// The anti-pattern: an envelope with no `total_cost_usd` metered as a bare
@@ -1056,7 +1108,11 @@ mod tests {
     /// the job's spend. It must be labelled.
     #[test]
     fn an_unpriced_answer_is_not_indistinguishable_from_a_free_one() {
-        assert_eq!(success_spend_event(None), (0.0, Some("cost_unreported")));
+        assert_eq!(
+            success_spend_event(None),
+            (0.0, SpendCertainty::Unmetered, Some("cost_unreported")),
+            "the model answered, so the operator WAS billed — an API consumer has to be              able to see that without parsing the detail string"
+        );
     }
 
     /// The boundary both metered seams share. `None` = unlimited, and the
