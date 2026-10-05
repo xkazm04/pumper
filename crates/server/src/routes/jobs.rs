@@ -211,18 +211,17 @@ pub(crate) async fn list_jobs(
         })
         .transpose()?;
     let limit = query.limit.clamp(1, 500);
+    let q = pumper_core::storage::JobQuery {
+        app: query.app.clone(),
+        status,
+        ..Default::default()
+    };
     let Some(cursor) = &query.cursor else {
-        let jobs = state
-            .storage
-            .list(query.app.as_deref(), status, limit)
-            .await?;
+        let jobs = state.storage.list(&q, limit).await?;
         return Ok(Json(json!(jobs)));
     };
     let after = parse_cursor(cursor);
-    let jobs = state
-        .storage
-        .list_page(query.app.as_deref(), status, after, limit)
-        .await?;
+    let jobs = state.storage.list_page(&q, after, limit).await?;
     let next_cursor = keyset_cursor(&jobs, limit, |j| {
         format!("{}|{}", pumper_core::datasets::ts(j.created_at), j.id)
     });

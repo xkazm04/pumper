@@ -53,7 +53,11 @@ async fn budget_zero_is_rejected_not_unlimited() {
     }
 
     // The refusal is a refusal: nothing was enqueued behind it.
-    let jobs = state.storage.list(None, None, 50).await.unwrap();
+    let jobs = state
+        .storage
+        .list(&pumper_core::storage::JobQuery::all(), 50)
+        .await
+        .unwrap();
     assert!(
         jobs.is_empty(),
         "a refused budget must not leave a job in the queue: {jobs:?}"

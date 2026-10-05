@@ -358,7 +358,13 @@ pub(crate) async fn test_trigger(
     // Most recent source job of the trigger's source app.
     let Some(source) = state
         .storage
-        .list(Some(&trigger.source_app), None, 1)
+        .list(
+            &pumper_core::storage::JobQuery {
+                app: Some(trigger.source_app.clone()),
+                ..Default::default()
+            },
+            1,
+        )
         .await?
         .into_iter()
         .next()

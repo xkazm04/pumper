@@ -144,7 +144,7 @@ async fn fire_schedule(state: &AppState, router: &axum::Router, params: Value) -
         .unwrap();
     let job = state
         .storage
-        .list(Some("targeted"), None, 50)
+        .list(&pumper_core::storage::JobQuery::for_app("targeted"), 50)
         .await
         .unwrap()
         .into_iter()

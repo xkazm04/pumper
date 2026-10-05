@@ -228,7 +228,12 @@ async fn enqueue_tool_validates_clamps_and_enqueues() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("params/rows"), "{text}");
     assert!(text.contains("query"), "{text}");
-    assert!(state.storage.list(None, None, 10).await.unwrap().is_empty());
+    assert!(state
+        .storage
+        .list(&pumper_core::storage::JobQuery::all(), 10)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Valid params: job lands, and the requested $100 budget is clamped to the
     // operator's $1 ceiling — on the stored row, not just the reply.
@@ -554,7 +559,12 @@ async fn http_enqueue_422s_on_schema_violation_with_pointer_paths() {
     let msg = body["error"].as_str().unwrap();
     assert!(msg.contains("params/rows"), "{msg}");
     assert_eq!(body["code"], "unprocessable");
-    assert!(state.storage.list(None, None, 10).await.unwrap().is_empty());
+    assert!(state
+        .storage
+        .list(&pumper_core::storage::JobQuery::all(), 10)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Valid params → 202 as before.
     let resp = app

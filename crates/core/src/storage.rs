@@ -21,6 +21,138 @@ const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, prio
                            target_key, result, error, requeue_reason, cause_kind, created_at, \
                            available_at, started_at, finished_at";
 
+/// The queue list's predicate set, as a struct rather than a growing row of
+/// positional `Option`s.
+///
+/// Every field is a column the `jobs` table already carries and an index
+/// already covers: `app` (`idx_jobs_app`), `status` (`idx_jobs_claim`),
+/// `schedule_id` (0012 `idx_jobs_schedule`), `trigger_id` (0014
+/// `idx_jobs_trigger`), `target_key` (0041 `idx_jobs_status_target`). The
+/// `created_at` window rides the same `(…, created_at DESC)` index tails the
+/// `ORDER BY` does.
+///
+/// A struct, not six more arguments, for two reasons: `list_page` would be
+/// nine positional parameters and fail `clippy::too_many_arguments`, and a
+/// new predicate is then additive at every call site instead of a signature
+/// churn across the tree.
+///
+/// **The window is half-open — `[since, until)`.** An inclusive upper bound
+/// makes a day-at-a-time walk return the boundary row in both pages, which
+/// is the error that makes a per-window count untrustworthy rather than
+/// merely off by one.
+#[derive(Debug, Clone, Default)]
+pub struct JobQuery {
+    pub app: Option<String>,
+    pub status: Option<JobStatus>,
+    pub schedule_id: Option<String>,
+    pub trigger_id: Option<String>,
+    pub target_key: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub since: Option<DateTime<Utc>>,
+    /// **Exclusive** upper bound on `created_at`.
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl JobQuery {
+    /// The unfiltered list — every job, newest first.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// One app's jobs and nothing else, the commonest single-predicate form.
+    pub fn for_app(app: &str) -> Self {
+        Self {
+            app: Some(app.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Appends `AND <col> = ?` for **only the predicates actually supplied**,
+/// binding every value.
+///
+/// This is the whole reason the queue list is built with a
+/// [`sqlx::QueryBuilder`] rather than one static statement with a
+/// `(?n IS NULL OR col = ?n)` clause per column. That nullable-parameter
+/// idiom reads as equivalent and is not: SQLite cannot use an index for a
+/// term it cannot prove is an equality at *planning* time, so a statement
+/// written that way **full-scans `jobs`** no matter which of the five
+/// columns the caller filtered on. The indexes 0012/0014/0041 paid for
+/// would stay exactly as unreachable as they were before this surface
+/// existed — the filter would work and the index would not. The plan is
+/// asserted, not assumed: see `Storage::explain_job_list` and the
+/// `trigger_filter_rides_idx_jobs_trigger` test in
+/// `crates/core/tests/jobs.rs`.
+///
+/// Values are **bound**, never interpolated. The only text this function
+/// pushes is its own column names.
+fn push_job_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, q: &JobQuery) {
+    if let Some(app) = &q.app {
+        qb.push(" AND app = ");
+        qb.push_bind(app.clone());
+    }
+    if let Some(status) = q.status {
+        qb.push(" AND status = ");
+        qb.push_bind(status.as_str());
+    }
+    if let Some(schedule_id) = &q.schedule_id {
+        qb.push(" AND schedule_id = ");
+        qb.push_bind(schedule_id.clone());
+    }
+    if let Some(trigger_id) = &q.trigger_id {
+        qb.push(" AND trigger_id = ");
+        qb.push_bind(trigger_id.clone());
+    }
+    if let Some(target_key) = &q.target_key {
+        qb.push(" AND target_key = ");
+        qb.push_bind(target_key.clone());
+    }
+    if let Some(since) = q.since {
+        qb.push(" AND created_at >= ");
+        qb.push_bind(crate::datasets::ts(since));
+    }
+    if let Some(until) = q.until {
+        qb.push(" AND created_at < ");
+        qb.push_bind(crate::datasets::ts(until));
+    }
+}
+
+/// The ONE assembler behind every job-list read: `list`, `list_page`, the
+/// `GROUP BY status` rollup, and the `EXPLAIN QUERY PLAN` probe all take
+/// their `WHERE` from here, so no two of them can disagree about what a
+/// filter means. `select` is the projection (and, for the probe, carries
+/// the `EXPLAIN QUERY PLAN` prefix).
+fn job_query_builder<'a>(
+    select: &str,
+    q: &JobQuery,
+    after: Option<&'a (String, String)>,
+    order_and_limit: Option<i64>,
+) -> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
+    // `WHERE 1 = 1` so every predicate below is uniformly ` AND …`; SQLite
+    // folds the constant away before planning, which the plan assertion in
+    // `crates/core/tests/jobs.rs` is what actually proves.
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("{select} FROM jobs WHERE 1 = 1"));
+    push_job_filters(&mut qb, q);
+    if let Some((after_ts, after_id)) = after {
+        qb.push(" AND (created_at < ");
+        qb.push_bind(after_ts.as_str());
+        qb.push(" OR (created_at = ");
+        qb.push_bind(after_ts.as_str());
+        qb.push(" AND id < ");
+        qb.push_bind(after_id.as_str());
+        qb.push("))");
+    }
+    if let Some(limit) = order_and_limit {
+        qb.push(if after.is_some() {
+            " ORDER BY created_at DESC, id DESC LIMIT "
+        } else {
+            " ORDER BY created_at DESC LIMIT "
+        });
+        qb.push_bind(limit);
+    }
+    qb
+}
+
 /// The claim's in-flight exclusion by target: a job whose `target_key` is
 /// already held by a `running` row is not the row this claim picks.
 ///
@@ -969,23 +1101,10 @@ impl Storage {
         row.map(Job::try_from).transpose()
     }
 
-    pub async fn list(
-        &self,
-        app: Option<&str>,
-        status: Option<JobStatus>,
-        limit: i64,
-    ) -> Result<Vec<Job>> {
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM jobs \
-             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
-             ORDER BY created_at DESC LIMIT ?3"
-        );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(app)
-            .bind(status.map(JobStatus::as_str))
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn list(&self, q: &JobQuery, limit: i64) -> Result<Vec<Job>> {
+        let select = format!("SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, None, Some(limit));
+        let rows: Vec<JobRow> = qb.build_query_as().fetch_all(&self.pool).await?;
         rows.into_iter().map(Job::try_from).collect()
     }
 
@@ -993,29 +1112,57 @@ impl Storage {
     /// previous page's last (created_at-as-stored, id); None starts at the top.
     pub async fn list_page(
         &self,
-        app: Option<&str>,
-        status: Option<JobStatus>,
+        q: &JobQuery,
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<Job>> {
-        let (after_ts, after_id) = after
-            .map(|(t, i)| (Some(t), Some(i)))
-            .unwrap_or((None, None));
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM jobs \
-             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
-             AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id < ?4)) \
-             ORDER BY created_at DESC, id DESC LIMIT ?5"
-        );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(app)
-            .bind(status.map(JobStatus::as_str))
-            .bind(after_ts)
-            .bind(after_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+        let select = format!("SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, after.as_ref(), Some(limit));
+        let rows: Vec<JobRow> = qb.build_query_as().fetch_all(&self.pool).await?;
         rows.into_iter().map(Job::try_from).collect()
+    }
+
+    /// `GROUP BY status` over the SAME `WHERE` the list uses — "how did this
+    /// schedule's night go?" as one statement instead of a paged table the
+    /// caller counts by hand.
+    ///
+    /// Metered as [`StoreOp::JobStatusCounts`], the family the unscoped
+    /// `/metrics` aggregate already belongs to. That meter is also the test's
+    /// instrument: the list paths are unmetered, so a handler that paged rows
+    /// to count them would leave this counter untouched.
+    ///
+    /// Returns only the statuses the window actually holds. An absent status is
+    /// absent, not `0`: a zero is a claim about a value, and inventing five of
+    /// them per response would make "no failures in the window" and "no window"
+    /// read identically.
+    pub async fn status_counts_filtered(&self, q: &JobQuery) -> Result<Vec<(String, i64)>> {
+        let q = q.clone();
+        self.metered(StoreOp::JobStatusCounts, move |mut conn| async move {
+            let mut qb = job_query_builder("SELECT status, COUNT(*)", &q, None, None);
+            qb.push(" GROUP BY status ORDER BY status");
+            let rows: Vec<(String, i64)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            // Rows *touched*, as `status_counts` reports: the figure's job is to
+            // separate "the query got slower" from "the window got bigger".
+            let scanned = rows.iter().map(|(_, n)| *n as u64).sum();
+            Ok((rows, scanned))
+        })
+        .await
+    }
+
+    /// `EXPLAIN QUERY PLAN` over the statement [`Storage::list`] would run for
+    /// `q` — the `detail` column, one string per plan row.
+    ///
+    /// Exists so the claim "this filter rides the index migration 0014 built"
+    /// is a **test assertion over the real plan** rather than a sentence in a
+    /// doc. A `(?n IS NULL OR col = ?n)` statement passes every behavioural
+    /// test here and fails this one, which is precisely the failure mode worth
+    /// a dedicated probe.
+    pub async fn explain_job_list(&self, q: &JobQuery, limit: i64) -> Result<Vec<String>> {
+        let select = format!("EXPLAIN QUERY PLAN SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, None, Some(limit));
+        // EXPLAIN QUERY PLAN's shape is (id, parent, notused, detail).
+        let rows: Vec<(i64, i64, i64, String)> = qb.build_query_as().fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(_, _, _, detail)| detail).collect())
     }
 
     /// Counts jobs grouped by status — for the metrics endpoint.

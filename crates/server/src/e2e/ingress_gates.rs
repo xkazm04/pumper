@@ -258,7 +258,10 @@ async fn an_unidentified_replay_dedupes_instead_of_enqueuing_forever() {
             "so it enqueues nothing the second time"
         );
     }
-    let jobs = storage.list(Some("fake"), None, 100).await.unwrap();
+    let jobs = storage
+        .list(&pumper_core::storage::JobQuery::for_app("fake"), 100)
+        .await
+        .unwrap();
     assert_eq!(jobs.len(), 1, "one job for one distinct event, not three");
 
     // A genuinely different body is a different event and does fire.

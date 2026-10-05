@@ -4,7 +4,7 @@
 //! deterministic (no sleeping).
 
 use chrono::{Duration, SecondsFormat, Utc};
-use pumper_core::storage::FailReason;
+use pumper_core::storage::{FailReason, JobQuery};
 use pumper_core::{EnqueueOptions, JobStatus};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -471,5 +471,313 @@ async fn the_retry_ladder_is_jittered_so_a_fleet_wide_outage_does_not_re_queue_i
         distinct.len() >= 10,
         "only {} distinct retry times across 20 jobs — the ladder is re-synchronizing the herd",
         distinct.len()
+    );
+}
+
+// ───────── the lineage slice: the plan, not just the rows ─────────
+//
+// `GET /jobs`'s filter surface is assembled from only the predicates a caller
+// actually supplied, which is the part no behavioural test can see. The obvious
+// alternative — one static statement with a `(?n IS NULL OR col = ?n)` clause
+// per column — returns byte-identical rows and **full-scans `jobs` every
+// time**: SQLite cannot use an index for a term it cannot prove is an equality
+// while planning. So the claim "this filter rides the index migration
+// 0012/0014/0041 paid for" is asserted here against the real
+// `EXPLAIN QUERY PLAN`, and nowhere else.
+
+/// Inserts one job with the lineage columns under the test's control.
+async fn insert_lineage_job(
+    pool: &SqlitePool,
+    app: &str,
+    status: &str,
+    created_at: &str,
+    schedule_id: Option<&str>,
+    trigger_id: Option<&str>,
+    target_key: Option<&str>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
+         created_at, available_at, schedule_id, trigger_id, target_key) \
+         VALUES (?1, ?2, '{}', ?3, 0, 1, 0, ?4, ?4, ?5, ?6, ?7)",
+    )
+    .bind(id.to_string())
+    .bind(app)
+    .bind(status)
+    .bind(created_at)
+    .bind(schedule_id)
+    .bind(trigger_id)
+    .bind(target_key)
+    .execute(pool)
+    .await
+    .expect("insert lineage job");
+    id
+}
+
+fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .expect("rfc3339")
+        .with_timezone(&Utc)
+}
+
+/// The anti-pattern this guards: a `(?n IS NULL OR col = ?n)` WHERE clause.
+/// It passes every row-level test and reaches NONE of these indexes, which
+/// would leave the whole lineage filter a convenience over a table scan.
+#[tokio::test]
+async fn lineage_filters_ride_the_indexes_not_a_table_scan() {
+    let store = fresh_db("lineage-plan").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+    insert_lineage_job(
+        &pool,
+        "a",
+        "failed",
+        "2026-10-02T00:00:00.000000Z",
+        Some("S"),
+        Some("T"),
+        Some("K"),
+    )
+    .await;
+
+    let plan_for = |q: JobQuery| {
+        let storage = storage.clone();
+        async move {
+            storage
+                .explain_job_list(&q, 50)
+                .await
+                .expect("explain")
+                .join(" | ")
+        }
+    };
+
+    // Migration 0014: idx_jobs_trigger (trigger_id, created_at DESC). The
+    // index tail IS the ORDER BY, so there is not even a sort to do.
+    let joined = plan_for(JobQuery {
+        trigger_id: Some("T".into()),
+        status: Some(JobStatus::Failed),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        joined.contains("idx_jobs_trigger"),
+        "?trigger_id= must ride migration 0014's index; plan was: {joined}"
+    );
+    assert!(
+        !joined.contains("SCAN jobs"),
+        "a full scan here means the WHERE clause was assembled with nullable \
+         parameters after all: {joined}"
+    );
+    assert!(
+        !joined.contains("TEMP B-TREE"),
+        "idx_jobs_trigger is (trigger_id, created_at DESC) — the ORDER BY is \
+         the index's own tail and must cost no sort: {joined}"
+    );
+
+    // Migration 0012: idx_jobs_schedule (schedule_id, status). Until this
+    // surface existed its only reader in the tree was the scheduler's internal
+    // overlap probe.
+    let joined = plan_for(JobQuery {
+        schedule_id: Some("S".into()),
+        status: Some(JobStatus::Failed),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        joined.contains("idx_jobs_schedule") && joined.contains("status=?"),
+        "?schedule_id=&status= must use BOTH columns of 0012's index: {joined}"
+    );
+
+    // Migration 0041: idx_jobs_status_target is (status, target_key) — `status`
+    // LEADS.
+    let joined = plan_for(JobQuery {
+        target_key: Some("K".into()),
+        status: Some(JobStatus::Failed),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        joined.contains("idx_jobs_status_target"),
+        "?status=&target_key= is the form 0041's (status, target_key) index \
+         covers: {joined}"
+    );
+
+    // ...so a bare `?target_key=` CANNOT use it. Pinned as a known gap rather
+    // than papered over: claiming otherwise in a doc would be a claim this
+    // plan refutes, and re-ordering the index is a migration this change does
+    // not own.
+    let bare = plan_for(JobQuery {
+        target_key: Some("K".into()),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        bare.contains("SCAN jobs"),
+        "KNOWN GAP, pinned so it cannot be quietly mis-documented: 0041's \
+         index leads with `status`, so a bare ?target_key= scans. If this \
+         stops scanning the index changed, and docs/features/http-api.md owes \
+         an edit: {bare}"
+    );
+
+    // The window rides the `created_at` tail of whichever index the equality
+    // picked, as a RANGE — not a post-filter over a sorted scan.
+    let joined = plan_for(JobQuery {
+        app: Some("a".into()),
+        since: Some(at("2026-10-01T00:00:00Z")),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        joined.contains("idx_jobs_app") && joined.contains("created_at>"),
+        "?app=&since= must become a range on idx_jobs_app's (app, created_at \
+         DESC): {joined}"
+    );
+
+    // And the unfiltered list is honestly a scan — the floor that proves the
+    // assertions above read a real plan rather than a constant string.
+    let joined = plan_for(JobQuery::default()).await;
+    assert!(
+        joined.contains("SCAN jobs"),
+        "with no predicate there is no index to ride; a plan that claims one \
+         means this probe is not explaining the real statement: {joined}"
+    );
+}
+
+/// The `created_at` window is half-open, `[since, until)`, at the STORE — the
+/// boundary row belongs to exactly one of two adjacent windows, which is what
+/// makes a day-at-a-time walk's counts add up.
+#[tokio::test]
+async fn the_created_at_window_is_half_open() {
+    let store = fresh_db("lineage-window").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+    let first = insert_lineage_job(
+        &pool,
+        "a",
+        "succeeded",
+        "2026-10-01T00:00:00.000000Z",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let boundary = insert_lineage_job(
+        &pool,
+        "a",
+        "succeeded",
+        "2026-10-02T00:00:00.000000Z",
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let ids = |q: JobQuery| {
+        let storage = storage.clone();
+        async move {
+            storage
+                .list(&q, 50)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|j| j.id)
+                .collect::<Vec<Uuid>>()
+        }
+    };
+
+    assert_eq!(
+        ids(JobQuery {
+            since: Some(at("2026-10-01T00:00:00Z")),
+            until: Some(at("2026-10-02T00:00:00Z")),
+            ..Default::default()
+        })
+        .await,
+        vec![first],
+        "`until` is EXCLUSIVE: the job stamped exactly at it is the NEXT \
+         window's, or a per-day count double-counts every boundary"
+    );
+    assert_eq!(
+        ids(JobQuery {
+            since: Some(at("2026-10-02T00:00:00Z")),
+            ..Default::default()
+        })
+        .await,
+        vec![boundary],
+        "...and `since` is INCLUSIVE"
+    );
+}
+
+/// The rollup aggregates the SAME `WHERE` the list filters by, and reports only
+/// the statuses the window actually holds.
+#[tokio::test]
+async fn the_status_rollup_is_scoped_by_the_same_predicates_as_the_list() {
+    let store = fresh_db("lineage-rollup").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+    for i in 0..12 {
+        insert_lineage_job(
+            &pool,
+            "a",
+            "succeeded",
+            &format!("2026-10-02T00:00:{i:02}.000000Z"),
+            Some("S"),
+            None,
+            None,
+        )
+        .await;
+    }
+    for i in 0..3 {
+        insert_lineage_job(
+            &pool,
+            "a",
+            "failed",
+            &format!("2026-10-02T01:00:{i:02}.000000Z"),
+            Some("S"),
+            None,
+            None,
+        )
+        .await;
+    }
+    // Another schedule's work, which the scoped rollup must not count.
+    insert_lineage_job(
+        &pool,
+        "a",
+        "failed",
+        "2026-10-02T02:00:00.000000Z",
+        Some("T"),
+        None,
+        None,
+    )
+    .await;
+
+    let counts = storage
+        .status_counts_filtered(&JobQuery {
+            schedule_id: Some("S".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("rollup");
+    assert_eq!(
+        counts,
+        vec![("failed".to_string(), 3), ("succeeded".to_string(), 12)],
+        "S's 12 succeeded and 3 failed, and T's failure is not S's"
+    );
+    assert!(
+        !counts.iter().any(|(_, n)| *n == 0),
+        "an absent status is ABSENT, not a zero: {counts:?}"
+    );
+
+    // Unscoped, it agrees with the /metrics aggregate over the same table.
+    let mut unscoped = storage
+        .status_counts_filtered(&JobQuery::default())
+        .await
+        .expect("rollup");
+    let mut metrics = storage.status_counts().await.expect("status_counts");
+    unscoped.sort();
+    metrics.sort();
+    assert_eq!(
+        unscoped, metrics,
+        "with no predicate the scoped rollup IS /metrics' aggregate; two \
+         spellings of one count is how a dashboard and a triage page come to \
+         disagree about the same queue"
     );
 }
