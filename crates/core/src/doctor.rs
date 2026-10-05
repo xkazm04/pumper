@@ -132,6 +132,14 @@ pub struct StoreFacts {
     pub orphan_derived: Vec<(String, String, String)>,
     /// Leftover `*_new` table-rebuild scaffolds.
     pub stale_rebuild_tables: Vec<String>,
+    /// The schema this store actually has, against the chain this binary
+    /// carries. `None` when the report did not consult it.
+    ///
+    /// On a booting server the unsound cases are mostly unreachable —
+    /// `Storage::connect` refuses them — with one deliberate exception:
+    /// `[storage] allow_schema_ahead = true` lets an ahead store through, and
+    /// this is the surface that keeps saying so afterwards.
+    pub schema: Option<crate::schema::SchemaReport>,
     /// Descriptive; only the unbounded-and-old ones become findings.
     pub tables: Vec<TableGrowth>,
     /// Descriptive; never a finding on its own — a dataset written by an app
@@ -337,6 +345,51 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
         });
     }
 
+    // The schema the store actually has, against the chain this binary carries.
+    // `Storage::connect` refuses both of these at boot, so reaching them here
+    // means either `[storage] allow_schema_ahead = true` or a table that
+    // vanished while the process was up.
+    if let Some(schema) = facts.schema.as_ref().filter(|s| !s.is_sound()) {
+        let mut parts = Vec::new();
+        if !schema.ahead.is_empty() {
+            parts.push(format!(
+                "the store has applied migration version(s) {} that this binary does not carry",
+                schema
+                    .ahead
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !schema.tables_missing.is_empty() {
+            parts.push(format!(
+                "table(s) the migration chain promises are absent: {}",
+                schema.tables_missing.join(", ")
+            ));
+        }
+        out.push(Finding {
+            check: "schema_drift",
+            severity: Severity::Warn,
+            summary: parts.join("; "),
+            count: (schema.ahead.len() + schema.tables_missing.len()) as i64,
+            remediation: "this build cannot fully read this store. If versions are AHEAD, run                           the newer pumper against it (there are no down migrations, so this                           build cannot undo them) or restore the pre-migration snapshot beside                           the database (`<database>.bak-premigrate-*`); `[storage]                           allow_schema_ahead = true` is what let this boot happen and should be                           turned back off once the right binary is running. If TABLES are                           missing, the ledger says the migration ran but the object is gone —                           restore that same snapshot and re-run so the chain replays, or move                           the database aside and let it rebuild from 0001. Do not create the                           table by hand: the chain is the only authority for its shape."
+                .into(),
+            examples: sample(
+                schema
+                    .ahead
+                    .iter()
+                    .map(|v| json!({ "ahead_version": v }))
+                    .chain(
+                        schema
+                            .tables_missing
+                            .iter()
+                            .map(|t| json!({ "missing_table": t })),
+                    ),
+            ),
+        });
+    }
+
     // The index went empty and nothing on this surface would ever have said so.
     if facts
         .search
@@ -475,6 +528,59 @@ mod tests {
             ..Default::default()
         };
         assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
+    }
+
+    /// GUARD. A sound schema — and an extra table the chain never created —
+    /// must stay out of `findings`. The doctor's whole contract is that a
+    /// healthy store is silent, and the schema block is descriptive until
+    /// something is actually unsound.
+    #[test]
+    fn a_sound_schema_says_nothing_even_with_an_extra_table() {
+        let mut observed: std::collections::BTreeSet<String> = crate::schema::EXPECTED_TABLES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        observed.insert("operator_scratch".into());
+        let facts = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(
+                &[1, 2],
+                &[1, 2],
+                &observed,
+            )),
+            ..Default::default()
+        };
+        assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
+    }
+
+    /// The two unsound shapes, each naming the object and a reachable remedy.
+    #[test]
+    fn an_unsound_schema_names_the_object_and_the_way_back() {
+        let full: std::collections::BTreeSet<String> = crate::schema::EXPECTED_TABLES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        let ahead = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(&[1, 2, 3], &[1, 2], &full)),
+            ..Default::default()
+        };
+        let findings = diagnose(&ahead);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, "schema_drift");
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert!(findings[0].summary.contains('3'), "names the version");
+        assert!(findings[0].remediation.contains("allow_schema_ahead"));
+
+        let mut short = full.clone();
+        short.remove("golden_docs");
+        let gone = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(&[1], &[1], &short)),
+            ..Default::default()
+        };
+        let findings = diagnose(&gone);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].summary.contains("golden_docs"));
+        assert!(findings[0].remediation.contains("bak-premigrate"));
+        assert_eq!(findings[0].count, 1);
     }
 
     /// Growth is flagged on the conjunction, never on size alone — otherwise a

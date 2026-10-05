@@ -1244,6 +1244,16 @@ pub struct StorageConfig {
     pub webhook_dead_letter_retention_days: u64,
     /// Days of per-job yield telemetry kept (backs `GET /economics`). `0` = off.
     pub job_yield_retention_days: u64,
+    /// Boot against a store whose `_sqlx_migrations` records versions this
+    /// binary does not carry — a store a NEWER pumper already migrated.
+    ///
+    /// **Defaults closed**, and the refusal names this key. A safety ceiling,
+    /// not a preference: this repo ships zero down migrations, so an older
+    /// binary cannot undo what a newer one did, and booting it means reading a
+    /// schema with columns and constraints this build cannot see. Opening it is
+    /// a deliberate "I know, let me in" — the boot then logs the ahead versions
+    /// at `warn` on every start rather than going quiet.
+    pub allow_schema_ahead: bool,
     /// Days of saved-search `seen` doc-ids kept. **Turning this on can re-alert:**
     /// a pruned row makes an already-notified document look new again, so a
     /// still-matching doc fires its webhook a second time. `0` = off.
@@ -1267,6 +1277,8 @@ impl Default for StorageConfig {
             webhook_dead_letter_retention_days: 0,
             job_yield_retention_days: 0,
             saved_search_seen_retention_days: 0,
+            // A ceiling, so it defaults closed. See the field doc.
+            allow_schema_ahead: false,
         }
     }
 }

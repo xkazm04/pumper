@@ -265,6 +265,56 @@ It is a **partial census by design** and says so in its own `# HELP` text: seven
 instrumented statement families, with schedules, watches, triggers, deliveries,
 saved searches, the caches and the search index explicitly unmeasured.
 
+## Boot: the schema post-condition
+
+The migration chain (`crates/core/migrations/`, `0001_init.sql` …) is replayed on
+every `Storage::connect`. It used to be replayed and then *believed*: the
+migrator ran, `connect` returned `Ok`, and nothing read back the schema it had
+produced. Boot now asserts it, in two halves, and **refuses** a store this
+binary cannot read (`Error::Schema`).
+
+**Half one, before the chain runs — is the store ahead of this binary?**
+`pumper_core::schema::classify` compares `_sqlx_migrations` against the embedded
+chain **in both directions**. `pending` (versions this binary carries that the
+store lacks) is ordinary forward migration. `ahead` (versions the store has that
+this binary does not) is a **downgrade**, and this repo ships **zero down
+migrations** — so running an older binary is the only way back, and it is the
+path that previously classified identically to "in sync". The five verdicts are
+`fresh`, `current`, `pending`, `ahead`, `diverged` (both directions at once).
+
+*What the operator sees:* boot fails with a message naming the ahead versions,
+the version this build's chain ends at, and three remedies — run the newer
+binary, restore the pre-migration snapshot written beside the database
+(`<database>.bak-premigrate-*`, see "Budgets" → the backup ritual is automatic),
+or set **`[storage] allow_schema_ahead = true`**. That key defaults to `false`:
+it is a safety ceiling, not a preference. With it on, the same store boots, the
+ahead versions are logged at `warn` on **every** start, and `GET
+/datasets/doctor` keeps reporting the drift as a finding.
+
+**Half two, after the chain runs — did it produce the inventory it promises?**
+`pumper_core::schema::EXPECTED_TABLES` is the single manifest of which tables the
+chain must leave behind (33 today). It used to live in `crates/core/tests/
+migrations.rs`, where the boot path could not reach it; it now lives in the crate
+and is read by **both** the CI replay test and every real boot. A missing table
+refuses the boot naming the table — this is drift *below* the ledger (an
+interrupted migration, a hand-restored partial copy, a table dropped out of
+band), which no version comparison can see. An **unexpected** table is logged at
+`info` and never fatal: an operator's own scratch table is not a fault.
+
+*What the operator does:* restore the `*.bak-premigrate-*` snapshot beside the
+database and re-run so the chain replays, or move the database aside and let it
+rebuild from 0001. Do not create the table by hand — the chain is the only
+authority for its shape.
+
+**A migration that creates a table without adding it to `EXPECTED_TABLES` now
+fails the test AND refuses a real boot.** Add the name in the same change as the
+migration.
+
+The pre-migration snapshot decision reads the same `classify`: a store that is
+`ahead` takes no snapshot (there is nothing this binary is about to change) but
+is logged as `SkipSchemaAhead`, not `SkipUpToDate` — the two used to be the same
+arm, which is how a downgrade rode in as a no-op.
+
 ## Known gaps
 
 - No auth on the HTTP API (deliberate local power mode; API-key auth is a parked product decision).

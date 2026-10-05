@@ -561,6 +561,29 @@ pub enum Error {
     /// the contract, and it really can come out differently next time.
     #[error("source drift: {0}")]
     SourceDrift(String),
+    /// The store on disk is not a schema this binary can read, detected at
+    /// **boot** rather than at the first query that trips over it.
+    ///
+    /// Two shapes, both raised by [`crate::storage::Storage::connect`] after
+    /// the migrator settles and both carrying their remedy in the sentence
+    /// (`crate::schema::ahead_refusal`, `crate::schema::missing_tables_refusal`):
+    ///
+    /// - **Ahead.** `_sqlx_migrations` records versions this build does not
+    ///   carry — a newer pumper already moved this store. This repo has zero
+    ///   down migrations, so running an older binary IS the only way back, and
+    ///   it is the path that previously classified identically to "in sync".
+    ///   `[storage] allow_schema_ahead = true` downgrades it to a loud warning.
+    /// - **Missing tables.** The ledger says every migration ran, but a table
+    ///   `crate::schema::EXPECTED_TABLES` promises is absent — divergence
+    ///   *below* the ledger, which no version comparison can see.
+    ///
+    /// Typed rather than folded into [`Error::Storage`] because the remedy is
+    /// an operator action on the file (run the other binary, restore the
+    /// pre-migration snapshot), never a retry: the two used to surface as a
+    /// bare `sqlx::Error` at an arbitrary call site, blamed on whatever query
+    /// happened to be first.
+    #[error("schema: {0}")]
+    Schema(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -879,6 +902,7 @@ impl Error {
                 | Error::BadRequest(_)
                 | Error::ReplayMiss(_)
                 | Error::SourceDrift(_)
+                | Error::Schema(_)
         )
     }
 
@@ -923,6 +947,10 @@ impl Error {
             // capability (`engine::Browser::transact`'s default); `ReplayMiss`
             // is our cassette, not an origin's answer.
             Error::Transact(_) | Error::ReplayMiss(_) => true,
+            // The store on disk is not one this build can read. Identical on
+            // every tier by construction — the schema is not a property of the
+            // engine that was about to be asked.
+            Error::Schema(_) => true,
             // Plugins split by kind, and only the load side is ours: an unknown
             // module, a disabled subsystem, a missing export are facts about our
             // own artifacts. A trap, malformed output or a host error happened
@@ -1613,7 +1641,8 @@ mod tests {
             | Error::Transact(_)
             | Error::BadRequest(_)
             | Error::ReplayMiss(_)
-            | Error::SourceDrift(_) => true,
+            | Error::SourceDrift(_)
+            | Error::Schema(_) => true,
             // Everything else can genuinely succeed on the next attempt.
             Error::Http { .. }
             | Error::Browser { .. }
@@ -1649,6 +1678,7 @@ mod tests {
             Error::ReplayMiss("no recorded response".into()),
             Error::BadRequest("bad filter".into()),
             Error::SourceDrift("hitCount>0 but 0 rows parsed".into()),
+            Error::Schema("store is ahead of this binary".into()),
             Error::Io(std::io::Error::other("disk hiccup")),
             Error::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
             Error::Other(anyhow::anyhow!("something else")),

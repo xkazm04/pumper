@@ -87,7 +87,9 @@ pub(crate) struct DoctorQuery {
     tag = "datasets",
     params(DoctorQuery),
     responses((status = 200, description = "Read-only store integrity report: `findings` (each \
-        with a concrete remediation; EMPTY on a healthy store), plus descriptive `coverage`, \
+        with a concrete remediation; EMPTY on a healthy store), plus descriptive `schema` \
+        (applied/pending/ahead migration versions and table drift against the chain this \
+        binary carries), `coverage`, \
         `tables`, `search` (index enabled/doc_count vs live record count) and per-app `artifacts` \
         byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.")),
 )]
@@ -105,6 +107,11 @@ pub(crate) async fn datasets_doctor(
         search: Some(search_facts(&state).await?),
         orphan_derived: ds.orphan_derived_specs().await?,
         stale_rebuild_tables: state.storage.stale_rebuild_tables().await?,
+        // What `Storage::connect` asserted at boot, re-read now. On a running
+        // server this is normally sound by construction - boot refuses the
+        // unsound cases - except when `[storage] allow_schema_ahead = true`
+        // waved one through, which is exactly when an operator needs to see it.
+        schema: Some(state.storage.schema_report().await?),
         coverage: ds
             .provenance_coverage_by_dataset()
             .await?
@@ -199,6 +206,7 @@ pub(crate) async fn datasets_doctor(
         "healthy": findings.is_empty(),
         "findings": findings,
         "artifacts": artifacts,
+        "schema": facts.schema,
         "search": facts.search,
         "tables": facts.tables,
         "coverage": facts.coverage,

@@ -185,6 +185,30 @@ Knobs: `[maintenance]` in `config.toml` (defaults documented there). Config
 validation refuses a ladder with an unreachable rung — a tick rarer than the
 interval, an inverted staleness window, a zero harm bound, or zero chunks.
 
+### Schema drift (`GET /datasets/doctor` → `schema`)
+
+Beside `tables`, the report carries a `schema` block: `applied` (migration
+versions in `_sqlx_migrations`, ascending), `pending`, `ahead`,
+`tables_missing`, `tables_unexpected`, and `state` (`fresh` | `current` |
+`pending` | `ahead` | `diverged`). On a healthy store it reads
+`{applied: [1..N], pending: [], ahead: [], tables_missing: [],
+tables_unexpected: [], state: "current"}` and produces **no finding** —
+`tables_unexpected` is descriptive, because an operator's own table is not a
+promise the store is failing to keep.
+
+A `schema_drift` finding (`Warn`, so `healthy: false`) appears when `ahead` or
+`tables_missing` is non-empty, naming each version and table in `examples`.
+Both of those normally make the process refuse to boot at all
+([runtime.md § Boot: the schema post-condition](runtime.md#boot-the-schema-post-condition)),
+so reaching this surface means one of exactly two things: `[storage]
+allow_schema_ahead = true` waved an ahead store through, or a table vanished
+while the process was up. The remediation names the way back — the newer binary,
+or the `<database>.bak-premigrate-*` snapshot — and says to turn
+`allow_schema_ahead` back off once the right binary is running.
+
+The boot refusal and this block are built from the same `SchemaReport`, so they
+cannot disagree about what the store has.
+
 ## Boot-time logs that state what the process can observe
 
 Two boot lines exist to close a gap between what is configured and what is

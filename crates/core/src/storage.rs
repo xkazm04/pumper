@@ -379,6 +379,20 @@ pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
 }
 
+/// Every non-internal table name in `sqlite_master`.
+///
+/// The `sqlite_%` filter lives here rather than in `crate::schema` so that
+/// module stays free of SQLite trivia and testable without a database.
+async fn observed_tables(pool: &SqlitePool) -> Result<std::collections::BTreeSet<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT name FROM sqlite_master WHERE type = 'table'          AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
+}
+
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
 /// re-queues anything that was mid-flight when the process died.
 #[derive(Clone)]
@@ -431,12 +445,63 @@ impl Storage {
         // schema. No-ops for fresh/up-to-date/in-memory databases, so the test
         // harness (`testing::TempStore`) never writes a backup — see
         // `backup::backup_decision`.
-        let migrator = migrator();
+        let mut migrator = migrator();
+        let db = cfg.database_path.display().to_string();
+
+        // POST-CONDITION, HALF ONE — before the chain runs, because a store
+        // ahead of this binary must not be touched at all. `classify` is the
+        // two-directional ledger compare; the old code could only see versions
+        // this binary had that the store lacked, so a store a NEWER pumper had
+        // already migrated was indistinguishable from one in sync.
+        let applied = crate::backup::applied_versions(&pool).await;
+        let available = crate::backup::available_versions(&migrator);
+        let verdict = crate::schema::classify(&applied, &available);
+        if !verdict.ahead().is_empty() {
+            if !cfg.allow_schema_ahead {
+                return Err(Error::Schema(crate::schema::ahead_refusal(
+                    &db,
+                    verdict.ahead(),
+                    available.iter().copied().max(),
+                )));
+            }
+            tracing::warn!(
+                ahead = ?verdict.ahead(),
+                db = %db,
+                "booting against a store AHEAD of this binary because                  [storage] allow_schema_ahead = true; its newer columns and                  constraints are invisible to this build"
+            );
+            // sqlx refuses to run a chain whose ledger holds versions it does
+            // not carry. The operator opened the door explicitly, so the
+            // migrator is told to tolerate what the refusal above described.
+            migrator.set_ignore_missing(true);
+        }
+
         crate::backup::backup_before_migrations(&pool, &cfg.database_path, &migrator).await;
         migrator
             .run(&pool)
             .await
             .map_err(|e| Error::Storage(sqlx::Error::Migrate(Box::new(e))))?;
+
+        // POST-CONDITION, HALF TWO — the chain claims to have run; check that
+        // it actually produced the inventory it promises. This is drift BELOW
+        // the ledger (an interrupted migration, a hand-restored partial copy, a
+        // table dropped out of band), which no version comparison can see.
+        // Extra tables are reported, never fatal: an operator's scratch table
+        // is not a fault.
+        let observed = observed_tables(&pool).await?;
+        let drift = crate::schema::table_drift(&observed, crate::schema::EXPECTED_TABLES);
+        if !drift.missing.is_empty() {
+            return Err(Error::Schema(crate::schema::missing_tables_refusal(
+                &db,
+                &drift.missing,
+            )));
+        }
+        if !drift.unexpected.is_empty() {
+            tracing::info!(
+                tables = ?drift.unexpected,
+                db = %db,
+                "store carries tables the migration chain does not create"
+            );
+        }
 
         Ok(Self {
             pool,
@@ -2612,6 +2677,22 @@ impl Storage {
             });
         }
         Ok(out)
+    }
+
+    /// What this store's schema looks like against the chain this binary
+    /// carries — the same three facts `connect` asserts on, in the shape
+    /// `GET /datasets/doctor` reports.
+    ///
+    /// Read-only and cheap: one `sqlite_master` scan and one ledger read. The
+    /// boot refusal and the operator report are therefore derived from the
+    /// same numbers rather than from two independent walks that can disagree.
+    pub async fn schema_report(&self) -> Result<crate::schema::SchemaReport> {
+        let applied = crate::backup::applied_versions(&self.pool).await;
+        let available = crate::backup::available_versions(&migrator());
+        let observed = observed_tables(&self.pool).await?;
+        Ok(crate::schema::SchemaReport::new(
+            &applied, &available, &observed,
+        ))
     }
 
     /// Tables named `*_new` still present in `sqlite_master`.

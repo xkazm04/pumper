@@ -135,7 +135,12 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
-        E::Storage(_)
+        // A boot-time refusal about the store on disk. It can only reach an
+        // HTTP boundary if a schema fault appeared while the process was up
+        // (`Storage::connect` refuses it at boot), and its message names
+        // absolute paths under the data dir, so it redacts like the rest.
+        E::Schema(_)
+        | E::Storage(_)
         | E::Parse { .. }
         | E::Config { .. }
         | E::App(_)

@@ -95,6 +95,37 @@ fn checks(body: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// The `schema` block, over a real migrated store driven as a route: the one
+/// surface that says whether the schema the process booted on is still the one
+/// the chain promises. A clean store answers `current` with every drift list
+/// empty and raises NO finding - an extra table would be descriptive, never a
+/// fault. `Storage::connect` refuses the unsound cases outright
+/// (`crates/core/tests/schema_verdict.rs`), so this is the half that proves the
+/// report is reachable and shaped as documented.
+#[tokio::test]
+async fn the_doctor_reports_the_schema_the_process_booted_on() {
+    let (status, body) = doctor_report(Arc::new(SizedSearch(3)), true, 3).await;
+    assert_eq!(status, StatusCode::OK);
+    let schema = &body["schema"];
+    assert_eq!(schema["state"], "current", "{body}");
+    for empty in ["pending", "ahead", "tables_missing", "tables_unexpected"] {
+        assert_eq!(
+            schema[empty].as_array().map(|a| a.len()),
+            Some(0),
+            "`{empty}` is not empty on a freshly replayed store: {schema}"
+        );
+    }
+    assert!(
+        schema["applied"].as_array().is_some_and(|a| !a.is_empty()),
+        "the applied ledger is reported: {schema}"
+    );
+    assert!(
+        !checks(&body).contains(&"schema_drift"),
+        "a sound schema must raise no finding: {:?}",
+        checks(&body)
+    );
+}
+
 /// The user moment: *"Search had been returning nothing for a week. `just
 /// doctor` said the store was healthy the whole time."* The signal existed —
 /// but only on `/search`'s own response, which means the operator learns about
