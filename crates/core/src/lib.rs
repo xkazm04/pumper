@@ -26,6 +26,7 @@ pub mod tiers;
 pub mod vcr;
 
 pub mod catalog;
+pub mod completeness;
 pub mod config;
 pub mod crawl;
 pub mod engine;
@@ -110,6 +111,7 @@ pub use catalog::{
     Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable, PlanOrphan,
     PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
 };
+pub use completeness::{judge, Completeness, Disposition, Expectation, Verdict};
 pub use config::Config;
 pub use crawl::{
     change_weight, crawl, due_score, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot,
