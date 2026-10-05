@@ -317,6 +317,66 @@ Two honest limits:
 - `CLAUDE.md` discovery walks *upward*. If your storage root sits inside a Claude Code project (the default `data/pumper.db` does, when you run from a checkout), the parent project is still found. The escape hatch is the existing `[storage] database_path`: point it somewhere outside any such project and the context is genuinely empty. There is no new config key for this.
 - `[claude] bare` (default `false`, unchanged) remains the complete lever: it skips hooks, plugin sync, auto-memory and `CLAUDE.md` auto-discovery outright, regardless of where the process runs. Set it when you want the subprocess to carry nothing but your prompt.
 
+## The recipe lifecycle (candidate → validated → retired)
+
+The pre-archive `api_recipe` tier replays a JSON API the browser tier discovered
+behind a rendered page (`pumper_core::recipes`, table `api_recipes`). A recipe is
+in exactly one of three states, **derived** from two stored facts (`validated`,
+`retired_at`) in one place so the wire, the `?state=` filter and the fetcher can
+never disagree about what a row is:
+
+```
+  discovery ──► candidate ──(overlapping replay)──► validated
+                  ▲                                   │
+                  └──────(max_failures strikes)───────┘
+                  │
+                  ├──(retire_after strikes, or POST /recipes/{id}/retire)──► retired
+                  ◄─────────────(POST /recipes/{id}/revive)────────────┘
+```
+
+- **`candidate`** — discovered, never proven. Replayed only opportunistically
+  (`[recipes] auto_validate`).
+- **`validated`** — a successful overlapping replay proved it. Always replayed.
+- **`retired`** — out of selection. `retired` **outranks** `validated`: a recipe
+  that was trusted and then retired reads back as retired, not as trusted.
+
+**`candidate → retired` is the rung that was missing.** `record_failure`
+incremented `consecutive_failures` and the counter's only consumer was guarded
+on `validated != 0`, so once a recipe was unvalidated that branch was
+unreachable for that row *forever* — the counter was write-only. `best_for_host`
+read neither, so a candidate that had failed ten thousand consecutive times was
+still the first thing tried for its host, firing a live outbound replay ahead of
+the archive tier on every single fetch. `best_for_host` now carries
+`AND retired_at IS NULL`, so a retired recipe costs a fetch **nothing** — not a
+request, not even a tier-trace entry.
+
+**A success clears the whole slate**, not just the counter: `consecutive_failures`
+back to 0 *and* `last_failure_at` back to `NULL`, because a recipe still
+advertising a failure it has since recovered from is a surface that lies to the
+operator reading it.
+
+**Revive is probation, not trust.** `POST /recipes/{id}/revive` clears
+`retired_at`, the strikes and the failure stamp and returns the row to
+**`candidate`** — never straight back to `validated`. A recipe that earned its
+way out of selection re-earns validation the same way it did the first time,
+with a successful overlapping replay.
+
+**There is no `DELETE`.** Retirement is the terminal state and it destroys
+nothing: the row survives, and so does `consecutive_failures`, which is the
+evidence an operator reads before deciding whether to revive. Nothing in the
+tree deletes an `api_recipes` row and `api_recipes` is not in `prune_ledgers`.
+`routes/mod.rs` carries a standing assertion
+(`the_recipe_surface_has_no_irreversible_door`) that no `DELETE /recipes*`
+operation exists, separate from the route EXPECTED-diff, so adding an
+irreversible door has to delete a test that argues against it rather than append
+one line to a list.
+
+Config: `[recipes] enabled`, `auto_validate`, `max_failures` (3),
+`retire_after` (10; `0` disables the rung) — see
+[runtime.md § `[recipes]`](runtime.md#recipes--learned-api-recipe-replay-and-its-two-strike-rungs).
+Surface: `GET /recipes?host=&state=&limit=` plus the two actions, in
+[http-api.md](http-api.md). Columns: [datasets.md § Migration 0046](datasets.md#migration-0046--api_recipes-gains-two-lifecycle-columns).
+
 ## Politeness governor (adaptive)
 
 Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. Learned penalties are **persisted** (see host profiles below) so they survive a restart.

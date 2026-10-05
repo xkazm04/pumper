@@ -286,6 +286,33 @@ A write under the job's **own** app is never reported: an app owns its namespace
 
 `config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
 
+### `[recipes]` — learned API-recipe replay, and its two strike rungs
+
+| key | default | what it does |
+| --- | --- | --- |
+| `enabled` | `false` | consider recipes on every fetch. A single fetch opts in without it via `FetchRequest.use_recipes`. |
+| `auto_validate` | `false` | also try an *unvalidated* recipe opportunistically, and promote it when a successful replay still overlaps its expected field paths. |
+| `max_failures` | `3` | consecutive failed/thin replays after which a **validated** recipe is un-validated (back to candidate, counter reset). **Must be >= 1** — `validate()` rejects `0`, because a validated recipe needs at least one consecutive failure before it is demoted. |
+| `retire_after` | `10` | the rung **below** `max_failures`: consecutive strikes after which a **candidate** is *retired* — stamped `retired_at` and dropped out of selection entirely (migration 0046). `0` disables the rung and restores pre-0046 selection exactly. |
+
+`retire_after` is the one key in this section that ships **on**, and the
+asymmetry is deliberate. Before it existed the strike counter had exactly one
+consumer and it was guarded on `validated`, so once a recipe was unvalidated
+that branch was unreachable for that row forever: the counter was write-only and
+selection never read it, which made a candidate that had failed ten thousand
+consecutive times still the first thing tried for its host — a live outbound
+replay ahead of the archive tier on every fetch. The rung only ever takes things
+*out* of selection, and with `[recipes]` off nothing is replayed and nothing
+strikes, so a default install pays nothing for it while an opted-in one is
+protected from an immortal candidate. Unlike `max_failures`, `0` is legal here:
+it is the documented escape hatch, not a misconfiguration.
+
+The threshold rides on the `RecipeStore` handle (wired in `state.rs` and
+`worker.rs`) rather than being threaded through `RecipeSource::record_failure`,
+because the `Fetcher` holds the source behind `dyn` and compiles without the
+`storage` feature — so the trait keeps its signature and the concrete store
+carries the policy. Full lifecycle: [fetching.md § The recipe lifecycle](fetching.md#the-recipe-lifecycle-candidate--validated--retired).
+
 ## Process startup & error reporting
 
 `main` (`crates/server/src/main.rs`) is **synchronous**: it loads `.env`, initializes error reporting, installs the tracing subscriber, and only then builds the tokio runtime and enters `run()`. The Sentry transport owns a background thread that must not be born inside a runtime about to be torn down, which is what forces that order.
