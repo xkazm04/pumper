@@ -91,13 +91,70 @@ Params defensively parsed from `ctx.params` with documented defaults; stable rec
 
 ## Output guards (agentic trades apps)
 
-All five trades apps (`trade-wages`, `homewyse-pricing`, `state-tax`, `valuation-multiples`, `state-licensing`) share output guards via the `trades-common` crate:
+All five trades apps (`trade-wages`, `homewyse-pricing`, `state-tax`, `valuation-multiples`, `state-licensing`) share output guards via the `trades-common` crate — and, since the completeness round, one verdict with the Czech open-data apps via `pumper_core::completeness`:
 
 - **Structured output**: every research request carries a `json_schema` (`claude --json-schema`), so the CLI validates the answer's shape.
 - **Salvage**: `trades_common::salvage_json` recovers a fenced or prose-wrapped object from raw text in ONE pass (no metered re-run) when the engine couldn't parse `output.json`.
 - **Plausibility** (`trades_common::validate`): bands must be monotone (low ≤ median ≤ high — wage entry/median/experienced hourly+annual, pricing low/median/high, SDE low/median/high), rates ∈ [0,100] (state top marginal, federal SE/QBI/top rates), magnitudes positive (wages, employment, prices, multiples). A record that violates any check is **rejected with per-record reasons** in the result (`rejected` array + `rejected_count`); valid siblings still upsert.
-- **Completeness** (`state-tax`): the 50 states + DC are enumerated in code (`US_JURISDICTIONS`); the result reports `states_covered`, `states_expected`, and a `missing_states` list.
+- **Completeness** (all five, and the three Czech apps): the 50 states + DC are enumerated in code (`US_JURISDICTIONS`); `state-tax` additionally reports the legacy `states_covered`, `states_expected`, `missing_states` aliases. The shared judgment, its three states and the per-app floors are documented under [One completeness verdict](#one-completeness-verdict-pumper_corecompleteness).
 - **Freshness gate** (avoids re-paying the priciest path in the product): before the metered `ctx.research` call, each app checks what it already holds and short-circuits with `{skipped, cost_usd: 0}`. `state-tax` and `trade-wages` gate on **vintage** (`year` equality — tax-year / OEWS-vintage facts are frozen once published, so a same-year refresh is pure burn). `homewyse-pricing` and `valuation-multiples` gate on **record age** (`max_age_days`, default 90 — those figures drift within a year); homewyse's age check is scoped to the requested `locality`. `force: true` always re-runs. This lives in the apps (domain freshness), not the core cache (which is request-identity + a 24h TTL).
+
+## One completeness verdict (`pumper_core::completeness`)
+
+Eight apps scrape a *bounded* thing — a 51-jurisdiction roster, a five-trade roster, a national
+earnings table, a vacancy register, a dump index — and all of them have the scraper's defining
+failure mode: fetch 200s, the parse succeeds, almost nothing comes out, and the job is **green**.
+Four authors each built a private floor for it (`COVERAGE_FLOOR = 0.9`, `MIN_PLAUSIBLE_ROWS = 50`,
+`MIN_PLAUSIBLE_POSTINGS = 1000`, `PARSE_FLOOR = 1.0`) in four vocabularies, and only two of them
+turned the floor into an **outcome**: five apps computed a `Coverage` and exactly one consulted it
+before writing, so a run that collapsed to 1 priced trade of 5 was a successful job carrying a
+string in `warnings[]`.
+
+The judgment is now one module in `core`. An app declares an **expectation** (a named roster, a
+count-only roster, a minimum row count, a parsed/seen share, or `unbounded` for a run that did not
+ask for the whole thing) and a **disposition** (where `suspect` starts, where `collapsed` starts,
+and whether the operator passed `allow_shrink`). It gets back one verdict with three states:
+
+| `completeness.verdict` | what it means | what the app does |
+| --- | --- | --- |
+| `ok` | the run got what it asked for | writes normally; a full-snapshot write may tombstone |
+| `suspect` | materially short, but plausibly real | **writes**, never tombstones — a full-snapshot write downgrades to an upsert and `removals_suppressed` says why |
+| `collapsed` | too short to be this source | the job **FAILS**; nothing is written |
+
+Every judged app reports the same block:
+
+```
+completeness: {verdict: ok|suspect|collapsed, unit, covered, expected, ratio,
+               suspect_below, collapse_below, bounded, missing, message}
+```
+
+`missing` is `null` for a count-only expectation, never a misleading empty list. `bounded: false`
+marks a run that deliberately asked for less than the whole source, so an operator can see *why*
+the floor stayed quiet rather than guessing.
+
+**Per-app dispositions** (the floors are now declared data, not private consts):
+
+| app | expectation | `suspect` below | `collapsed` below |
+| --- | --- | --- | --- |
+| `homewyse-pricing`, `valuation-multiples`, `trade-wages`, `state-licensing` | trade/jurisdiction roster | 0.9 | **0.5** |
+| `state-tax` | 50 states + DC | 0.9 | never (suppresses removals instead) |
+| `mpsv-ispv` | ≥ 50 `polozky` rows | 1.0 | 1.0 |
+| `mpsv-vpm` | ≥ 1 000 postings, default feed at full width only | 1.0 | 1.0 |
+| `smlouvy-dump-watch` | parsed ÷ `<dump>` blocks seen | 1.0 | never |
+
+**Operator-visible change (policy tighten).** The four trades apps that write by upsert used to
+report *any* shortfall as a green job. A run that returns **less than half** its roster now FAILS
+with a `collapsed` error naming `covered of expected`; between 50% and 90% it still succeeds, as
+`suspect`, with the same `warnings[]` text it has always emitted. `state-tax` and
+`smlouvy-dump-watch` are unchanged in behaviour — they keep suppressing removals and never fail —
+because refusing to write at all is a worse answer than refusing to tombstone. `allow_shrink: true`
+still forces `ok` on the apps that accept it.
+
+**The ratchet.** `crates/server/src/registry.rs` carries an EXPECTED-diff inventory over
+`registry::apps()`: the set of apps whose `output_shape` declares a `floor` is pinned by name, and
+each of them must also declare `completeness`. A tenth market-data app cannot be registered with a
+private const — it fails the inventory **by name**. `hackernews` is the one floor still judged
+privately; it is listed in `AWAITING_THE_JUDGE`, and that list is asserted only ever to shrink.
 
 ### Shared result contract (round 21)
 
@@ -109,6 +166,11 @@ and quietly omit them.
 - **`coverage: {unit, covered, expected, ratio, floor, short, missing}`** — how much of the expected
   roster the run actually returned. `floor` is 0.9; below it `short: true`. `missing` is `null` for a
   count-only roster, never a misleading empty list. `state-licensing` reports it per trade.
+- **`completeness: {verdict, …}`** — the VERDICT that coverage was computed for, and now part of
+  `RESULT_FIELDS` so a sixth app cannot report the number and discard the judgment. See
+  [One completeness verdict](#one-completeness-verdict-pumper_corecompleteness) above.
+  `state-licensing` reports it per trade, and a resumed trade replays the verdict its paid-for
+  attempt recorded rather than recomputing it from an answer that is gone.
 - **`warnings: [string]`** — a coverage shortfall, a suppressed removal, or a truncated join input.
   **Near-total rejection is no longer a silent success**: previously only a *fully* empty batch
   errored, so 1 surviving record of 51 was a green run with `rejected_count: 50`.

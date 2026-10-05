@@ -93,6 +93,8 @@ impl ScrapeApp for HomewysePricing {
             output_shape: Some(
                 "{source, locality, year, trades: [{trade, jobs_priced}], records, \
                  coverage: {unit, covered, expected, ratio, floor, short, missing}, \
+                 completeness: {verdict: ok|suspect|collapsed, unit, covered, expected, \
+                 ratio, suspect_below, collapse_below, bounded, missing, message}, \
                  warnings: [string], new, \
                  changed, unchanged, rejected: [{key, reasons}], rejected_count, \
                  unknown_trades, unified: {dataset, trust, new, changed, unchanged, \
@@ -307,6 +309,16 @@ impl ScrapeApp for HomewysePricing {
             ));
         }
 
+        // **The verdict this coverage was computed for.** The family built the
+        // number here for a release and then wrote anyway: a 1-of-5 run was a
+        // GREEN job carrying a string in `warnings[]`. `upsert_disposition`
+        // makes it an outcome -- short is `suspect` and still writes, collapsed
+        // is an `Err` and writes nothing.
+        let verdict = cov.judge(coverage::upsert_disposition(trades_common::allow_shrink(
+            &ctx,
+        )));
+        verdict.guard()?;
+
         // One research call produced every row, so a batch-level stamp is the
         // honest grain.
         let summary = ctx
@@ -324,6 +336,7 @@ impl ScrapeApp for HomewysePricing {
             "trades": trade_summaries,
             "records": all_records.len(),
             "coverage": cov.to_json(),
+            "completeness": verdict.to_json(),
             "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),

@@ -687,6 +687,7 @@ pub mod validate {
 /// Round 1 taught these apps to *report* coverage (`state-tax`'s
 /// `missing_states`). This module is the other half: coverage that **acts**.
 pub mod coverage {
+    use pumper_core::completeness::{self, Disposition, Expectation, Verdict};
     use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
     use serde_json::{json, Value};
 
@@ -699,20 +700,45 @@ pub mod coverage {
     /// routine, survivable answer from a model; 30 of 51 is not.
     pub const COVERAGE_FLOOR: f64 = 0.9;
 
+    /// The ratio below which a run is not a *short* answer from the source but
+    /// **a different source**. Half the roster missing is not a model declining
+    /// one jurisdiction; it is a truncated response, a quota cut-off, or a
+    /// prompt the source no longer understands.
+    ///
+    /// Above it the family tolerates and reports (`Completeness::Suspect`);
+    /// below it the apps that write by upsert now REFUSE, which is the change
+    /// this constant exists for. The one app that writes a full snapshot
+    /// (`state-tax`) is judged with [`snapshot_disposition`] instead and never
+    /// fails on a shortfall -- refusing to write at all is a worse answer than
+    /// refusing to tombstone.
+    pub const COLLAPSE_FLOOR: f64 = 0.5;
+
+    /// The disposition of a family app that writes by **upsert**: short at
+    /// [`COVERAGE_FLOOR`], collapsed at [`COLLAPSE_FLOOR`]. A collapsed run is
+    /// an `Err`, not a green job carrying a string.
+    pub fn upsert_disposition(allow_shrink: bool) -> Disposition {
+        Disposition::new(COVERAGE_FLOOR, COLLAPSE_FLOOR).allow_shrink(allow_shrink)
+    }
+
+    /// The disposition of the family app that writes a **full snapshot**: short
+    /// at [`COVERAGE_FLOOR`], never collapsed. A shortfall suppresses removal
+    /// detection; it does not throw away an agentic run that was paid for.
+    pub fn snapshot_disposition(allow_shrink: bool) -> Disposition {
+        Disposition::suppress_only(COVERAGE_FLOOR).allow_shrink(allow_shrink)
+    }
+
     /// What one run covered of the roster it was asked for.
     ///
     /// `unit` names the roster members ("states", "trades", "priced trades") and
     /// is only ever used in reporting text.
+    ///
+    /// A thin newtype over [`pumper_core::Expectation`]: the shape, the
+    /// vocabulary and the reporting text stay the family's, the judging is the
+    /// workspace's one judge. The Czech open-data apps cannot import a
+    /// `trades-*` crate (apps depend only on `core`), so the arithmetic had to
+    /// move down a layer for them to share it.
     #[derive(Debug, Clone)]
-    pub struct Coverage {
-        unit: &'static str,
-        expected: usize,
-        covered: usize,
-        /// `None` when the roster's members are not fixed names (a count-only
-        /// roster) — honest-Null rather than an empty list, which would read as
-        /// "nothing missing".
-        missing: Option<Vec<String>>,
-    }
+    pub struct Coverage(Expectation);
 
     impl Coverage {
         /// Coverage of a NAMED roster: `roster` is the full expected list,
@@ -723,56 +749,51 @@ pub mod coverage {
             roster: &[&str],
             present: &std::collections::HashSet<String>,
         ) -> Self {
-            let missing: Vec<String> = roster
-                .iter()
-                .filter(|m| !present.contains(**m))
-                .map(|m| (*m).to_string())
-                .collect();
-            Self {
-                unit,
-                expected: roster.len(),
-                covered: roster.len().saturating_sub(missing.len()),
-                missing: Some(missing),
-            }
+            Self(Expectation::roster(unit, roster, present))
         }
 
         /// Coverage by COUNT, for rosters whose members are not a fixed list of
         /// names (e.g. "trades that came back with at least one priced job").
         pub fn of_counts(unit: &'static str, expected: usize, covered: usize) -> Self {
-            Self {
-                unit,
-                expected,
-                covered: covered.min(expected),
-                missing: None,
-            }
+            Self(Expectation::counts(unit, expected, covered))
+        }
+
+        /// The core expectation behind this coverage, for a caller that wants to
+        /// judge it with a disposition of its own.
+        pub fn expectation(&self) -> &Expectation {
+            &self.0
+        }
+
+        /// **The verdict this coverage was computed for.** Five apps in this
+        /// family build a `Coverage`; historically exactly one consulted it
+        /// before writing. This is the call the other four were missing.
+        pub fn judge(&self, disposition: Disposition) -> Verdict {
+            completeness::judge(&self.0, disposition)
         }
 
         pub fn unit(&self) -> &'static str {
-            self.unit
+            self.0.unit()
         }
         pub fn expected(&self) -> usize {
-            self.expected
+            self.0.expected()
         }
         pub fn covered(&self) -> usize {
-            self.covered
+            self.0.covered()
         }
         /// The roster members this run did not return, or `&[]` for a count-only
         /// roster (see [`Coverage::missing_named`]).
         pub fn missing(&self) -> &[String] {
-            self.missing.as_deref().unwrap_or(&[])
+            self.0.missing()
         }
         /// Whether this coverage knows the *names* of what is missing.
         pub fn missing_named(&self) -> bool {
-            self.missing.is_some()
+            self.0.missing_named()
         }
 
         /// Covered / expected. An empty roster is complete (1.0) — nothing was
         /// asked for, so nothing is missing.
         pub fn ratio(&self) -> f64 {
-            if self.expected == 0 {
-                return 1.0;
-            }
-            self.covered as f64 / self.expected as f64
+            self.0.ratio()
         }
 
         /// Whether the run came back materially short of its roster.
@@ -783,16 +804,17 @@ pub mod coverage {
         /// The shared `coverage` block every app in the family reports.
         pub fn to_json(&self) -> Value {
             json!({
-                "unit": self.unit,
-                "covered": self.covered,
-                "expected": self.expected,
+                "unit": self.unit(),
+                "covered": self.covered(),
+                "expected": self.expected(),
                 // 3 dp: enough to read, short of float noise in a stored result.
                 "ratio": (self.ratio() * 1000.0).round() / 1000.0,
                 "floor": COVERAGE_FLOOR,
                 "short": self.is_short(),
-                "missing": match &self.missing {
-                    Some(m) => json!(m),
-                    None => Value::Null,
+                "missing": if self.missing_named() {
+                    json!(self.missing())
+                } else {
+                    Value::Null
                 },
             })
         }
@@ -807,9 +829,9 @@ pub mod coverage {
             self.is_short().then(|| {
                 format!(
                     "coverage short: {} of {} {} ({:.0}% < {:.0}% floor)",
-                    self.covered,
-                    self.expected,
-                    self.unit,
+                    self.covered(),
+                    self.expected(),
+                    self.unit(),
                     self.ratio() * 100.0,
                     COVERAGE_FLOOR * 100.0,
                 )
@@ -822,7 +844,17 @@ pub mod coverage {
     /// `index_datasets` declaration without which no `trades/*` revision is
     /// visible to a watch, trigger, contract or search doc
     /// (`unified::product_index_datasets`).
-    pub const RESULT_FIELDS: [&str; 3] = ["coverage", "warnings", "index_datasets"];
+    pub const RESULT_FIELDS: [&str; 4] = [
+        "coverage",
+        // The VERDICT, not only the number. `coverage` says what arrived;
+        // `completeness` says whether that counts as a run. A manifest that
+        // declares the first and not the second is an app that computes the
+        // judgment and throws it away -- the exact defect this module exists
+        // to kill, which four of the five apps shipped for a release.
+        "completeness",
+        "warnings",
+        "index_datasets",
+    ];
 
     /// Whether a manifest's `output_shape` declares [`RESULT_FIELDS`].
     ///
@@ -838,12 +870,16 @@ pub mod coverage {
     /// detection: only a run that covered its roster, or one an operator
     /// explicitly told to shrink.
     pub fn may_tombstone(cov: &Coverage, allow_shrink: bool) -> bool {
-        allow_shrink || !cov.is_short()
+        cov.judge(snapshot_disposition(allow_shrink))
+            .may_tombstone()
     }
 
     /// Outcome of a completeness-gated snapshot write.
     pub struct SnapshotWrite {
         pub summary: UpsertSummary,
+        /// The judged completeness of the run that produced this write -- the
+        /// block the app reports as `completeness`.
+        pub verdict: Verdict,
         /// `Some(reason)` when removal detection was deliberately skipped because
         /// the run was short. A suppressed removal is visible as such rather than
         /// silently absent.
@@ -889,10 +925,15 @@ pub mod coverage {
         cov: &Coverage,
         allow_shrink: bool,
     ) -> Result<SnapshotWrite> {
-        if may_tombstone(cov, allow_shrink) {
+        let verdict = cov.judge(snapshot_disposition(allow_shrink));
+        // `suppress_only`, so this can never be `Collapsed`; the guard is here
+        // so that a later disposition change cannot silently make it writable.
+        verdict.guard()?;
+        if verdict.may_tombstone() {
             let summary = ctx.sync_many_with_provenance(dataset, items, prov).await?;
             return Ok(SnapshotWrite {
                 summary,
+                verdict,
                 removals_suppressed: None,
             });
         }
@@ -913,6 +954,7 @@ pub mod coverage {
             .await?;
         Ok(SnapshotWrite {
             summary,
+            verdict,
             removals_suppressed: Some(reason),
         })
     }
@@ -986,11 +1028,22 @@ pub mod coverage {
         #[test]
         fn a_shape_missing_warnings_does_not_count_as_declaring_coverage() {
             assert!(shape_declares_coverage(
-                "{records, coverage: {...}, warnings: [string], index_datasets, new}"
+                "{records, coverage: {...}, completeness: {...}, warnings: [string], \
+                 index_datasets, new}"
             ));
             assert!(!shape_declares_coverage(
-                "{records, coverage: {...}, index_datasets, new}"
+                "{records, coverage: {...}, completeness: {...}, index_datasets, new}"
             ));
+            // The ratchet this round added: declaring the NUMBER without the
+            // VERDICT is exactly the four-of-five state the family shipped.
+            // Forbidding the old expression is what stops it coming back.
+            assert!(
+                !shape_declares_coverage(
+                    "{records, coverage: {...}, warnings: [string], index_datasets, new}"
+                ),
+                "a shape that reports coverage but declares no verdict must not \
+                 count as declaring it"
+            );
             assert!(!shape_declares_coverage(
                 "{records, warnings: [string], index_datasets}"
             ));
@@ -999,6 +1052,60 @@ pub mod coverage {
             assert!(!shape_declares_coverage(
                 "{records, coverage: {...}, warnings: [string]}"
             ));
+        }
+
+        /// The defect, as a test: four apps built this exact Coverage and wrote
+        /// anyway. A 1-of-5 upsert run is now an `Err`, not a green job.
+        #[test]
+        fn a_one_of_five_run_is_not_a_green_job() {
+            let cov = Coverage::of_roster("priced trades", &ROSTER, &present(&["AL"]));
+            let v = cov.judge(upsert_disposition(false));
+            assert!(
+                v.is_collapsed(),
+                "1 of 5 = 20% is below the 50% collapse floor"
+            );
+            assert!(v.guard().is_err());
+            assert_eq!(v.to_json()["verdict"], "collapsed");
+        }
+
+        /// ...and a 4-of-5 run is NOT. The tightening must not turn a routine
+        /// single-member shortfall into a red job.
+        #[test]
+        fn a_four_of_five_run_still_succeeds_as_suspect() {
+            let cov = Coverage::of_roster(
+                "priced trades",
+                &ROSTER,
+                &present(&["AL", "AK", "AZ", "AR"]),
+            );
+            let v = cov.judge(upsert_disposition(false));
+            assert!(v.is_suspect());
+            assert!(v.guard().is_ok());
+            // The warning text the family already shipped is unchanged.
+            assert_eq!(
+                cov.warning().as_deref(),
+                Some("coverage short: 4 of 5 priced trades (80% < 90% floor)")
+            );
+        }
+
+        /// The snapshot app is judged by a DIFFERENT disposition on purpose: a
+        /// catastrophic shortfall suppresses removals, it never discards a run.
+        #[test]
+        fn a_short_snapshot_suppresses_removals_but_never_collapses() {
+            let cov = Coverage::of_counts("states", 51, 1);
+            let v = cov.judge(snapshot_disposition(false));
+            assert!(v.is_suspect(), "snapshot disposition never collapses");
+            assert!(v.guard().is_ok());
+            assert!(!v.may_tombstone());
+            // The same coverage under the upsert disposition WOULD collapse --
+            // the two dispositions are a real distinction, not decoration.
+            assert!(cov.judge(upsert_disposition(false)).is_collapsed());
+        }
+
+        #[test]
+        fn allow_shrink_still_reaches_the_tombstone_path() {
+            let cov = Coverage::of_counts("states", 51, 1);
+            assert!(may_tombstone(&cov, true));
+            assert!(cov.judge(upsert_disposition(true)).is_ok());
         }
 
         #[test]

@@ -56,7 +56,7 @@
 //! drift ([`feed_postings`]) instead of aggregating zero postings into a clean
 //! `feedRecords: 0` success, and the DEFAULT feed at full width carrying fewer
 //! than [`MIN_PLAUSIBLE_POSTINGS`] postings fails before any aggregation
-//! ([`implausibly_small_feed`]) so a collapsed feed cannot overwrite every
+//! ([`feed_verdict`]) so a collapsed feed cannot overwrite every
 //! national cell with near-empty ones. Both paths write nothing, and since
 //! every dataset here is upsert-only, yesterday's values stay in place.
 
@@ -66,6 +66,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate, Utc};
+use pumper_core::completeness::{self, Disposition, Expectation, Verdict};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
     ScrapeApp,
@@ -86,7 +87,7 @@ const SALARY_MAX: f64 = 2_000_000.0;
 /// ~300k postings, replaced daily. 1 000 is 0.3% of that: no holiday, no
 /// seasonal trough and no real labour-market event produces it, only a
 /// truncated download or a partial publication. Applies to the default feed at
-/// full width only — see [`implausibly_small_feed`].
+/// full width only — see [`feed_verdict`].
 const MIN_PLAUSIBLE_POSTINGS: usize = 1_000;
 
 /// Official ISPV salary statistics — read cross-app from the store.
@@ -373,7 +374,9 @@ impl ScrapeApp for MpsvVpm {
                 },
             ],
             output_shape: Some(
-                "{feedRecords, considered, kept, filteredOld, agg*/region*/samples*/skill*/\
+                "{feedRecords, completeness: {verdict: ok|suspect|collapsed, unit, \
+                 covered, expected, ratio, suspect_below, collapse_below, bounded, \
+                 missing, message}, considered, kept, filteredOld, agg*/region*/samples*/skill*/\
                  education*/trend* tallies, trendingTop[], fadingTop[], salaryGap{…}, \
                  salaryNowcast{…}, employers{…}, vacancyLedger{…}, freshness{…}} — writes \
                  mpsv-vpm/{role_region_agg, region_agg, vacancy_samples, skill_demand, \
@@ -443,9 +446,10 @@ impl ScrapeApp for MpsvVpm {
 
         let total = postings.len();
         // The size floor: only the DEFAULT national feed at full width is judged
-        // (see `implausibly_small_feed`). Checked before ANY aggregation, so a
+        // (see `feed_verdict`). Checked before ANY aggregation, so a
         // collapsed feed republishes nothing at all.
-        if implausibly_small_feed(total, url == FULL_URL, max_records) {
+        let verdict = feed_verdict(total, url == FULL_URL, max_records);
+        if verdict.is_collapsed() {
             return Err(Error::App(format!(
                 "mpsv-vpm: the national vacancy register carried only {total} postings (floor \
                  {MIN_PLAUSIBLE_POSTINGS}, normal ~300k) — refusing to recompute national \
@@ -1219,6 +1223,7 @@ impl ScrapeApp for MpsvVpm {
         let out = json!({
             "source": "data.mpsv.cz/volna-mista",
             "feedRecords": total,
+            "completeness": verdict.to_json(),
             "considered": considered,
             "kept": kept,
             "filteredOld": filtered_old,
@@ -1348,7 +1353,7 @@ fn region_title(kraj: &str, org: &str, count: usize, median: Option<i64>) -> Str
 /// observable was a `0` in a field nobody alerts on.
 ///
 /// A present-but-EMPTY `polozky: []` is a different claim ("the register is
-/// empty today") and is judged by [`implausibly_small_feed`], not here.
+/// empty today") and is judged by [`feed_verdict`], not here.
 fn feed_postings(feed: Feed) -> std::result::Result<Vec<Posting>, &'static str> {
     feed.polozky.ok_or(
         "the document carries no `polozky` array — the source contract changed \
@@ -1371,8 +1376,25 @@ fn feed_postings(feed: Feed) -> std::result::Result<Vec<Posting>, &'static str> 
 /// A floor that judged those would refuse the runs it exists to allow. This is
 /// a per-feed floor, not a global one, for the same reason mpsv-ispv's floor is
 /// 50 and not 1000: the number is a property of the source, not of the fleet.
-fn implausibly_small_feed(total: usize, is_default_feed: bool, max_records: usize) -> bool {
-    is_default_feed && max_records == 0 && total < MIN_PLAUSIBLE_POSTINGS
+/// The completeness verdict on one feed read, in the workspace's one
+/// vocabulary.
+///
+/// **One expression of the rule, not two.** This replaced a separate
+/// `implausibly_small_feed` predicate: a `bool` beside a verdict is a second
+/// place the floor and its carve-outs can drift apart.
+///
+/// The carve-outs are the DATA, not a branch around the judge: a run that did
+/// not ask for the whole register declares [`Expectation::unbounded`], so there
+/// is no shortfall to measure and the verdict is `ok` with `bounded: false` --
+/// an operator can see that this run was deliberately narrow rather than
+/// guessing why the floor stayed quiet.
+fn feed_verdict(total: usize, is_default_feed: bool, max_records: usize) -> Verdict {
+    let expectation = if is_default_feed && max_records == 0 {
+        Expectation::min_rows("postings", MIN_PLAUSIBLE_POSTINGS, total)
+    } else {
+        Expectation::unbounded("postings")
+    };
+    completeness::judge(&expectation, Disposition::fatal(1.0))
 }
 
 /// The region roll-up cells one posting contributes to: its own kraj (per org
@@ -2948,15 +2970,38 @@ mod tests {
     #[test]
     fn size_floor_judges_the_national_feed_only_never_a_mirror_or_a_capped_run() {
         // The collapse the floor exists for: default feed, full width.
-        assert!(implausibly_small_feed(0, true, 0));
-        assert!(implausibly_small_feed(MIN_PLAUSIBLE_POSTINGS - 1, true, 0));
-        assert!(!implausibly_small_feed(MIN_PLAUSIBLE_POSTINGS, true, 0));
-        assert!(!implausibly_small_feed(300_000, true, 0));
+        assert!(feed_verdict(0, true, 0).is_collapsed());
+        assert!(feed_verdict(MIN_PLAUSIBLE_POSTINGS - 1, true, 0).is_collapsed());
+        assert!(!feed_verdict(MIN_PLAUSIBLE_POSTINGS, true, 0).is_collapsed());
+    }
+
+    /// **The carve-out had to survive the move into the shared judge.** The
+    /// SAME 999 postings are a collapsed national feed and a perfectly ordinary
+    /// truncated one; only the request tells them apart, so the request is what
+    /// builds the expectation.
+    #[test]
+    fn a_truncated_feed_is_not_a_collapsed_one() {
+        let collapsed = feed_verdict(MIN_PLAUSIBLE_POSTINGS - 1, true, 0);
+        assert!(collapsed.is_collapsed());
+        assert!(collapsed.guard().is_err());
+        assert_eq!(collapsed.to_json()["bounded"], true);
+
+        // `maxRecords` truncated it on purpose.
+        let capped = feed_verdict(MIN_PLAUSIBLE_POSTINGS - 1, true, 500);
+        assert!(capped.is_ok());
+        assert_eq!(capped.to_json()["bounded"], false);
+
+        // A `url` override points at a trimmed mirror on purpose -- the
+        // manifest's own smoke example does exactly that.
+        let mirror = feed_verdict(MIN_PLAUSIBLE_POSTINGS - 1, false, 0);
+        assert!(mirror.is_ok());
+        assert_eq!(mirror.to_json()["bounded"], false);
+        assert!(!feed_verdict(300_000, true, 0).is_collapsed());
         // A `url` override is a deliberately trimmed mirror — the manifest's own
         // smoke example. Refusing it would break the runs the floor exists to allow.
-        assert!(!implausibly_small_feed(20, false, 0));
+        assert!(!feed_verdict(20, false, 0).is_collapsed());
         // `maxRecords` truncates on purpose.
-        assert!(!implausibly_small_feed(20, true, 20_000));
+        assert!(!feed_verdict(20, true, 20_000).is_collapsed());
     }
 
     /// Bughunt 2026-07-14 #2: the region roll-up sat behind the CZ-ISCO early

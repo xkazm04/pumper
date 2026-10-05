@@ -100,7 +100,9 @@ impl ScrapeApp for TradeWages {
             ],
             output_shape: Some(
                 "{source, year, records, coverage: {unit, covered, expected, ratio, \
-                 floor, short, missing}, warnings: [string], new, changed, unchanged, \
+                 floor, short, missing}, completeness: {verdict: ok|suspect|collapsed, \
+                 unit, covered, expected, ratio, suspect_below, collapse_below, bounded, \
+                 missing, message}, warnings: [string], new, changed, unchanged, \
                  rejected: [{key, \
                  reasons}], rejected_count, unknown_trades, unified: {dataset, trust, new, changed, unchanged, \
                  inputs_truncated, join_complete}, index_datasets, \
@@ -218,6 +220,16 @@ impl ScrapeApp for TradeWages {
                 "trade-wages: agent JSON contained no plausible trades".into(),
             ));
         }
+
+        // **The verdict this coverage was computed for.** The family built the
+        // number here for a release and then wrote anyway: a 1-of-5 run was a
+        // GREEN job carrying a string in `warnings[]`. `upsert_disposition`
+        // makes it an outcome -- short is `suspect` and still writes, collapsed
+        // is an `Err` and writes nothing.
+        let verdict = cov.judge(coverage::upsert_disposition(trades_common::allow_shrink(
+            &ctx,
+        )));
+        verdict.guard()?;
         // One batch, one derivation — a batch-level stamp is the honest grain
         // here (every row came out of the same single research call).
         let summary = ctx
@@ -233,6 +245,7 @@ impl ScrapeApp for TradeWages {
             "year": year,
             "records": all_records.len(),
             "coverage": cov.to_json(),
+            "completeness": verdict.to_json(),
             "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),

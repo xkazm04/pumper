@@ -164,6 +164,8 @@ impl ScrapeApp for StateTax {
             output_shape: Some(
                 "{source, year, records, states_covered, states_expected, missing_states, \
                  coverage: {unit, covered, expected, ratio, floor, short, missing}, \
+                 completeness: {verdict: ok|suspect|collapsed, unit, covered, expected, \
+                 ratio, suspect_below, collapse_below, bounded, missing, message}, \
                  warnings: [string], new, changed, unchanged, removed, \
                  removals_suppressed, rejected: [{key, reasons}], rejected_count, \
                  unified: {dataset, trust, new, changed, unchanged, \
@@ -364,6 +366,7 @@ impl ScrapeApp for StateTax {
         )
         .await?;
         let summary = write.summary;
+        let write_verdict = write.verdict;
         if let Some(reason) = &write.removals_suppressed {
             warnings.push(reason.clone());
         }
@@ -380,6 +383,11 @@ impl ScrapeApp for StateTax {
             "states_expected": US_JURISDICTIONS.len(),
             "missing_states": cov.missing(),
             "coverage": cov.to_json(),
+            // The same block every judged app reports. `state-tax` writes a
+            // full snapshot, so its disposition is `suppress_only`: a shortfall
+            // is `suspect` and keeps the un-returned states alive, and no
+            // shortfall, however severe, throws away a paid agentic run.
+            "completeness": write_verdict.to_json(),
             "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),

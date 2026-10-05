@@ -29,6 +29,7 @@
 //! stays in place as mpsv-vpm's anchor.
 
 use async_trait::async_trait;
+use pumper_core::completeness::{self, Disposition, Expectation, Verdict};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
     ScrapeApp,
@@ -90,6 +91,7 @@ impl ScrapeApp for MpsvIspv {
                  count, `stored` the rows that carried a `czIsco` and were upserted into the \
                  `wages` dataset (key `<czIsco>|<sfera>`, value = the whole source row). A run \
                  whose document has no `polozky` array, or carries fewer than 50 rows, FAILS \
+                 with `completeness.verdict: collapsed` \
                  naming the drift instead of reporting `stored: 0` — nothing is written, so the \
                  last good vintage stays the anchor",
             ),
@@ -118,7 +120,12 @@ impl ScrapeApp for MpsvIspv {
         let rows = polozky_rows(&parsed).map_err(|why| {
             Error::App(format!("mpsv-ispv: source contract drift at {URL}: {why}"))
         })?;
-        if implausibly_few_rows(rows.len()) {
+        // The private row floor, now stated in the workspace's one vocabulary
+        // (`pumper_core::completeness`): the verdict is reported as well as
+        // acted on, so an operator reads this app the same way as the five
+        // trades apps and `smlouvy-dump-watch`.
+        let verdict = row_verdict(rows.len());
+        if verdict.is_collapsed() {
             return Err(Error::App(format!(
                 "mpsv-ispv: {URL} carried only {} rows (floor {MIN_PLAUSIBLE_ROWS}) — refusing to \
                  treat a collapsed document as a publishable vintage. The stored `wages` anchor is \
@@ -151,6 +158,7 @@ impl ScrapeApp for MpsvIspv {
         Ok(json!({
             "source": "data.mpsv.cz/ispv-zamestnani",
             "rows": rows.len(),
+            "completeness": verdict.to_json(),
             "stored": items.len(),
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -198,11 +206,23 @@ fn polozky_rows(parsed: &Value) -> std::result::Result<&Vec<Value>, String> {
     }
 }
 
-/// Whether a parsed row count is too small to be an ISPV vintage — see
-/// [`MIN_PLAUSIBLE_ROWS`]. `polozky: []` is included on purpose: an empty
-/// national earnings table is an outage, not a quarter with no earnings.
-fn implausibly_few_rows(rows: usize) -> bool {
-    rows < MIN_PLAUSIBLE_ROWS
+/// The completeness verdict on a parsed vintage — see [`MIN_PLAUSIBLE_ROWS`].
+/// `polozky: []` is included on purpose: an empty national earnings table is an
+/// outage, not a quarter with no earnings.
+///
+/// **One expression of the rule, not two.** This replaced a separate
+/// `implausibly_few_rows` predicate: a `bool` beside a verdict is a second
+/// place the floor can drift, and the count already carries the predicate.
+///
+/// `Disposition::fatal` because [`MIN_PLAUSIBLE_ROWS`] is already set far below
+/// the real count: a document that reaches it is not a thin quarter, it is a
+/// broken download. There is no `suspect` band here on purpose -- the floor
+/// catches collapse, it does not police the source's size.
+fn row_verdict(rows: usize) -> Verdict {
+    completeness::judge(
+        &Expectation::min_rows("rows", MIN_PLAUSIBLE_ROWS, rows),
+        Disposition::fatal(1.0),
+    )
 }
 
 /// JSON type name, for a drift message that says what actually arrived.
@@ -385,12 +405,31 @@ mod tests {
     #[test]
     fn row_floor_rejects_a_collapsed_document_but_not_a_full_vintage() {
         assert!(
-            implausibly_few_rows(0),
+            row_verdict(0).is_collapsed(),
             "an empty national table is an outage"
         );
-        assert!(implausibly_few_rows(MIN_PLAUSIBLE_ROWS - 1));
-        assert!(!implausibly_few_rows(MIN_PLAUSIBLE_ROWS));
-        assert!(!implausibly_few_rows(800)); // a realistic vintage
+        assert!(row_verdict(MIN_PLAUSIBLE_ROWS - 1).is_collapsed());
+        assert!(!row_verdict(MIN_PLAUSIBLE_ROWS).is_collapsed());
+    }
+
+    /// The floor as the workspace's one verdict: 49 rows is `collapsed` and
+    /// errors the job, 50 is `ok` and writes. Before this round the same
+    /// decision was a private `bool` no operator and no other app could read.
+    #[test]
+    fn a_short_vintage_is_collapsed_and_a_floor_length_one_is_ok() {
+        let short = row_verdict(MIN_PLAUSIBLE_ROWS - 1);
+        assert!(short.is_collapsed());
+        assert!(short.guard().is_err());
+        assert_eq!(short.to_json()["verdict"], "collapsed");
+        assert_eq!(short.to_json()["expected"], MIN_PLAUSIBLE_ROWS);
+
+        let at_floor = row_verdict(MIN_PLAUSIBLE_ROWS);
+        assert!(at_floor.is_ok());
+        assert_eq!(at_floor.to_json()["verdict"], "ok");
+        // A normal vintage is hundreds of rows and is still exactly `ok` --
+        // the floor catches collapse, it does not police the source's size.
+        assert!(row_verdict(900).is_ok());
+        assert!(!row_verdict(800).is_collapsed()); // a realistic vintage
     }
 
     // ── run() end-to-end over a stubbed HTTP engine ─────────────────────────
