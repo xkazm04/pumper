@@ -242,6 +242,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(import_host_weather))
         .routes(routes!(list_profiles))
         .routes(routes!(list_recipes))
+        .routes(routes!(retire_recipe))
+        .routes(routes!(revive_recipe))
         .routes(routes!(fetch_proxy))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
@@ -589,6 +591,13 @@ mod api_spec_tests {
         "POST /host-weather/import",
         "GET /profiles",
         "GET /recipes",
+        // The two operator actions on a recipe (0046 lifecycle). Both are
+        // REVERSIBLE by design, and the absence of a `DELETE /recipes/{id}`
+        // below is load-bearing, not an oversight: retirement is the terminal
+        // state and it destroys nothing. If a DELETE ever appears in this list,
+        // it is a new irreversible door and wants its own review.
+        "POST /recipes/{id}/retire",
+        "POST /recipes/{id}/revive",
         "POST /fetch-proxy",
         "GET /plugins",
         "POST /plugins/reload",
@@ -659,6 +668,34 @@ mod api_spec_tests {
             undocumented.is_empty(),
             "spec has operations not in the expected inventory (update EXPECTED): {undocumented:?}"
         );
+    }
+
+    /// The recipe surface is **reversible by construction**: `retire` takes a
+    /// recipe out of selection and `revive` puts it back, and nothing destroys
+    /// the row or the strike evidence an operator reads before deciding.
+    ///
+    /// This is a separate assertion from the EXPECTED-diff above on purpose. A
+    /// new row in that list is a routine, easily-approved edit; an irreversible
+    /// door on this table is not, and it should have to delete a test that says
+    /// so in its own words rather than append one line.
+    #[test]
+    fn the_recipe_surface_has_no_irreversible_door() {
+        let destructive: Vec<_> = spec_operations()
+            .into_iter()
+            .filter(|op| op.starts_with("DELETE /recipes"))
+            .collect();
+        assert!(
+            destructive.is_empty(),
+            "a destructive recipe route appeared: {destructive:?}. Retirement is the terminal \
+             state and it is reversible — a DELETE would also take the consecutive_failures \
+             evidence with it. If this is genuinely wanted, it needs its own review, not this \
+             assertion weakened."
+        );
+        // The paired half: the reversible doors are both actually there, so
+        // this test cannot pass by the surface simply having no actions at all.
+        let ops = spec_operations();
+        assert!(ops.contains("POST /recipes/{id}/retire"));
+        assert!(ops.contains("POST /recipes/{id}/revive"));
     }
 
     /// Routes exempted from the global [`super::BODY_LIMIT_BYTES`] ceiling by

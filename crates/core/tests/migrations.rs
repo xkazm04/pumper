@@ -167,6 +167,15 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         recipes.contains("consecutive_failures"), // 0028 recipe strikes
         "api_recipes lost column `consecutive_failures`: {recipes:?}"
     );
+    for col in [
+        "retired_at",      // 0046 recipe lifecycle
+        "last_failure_at", // 0046 recipe lifecycle
+    ] {
+        assert!(
+            recipes.contains(col),
+            "api_recipes lost column `{col}`: {recipes:?}"
+        );
+    }
 
     let cost_events = column_names(&pool, "cost_events").await;
     assert!(

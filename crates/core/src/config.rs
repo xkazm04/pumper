@@ -450,6 +450,19 @@ pub struct RecipesConfig {
     /// Consecutive failed/thin replays after which a validated recipe is
     /// un-validated (back to opportunistic-only). Must be >= 1.
     pub max_failures: u32,
+    /// The rung BELOW `max_failures`: consecutive failed/thin replays after
+    /// which an *unvalidated* recipe (a candidate) is **retired** — stamped
+    /// `retired_at` and dropped out of selection entirely (migration 0046).
+    ///
+    /// Without this rung the strike counter had exactly one consumer, guarded
+    /// on `validated`, so a candidate that had failed ten thousand consecutive
+    /// times was still the first thing tried for its host — a live outbound
+    /// replay ahead of the archive tier on every fetch, forever.
+    ///
+    /// Retirement is **reversible**: `POST /recipes/{id}/revive` returns the
+    /// recipe to probation. `0` disables the rung and restores pre-0046
+    /// selection exactly.
+    pub retire_after: u32,
 }
 
 impl Default for RecipesConfig {
@@ -458,6 +471,7 @@ impl Default for RecipesConfig {
             enabled: false,
             auto_validate: false,
             max_failures: 3,
+            retire_after: crate::recipes::DEFAULT_RETIRE_AFTER,
         }
     }
 }
@@ -2075,11 +2089,24 @@ mod tests {
         assert!(!r.enabled, "recipe replay must be opt-in");
         assert!(!r.auto_validate, "auto-validation must be opt-in");
         assert_eq!(r.max_failures, 3);
+        // The reaper rung ships ON (unlike the tier itself), because it only
+        // ever takes things OUT of selection: with `[recipes]` off nothing is
+        // replayed and nothing strikes, so a shipping 10 costs a default
+        // install nothing and protects an opted-in one from an immortal
+        // candidate. Unlike `max_failures`, 0 is legal here — it is the
+        // documented escape hatch back to pre-0046 selection.
+        assert_eq!(r.retire_after, crate::recipes::DEFAULT_RETIRE_AFTER);
+        assert_eq!(r.retire_after, 10);
 
         let mut cfg = Config::default();
         cfg.recipes.max_failures = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("[recipes] max_failures"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.recipes.retire_after = 0;
+        cfg.validate()
+            .expect("retire_after = 0 disables the rung — it is not a misconfiguration");
     }
 
     #[test]

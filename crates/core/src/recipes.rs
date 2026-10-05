@@ -29,6 +29,31 @@
 //! `[recipes] auto_validate` ON, an unvalidated recipe is tried
 //! opportunistically and a successful replay whose payload still overlaps its
 //! [`ApiRecipe::json_paths`] ([`payload_overlaps`]) marks it validated.
+//!
+//! ## The lifecycle (migration 0046)
+//!
+//! A recipe is in one of three [`RecipeState`]s, derived from two stored facts:
+//!
+//! ```text
+//!   discovery ──▶ candidate ──(overlapping replay)──▶ validated
+//!                     ▲                                   │
+//!                     └──────(max_failures strikes)────────┘
+//!                     │
+//!                     ├──(retire_after strikes, or an operator retire)──▶ retired
+//!                     ◀──────────────(operator revive)─────────────────────┘
+//! ```
+//!
+//! The `candidate → retired` rung is the one that was missing. `record_failure`
+//! incremented the counter and its only consumer was guarded on `validated`, so
+//! once a recipe was unvalidated that branch was unreachable for that row
+//! forever: the counter was write-only and [`RecipeSource::best_for_host`] —
+//! which reads neither — kept returning the same dead candidate first for its
+//! host. A retired recipe is now invisible to selection at every opt-in level,
+//! so it costs a fetch nothing, not even a row.
+//!
+//! **Retirement is terminal and reversible.** Nothing in this crate deletes a
+//! recipe row; [`RecipeStore::revive`] is the way back, and it returns the row
+//! to *candidate* rather than to the trust it last held.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -110,6 +135,106 @@ pub fn payload_overlaps(json_paths: &[String], payload: &Value) -> bool {
     collect_payload_leaves(payload, "$", &mut leaves);
     let present: BTreeSet<&str> = leaves.iter().map(|(p, _)| p.as_str()).collect();
     json_paths.iter().any(|p| present.contains(p.as_str()))
+}
+
+// ── the lifecycle: candidate → validated → candidate → retired → candidate ──
+
+/// Shipping `[recipes] retire_after`, and the threshold migration 0046's
+/// back-fill applies to rows that pre-date the rung.
+pub const DEFAULT_RETIRE_AFTER: u32 = 10;
+
+/// Where a recipe sits between discovered and gone.
+///
+/// The table stores two facts (`validated`, `retired_at`); this is the single
+/// derivation of them, so the wire, the filter and the fetcher can never
+/// disagree about what a row *is*. `Retired` outranks `Validated`: a retired
+/// recipe is out of selection whatever it was proven to be before.
+///
+/// There is no `Deleted`. Nothing in this crate destroys a recipe row —
+/// retirement is the terminal state and it is reversible ([`RecipeStore::revive`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeState {
+    /// Discovered, never proven. Replayed only opportunistically
+    /// (`[recipes] auto_validate`).
+    Candidate,
+    /// A successful overlapping replay proved it. Always replayed.
+    Validated,
+    /// Out of selection: `retire_after` consecutive strikes, an operator
+    /// retire, or the 0046 back-fill. Never replayed, at any opt-in level.
+    Retired,
+}
+
+impl RecipeState {
+    /// The one derivation from the two stored facts.
+    pub fn of(validated: bool, retired: bool) -> Self {
+        if retired {
+            Self::Retired
+        } else if validated {
+            Self::Validated
+        } else {
+            Self::Candidate
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Validated => "validated",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// Parses a `?state=` filter value. `None` is a **400**, deliberately:
+    /// answering `?state=bogus` with an empty page tells an operator the hosts
+    /// are clean when it means the word was not understood.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "candidate" => Some(Self::Candidate),
+            "validated" => Some(Self::Validated),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
+/// What one recorded strike does to the recipe it landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrikeVerdict {
+    /// Counted, nothing else.
+    Noted,
+    /// A validated recipe crossed `max_failures`: back to candidate, counter
+    /// reset so the next validation attempt starts clean.
+    Unvalidated,
+    /// A candidate crossed `retire_after`: out of selection. The counter is
+    /// kept — it is the evidence an operator reads before reviving.
+    Retired,
+}
+
+/// Which rung a strike lands on — the whole ladder, as a pure function.
+///
+/// This used to be an inline `if validated != 0 && failures >= unvalidate_after`
+/// with no `else`, which is exactly why the ladder had one rung: below
+/// validation the counter had no consumer at all, so a candidate that had failed
+/// ten thousand consecutive times was still the first thing tried for its host.
+/// Either threshold at `0` disables its own rung and nothing else.
+pub fn strike_verdict(
+    validated: bool,
+    failures: i64,
+    unvalidate_after: u32,
+    retire_after: u32,
+) -> StrikeVerdict {
+    if validated {
+        if unvalidate_after > 0 && failures >= i64::from(unvalidate_after) {
+            StrikeVerdict::Unvalidated
+        } else {
+            StrikeVerdict::Noted
+        }
+    } else if retire_after > 0 && failures >= i64::from(retire_after) {
+        StrikeVerdict::Retired
+    } else {
+        StrikeVerdict::Noted
+    }
 }
 
 /// Read side of the fetcher's `api_recipe` tier plus its strike/validation
@@ -305,12 +430,29 @@ pub fn discover_recipes(network: &[CapturedCall], extracted: &[Value]) -> Vec<Ap
 #[cfg(feature = "storage")]
 pub struct RecipeStore {
     pool: sqlx::SqlitePool,
+    /// Consecutive strikes after which a **candidate** retires (migration 0046).
+    /// Carried on the handle rather than threaded through
+    /// [`RecipeSource::record_failure`] so the trait — which the `Fetcher`
+    /// holds behind `dyn` without the `storage` feature — keeps its signature.
+    /// `0` disables the rung.
+    retire_after: u32,
 }
 
 #[cfg(feature = "storage")]
 impl RecipeStore {
     pub fn new(pool: sqlx::SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            retire_after: DEFAULT_RETIRE_AFTER,
+        }
+    }
+
+    /// Wires `[recipes] retire_after`. `0` disables the candidate rung, which
+    /// restores pre-0046 selection exactly: a failing candidate stays
+    /// selectable forever.
+    pub fn with_retire_after(mut self, retire_after: u32) -> Self {
+        self.retire_after = retire_after;
+        self
     }
 
     /// Inserts or refreshes one discovered recipe. Returns the stored id.
@@ -349,51 +491,95 @@ impl RecipeStore {
         Ok(stored.0)
     }
 
-    /// Lists recipes, best score first, optionally filtered by host.
-    pub async fn list(&self, host: Option<&str>, limit: i64) -> crate::Result<Vec<Value>> {
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            f64,
-            i64,
-            String,
-            String,
-        )> = sqlx::query_as(
+    /// Lists recipes, best score first, optionally filtered by host and by
+    /// [`RecipeState`]. An unparseable state never reaches here — the route
+    /// turns it into a 400 (see [`RecipeState::parse`]).
+    pub async fn list(
+        &self,
+        host: Option<&str>,
+        state: Option<RecipeState>,
+        limit: i64,
+    ) -> crate::Result<Vec<Value>> {
+        let rows: Vec<RecipeRow> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated, \
-                        discovered_at, last_seen_at \
+                        discovered_at, last_seen_at, consecutive_failures, \
+                        retired_at, last_failure_at \
                  FROM api_recipes \
                  WHERE (?1 IS NULL OR host = ?1) \
+                   AND (?2 IS NULL \
+                        OR (?2 = 'retired'   AND retired_at IS NOT NULL) \
+                        OR (?2 = 'validated' AND retired_at IS NULL AND validated = 1) \
+                        OR (?2 = 'candidate' AND retired_at IS NULL AND validated = 0)) \
                  ORDER BY score DESC, host, url_template \
-                 LIMIT ?2",
+                 LIMIT ?3",
         )
         .bind(host)
+        .bind(state.map(RecipeState::as_str))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, host, url_template, params, json_paths, score, validated, disc, seen)| {
-                    serde_json::json!({
-                        "id": id,
-                        "host": host,
-                        "url_template": url_template,
-                        "params": serde_json::from_str::<Value>(&params)
-                            .unwrap_or(Value::Null),
-                        "json_paths": serde_json::from_str::<Value>(&json_paths)
-                            .unwrap_or(Value::Null),
-                        "score": score,
-                        "validated": validated != 0,
-                        "discovered_at": disc,
-                        "last_seen_at": seen,
-                    })
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(recipe_row_json).collect())
+    }
+
+    /// One recipe by id, in the same shape `list` returns. `None` = no such id,
+    /// which the routes turn into a 404 rather than an empty body.
+    pub async fn get(&self, id: &str) -> crate::Result<Option<Value>> {
+        let row: Option<RecipeRow> = sqlx::query_as(
+            "SELECT id, host, url_template, params, json_paths, score, validated, \
+                    discovered_at, last_seen_at, consecutive_failures, \
+                    retired_at, last_failure_at \
+             FROM api_recipes WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(recipe_row_json))
+    }
+
+    /// Operator retire: takes a recipe out of selection **now**, without
+    /// waiting for `retire_after` live strikes to accumulate. Reversible via
+    /// [`Self::revive`]. Returns whether the recipe existed.
+    ///
+    /// `retired_at IS NULL` in the predicate keeps the FIRST stamp: retiring an
+    /// already-retired recipe is a no-op that still reports success, because
+    /// the row does end in the state the caller asked for.
+    pub async fn retire(&self, id: &str) -> crate::Result<bool> {
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM api_recipes WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE api_recipes SET retired_at = ?2 WHERE id = ?1 AND retired_at IS NULL")
+            .bind(id)
+            .bind(now_stamp())
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    /// Operator revive: clears `retired_at`, the strike count and the failure
+    /// stamp, and returns the recipe to **candidate** — never straight back to
+    /// validated. Revival is probation, not trust: a recipe that earned its way
+    /// out of selection re-earns validation the same way it did the first time,
+    /// with a successful overlapping replay.
+    ///
+    /// Returns the refreshed row, or `None` when there is no such id.
+    pub async fn revive(&self, id: &str) -> crate::Result<Option<Value>> {
+        let res = sqlx::query(
+            "UPDATE api_recipes \
+             SET retired_at = NULL, consecutive_failures = 0, \
+                 last_failure_at = NULL, validated = 0 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
     }
 
     /// Flips a recipe's `validated` flag (a successful replay proves it).
@@ -406,6 +592,64 @@ impl RecipeStore {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+}
+
+/// The twelve columns `GET /recipes` serves, as one row type so `list` and
+/// `get` cannot drift into two different wire shapes.
+#[cfg(feature = "storage")]
+type RecipeRow = (
+    String,         // id
+    String,         // host
+    String,         // url_template
+    String,         // params (JSON)
+    String,         // json_paths (JSON)
+    f64,            // score
+    i64,            // validated
+    String,         // discovered_at
+    String,         // last_seen_at
+    i64,            // consecutive_failures
+    Option<String>, // retired_at
+    Option<String>, // last_failure_at
+);
+
+/// One stored row as the wire shape. `state` is derived here and nowhere else.
+#[cfg(feature = "storage")]
+fn recipe_row_json(row: RecipeRow) -> Value {
+    let (
+        id,
+        host,
+        url_template,
+        params,
+        json_paths,
+        score,
+        validated,
+        disc,
+        seen,
+        failures,
+        retired_at,
+        last_failure_at,
+    ) = row;
+    serde_json::json!({
+        "id": id,
+        "host": host,
+        "url_template": url_template,
+        "params": serde_json::from_str::<Value>(&params).unwrap_or(Value::Null),
+        "json_paths": serde_json::from_str::<Value>(&json_paths).unwrap_or(Value::Null),
+        "score": score,
+        "validated": validated != 0,
+        "state": RecipeState::of(validated != 0, retired_at.is_some()).as_str(),
+        "consecutive_failures": failures,
+        "last_failure_at": last_failure_at,
+        "retired_at": retired_at,
+        "discovered_at": disc,
+        "last_seen_at": seen,
+    })
+}
+
+/// The one timestamp format this table stores (RFC3339, microseconds, UTC).
+#[cfg(feature = "storage")]
+fn now_stamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 /// The real [`RecipeSource`]: rows from `api_recipes`, strikes in its
@@ -421,7 +665,7 @@ impl RecipeSource for RecipeStore {
         let row: Option<(String, String, String, String, String, f64, i64)> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated \
              FROM api_recipes \
-             WHERE host = ?1 AND (validated = 1 OR ?2) \
+             WHERE host = ?1 AND retired_at IS NULL AND (validated = 1 OR ?2) \
              ORDER BY validated DESC, score DESC, url_template \
              LIMIT 1",
         )
@@ -443,9 +687,13 @@ impl RecipeSource for RecipeStore {
     }
 
     async fn record_success(&self, id: &str, validate: bool) -> crate::Result<()> {
+        // One good replay clears the WHOLE slate, not only the counter: a
+        // recipe still advertising a `last_failure_at` it has since recovered
+        // from is a surface that lies to the operator reading it.
         sqlx::query(
             "UPDATE api_recipes \
              SET consecutive_failures = 0, \
+                 last_failure_at = NULL, \
                  validated = CASE WHEN ?2 THEN 1 ELSE validated END \
              WHERE id = ?1",
         )
@@ -458,26 +706,51 @@ impl RecipeSource for RecipeStore {
 
     async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool> {
         let row: Option<(i64, i64)> = sqlx::query_as(
-            "UPDATE api_recipes SET consecutive_failures = consecutive_failures + 1 \
+            "UPDATE api_recipes \
+             SET consecutive_failures = consecutive_failures + 1, last_failure_at = ?2 \
              WHERE id = ?1 \
              RETURNING consecutive_failures, validated",
         )
         .bind(id)
+        .bind(now_stamp())
         .fetch_optional(&self.pool)
         .await?;
         let Some((failures, validated)) = row else {
-            return Ok(false); // recipe deleted since the fetch looked it up
+            return Ok(false); // recipe vanished since the fetch looked it up
         };
-        if validated != 0 && failures >= i64::from(unvalidate_after) {
-            sqlx::query(
-                "UPDATE api_recipes SET validated = 0, consecutive_failures = 0 WHERE id = ?1",
-            )
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-            return Ok(true);
+        match strike_verdict(
+            validated != 0,
+            failures,
+            unvalidate_after,
+            self.retire_after,
+        ) {
+            StrikeVerdict::Noted => Ok(false),
+            StrikeVerdict::Unvalidated => {
+                sqlx::query(
+                    "UPDATE api_recipes SET validated = 0, consecutive_failures = 0 WHERE id = ?1",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+                Ok(true)
+            }
+            StrikeVerdict::Retired => {
+                // `retired_at IS NULL` keeps the first stamp: every further
+                // strike on a retired row is a no-op, and the counter is left
+                // standing as the evidence an operator reads before reviving.
+                sqlx::query(
+                    "UPDATE api_recipes SET retired_at = ?2 \
+                     WHERE id = ?1 AND retired_at IS NULL",
+                )
+                .bind(id)
+                .bind(now_stamp())
+                .execute(&self.pool)
+                .await?;
+                // Not a demotion: the caller's `bool` means "un-validated",
+                // and a candidate was never validated to begin with.
+                Ok(false)
+            }
         }
-        Ok(false)
     }
 }
 
@@ -659,6 +932,78 @@ mod tests {
         assert!(!payload_overlaps(&paths, &renamed));
         // No expected paths at all can never validate anything.
         assert!(!payload_overlaps(&[], &good));
+    }
+
+    // ── the strike ladder, as a pure function ───────────────────────────────
+
+    /// The defect this whole module change exists for: the ladder used to have
+    /// exactly one rung, and it was guarded on `validated`. Below validation
+    /// the counter had no consumer at all.
+    #[test]
+    fn strike_verdict_reaps_a_candidate_not_only_demotes_a_validated() {
+        // The rung that already existed.
+        assert_eq!(
+            strike_verdict(true, 3, 3, 10),
+            StrikeVerdict::Unvalidated,
+            "a validated recipe at max_failures still demotes"
+        );
+        assert_eq!(strike_verdict(true, 2, 3, 10), StrikeVerdict::Noted);
+        // A validated recipe never retires: it takes the demotion rung first,
+        // and only then becomes eligible for the one below.
+        assert_eq!(strike_verdict(true, 10_000, 0, 10), StrikeVerdict::Noted);
+
+        // The rung that did not. 10_000 strikes used to be `Noted` forever.
+        assert_eq!(strike_verdict(false, 10, 3, 10), StrikeVerdict::Retired);
+        assert_eq!(strike_verdict(false, 10_000, 3, 10), StrikeVerdict::Retired);
+        assert_eq!(strike_verdict(false, 9, 3, 10), StrikeVerdict::Noted);
+    }
+
+    /// Each threshold disables its OWN rung at 0 and leaves the other standing,
+    /// so the escape hatch cannot silently take the whole ladder with it.
+    #[test]
+    fn a_zero_threshold_disables_one_rung_not_the_ladder() {
+        assert_eq!(strike_verdict(false, 99, 3, 0), StrikeVerdict::Noted);
+        assert_eq!(strike_verdict(true, 99, 3, 0), StrikeVerdict::Unvalidated);
+        assert_eq!(strike_verdict(true, 99, 0, 10), StrikeVerdict::Noted);
+        assert_eq!(strike_verdict(false, 99, 0, 10), StrikeVerdict::Retired);
+    }
+
+    /// `Retired` outranks `Validated`: a recipe that was trusted and then taken
+    /// out of selection must not read back as trusted on the wire.
+    #[test]
+    fn retired_outranks_validated_in_the_derived_state() {
+        assert_eq!(RecipeState::of(false, false), RecipeState::Candidate);
+        assert_eq!(RecipeState::of(true, false), RecipeState::Validated);
+        assert_eq!(RecipeState::of(true, true), RecipeState::Retired);
+        assert_eq!(RecipeState::of(false, true), RecipeState::Retired);
+    }
+
+    /// An unknown `?state=` is a parse miss, never a silently empty page.
+    #[test]
+    fn an_unknown_state_filter_is_a_miss_not_an_empty_page() {
+        assert_eq!(RecipeState::parse("RETIRED"), Some(RecipeState::Retired));
+        assert_eq!(
+            RecipeState::parse(" candidate "),
+            Some(RecipeState::Candidate)
+        );
+        assert_eq!(
+            RecipeState::parse("validated"),
+            Some(RecipeState::Validated)
+        );
+        for bogus in ["", "bogus", "retire", "deleted", "all"] {
+            assert!(
+                RecipeState::parse(bogus).is_none(),
+                "{bogus} must not parse"
+            );
+        }
+        // Round trip, so the wire word and the filter word stay the same word.
+        for s in [
+            RecipeState::Candidate,
+            RecipeState::Validated,
+            RecipeState::Retired,
+        ] {
+            assert_eq!(RecipeState::parse(s.as_str()), Some(s));
+        }
     }
 
     // ── strike / validation state machine (storage-backed) ──────────────────

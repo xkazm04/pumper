@@ -802,7 +802,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
-        recipes: Arc::new(state.storage.recipes()),
+        recipes: Arc::new(
+            state
+                .storage
+                .recipes()
+                .with_retire_after(state.config.recipes.retire_after),
+        ),
         plugins: state.plugins.clone(),
         progress: state
             .progress
