@@ -24,11 +24,12 @@ use crate::state::AppState;
 // routes push the filters into SQL.
 // ---------------------------------------------------------------------------
 
-/// Virtual app namespace holding the cross-source grants datasets. Mirrors
-/// `grants_common::{UNIFIED_APP, UNIFIED_DATASET}`; duplicated as literals rather
-/// than taking a server dependency on a library crate for two strings.
-const GRANTS_APP: &str = "grants";
-const GRANTS_DATASET: &str = "unified";
+/// Virtual app namespace holding the cross-source grants datasets, taken from
+/// the crate that owns them. These were literals while the only thing the server
+/// wanted from `grants-common` was two strings; the deadline rule below is not
+/// two strings, so the dependency is declared and the names come with it.
+const GRANTS_APP: &str = grants_common::UNIFIED_APP;
+const GRANTS_DATASET: &str = grants_common::UNIFIED_DATASET;
 
 /// Upper bound on `GET /grants?limit=`. The default is `default_limit` (50).
 const GRANTS_MAX_LIMIT: i64 = 500;
@@ -91,29 +92,95 @@ fn parse_grant_date(value: &str, field: &str) -> Result<chrono::NaiveDate, ApiEr
     })
 }
 
-/// One closing-soon row. `days_left` is the whole-day distance from `today`,
-/// or JSON null when `close_date` is missing or not `YYYY-MM-DD`. The row is
-/// still returned: dropping it made `grants` shorter than the SQL page while
-/// `count` still included it.
-pub(crate) fn closing_soon_grant(key: &str, data: &Value, today: chrono::NaiveDate) -> Value {
-    let days_left = data
-        .get("close_date")
-        .and_then(Value::as_str)
-        .and_then(|close| chrono::NaiveDate::parse_from_str(close, "%Y-%m-%d").ok())
-        .map(|close| (close - today).num_days());
+/// One closing-soon row: its unified record, plus `key` and the countdown
+/// `grants_common::deadline_countdown` computes from the ONE canonical deadline
+/// instant.
+///
+/// The anti-pattern this closes: `days_left` used to be
+/// `NaiveDate::parse_from_str(close_date) - Utc::now().date_naive()`, and
+/// `close_at` appeared nowhere in this file. A zoned deadline eighteen hours
+/// away printed "1 day", and `grants_common::deadline_end_utc`'s own doc names a
+/// caller that re-derives the rule from `date_naive()` as reopening the timezone
+/// bug it exists to close. The corpus sweep, the batch sweep and the per-source
+/// digests all decide at that instant; this row now does too.
+///
+/// Four fields, and the last is the one an operator could not get before:
+/// - `closes_at` - the canonical RFC3339 instant, or null when nothing parses.
+/// - `hours_left` / `days_left` - null together with `closes_at`, never negative.
+/// - `lapsed` - the stored `status` still says `open`, but the deadline has
+///   provably passed. That state is normal rather than corrupt: the corpus-wide
+///   sweep is claimed by one producer per UTC cycle
+///   (`grants_common::claim_corpus_pass`), so a lapsed row carries `open` until
+///   the next cycle's winner runs.
+///
+/// A row whose deadline does not parse keeps every field null and STAYS on the
+/// page. Dropping it made `grants` shorter than the SQL page while `count` still
+/// included it, which is a bug this route has already had once.
+pub(crate) fn closing_soon_grant(
+    key: &str,
+    data: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let field = |name: &str| data.get(name).and_then(Value::as_str);
+    let countdown = grants_common::deadline_countdown(field("close_date"), field("close_at"), now);
     let mut grant = match data.as_object() {
         Some(obj) => obj.clone(),
         None => serde_json::Map::new(),
     };
     grant.insert("key".into(), json!(key));
     grant.insert(
-        "days_left".into(),
-        match days_left {
-            Some(n) => json!(n),
+        "closes_at".into(),
+        match countdown {
+            Some(c) => json!(c
+                .closes_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             None => Value::Null,
         },
     );
+    for (name, value) in [
+        ("days_left", countdown.map(|c| c.days_left)),
+        ("hours_left", countdown.map(|c| c.hours_left)),
+    ] {
+        grant.insert(
+            name.into(),
+            match value {
+                Some(n) => json!(n),
+                None => Value::Null,
+            },
+        );
+    }
+    grant.insert("lapsed".into(), json!(countdown.is_some_and(|c| c.lapsed)));
     Value::Object(grant)
+}
+
+/// The store predicate for the closing-soon window, as ONE value shared by the
+/// COUNT and the page so the two can never select different sets.
+///
+/// The bounds come from `grants_common::closing_window_bounds`, which states the
+/// canonical instant set as a pair of printed dates precisely so it stays a text
+/// compare SQL can push down. Before, both bounds were `Utc::now().date_naive()`
+/// arithmetic, so for the first twelve hours of every UTC day the grant closing
+/// today was open in `grants/unified` and absent from this view.
+fn closing_soon_filters(
+    now: chrono::DateTime<chrono::Utc>,
+    days: i64,
+) -> Vec<pumper_core::datasets::JsonFilter> {
+    use pumper_core::datasets::JsonFilter;
+    let (lower, upper) = grants_common::closing_window_bounds(now, days);
+    vec![
+        JsonFilter::Eq {
+            path: "$.status".into(),
+            value: "open".into(),
+        },
+        JsonFilter::Gte {
+            path: "$.close_date".into(),
+            value: lower,
+        },
+        JsonFilter::Lte {
+            path: "$.close_date".into(),
+            value: upper,
+        },
+    ]
 }
 
 /// Translates the query params into store-level JSON predicates.
@@ -210,38 +277,26 @@ pub(crate) struct ClosingSoonQuery {
     path = "/grants/closing-soon",
     tag = "grants",
     params(ClosingSoonQuery),
-    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200."))
+    responses((status = 200, description = "`{days, count, expired_unswept, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key`, `closes_at`, `hours_left`, `days_left` and `lapsed`, every one of them decided at the canonical deadline instant. `count` is the window total; `grants` is capped at 200."))
 )]
 pub(crate) async fn closing_soon(
     State(state): State<AppState>,
     Query(query): Query<ClosingSoonQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    use pumper_core::datasets::JsonFilter;
     let days = query
         .days
         .unwrap_or(CLOSING_SOON_DEFAULT_DAYS)
         .clamp(1, 365);
-    let today = chrono::Utc::now().date_naive();
-    let until = today + chrono::Duration::days(days);
+    // One clock reading for the whole response: the window bounds and every
+    // row's countdown answer the same question, and reading `now` twice is how a
+    // row lands outside the window that selected it.
+    let now = chrono::Utc::now();
 
     // Computed on read rather than materialized as a dataset: a read view can
     // never go stale between syncs — which a "closing soon" list, whose membership
     // changes with the calendar and not with the data, absolutely would if it were
     // snapshotted.
-    let filters = vec![
-        JsonFilter::Eq {
-            path: "$.status".into(),
-            value: "open".into(),
-        },
-        JsonFilter::Gte {
-            path: "$.close_date".into(),
-            value: today.to_string(),
-        },
-        JsonFilter::Lte {
-            path: "$.close_date".into(),
-            value: until.to_string(),
-        },
-    ];
+    let filters = closing_soon_filters(now, days);
     // Order by close_date ASC and cap in SQL, so the returned rows are genuinely
     // the soonest-closing across the whole corpus — not an arbitrary
     // most-recently-updated slice that an in-memory sort would only reorder. The
@@ -268,10 +323,21 @@ pub(crate) async fn closing_soon(
     // shorter than both the cap and the count with nothing saying why.
     let grants: Vec<Value> = records
         .into_iter()
-        .map(|r| closing_soon_grant(&r.key, &r.data, today))
+        .map(|r| closing_soon_grant(&r.key, &r.data, now))
         .collect();
+    // Sweep lag as a number instead of a question. Rows still stamped `open`
+    // whose canonical deadline has provably passed: the corpus-wide sweep is
+    // claimed by one producer per UTC cycle, so this is a normal transient, and
+    // an operator previously had no way to tell it from a live listing.
+    //
+    // Counted over the returned page, which is sound because the page is ordered
+    // by `$.close_date` ASC: lapsed rows carry the earliest dates in the window
+    // and so sit at the front of it. Only a window holding more than
+    // CLOSING_SOON_CAP lapsed rows could hide one, which is already the cap's
+    // documented truncation.
+    let expired_unswept = grants.iter().filter(|g| g["lapsed"] == json!(true)).count();
     Ok(Json(
-        json!({ "days": days, "count": count, "grants": grants }),
+        json!({ "days": days, "count": count, "expired_unswept": expired_unswept, "grants": grants }),
     ))
 }
 
@@ -617,33 +683,228 @@ pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<V
 
 #[cfg(test)]
 mod closing_soon_tests {
-    use super::closing_soon_grant;
-    use chrono::NaiveDate;
+    use super::{closing_soon_filters, closing_soon_grant};
     use serde_json::json;
 
-    /// The anti-pattern: `filter_map` dropped a row whose `close_date` was not
-    /// `YYYY-MM-DD`. The SQL `count` still included it, so the page was a
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// The anti-pattern: `filter_map` dropped a row whose `close_date` the route
+    /// could not read. The SQL `count` still included it, so the page was a
     /// silent short list.
+    ///
+    /// Strengthened when the route moved onto the canonical instant. The guard
+    /// is unchanged - an unreadable deadline is a null countdown, never a
+    /// missing row - but "unreadable" now means what `grants_common` means by
+    /// it, which is strictly less than what a bare `%Y-%m-%d` parse meant. A
+    /// US-format date used to vanish into `days_left: null`; the canonical door
+    /// reads it, so the case is restated with a genuinely unparseable value and
+    /// the old one is pinned to its new, better answer.
     #[test]
-    fn unparseable_close_date_stays_on_the_page() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let bad = closing_soon_grant("eu-sedia:1", &json!({ "close_date": "01/10/2026" }), today);
+    fn unreadable_close_date_stays_on_the_page_as_nulls_not_a_gap() {
+        let now = at("2026-10-01T09:00:00Z");
+
+        let bad = closing_soon_grant(
+            "eu-sedia:1",
+            &json!({ "close_date": "Deadline\u{2014}see website" }),
+            now,
+        );
         assert_eq!(bad["key"], "eu-sedia:1");
-        assert!(
-            bad["days_left"].is_null(),
-            "a bad date is null, not a missing row"
+        for field in ["days_left", "hours_left", "closes_at"] {
+            assert!(
+                bad[field].is_null(),
+                "{field}: an unreadable deadline is null, not a missing row"
+            );
+        }
+        assert_eq!(
+            bad["lapsed"], false,
+            "an unknown deadline is never a lapsed one"
         );
-        assert_eq!(bad["close_date"], "01/10/2026");
+        assert_eq!(bad["close_date"], "Deadline\u{2014}see website");
 
-        let good = closing_soon_grant(
-            "grants-gov:2",
-            &json!({ "close_date": "2026-10-01" }),
-            today,
-        );
+        // The old expression returned null here; the canonical parser reads it.
+        let us = closing_soon_grant("grants-gov:4", &json!({ "close_date": "10/01/2026" }), now);
+        assert_eq!(us["days_left"], 0);
+        assert_eq!(us["closes_at"], "2026-10-02T12:00:00Z");
+
+        let good = closing_soon_grant("grants-gov:2", &json!({ "close_date": "2026-10-01" }), now);
         assert_eq!(good["days_left"], 0);
+        assert_eq!(good["hours_left"], 27);
+        assert_eq!(good["lapsed"], false);
 
-        let bare = closing_soon_grant("ca-grants:3", &json!("not-an-object"), today);
+        let bare = closing_soon_grant("ca-grants:3", &json!("not-an-object"), now);
         assert_eq!(bare["key"], "ca-grants:3");
         assert!(bare["days_left"].is_null());
+    }
+
+    /// THE defect, at the row level. A grants.gov grant printed `2026-10-04` is
+    /// open in `grants/unified` until `2026-10-05T12:00:00Z`, and this view used
+    /// to lose it at `00:00Z` - roughly twelve hours a day, in the direction that
+    /// hides claimable money.
+    ///
+    /// The forbidden expression, named so a revert fails here: `days_left` must
+    /// NOT be `(NaiveDate::parse_from_str(close_date) - now.date_naive())`,
+    /// which is `-1` for this row and would have printed a negative day count or
+    /// a dropped row.
+    #[test]
+    fn the_last_day_grant_is_present_and_counted_from_the_instant() {
+        let now = at("2026-10-05T03:00:00Z");
+        let row = closing_soon_grant(
+            "grants-gov:1",
+            &json!({ "status": "open", "close_date": "2026-10-04" }),
+            now,
+        );
+        assert_eq!(row["closes_at"], "2026-10-05T12:00:00Z");
+        assert_eq!(row["hours_left"], 9);
+        assert_eq!(
+            row["days_left"], 0,
+            "claimable TODAY, not -1 and not absent"
+        );
+        assert_eq!(row["lapsed"], false);
+
+        // And the window that selects it agrees, from both sides of midday.
+        let bound = |now: &str| match &closing_soon_filters(at(now), 14)[1] {
+            pumper_core::datasets::JsonFilter::Gte { path, value } => {
+                assert_eq!(path, "$.close_date");
+                value.clone()
+            }
+            other => panic!("the lower bound moved: {other:?}"),
+        };
+        assert_eq!(bound("2026-10-05T03:00:00Z"), "2026-10-04");
+        assert_eq!(bound("2026-10-05T13:00:00Z"), "2026-10-05");
+    }
+
+    /// A zoned deadline is reported as the instant the source published, not
+    /// rounded up to the anywhere-on-Earth end of its printed day.
+    #[test]
+    fn a_sedia_topic_is_counted_to_the_hour_not_to_the_day() {
+        let now = at("2026-10-05T23:00:00Z");
+        let row = closing_soon_grant(
+            "eu-sedia:7",
+            &json!({
+                "status": "open",
+                "close_date": "2026-10-06",
+                "close_at": "2026-10-06T17:00:00Z",
+            }),
+            now,
+        );
+        assert_eq!(
+            row["closes_at"], "2026-10-06T17:00:00Z",
+            "the zoned instant, NOT 2026-10-07T12:00:00Z"
+        );
+        assert_eq!(row["hours_left"], 18);
+        assert_eq!(row["days_left"], 0, "eighteen hours is not a day");
+    }
+
+    /// Sweep lag, visible. A row whose canonical deadline has passed while its
+    /// stored `status` is still `open` is RETURNED and marked, never silently
+    /// dropped - and the response's `expired_unswept` is exactly the count of
+    /// those marks over the page.
+    #[test]
+    fn a_lapsed_row_is_marked_and_counted_not_dropped() {
+        let now = at("2026-10-05T03:00:00Z");
+        let page: Vec<_> = [
+            json!({ "status": "open", "close_date": "2026-10-04", "close_at": "2026-10-04T23:00:00Z" }),
+            json!({ "status": "open", "close_date": "2026-10-04" }),
+            json!({ "status": "open", "close_date": "2026-10-20" }),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, data)| closing_soon_grant(&format!("k{i}"), data, now))
+        .collect();
+
+        assert_eq!(
+            page.len(),
+            3,
+            "every row the page selected stays on the page"
+        );
+        assert_eq!(
+            page[0]["lapsed"], true,
+            "its zoned deadline passed at 23:00Z"
+        );
+        assert_eq!(
+            page[0]["hours_left"], 0,
+            "a spent countdown is 0, never negative"
+        );
+        assert_eq!(
+            page[1]["lapsed"], false,
+            "no zoned instant: still in the tail"
+        );
+        assert_eq!(page[2]["lapsed"], false);
+
+        let expired_unswept = page.iter().filter(|g| g["lapsed"] == json!(true)).count();
+        assert_eq!(expired_unswept, 1);
+    }
+
+    /// `count` and `grants` are two reads of ONE predicate value. The route used
+    /// to build the filter list inline and would have let a second clock reading
+    /// or a second bound expression drift between them.
+    #[test]
+    fn count_and_page_cannot_select_different_sets() {
+        let now = at("2026-10-05T03:00:00Z");
+        let filters = closing_soon_filters(now, 14);
+        assert_eq!(filters.len(), 3);
+        assert_eq!(
+            format!("{filters:?}"),
+            format!("{:?}", closing_soon_filters(now, 14)),
+            "pure in `now`"
+        );
+        // The route holds exactly one `filters` binding and hands the same
+        // reference to `count_filtered` and `list_filtered_ordered`; this pins
+        // the shape it is built from.
+        let code = route_code();
+        assert!(
+            !code.contains("Utc::now().date_naive()"),
+            "the forbidden expression: the window must not be re-derived from a bare date"
+        );
+        assert_eq!(
+            code.matches("closing_soon_filters(now, days)").count(),
+            1,
+            "one predicate value, built once"
+        );
+    }
+
+    /// The executable part of this module's own file: everything above the test
+    /// module, with comment lines removed.
+    ///
+    /// Both exclusions are load-bearing, and the matcher above was briefly wrong
+    /// without them. A source guard that reads raw text matches the doc comment
+    /// that NAMES the anti-pattern, and it matches the assertion string in the
+    /// guard itself - so the gate goes red on a clean file and tells you nothing.
+    /// Stripping comments is the rule the repo already states for source-scanning
+    /// gates; cutting the test module is the same rule applied to a guard that
+    /// has to quote what it forbids.
+    fn route_code() -> String {
+        let src = include_str!("query.rs");
+        let executable = src.split("#[cfg(test)]").next().unwrap_or(src);
+        executable
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Seeded violation: the guard above only means something if it can go red.
+    #[test]
+    fn the_forbidden_expression_guard_can_still_fail() {
+        let seeded = format!(
+            "{}\nlet today = chrono::Utc::now().date_naive();",
+            route_code()
+        );
+        assert!(
+            seeded.contains("Utc::now().date_naive()"),
+            "a reverted route must trip the guard"
+        );
+        // `parse_grant_date` still uses a `%Y-%m-%d` parse, and should: it
+        // validates a user-supplied `closing_before` param, which IS a printed
+        // date. What must not come back is that parse being used to DECIDE a
+        // deadline, which is what the subtraction below spelled.
+        assert!(
+            !route_code().contains(".num_days()"),
+            "the other half of the old rule - a date subtraction as the countdown - is gone"
+        );
     }
 }
