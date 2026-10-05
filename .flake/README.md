@@ -159,6 +159,57 @@ source scan that found zero `#[ignore]`s in a tree that has nineteen). A 3 is no
 a pass: nothing was verified. Same discipline as
 `scripts/docs/check-doc-sync.mjs`, and for the same reason.
 
+## The register reads back: a failing test says where it stands
+
+The register is also consulted **from inside a failing run**. `crates/server`'s
+e2e harness installs a panic hook (`harness::arm()`, chained onto the default
+hook, so normal panic output is unchanged) that appends a footer naming three
+things:
+
+    ──────────────────────────────────────────────────────────────────────────────
+    e2e failure: e2e::fanout_offslot::a_slow_index_no_longer_holds_a_scrape_permit
+    reproduce:   cargo test -p pumper-server --bin pumper -- --exact \
+                 e2e::fanout_offslot::a_slow_index_no_longer_holds_a_scrape_permit --nocapture
+    flake register: NOT REGISTERED — no row in .flake/register.json.
+                    "no row" is NOT "known good" ...
+    timing claim [FAILED]: moving the fan-out off the worker permit at least halves the drain
+                    1.97x achieved, 2.00x required (fast arm 518ms vs slow arm 1020ms)
+                    — MISSED BY A HAIR ...
+    ──────────────────────────────────────────────────────────────────────────────
+
+The register status has the same three outcomes as the gate, for the same
+reason: `QUARANTINED` (with owner, entry, expiry and cause, plus
+`just flake-report`), `NOT REGISTERED`, and `CANNOT CHECK` when the register is
+missing or unparseable. **A cannot-check is not a pass** — the footer says so
+rather than falling silent, because a silent footer and a clean register look
+identical from a CI log.
+
+The reader is **read-only, always**. Nothing in the test path writes a row: the
+one rule above is not negotiable, and an automated writer is the most
+respectable disguise the shortcut has.
+
+### The second population: wall-clock claims
+
+This register's population is the set of `#[ignore]`s, so **a test that flakes
+without being ignored can never appear in it**. That blind spot is where
+`fanout_offslot`'s wall-clock ratio sat for two months after a session note
+called it load-flaky.
+
+So the e2e suite carries a second, derived population. Every wall-clock
+comparison in `crates/server/src/e2e/**` must route through
+`harness::timed_claim`, which carries both measured figures and the
+achieved-vs-required margin into the footer — the margin being the whole
+flake-vs-regression decision, since `1.97x of a required 2.00x` is a loaded box
+and `0.4x` is a regression and a bare `assert!` renders them identically. A
+census test over `read_dir` enforces it and goes red on a seeded raw
+`assert!(a_ms < b_ms)`, naming the file and line. The same scan proves every
+e2e module is declared in `mod.rs` (rustc never warns about an uncompiled
+sibling) and reaches the footer.
+
+A deadline poll (`Instant::now() < deadline` inside a `wait_*` helper) is a
+timeout guard, not a performance claim, and is out of scope by construction
+rather than by an allowlist.
+
 ## Commands
 
     just flake-check          # the gate
