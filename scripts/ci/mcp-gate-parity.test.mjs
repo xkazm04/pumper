@@ -19,6 +19,7 @@ import {
   defaultRepoRoot,
   extractSites,
   findings,
+  rootFromArgv,
 } from './mcp-gate-parity.mjs';
 
 const SRC = fs.readFileSync(
@@ -185,4 +186,10 @@ test('exit_3_a_source_whose_shape_moved_is_cannot_check', () => {
   const r = runChecker(root);
   assert.equal(r.status, 3, r.stdout + r.stderr);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('rootFromArgv_defaults_to_the_checkout_and_honours_an_override', () => {
+  assert.equal(rootFromArgv([], '/r'), '/r');
+  assert.equal(rootFromArgv(['--root'], '/r'), '/r');
+  assert.equal(rootFromArgv(['--root', '.'], '/r'), path.resolve('.'));
 });

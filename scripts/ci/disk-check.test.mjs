@@ -22,6 +22,7 @@ import {
   findings,
   formatBytes,
   measure,
+  parseArgs,
   pruneTarget,
   splitArtifact,
   staleIncrementalDirs,
@@ -337,4 +338,28 @@ test('exit_0_a_root_within_budget_passes_as_a_process', () => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /Within budget/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+// --- the seam itself --------------------------------------------------------
+
+test('parseArgs_falls_back_to_the_declared_budget_rather_than_to_NaN', () => {
+  // A ceiling of NaN compares false against every size, which is a gate that
+  // cannot fail — the exact shape of instrument this whole file exists to deny.
+  assert.equal(parseArgs(['--ceiling-gb', 'banana'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--ceiling-gb'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--ceiling-gb', '-5'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--stale-gb', '0'], '/r').staleFindingGb, STALE_FINDING_GB);
+});
+
+test('parseArgs_reads_the_overrides_and_defaults_the_root_to_the_checkout', () => {
+  const a = parseArgs(['--ceiling-gb', '2.5', '--stale-gb', '1'], '/r');
+  assert.equal(a.ceilingGb, 2.5);
+  assert.equal(a.staleFindingGb, 1);
+  assert.equal(parseArgs([], '/r').root, '/r');
+  assert.equal(parseArgs(['--root', scratch()], '/r').root !== '/r', true);
+});
+
+test('findings_honours_an_overridden_budget_without_touching_the_default', () => {
+  assert.deepEqual(findings({ bytes: 5 * GB, staleBytes: 0 }), []);
+  assert.equal(findings({ bytes: 5 * GB, staleBytes: 0 }, { ceilingGb: 1 }).length, 1);
 });

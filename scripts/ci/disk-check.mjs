@@ -50,6 +50,20 @@
 //   --report    human breakdown of where the disk went. Always exit 0.
 //   --prune     delete stale artifacts, then report what was reclaimed.
 //   --dry-run   with --prune: list what WOULD be deleted, delete nothing.
+//
+// TEST SEAMS
+//
+//   --root <dir>        judge THIS tree instead of the checkout this script
+//                       lives in. Without it the root came from import.meta.url
+//                       with no override, so the exit-3 branch below could not
+//                       be reached by any fixture and the gate's declared three
+//                       outcomes had never been observed as exit codes.
+//   --ceiling-gb <n>    override CEILING_GB. A fixture cannot write 40 GB, and
+//   --stale-gb <n>      override STALE_FINDING_GB. a budget whose breach cannot
+//                       be staged is a budget nobody has watched go red.
+//
+// These are deliberately plain flags, not env vars: `just disk-check` reads the
+// same way whether or not a test is driving it.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -70,6 +84,29 @@ const DAY_MS = 86400000;
 
 export function defaultRepoRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
+/**
+ * The three overridable inputs, pulled out of argv.
+ *
+ * Returns {root, ceilingGb, staleFindingGb}. An option given without a value,
+ * or with one that is not a positive number, falls back to the declared default
+ * rather than silently becoming NaN — a ceiling of NaN compares false against
+ * everything, which is a gate that cannot fail.
+ */
+export function parseArgs(argv, root = defaultRepoRoot()) {
+  const num = (flag, fallback) => {
+    const i = argv.indexOf(flag);
+    if (i === -1) return fallback;
+    const v = Number.parseFloat(argv[i + 1]);
+    return Number.isFinite(v) && v > 0 ? v : fallback;
+  };
+  const ri = argv.indexOf('--root');
+  return {
+    root: ri !== -1 && argv[ri + 1] ? path.resolve(argv[ri + 1]) : root,
+    ceilingGb: num('--ceiling-gb', CEILING_GB),
+    staleFindingGb: num('--stale-gb', STALE_FINDING_GB),
+  };
 }
 
 export function formatBytes(bytes) {
@@ -214,16 +251,25 @@ export function staleIncrementalDirs(incrementalDir, staleBefore) {
   return out;
 }
 
-/** Judge a measured target dir against the declared budget. Returns [message]. */
-export function findings({ bytes, staleBytes }) {
+/**
+ * Judge a measured target dir against a budget. Returns [message].
+ *
+ * The budget defaults to the declared constants, so every existing caller and
+ * test reads unchanged; a fixture passes its own so a breach can be staged
+ * without writing 40 GB to a temp dir.
+ */
+export function findings(
+  { bytes, staleBytes },
+  { ceilingGb = CEILING_GB, staleFindingGb = STALE_FINDING_GB } = {},
+) {
   const out = [];
-  if (bytes > CEILING_GB * GB) {
+  if (bytes > ceilingGb * GB) {
     out.push(
-      `target/ is ${formatBytes(bytes)}, over the ${CEILING_GB} GB ceiling. ` +
+      `target/ is ${formatBytes(bytes)}, over the ${ceilingGb} GB ceiling. ` +
         'Run `just disk-prune`; if that does not clear it, `just clean-target`.',
     );
   }
-  if (staleBytes > STALE_FINDING_GB * GB) {
+  if (staleBytes > staleFindingGb * GB) {
     out.push(
       `${formatBytes(staleBytes)} of target/ has not been touched in ${STALE_DAYS} days. ` +
         'Pruning has stopped happening, which is the state that reached 280 GB. Run `just disk-prune`.',
@@ -283,7 +329,7 @@ function runPrune(root, targetDir, staleBefore, dryRun) {
   return 0;
 }
 
-function runReport(root, targetDir, staleBefore, target) {
+function runReport(root, targetDir, staleBefore, target, budget) {
   console.log(`target/${formatBytes(target.bytes).padStart(13)}  ${target.files} files`);
   console.log(
     `  stale${formatBytes(target.staleBytes).padStart(13)}  untouched ${STALE_DAYS}d+`,
@@ -303,12 +349,13 @@ function runReport(root, targetDir, staleBefore, target) {
     const m = measure(p);
     console.log(`${other.padEnd(7)}${formatBytes(m.bytes).padStart(13)}  ${m.files} files`);
   }
-  console.log(`\nbudget: ceiling ${CEILING_GB} GB — currently ${formatBytes(target.bytes)}.`);
+  console.log(`\nbudget: ceiling ${budget.ceilingGb} GB — currently ${formatBytes(target.bytes)}.`);
   return 0;
 }
 
 function main(argv) {
-  const root = defaultRepoRoot();
+  const { root, ceilingGb, staleFindingGb } = parseArgs(argv);
+  const budget = { ceilingGb, staleFindingGb };
   if (!fs.existsSync(path.join(root, 'Cargo.toml'))) {
     console.error('disk-check: no Cargo.toml at the repo root — cannot check.');
     return EXIT_CANNOT_CHECK;
@@ -328,13 +375,13 @@ function main(argv) {
   const target = measure(targetDir, staleBefore);
 
   if (argv.includes('--report')) {
-    return runReport(root, targetDir, staleBefore, target);
+    return runReport(root, targetDir, staleBefore, target, budget);
   }
 
-  const before = findings(target);
+  const before = findings(target, budget);
   if (before.length === 0) {
     console.log(
-      `disk-check: target/ is ${formatBytes(target.bytes)} of ${CEILING_GB} GB, ` +
+      `disk-check: target/ is ${formatBytes(target.bytes)} of ${ceilingGb} GB, ` +
         `${formatBytes(target.staleBytes)} stale. Within budget.`,
     );
     return 0;
@@ -352,12 +399,12 @@ function main(argv) {
   // pruning cannot fix — which is the case actually worth a human's attention.
   const { reclaimed, removed } = pruneTarget(targetDir, staleBefore);
   const after = measure(targetDir, staleBefore);
-  const remaining = findings(after);
+  const remaining = findings(after, budget);
   if (remaining.length === 0) {
     console.log(
       `disk-check: target/ was ${formatBytes(target.bytes)}, over budget. ` +
         `Pruned ${formatBytes(reclaimed)} across ${removed} stale entries — ` +
-        `now ${formatBytes(after.bytes)} of ${CEILING_GB} GB. Within budget.`,
+        `now ${formatBytes(after.bytes)} of ${ceilingGb} GB. Within budget.`,
     );
     return 0;
   }
