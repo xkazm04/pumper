@@ -372,6 +372,47 @@ out of the migration file itself rather than a paraphrase of it.
 in the tree. That is deliberate: retirement is the terminal state and it is
 reversible. See [fetching.md § The recipe lifecycle](fetching.md#the-recipe-lifecycle-candidate--validated--retired).
 
+## Migration 0047 — `schedule_runs`, the schedule decision ledger
+
+A new table, additive: nothing existing changes shape and there is no back-fill
+to do (the history it records could not be reconstructed anyway — re-deriving a
+past tick's verdict would run today's logic against state that has moved).
+
+| column | meaning |
+| --- | --- |
+| `schedule_id` | the schedule the decision is about, or `*` for the pass heartbeat, which is a fact about the reconcile **loop** rather than any one schedule |
+| `outcome` | `fired` \| `skipped` \| `held` \| `refused` \| `failed` \| `pass` (`storage::SCHEDULE_OUTCOMES`) |
+| `reason` | the admission `health` word, read verbatim off `scheduler::admit()`. `NULL` only when admission never ran |
+| `due_at` | the firing this row is about |
+| `job_id` | the job enqueued, or (for `held`) the job holding the slot |
+| `missed` | firings advanced past by `misfire_policy = "skip"` |
+| `detail` | free text: an error message, the retired dataset, the collapsed backlog size |
+
+Two indexes: `(schedule_id, created_at DESC, id DESC)` for the newest-first read
+path, `(created_at)` for the prune sweep.
+
+**Diagnostic, not evidence — which decides its retention.** Like `trigger_runs`
+(migration 0036) and unlike the opt-in `LEDGER_TABLES`, losing an old row loses
+no history anyone can act on, so it is bounded **by default** rather than by an
+operator knob: the worker's reaper tick prunes past 14 days, in the same
+function and under the same hourly due-check as the trigger ledger. A second
+diagnostic ledger with its own clock is how one of them ends up swept and the
+other growing forever.
+
+**One row is exempt from the sweep: the pass heartbeat.** It is a single row with
+a fixed primary key, upserted in place rather than appended, so the table's size
+is independent of the tick rate — an append-only heartbeat on a 15-second tick
+writes ~5,700 rows a day, and the trigger ledger already shows that a
+written-once fact in that shape paginates out of reach of the newest-first page
+it was meant to be read from. Pruning it would delete the evidence of the very
+wedge it exists to prove, so `prune_schedule_runs` excludes it in SQL.
+
+`schedule_runs` is declared in `schema::EXPECTED_TABLES`, so a store missing it
+is **refused at boot** rather than failing at the first write, and
+`crates/core/tests/migrations.rs` guards its columns against a 0001→NNNN replay.
+Full read surface and the operator story: [runtime.md § The decision
+ledger](runtime.md#the-decision-ledger-get-schedulesidruns).
+
 ## Known gaps
 
 - **Duplicate scan** uses banded SimHash bucketing (`simhash::BandedIndex`, shared with the crawler's near-dup gate): candidates come from `distance + 1` contiguous bit-bands and are then verified by exact Hamming, so the pair set, the `MAX_DUP_PAIRS`=10,000 cap and the result ordering are identical to the all-pairs scan it replaced. Bands are `64 / (distance + 1)` bits wide, so **the index turns banding off above distance 5** and verifies against a plain walk — same answers, linear candidate generation. At the distance every real caller uses (3: the `/duplicates` default and grants `link_duplicates`) a 50k-record scan measured **~0.8s vs ~23s** for the all-pairs sweep.
