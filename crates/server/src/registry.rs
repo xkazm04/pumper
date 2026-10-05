@@ -466,6 +466,119 @@ mod manifest_tests {
         }
     }
 }
+/// **The materiality inventory.** The sibling of
+/// `completeness_inventory_tests`, one layer down: that one pins "did this run
+/// get enough?", this one pins "is this change news?".
+///
+/// The defect it ratchets is identical in shape and was found in the same
+/// context. Four monitors lived in `crates/apps/` with four different answers —
+/// `watch` had none and reported the store's raw exact-hash `ChangeKind`,
+/// `connector-api-watch` had two (an empty line diff plus a Claude severity
+/// ladder), `plugin`'s observatory had a third, `hackernews` had none — and a
+/// fifth, `pumper_core::crawl::change_weight`, was already correct in `core`
+/// and reached by nobody. None of them could see the others, because apps may
+/// not depend on apps.
+#[cfg(test)]
+mod materiality_inventory_tests {
+    use super::apps;
+    use std::collections::BTreeSet;
+
+    /// The block a monitor puts in its declared `output_shape` once its answer
+    /// to "is this change news?" is a VERDICT from `pumper_core::materiality`
+    /// rather than a private rule. The brace is part of the marker: the word
+    /// alone appears in prose, the block is a declaration.
+    const VERDICT_MARKER: &str = "materiality {";
+
+    /// **EXACTLY** the registered apps that declare a materiality verdict.
+    /// Pinned as a set rather than a count, so a monitor that is added — or one
+    /// that quietly stops declaring — fails BY NAME instead of drifting.
+    const JUDGED_MONITORS: [&str; 2] = ["connector-api-watch", "watch"];
+
+    /// The monitors that still answer privately. They are listed, not
+    /// tolerated: `the_un_judged_monitor_list_only_ever_shrinks` fails the
+    /// moment one adopts the judge, which forces the entry out rather than
+    /// letting a permanent exemption accumulate.
+    ///
+    /// Out of this round's write set on purpose. `plugin`'s observatory already
+    /// solved its own case correctly with `DerivedPaths`, and `hackernews`'s
+    /// volatile `points`/`comments` is a *completeness* question entangled with
+    /// a materiality one — bundling them is how a card stops being falsifiable.
+    const MONITORS_AWAITING_THE_JUDGE: [&str; 2] = ["hackernews", "plugin"];
+
+    fn shape_of(name: &str) -> String {
+        apps()
+            .iter()
+            .find(|a| a.name() == name)
+            .unwrap_or_else(|| panic!("'{name}' is not a registered app — the list is stale"))
+            .manifest()
+            .output_shape
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The EXPECTED-diff, reported in both directions so neither a new monitor
+    /// nor a silently-dropped verdict can slide past.
+    #[test]
+    fn the_monitors_that_declare_a_materiality_verdict_are_exactly_the_listed_ones() {
+        let found: BTreeSet<String> = apps()
+            .iter()
+            .filter(|a| {
+                a.manifest()
+                    .output_shape
+                    .unwrap_or("")
+                    .contains(VERDICT_MARKER)
+            })
+            .map(|a| a.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = JUDGED_MONITORS.iter().map(|n| n.to_string()).collect();
+        let added: Vec<&String> = found.difference(&expected).collect();
+        let gone: Vec<&String> = expected.difference(&found).collect();
+        assert!(
+            added.is_empty() && gone.is_empty(),
+            "the materiality inventory drifted. App(s) newly declaring a verdict: \
+             {added:?} — add them to JUDGED_MONITORS. Listed app(s) that no longer \
+             declare one: {gone:?} — a verdict that vanished means that monitor went \
+             back to answering 'is this change news?' privately, which is exactly how \
+             four monitors ended up with four answers."
+        );
+    }
+
+    /// Every listed monitor must be a registered app with an `output_shape` —
+    /// a hand-kept list that outlives its apps is a lie.
+    #[test]
+    fn every_listed_monitor_is_registered() {
+        for name in JUDGED_MONITORS
+            .iter()
+            .chain(MONITORS_AWAITING_THE_JUDGE.iter())
+        {
+            assert!(
+                !shape_of(name).is_empty(),
+                "app '{name}' declares no output_shape at all, so nothing can be \
+                 asserted about its verdict"
+            );
+        }
+    }
+
+    /// The exemption list is a countdown, not a carve-out, and it may not grow:
+    /// a fifth private answer to "is this change news?" is the defect, not a
+    /// new entry.
+    #[test]
+    fn the_un_judged_monitor_list_only_ever_shrinks() {
+        for name in MONITORS_AWAITING_THE_JUDGE {
+            assert!(
+                !shape_of(name).contains(VERDICT_MARKER),
+                "app '{name}' now declares a `{VERDICT_MARKER}` block, so it is no \
+                 longer awaiting the judge — drop it from MONITORS_AWAITING_THE_JUDGE"
+            );
+        }
+        assert!(
+            MONITORS_AWAITING_THE_JUDGE.len() <= 2,
+            "the un-judged monitor list grew; a new monitor routes through \
+             `pumper_core::materiality`, it does not join the exemption"
+        );
+    }
+}
+
 #[cfg(test)]
 mod completeness_inventory_tests {
     use super::apps;

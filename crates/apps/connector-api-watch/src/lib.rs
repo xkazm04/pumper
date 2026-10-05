@@ -25,6 +25,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use pumper_core::datasets::ChangeKind;
 use pumper_core::fetcher::FetchRequest;
+use pumper_core::materiality::{self, Sensitivity, Signal, Verdict};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, Provenance, ResearchOutput,
     ResearchRequest, Result, ScrapeApp,
@@ -355,6 +356,28 @@ impl ScrapeApp for ConnectorApiWatch {
     }
 }
 
+/// **Is this doc change an event?** The deterministic first verdict, from the
+/// one judge the whole fleet shares.
+///
+/// This used to be two private answers in this one file: an empty line diff
+/// treated as noise (`added.is_empty() && removed.is_empty()`), and a
+/// Claude-scored `patch|minor|major|breaking` ladder stacked on top of it. The
+/// line-diff answer was a proxy — it could only see lines that appeared or
+/// vanished, never how far the document actually moved — and it lived where no
+/// sibling monitor could reach it. The Claude ladder stays, as what it always
+/// was: a second, LLM-scored opinion, now reached only once the deterministic
+/// verdict already says this is news, so a whitespace reflow stops being billed
+/// as a summary.
+///
+/// `markdown` is the record path carrying the body, so the verdict names it as
+/// the path that moved.
+fn doc_verdict(previous: &str, current: &str) -> Verdict {
+    materiality::judge(
+        &Signal::bodies(previous, current).moved(["markdown"]),
+        &Sensitivity::default(),
+    )
+}
+
 fn sha256(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
@@ -512,6 +535,10 @@ mod tests {
     // after an endpoint was replaced (Stripe-style endpoint listing).
     const OLD_DOC: &str = "# Payments API\n\n## Endpoints\n\n- POST /v1/charges\n- GET /v1/charges/:id\n\nRate limit: 100 req/min\n";
     const NEW_DOC: &str = "# Payments API\n\n## Endpoints\n\n- POST /v1/payment_intents\n- GET /v1/charges/:id\n\nRate limit: 100 req/min\n";
+    /// [`OLD_DOC`] re-indented and reordered — not one word differs. Shared
+    /// verbatim with `pumper_core::materiality`'s own fixtures, so the two
+    /// monitors are provably judged by one function over one pair of bodies.
+    const REFLOWED_DOC: &str = "  # Payments API\n## Endpoints\n- GET /v1/charges/:id\n- POST /v1/charges\n\nRate limit: 100 req/min\n";
 
     #[test]
     fn line_diff_reports_appeared_and_disappeared_lines_not_the_whole_doc() {
@@ -520,16 +547,43 @@ mod tests {
         assert_eq!(removed, vec!["- POST /v1/charges"]);
     }
 
+    /// Same lines re-indented and reordered: the content hash flips, and no
+    /// change event may fire. The decision now comes from the shared judge —
+    /// the private `added.is_empty() && removed.is_empty()` suppressor this
+    /// file used to carry is gone — and the line diff stays here only as
+    /// corroboration that the two answers agree where they overlap.
     #[test]
     fn whitespace_reflow_and_reorder_is_noise_not_a_change() {
-        // Same lines re-indented and reordered: the content hash flips, but the
-        // diff must come back empty so no change event fires.
-        let reflowed = "  # Payments API\n## Endpoints\n- GET /v1/charges/:id\n- POST /v1/charges\n\nRate limit: 100 req/min\n";
-        let (added, removed) = line_diff(OLD_DOC, reflowed);
+        let verdict = doc_verdict(OLD_DOC, REFLOWED_DOC);
+        assert_eq!(
+            verdict.significance(),
+            pumper_core::Significance::Cosmetic,
+            "{}",
+            verdict.reason()
+        );
+        assert!(
+            !verdict.is_news(),
+            "a reflow must emit zero change events, and cost zero Claude calls"
+        );
+
+        let (added, removed) = line_diff(OLD_DOC, REFLOWED_DOC);
         assert!(added.is_empty(), "reflow produced added lines: {added:?}");
         assert!(
             removed.is_empty(),
             "reflow produced removed lines: {removed:?}"
+        );
+    }
+
+    /// The other direction, which the deleted suppressor could not express: a
+    /// replaced endpoint is news, and the deterministic verdict — not the
+    /// Claude ladder — is what lets the metered summary pass run at all.
+    #[test]
+    fn one_replaced_endpoint_is_an_event_the_judge_lets_through() {
+        let verdict = doc_verdict(OLD_DOC, NEW_DOC);
+        assert!(verdict.is_news(), "{}", verdict.reason());
+        assert!(
+            verdict.distance().is_some_and(|d| d > 0),
+            "a real edit moves the fingerprint"
         );
     }
 

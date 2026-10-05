@@ -4990,13 +4990,20 @@ impl DerivedPaths {
         self.0.is_empty()
     }
 
+    /// The declared paths, in declaration order. Readable so a caller that
+    /// *computes* its derived set — a change-materiality verdict naming the
+    /// paths it ruled cosmetic — can assert over it.
+    pub fn paths(&self) -> &[String] {
+        &self.0
+    }
+
     /// The value change detection hashes: `value` with every declared path
     /// removed.
     ///
     /// Borrowed — and therefore byte-identical to hashing `value` itself — when
     /// nothing is declared or nothing matched. That equivalence is the whole
     /// safety argument for adding this to a shared write path.
-    fn hash_input<'v>(&self, value: &'v Value) -> std::borrow::Cow<'v, Value> {
+    pub(crate) fn hash_input<'v>(&self, value: &'v Value) -> std::borrow::Cow<'v, Value> {
         if self.0.is_empty() {
             return std::borrow::Cow::Borrowed(value);
         }

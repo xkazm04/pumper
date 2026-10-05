@@ -41,6 +41,7 @@ pub mod job;
 pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
+pub mod materiality;
 pub mod plugin;
 pub mod process_env;
 pub mod recipes;
@@ -146,6 +147,11 @@ pub use job::{Job, JobStatus};
 pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
+// `judge`, `Signal` and `Verdict` stay module-qualified
+// (`materiality::judge`): the top level already carries `completeness::judge`
+// and `completeness::Verdict`, and two judgments sharing one bare name at the
+// crate root is how a caller reaches for the wrong one.
+pub use materiality::{Sensitivity, Significance};
 pub use plugin::{NoPlugins, Plugins};
 #[cfg(feature = "storage")]
 pub use recipes::RecipeStore;
