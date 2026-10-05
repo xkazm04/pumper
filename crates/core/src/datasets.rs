@@ -485,6 +485,87 @@ pub fn group_by_trust(items: Vec<(String, Value)>, trusts: &[Option<String>]) ->
     groups
 }
 
+/// Which way the change feed runs.
+///
+/// `Desc` (the default, and the only shape the HTTP surface serves unless a
+/// caller opts in) is a browse order: newest first, for "what changed lately".
+/// `Asc` is a *drain* order: oldest first, for a mirror that must apply every
+/// revision exactly once and may be interrupted at any point.
+///
+/// The direction is not cosmetic — it decides whether a consumer may
+/// checkpoint. On a descending feed, page 1 is the newest, so a watermark
+/// taken from it jumps over every older page not yet applied; the only sound
+/// strategy is to buffer the whole backlog and commit once. On an ascending
+/// feed, the last row of each page is a position every earlier revision is
+/// behind, so a consumer can apply the page, store that position, and resume
+/// there after a crash.
+///
+/// That is also why `Asc` mints a `next_cursor` for a SHORT page while `Desc`
+/// does not. For a browse order a short page means "the end, stop asking"; for
+/// a drain it means "you are caught up HERE" — and the consumer needs that
+/// position to resume from when the producer writes more. Re-reading it later
+/// yields an empty page, which is the correct answer, not a wasted round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeedOrder {
+    /// Newest first. The historical and default behaviour of `/changes`.
+    #[default]
+    Desc,
+    /// Oldest first: a forward drain a consumer can checkpoint page by page.
+    Asc,
+}
+
+impl FeedOrder {
+    /// The keyset half of the WHERE clause, over bind params `?4` (the
+    /// cursor's `created_at`) and `?5` (its rowid). It must compare the tuple
+    /// the same way [`order_by`](Self::order_by) sorts it, which is precisely
+    /// what the bare `created_at > since` filter fails to do: that predicate
+    /// has no rowid tiebreak, so it skips every sibling sharing the boundary
+    /// stamp (and `upsert_many` gives a whole 500-row chunk one stamp).
+    fn keyset_predicate(self) -> &'static str {
+        match self {
+            FeedOrder::Desc => {
+                "(?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5))"
+            }
+            FeedOrder::Asc => "(?4 IS NULL OR created_at > ?4 OR (created_at = ?4 AND rowid > ?5))",
+        }
+    }
+
+    fn order_by(self) -> &'static str {
+        match self {
+            FeedOrder::Desc => "created_at DESC, rowid DESC",
+            FeedOrder::Asc => "created_at ASC, rowid ASC",
+        }
+    }
+
+    /// Whether this page should carry a resume cursor. See the type docs: a
+    /// drain checkpoints even on a short page, a browse order does not.
+    fn mints_cursor(self, rows: i64, limit: i64) -> bool {
+        match self {
+            FeedOrder::Desc => rows == limit,
+            FeedOrder::Asc => rows > 0,
+        }
+    }
+
+    /// Parses the wire value. `None` for anything else — the caller decides
+    /// the error shape, and must never fall back silently: a typo resolving to
+    /// `desc` would hand a forward drain the one order it cannot checkpoint.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "desc" => Some(FeedOrder::Desc),
+            "asc" => Some(FeedOrder::Asc),
+            _ => None,
+        }
+    }
+
+    /// The wire value, so a route can echo back what it resolved.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedOrder::Desc => "desc",
+            FeedOrder::Asc => "asc",
+        }
+    }
+}
+
 /// A keyset page of revisions plus the cursor to fetch the next page (None at
 /// the end). The tiebreak differs by feed — rowid for the cross-key change feed,
 /// per-key `revision` for a single record's history — so the cursor is built
@@ -1153,18 +1234,37 @@ impl Datasets {
         limit: i64,
         trust: Option<&str>,
     ) -> Result<RevisionPage> {
+        self.changes_page_ordered(app, dataset, since, after, limit, trust, FeedOrder::Desc)
+            .await
+    }
+
+    /// [`changes_page`](Self::changes_page) with the feed's direction as a
+    /// parameter. See [`FeedOrder`] for why forward is not just the same query
+    /// read backwards.
+    ///
+    /// The keyset predicate and the ordering are chosen together — that
+    /// coupling is the whole point. Reading `Desc` with an `Asc` comparison (or
+    /// the other way round) is exactly the mismatch `since` has with the
+    /// ordering today, and it is what loses rows.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn changes_page_ordered(
+        &self,
+        app: &str,
+        dataset: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        after: Option<(String, i64)>,
+        limit: i64,
+        trust: Option<&str>,
+        order: FeedOrder,
+    ) -> Result<RevisionPage> {
         let (after_ts, after_rowid) = after
             .map(|(t, r)| (Some(t), Some(r)))
             .unwrap_or((None, None));
         let rows: Vec<RevisionFeedRow> = sqlx::query_as(&format!(
-            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust, \
-                    job_id, source_url, artifact_sha, rules_hash \
-             FROM record_revisions \
-             WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
-             AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5)) \
-             AND {} \
-             ORDER BY created_at DESC, rowid DESC LIMIT ?6",
-            trust_predicate(7)
+            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust,                     job_id, source_url, artifact_sha, rules_hash              FROM record_revisions              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3)              AND {}              AND {}              ORDER BY {} LIMIT ?6",
+            order.keyset_predicate(),
+            trust_predicate(7),
+            order.order_by(),
         ))
         .bind(app)
         .bind(dataset)
@@ -1175,7 +1275,8 @@ impl Datasets {
         .bind(trust)
         .fetch_all(&self.pool)
         .await?;
-        let next_cursor = ((rows.len() as i64) == limit)
+        let next_cursor = order
+            .mints_cursor(rows.len() as i64, limit)
             .then(|| rows.last())
             .flatten()
             .map(|r| format!("{}|{}", r.inner.created_at, r.rowid));
