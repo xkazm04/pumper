@@ -351,6 +351,22 @@ That's the whole integration. `cargo run -p pumper-server --bin pumper` (or
 `just run`), confirm your app appears in `GET /apps`, enqueue a job, verify the
 result.
 
+**Two declarations the registry's inventory tests will ask you for.** Both are
+judgments this fleet standardised after finding them re-invented privately in
+four crates each, and both are checked against your `output_shape` in **both**
+directions — declare one without being listed, or get listed and stop
+declaring, and the test fails by name:
+
+| if your app… | declare | and be listed in |
+| --- | --- | --- |
+| scrapes a **bounded** thing (a roster, a full listing) | a `completeness` block, judged by `pumper_core::completeness` | `JUDGED` |
+| **monitors for change** (anything that decides whether a human gets woken) | a `materiality {…}` block, judged by `pumper_core::materiality` | `JUDGED_MONITORS` |
+
+Do not write a private floor or a private noise rule. If the shared judge is
+genuinely wrong for your source, that is a finding worth recording — the
+`*_AWAITING_THE_JUDGE` rosters exist for it, they carry a written reason, and
+they only ever shrink.
+
 **Cron note:** `schedule()` returns a 6-field expression *with seconds*:
 `sec min hour day month weekday`. `"0 0 */6 * * *"` = every 6 hours. Scheduled
 runs use `default_params()`, so make sure those params are sufficient (e.g. the

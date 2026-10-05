@@ -2,6 +2,15 @@
 
 Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/server/src/registry.rs`) as **jobs** on a durable SQLite queue.
 
+**The registry carries the fleet's declaration ratchets.** An app's `manifest().output_shape` is not only documentation — `registry.rs` holds two-direction EXPECTED-diff inventories over it, so a judgment the fleet has standardised cannot be re-answered privately by the next app without failing a test **by name**:
+
+| inventory | the declaration it pins | the roster that still owes it |
+| --- | --- | --- |
+| `completeness_inventory_tests` | a `completeness` block — "did this run get enough?" (`pumper_core::completeness`) | `AWAITING_THE_JUDGE` |
+| `materiality_inventory_tests` | a `materiality {` block — "is this change news?" (`pumper_core::materiality`, see [datasets.md](datasets.md)) | `MONITORS_AWAITING_THE_JUDGE` |
+
+Both fail in **both** directions — an app that newly declares and is not listed, and a listed app whose declaration vanished — and both exemption rosters only ever shrink: a listed app that adopts the judge fails the test until it is dropped from the roster, so an exemption cannot become permanent. Each is the generalised fix for the same defect found one layer apart: a judgment invented privately in four crates nobody else can reach.
+
 ## Jobs
 
 - Enqueue: `POST /apps/{name}/jobs` with optional `{params, max_attempts, delay_secs, priority, callback_url, callback_secret, budget_usd, idempotency_key}`. An `Idempotency-Key` header (or body field) makes retries safe: a duplicate key returns the original job with `200` instead of a new `202`.
