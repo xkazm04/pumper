@@ -447,6 +447,25 @@ the cache TTL are served from disk at $0, misses refuse to start once the job
 budget is spent, and every call — including a failed one that already spent —
 lands in `cost_events`.
 
+**Two ways `ctx.research` refuses on money, and an app must handle both the
+same way: propagate.** `Error::BudgetExhausted` is terminal for the job (the
+worker fails it permanently rather than retrying), and it now covers a second
+case beyond "the ceiling is reached": the job's spend is **unpriceable**
+— it holds calls whose bill could not be read and none that could, so there is
+nothing to estimate the blind ones from and the cap cannot be measured at all.
+The message says which, because the operator's fix differs (find the unreadable
+bill vs. raise the ceiling). `ctx.remaining_budget_usd()` reports `Some(0.0)` in
+that state and never the untouched budget — so an app that plans work against
+the headroom plans no paid work, which is the intended answer. An `$0`-headroom
+reading is not a reason to retry; see [runtime.md § Budgets](docs/features/runtime.md#budgets--the-cost-ledger)
+for the imputation and the `[costs] budget_imputation` rollback knob.
+
+A raw-engine app that calls `ctx.meter_with_certainty` directly (the crawler's
+seam) is what keeps this honest: pass the certainty the engine actually
+reported, never `Billed` for an amount you did not read. The in-memory total the
+ceiling reads advances from that argument, so a mislabelled floor is a cap the
+platform cannot enforce.
+
 Model + reasoning are chosen per job: pass a `role` (presets in `[claude.roles]`),
 or set `model` / `effort` (`low|medium|high|xhigh|max`) directly — request fields
 override the role, which overrides the config default, **per field independently**.

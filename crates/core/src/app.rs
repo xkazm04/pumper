@@ -194,12 +194,25 @@ impl AppContext {
     ///
     /// Reads the in-context running total rather than re-aggregating the ledger:
     /// this is on the pre-flight path of every metered call, so a `SELECT SUM`
-    /// here costs O(spend events so far) per call and O(n²) over a job.
+    /// here costs O(spend events so far) per call and O(n²) over a job. It
+    /// issues NO query at all — the whole verdict comes from [`SpentTotal`].
+    ///
+    /// **The headroom is charged for the calls we could not price.** It used to
+    /// be `budget - billed`, which read a Claude run killed mid-generation as
+    /// free. It is now `budget - billed - imputed`, where `imputed` is the
+    /// job's own mean price times its unpriceable call count
+    /// ([`crate::costs::impute_uncertain`]).
+    ///
+    /// **An unpriceable job reports `Some(0.0)`, never its untouched budget.**
+    /// Blindness is not headroom. The hard refusal in [`Self::require_budget`]
+    /// is what names *why* there is no room; this is the number, and a number
+    /// here must not be the more permissive of the two answers.
     pub async fn remaining_budget_usd(&self) -> Result<Option<f64>> {
-        let Some(budget) = self.budget_usd else {
-            return Ok(None);
-        };
-        Ok(Some((budget - self.spent_usd.get()).max(0.0)))
+        Ok(match self.spent_usd.verdict(self.budget_usd) {
+            crate::costs::BudgetVerdict::Unlimited => None,
+            crate::costs::BudgetVerdict::Headroom(remaining) => Some(remaining),
+            crate::costs::BudgetVerdict::Unpriceable { .. } => Some(0.0),
+        })
     }
 
     /// Clamps a per-call budget ceiling to the job's remaining headroom: keep the
@@ -257,7 +270,11 @@ impl AppContext {
         certainty: SpendCertainty,
         detail: Option<&str>,
     ) {
-        self.spent_usd.add(cost_usd);
+        // The mirror advances with the SAME certainty the ledger row carries —
+        // one seam, so the in-memory total the ceiling reads cannot come to
+        // disagree with `cost_events` about how much of a job's money is a
+        // price and how much is a floor.
+        self.spent_usd.add_call(cost_usd, certainty);
         if let Err(e) = self
             .costs
             .record(
@@ -310,7 +327,17 @@ impl AppContext {
     /// permanently rather than retrying it (see [`Error::is_terminal_for_job`]).
     /// Nothing else in this method may produce that variant — a ledger read
     /// failure propagates as itself and stays retryable.
+    ///
+    /// Two refusals now, from one verdict. An **exhausted** ceiling says the
+    /// money ran out; an **unpriceable** one says we cannot tell, and the
+    /// operator's fix for the second is "find out why the bill is unreadable",
+    /// not "raise the budget" — so they must not share a message.
     async fn require_budget(&self) -> Result<Option<f64>> {
+        if let crate::costs::BudgetVerdict::Unpriceable { uncertain_calls } =
+            self.spent_usd.verdict(self.budget_usd)
+        {
+            return Err(budget_unpriceable_error(self.budget_usd, uncertain_calls));
+        }
         let remaining = self.remaining_budget_usd().await?;
         if budget_is_exhausted(remaining) {
             return Err(budget_exhausted_error(self.budget_usd));
@@ -374,13 +401,11 @@ impl AppContext {
             // Same `budget_is_exhausted` predicate the hard refusal uses — one
             // definition of "out of money", two responses: `research` errors,
             // `fetch` downgrades. They must never disagree about the boundary.
+            let verdict = self.spent_usd.verdict(self.budget_usd);
             let remaining = self.remaining_budget_usd().await?;
             if budget_is_exhausted(remaining) {
                 req.strategy = crate::fetcher::FetchStrategy::Auto;
-                budget_note = Some(format!(
-                    "claude tier skipped: job budget of ${:.2} exhausted",
-                    self.budget_usd.unwrap_or(0.0)
-                ));
+                budget_note = Some(claude_tier_skip_note(self.budget_usd, verdict));
             } else if let Some(remaining) = remaining {
                 req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
             }
@@ -795,6 +820,25 @@ fn budget_is_exhausted(remaining: Option<f64>) -> bool {
     matches!(remaining, Some(r) if r <= 0.0)
 }
 
+/// The escalation-trail line a fetch leaves when it downgrades off the Claude
+/// tier for lack of money. `fetch` degrades where `research` errors, so the two
+/// responses to one boundary must still SAY the same thing about which
+/// boundary it was: an unpriceable job is not an exhausted one, and a trail
+/// that calls it exhausted sends the reader to raise a budget that is untouched.
+fn claude_tier_skip_note(budget_usd: Option<f64>, verdict: crate::costs::BudgetVerdict) -> String {
+    match verdict {
+        crate::costs::BudgetVerdict::Unpriceable { uncertain_calls } => format!(
+            "claude tier skipped: job budget of ${:.2} is unpriceable \
+             ({uncertain_calls} call(s) with an unreadable bill, none readable)",
+            budget_usd.unwrap_or(0.0)
+        ),
+        _ => format!(
+            "claude tier skipped: job budget of ${:.2} exhausted",
+            budget_usd.unwrap_or(0.0)
+        ),
+    }
+}
+
 /// The cost-event `detail` one completed fetch leaves on the job's receipt: the
 /// escalation trail, led by an explicit **snapshot-provenance** line whenever
 /// the body came out of a stored capture instead of the live site.
@@ -845,6 +889,30 @@ fn success_spend_event(cost_usd: Option<f64>) -> (f64, SpendCertainty, Option<&'
 fn budget_exhausted_error(budget_usd: Option<f64>) -> Error {
     Error::BudgetExhausted(format!(
         "job budget of ${:.2} exhausted — aborting before further metered spend",
+        budget_usd.unwrap_or(0.0)
+    ))
+}
+
+/// The refusal for a ceiling that cannot be MEASURED, as distinct from one that
+/// has been reached.
+///
+/// Same typed variant, deliberately: it is the same fact about the job's own
+/// ledger, equally deterministic (a retry re-reads the same rows and re-refuses
+/// in the same place), and equally terminal. What differs is the sentence, and
+/// the sentence is the whole value — "exhausted" sends an operator to raise
+/// `budget_usd`, which would not help and would authorise more unmeasurable
+/// spend. This one sends them to the unreadable bills.
+///
+/// Registry `cost-evidence-and-imputation`, the degenerate case: an enforcing
+/// cap refuses in the unpriceable state, because a cap that cannot be measured
+/// is not a cap.
+fn budget_unpriceable_error(budget_usd: Option<f64>, uncertain_calls: i64) -> Error {
+    Error::BudgetExhausted(format!(
+        "job budget of ${:.2} is unpriceable: {uncertain_calls} metered call(s) \
+         have an unreadable bill and none has a readable one, so this job's \
+         spend cannot be bounded — refusing further metered spend rather than \
+         reading that blindness as headroom. Find why the bill is unreadable \
+         (GET /jobs/{{id}}/costs names the calls); raising the budget cannot help",
         budget_usd.unwrap_or(0.0)
     ))
 }

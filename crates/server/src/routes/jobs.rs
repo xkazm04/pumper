@@ -4,7 +4,10 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use pumper_core::costs::{headroom_certainty, total_certainty, SpendCertainty};
+use pumper_core::config::BudgetImputation;
+use pumper_core::costs::{
+    budget_verdict, headroom_certainty, total_certainty, BudgetVerdict, JobSpend, SpendCertainty,
+};
 use pumper_core::{EnqueueOptions, Job, JobStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -480,7 +483,7 @@ pub(crate) async fn cancel_job(
     tag = "costs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "`{job_id, app, total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, calls, fresh_records, cost_per_fresh_record_usd, cost_per_fresh_record_unavailable, budget_usd, budget_remaining_usd, budget_remaining_certainty, events}`. `billed_usd` is the money we can price; `total_certainty` is `exact` or `at_least`."),
+        (status = 200, description = "`{job_id, app, total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, calls, fresh_records, cost_per_fresh_record_usd, cost_per_fresh_record_unavailable, budget_usd, budget_remaining_usd, budget_remaining_certainty, budget_imputed_usd, budget_imputation, unpriceable, breached, events}`. `billed_usd` is the money we can price; `total_certainty` is `exact` or `at_least`. `budget_remaining_usd` is charged for the calls we could not price and `budget_imputed_usd` says how much of that charge is an estimate; it is `null` with `unpriceable: true` when the job has unreadable bills and no readable one, where the ceiling refuses further metered spend."),
         (status = 404, description = "Job not found", body = Object),
     )
 )]
@@ -498,7 +501,10 @@ pub(crate) async fn job_costs(
             + r.get("changed").and_then(Value::as_u64).unwrap_or(0)
     });
     let (cost_per_fresh_record, unavailable) = fresh_record_cost(&roll, fresh);
-    let headroom = budget_headroom(job.budget_usd, roll.billed_usd);
+    // The ceiling's own view of the same events — `JobSpend` carries the
+    // `billed_calls` denominator `CostRollup` does not, and no second query is
+    // issued for it.
+    let spend = JobSpend::from_events(&events);
     let mut body = json!({
         "job_id": id,
         "app": job.app,
@@ -510,12 +516,16 @@ pub(crate) async fn job_costs(
         "fresh_records": fresh,
         "cost_per_fresh_record_usd": cost_per_fresh_record,
         "cost_per_fresh_record_unavailable": unavailable,
-        "budget_usd": job.budget_usd,
-        "budget_remaining_usd": headroom,
-        "budget_remaining_certainty": headroom_certainty(roll.uncertain_calls()),
         "events": events,
     });
     merge_certainty_fields(&mut body, &roll);
+    if let Some(obj) = body.as_object_mut() {
+        obj.extend(budget_block(
+            job.budget_usd,
+            &spend,
+            state.config.costs.budget_imputation,
+        ));
+    }
     Ok(Json(body))
 }
 
@@ -781,17 +791,59 @@ pub(crate) fn fresh_record_cost(
     }
 }
 
-/// Remaining spend headroom against a job's ceiling, floored at zero. `None`
-/// when the job carries no ceiling (which means *unlimited*, not *exhausted*).
+/// The whole budget block of `GET /jobs/{id}/costs`, as one pure function of
+/// the ceiling, the job's spend and the configured imputation policy.
 ///
-/// The ceiling itself is unchanged: `CostLedger::job_total` still sums
-/// `cost_usd`, so an unmetered call still contributes `$0` to enforcement. What
-/// changes is that the number is now LABELLED — see `headroom_certainty`, which
-/// calls this an upper bound whenever a floor went into it.
-pub(crate) fn budget_headroom(budget_usd: Option<f64>, billed_usd: f64) -> Option<f64> {
-    budget_usd
-        .filter(|b| b.is_finite())
-        .map(|b| (b - billed_usd).max(0.0))
+/// It reports the SAME verdict the enforcement point acts on
+/// (`pumper_core::costs::budget_verdict`, which `AppContext::remaining_budget_usd`
+/// and the Claude-tier downgrade also call) rather than re-deriving headroom
+/// here. A report that computes its own answer is a report that will one day
+/// tell an operator there is money left while the worker is refusing calls.
+///
+/// Four keys, and each answers a question the previous shape could not:
+///
+/// - `budget_remaining_usd` — headroom charged for the calls we could not
+///   price, or **`null`** in the unpriceable state. Not `0.0`: zero is a
+///   measurement, and this is the absence of one (registry law
+///   `nullable-never-zero`).
+/// - `budget_imputed_usd` — how much of the charge is an ESTIMATE. The
+///   estimate must announce itself; a headroom that silently includes imputed
+///   dollars is a number an operator cannot audit.
+/// - `unpriceable` — true when the job has calls we could not price and none
+///   we could, so its spend has no actionable bound. The fix is "find why the
+///   bill is unreadable", never "raise the budget".
+/// - `breached` — the ceiling was actually *reached* by charged spend, which is
+///   a different fact from `unpriceable` and must not be conflated with it: a
+///   blind job has not been shown to have overspent anything.
+pub(crate) fn budget_block(
+    budget_usd: Option<f64>,
+    spend: &JobSpend,
+    policy: BudgetImputation,
+) -> serde_json::Map<String, Value> {
+    let verdict = budget_verdict(budget_usd, *spend, policy);
+    let (remaining, unpriceable) = match verdict {
+        BudgetVerdict::Unlimited => (None, false),
+        BudgetVerdict::Headroom(r) => (Some(r), false),
+        BudgetVerdict::Unpriceable { .. } => (None, true),
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("budget_usd".into(), json!(budget_usd));
+    out.insert("budget_remaining_usd".into(), json!(remaining));
+    out.insert(
+        "budget_remaining_certainty".into(),
+        json!(headroom_certainty(spend.uncertain_calls)),
+    );
+    out.insert(
+        "budget_imputed_usd".into(),
+        json!(spend.imputed_usd(policy)),
+    );
+    out.insert("budget_imputation".into(), json!(policy.as_str()));
+    out.insert("unpriceable".into(), json!(unpriceable));
+    out.insert(
+        "breached".into(),
+        json!(matches!(verdict, BudgetVerdict::Headroom(r) if r <= 0.0)),
+    );
+    out
 }
 
 /// Every place in the server crate that turns `cost_events.cost_usd` into a
@@ -1085,37 +1137,142 @@ mod cost_certainty_tests {
         assert_eq!(fresh_record_cost(&roll, None), (None, None));
     }
 
-    /// Headroom is arithmetic on the billed sum only, and is labelled an upper
-    /// bound exactly when a floor went into it.
+    /// Headroom is CHARGED for the calls we could not price, and is labelled an
+    /// upper bound exactly when a floor went into it.
+    ///
+    /// **This assertion was inverted, on purpose.** It used to pin
+    /// `Some(0.70)` for a job with an unreadable bill with the comment "the
+    /// ceiling arithmetic is deliberately UNCHANGED" — that WAS the defect, and
+    /// the guard made it a promise. The new expression is pinned here and the
+    /// old one is explicitly forbidden, so the blind answer cannot come back
+    /// quietly under either policy.
     #[test]
     fn headroom_is_labelled_an_upper_bound_when_spend_is_a_floor() {
-        let certain = roll_up(&[event(0.30, SpendCertainty::Billed)]);
-        assert_eq!(budget_headroom(Some(1.0), certain.billed_usd), Some(0.70));
-        assert_eq!(headroom_certainty(certain.uncertain_calls()), "exact");
+        let certain = JobSpend::from_events(&[event(0.30, SpendCertainty::Billed)]);
+        let block = budget_block(Some(1.0), &certain, BudgetImputation::WindowMean);
+        assert_eq!(block["budget_remaining_usd"], json!(0.70));
+        assert_eq!(block["budget_remaining_certainty"], json!("exact"));
+        assert_eq!(block["budget_imputed_usd"], json!(0.0));
+        assert_eq!(block["unpriceable"], json!(false));
+        assert_eq!(block["breached"], json!(false));
 
-        let floored = roll_up(&[
+        let floored = JobSpend::from_events(&[
             event(0.30, SpendCertainty::Billed),
             event(0.0, SpendCertainty::Unmetered),
         ]);
+        let block = budget_block(Some(1.0), &floored, BudgetImputation::WindowMean);
         assert_eq!(
-            budget_headroom(Some(1.0), floored.billed_usd),
-            Some(0.70),
-            "the ceiling arithmetic is deliberately UNCHANGED"
+            block["budget_remaining_usd"],
+            json!(0.40),
+            "the unmetered call is charged the job's own $0.30 mean"
+        );
+        assert_ne!(
+            block["budget_remaining_usd"], json!(0.70),
+            "FORBIDDEN: $0.70 is the blind answer that read an unreadable bill              as free money"
         );
         assert_eq!(
-            headroom_certainty(floored.uncertain_calls()),
-            "at_most",
+            block["budget_imputed_usd"],
+            json!(0.30),
+            "the estimate announces itself"
+        );
+        assert_eq!(
+            block["budget_remaining_certainty"],
+            json!("at_most"),
             "a headroom derived from a floor is an upper bound, and must say so"
         );
+
+        // `off` is the no-deploy rollback and must restore the old number here.
+        let block = budget_block(Some(1.0), &floored, BudgetImputation::Off);
+        assert_eq!(block["budget_remaining_usd"], json!(0.70));
+        assert_eq!(block["budget_imputed_usd"], json!(0.0));
+    }
+
+    /// A job with unreadable bills and NO readable one has no headroom anybody
+    /// can act on: `null`, not `0.0` (that is a measurement) and certainly not
+    /// the untouched budget. `breached` stays false — a blind job has not been
+    /// shown to have overspent anything.
+    #[test]
+    fn an_unpriceable_job_reports_no_headroom_rather_than_its_whole_budget() {
+        let blind = JobSpend::from_events(&[
+            event(0.0, SpendCertainty::Unmetered),
+            event(0.0, SpendCertainty::Unknown),
+        ]);
+        let block = budget_block(Some(1.0), &blind, BudgetImputation::WindowMean);
+        assert_eq!(block["unpriceable"], json!(true));
+        assert_eq!(block["budget_remaining_usd"], Value::Null);
+        assert_ne!(
+            block["budget_remaining_usd"],
+            json!(1.0),
+            "FORBIDDEN: the platform's blindness presented as the job's headroom"
+        );
+        assert_eq!(block["budget_imputed_usd"], Value::Null);
+        assert_eq!(block["breached"], json!(false));
+
+        // Unbudgeted: nothing to be blind about, so nothing to flag.
+        let block = budget_block(None, &blind, BudgetImputation::WindowMean);
+        assert_eq!(block["unpriceable"], json!(false));
+        assert_eq!(block["budget_remaining_usd"], Value::Null);
+
+        // `off` admits it against its $0 total — today's behaviour, kept.
+        let block = budget_block(Some(1.0), &blind, BudgetImputation::Off);
+        assert_eq!(block["unpriceable"], json!(false));
+        assert_eq!(block["budget_remaining_usd"], json!(1.0));
     }
 
     /// No ceiling means unlimited, not exhausted; overspend floors at zero
-    /// rather than reporting negative headroom.
+    /// rather than reporting negative headroom, and THAT is `breached`.
     #[test]
     fn no_ceiling_is_not_zero_headroom() {
-        assert_eq!(budget_headroom(None, 5.0), None);
-        assert_eq!(budget_headroom(Some(1.0), 5.0), Some(0.0));
-        assert_eq!(budget_headroom(Some(f64::NAN), 1.0), None);
+        let spend = JobSpend {
+            billed_usd: 5.0,
+            billed_calls: 1,
+            uncertain_calls: 0,
+        };
+        let on = BudgetImputation::WindowMean;
+        assert_eq!(
+            budget_block(None, &spend, on)["budget_remaining_usd"],
+            Value::Null
+        );
+        assert_eq!(budget_block(None, &spend, on)["breached"], json!(false));
+        assert_eq!(
+            budget_block(Some(1.0), &spend, on)["budget_remaining_usd"],
+            json!(0.0)
+        );
+        assert_eq!(budget_block(Some(1.0), &spend, on)["breached"], json!(true));
+        // A non-finite ceiling has never been a ceiling.
+        assert_eq!(
+            budget_block(Some(f64::NAN), &spend, on)["budget_remaining_usd"],
+            Value::Null
+        );
+    }
+
+    /// The report and the ENFORCEMENT point answer from one function. If this
+    /// drifts, `GET /jobs/{id}/costs` tells an operator there is money left
+    /// while the worker is refusing the next call.
+    #[test]
+    fn the_report_and_the_ceiling_cannot_disagree() {
+        let cases = [
+            JobSpend::default(),
+            JobSpend::from_events(&[event(0.40, SpendCertainty::Billed)]),
+            JobSpend::from_events(&[
+                event(0.40, SpendCertainty::Billed),
+                event(0.0, SpendCertainty::Unmetered),
+            ]),
+            JobSpend::from_events(&[event(0.0, SpendCertainty::Unknown)]),
+        ];
+        for policy in [BudgetImputation::WindowMean, BudgetImputation::Off] {
+            for spend in &cases {
+                let block = budget_block(Some(1.0), spend, policy);
+                let expected = match budget_verdict(Some(1.0), *spend, policy) {
+                    BudgetVerdict::Headroom(r) => json!(r),
+                    _ => Value::Null,
+                };
+                assert_eq!(
+                    block["budget_remaining_usd"], expected,
+                    "report disagreed with the verdict for {spend:?} under {policy:?}"
+                );
+            }
+        }
     }
 
     /// An unknown `?certainty=` is a 400 naming the vocabulary — never a

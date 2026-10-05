@@ -32,6 +32,7 @@ pub struct Config {
     pub contracts: ContractsConfig,
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
+    pub costs: CostsConfig,
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
@@ -167,6 +168,69 @@ impl Default for RefresherConfig {
             retention_days: 30,
         }
     }
+}
+
+/// How the per-job budget ceiling charges the calls it could not price.
+///
+/// Migration 0045 gave every `cost_events` row a typed `spend_certainty`, so
+/// the store can say whether money actually moved. The ceiling could not read
+/// it: a Claude run killed mid-generation records `cost_usd = 0.0` with
+/// `spend_certainty = 'unmetered'`, and the ceiling summed the `0.0`. The run
+/// that spent the most contributed nothing to its own cap, and the Claude tier
+/// is both the only tier that spends real money and the only one that can
+/// produce such a row.
+///
+/// Registry: `llm-observability/usage-limit-governance/cost-evidence-and-imputation`
+/// — charge each unpriceable call the mean of the *priced* calls in the same
+/// window, keep the estimate in the EVALUATION and never in the stored row, and
+/// disclose the imputed share beside the current value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetImputation {
+    /// **Default.** An unpriceable call is charged the mean of the job's own
+    /// priced calls, and a job with unpriceable calls and *no* priced call is
+    /// REFUSED rather than admitted against its untouched budget.
+    ///
+    /// The window is the job's own ledger, not a fleet-wide average: a cap is
+    /// per job, and borrowing another job's prices to spend this job's money is
+    /// a number with no owner. The refusal is the operator's chosen policy and
+    /// the registry technique's own degenerate case — "a cap that cannot be
+    /// measured is not a cap", so blindness must never be read as headroom.
+    #[default]
+    WindowMean,
+    /// The pre-0045 ceiling: sum `cost_usd` and only `cost_usd`. An unreadable
+    /// bill contributes `$0.00` and an unpriceable job is admitted.
+    ///
+    /// Kept reachable on purpose: it is the **no-deploy rollback** for the
+    /// tightening above, and `crates/core/tests/budget_imputation.rs` proves
+    /// the two policies against one table so "byte-identical to before" stays a
+    /// test rather than a claim.
+    Off,
+}
+
+impl BudgetImputation {
+    /// Whether the ceiling charges for what it cannot price.
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::WindowMean)
+    }
+
+    /// The wire/report spelling, for the surfaces that disclose the policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowMean => "window_mean",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Cost-ledger policy: today, only how the per-job ceiling treats the calls it
+/// could not price. See [`BudgetImputation`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CostsConfig {
+    /// `window_mean` (default) | `off`. An unknown value is a startup error
+    /// naming the vocabulary — a typo must not silently un-enforce a cap.
+    pub budget_imputation: BudgetImputation,
 }
 
 /// Information economics (M04): joining the cost ledger with per-job yield

@@ -24,7 +24,7 @@ use pumper_core::costs::{
     budget_verdict, impute_uncertain, BudgetVerdict, CostLedger, JobSpend, SpendCertainty,
     SpentTotal,
 };
-use pumper_core::testing::{TempStore, TestContext};
+use pumper_core::testing::{engines_with, Dead, ScriptedResearcher, TempStore, TestContext};
 use pumper_core::{Error, ResearchRequest};
 use uuid::Uuid;
 
@@ -33,6 +33,26 @@ const OFF: BudgetImputation = BudgetImputation::Off;
 
 fn job() -> Uuid {
     Uuid::new_v4()
+}
+
+/// A context whose researcher ANSWERS, so "admitted" and "refused" are told
+/// apart by whether the engine was reached rather than by which error came
+/// back. [`Dead`] panics on any call, which cannot express "this job still
+/// runs".
+fn scripted(
+    store: &TempStore,
+    budget_usd: Option<f64>,
+    engine: Arc<ScriptedResearcher>,
+) -> pumper_core::AppContext {
+    let mut b = TestContext::new(&store.storage, "demo").engines(engines_with(
+        Arc::new(Dead),
+        Arc::new(Dead),
+        engine,
+    ));
+    if let Some(budget) = budget_usd {
+        b = b.budget_usd(budget);
+    }
+    b.build()
 }
 
 /// Seeds a ledger with `(cost_usd, certainty)` rows and returns the job's
@@ -190,9 +210,8 @@ async fn an_unpriceable_job_refuses_instead_of_reading_blindness_as_headroom() {
     assert_eq!(spend.uncertain_calls, 2);
     assert_eq!(spend.imputed_usd(ON), None, "nothing to impute from");
 
-    let mut ctx = TestContext::new(&store.storage, "demo")
-        .budget_usd(1.00)
-        .build();
+    let engine = Arc::new(ScriptedResearcher::new().always_text("expensive answer"));
+    let mut ctx = scripted(&store, Some(1.00), engine.clone());
     ctx.job_id = job_id;
     ctx.spent_usd = Arc::new(SpentTotal::from_spend(spend, ON));
 
@@ -223,6 +242,11 @@ async fn an_unpriceable_job_refuses_instead_of_reading_blindness_as_headroom() {
         err.is_terminal_for_job(),
         "the refusal is deterministic — retrying re-reads the same ledger"
     );
+    assert_eq!(
+        engine.call_count(),
+        0,
+        "the refusal must land BEFORE the engine — a call that reaches the CLI          has already spent the money the cap exists to withhold"
+    );
 }
 
 /// The other half of ACCEPTANCE 3: this tightening touches budgeted jobs only.
@@ -231,7 +255,8 @@ async fn an_unpriceable_job_refuses_instead_of_reading_blindness_as_headroom() {
 #[tokio::test]
 async fn an_unbudgeted_job_in_the_same_state_still_runs() {
     let store = TempStore::new("budget-imputation-unbudgeted").await;
-    let mut ctx = TestContext::new(&store.storage, "demo").build();
+    let engine = Arc::new(ScriptedResearcher::new().always_text("an answer"));
+    let mut ctx = scripted(&store, None, engine.clone());
     ctx.spent_usd = Arc::new(SpentTotal::from_spend(
         JobSpend {
             billed_usd: 0.0,
@@ -246,14 +271,10 @@ async fn an_unbudgeted_job_in_the_same_state_still_runs() {
         None,
         "no ceiling means unlimited, not unpriceable"
     );
-    let err = ctx
-        .research(ResearchRequest::new("an unbudgeted question"))
+    ctx.research(ResearchRequest::new("an unbudgeted question"))
         .await
-        .expect_err("the Dead test engine always errors");
-    assert!(
-        !matches!(err, Error::BudgetExhausted(_)),
-        "an unbudgeted job was refused for the platform's blindness: {err:?}"
-    );
+        .expect("an unbudgeted job must still run");
+    assert_eq!(engine.call_count(), 1, "the engine was never reached");
 }
 
 // ── case 4 — the unlimited path stays free of the ledger ────────────────────
@@ -347,9 +368,8 @@ async fn off_is_todays_blind_ceiling_exactly() {
         ],
     )
     .await;
-    let mut ctx = TestContext::new(&store.storage, "demo")
-        .budget_usd(1.00)
-        .build();
+    let engine = Arc::new(ScriptedResearcher::new().always_text("admitted answer"));
+    let mut ctx = scripted(&store, Some(1.00), engine.clone());
     ctx.spent_usd = Arc::new(SpentTotal::from_spend(blind, OFF));
     assert_eq!(
         ctx.remaining_budget_usd().await.unwrap(),
@@ -357,14 +377,10 @@ async fn off_is_todays_blind_ceiling_exactly() {
         "off reads blindness as the full budget — which is exactly the defect, \
          kept reachable on purpose as the no-deploy rollback"
     );
-    let err = ctx
-        .research(ResearchRequest::new("admitted under off"))
+    ctx.research(ResearchRequest::new("admitted under off"))
         .await
-        .expect_err("the Dead test engine always errors");
-    assert!(
-        !matches!(err, Error::BudgetExhausted(_)),
-        "off must admit the unpriceable job: {err:?}"
-    );
+        .expect("off must admit the unpriceable job");
+    assert_eq!(engine.call_count(), 1, "the engine was never reached");
 }
 
 /// The verdict is one closed vocabulary, and `Unlimited` outranks
