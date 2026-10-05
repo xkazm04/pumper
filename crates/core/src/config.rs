@@ -597,6 +597,30 @@ pub struct ResilienceConfig {
     /// looked at. `0` would let a source un-quarantine itself on the first run
     /// that happened not to trip, so it is rejected.
     pub recovery_runs: u32,
+    /// Sources (`"<app>/<dataset>"`) whose stored verdicts are allowed to gate
+    /// anything, when `enforce` is off. Opt-in per source, exactly like
+    /// `auto_retire` below and for the same reason: the risk a verdict is wrong
+    /// is a property of one source, so the decision to act on it belongs at one
+    /// source too.
+    ///
+    /// Composition, which is the whole of the design:
+    ///
+    /// - `enforce = true` arms **every** source and always will. An allowlist
+    ///   may widen arming from nothing; it may never narrow it from all, so a
+    ///   list beside `enforce = true` is redundant rather than restrictive —
+    ///   reported as `redundant_sources` by `GET /enforcement/preview` rather
+    ///   than quietly un-enforcing a fleet.
+    /// - `enforce = false` + a non-empty list arms exactly the listed sources.
+    /// - `enforce = false` + an empty list (the shipping default) arms nothing,
+    ///   which is soak mode byte for byte: no source is read on the write path.
+    ///   An unset allowlist means **none**, never all.
+    /// - `enabled = false` is still the absolute off and fronts all of the
+    ///   above.
+    ///
+    /// Matched verbatim against the source id, so a typo arms nothing — which
+    /// is why the preview reports unmatched entries as `armed_unseen` rather
+    /// than letting a non-rollout look like a successful one.
+    pub enforce_sources: Vec<String>,
     /// Sources (`"<app>/<dataset>"`) allowed to retire themselves on sustained
     /// permanent fetch failure. Opt-in per source: retirement stops scheduling,
     /// so no source reaches it by default. Empty = nothing ever auto-retires.
@@ -634,6 +658,9 @@ impl Default for ResilienceConfig {
             // to degrade, three consecutive to quarantine): recovery should cost
             // at least what the fall did.
             recovery_runs: 3,
+            // Nothing armed. The default does not move: an empty allowlist
+            // under `enforce = false` is today's soak mode exactly.
+            enforce_sources: Vec::new(),
             auto_retire: Vec::new(),
             golden_refresh_days: 30,
         }

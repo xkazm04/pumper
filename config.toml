@@ -263,10 +263,19 @@ enabled = false
 [resilience]
 enabled = true
 enforce = false             # false = compute and store every verdict, gate NOTHING (soak mode).
-                            # Flip to true only after `GET /sources` shows the false-positive
-                            # rate is acceptable on real data: on an unattended box a false
-                            # quarantine that silently stops a working pipeline is worse than
-                            # a detection that arrives a week late.
+                            # true arms the WHOLE fleet at once, which is a fleet-wide
+                            # precondition for a per-source risk. Prefer enforce_sources below:
+                            # arm the source whose preview you have actually read, one at a time.
+# enforce_sources = []      # sources ("<app>/<dataset>") armed while enforce = false. Opt-in per
+                            # source, exactly like auto_retire. Run `just enforcement-preview`,
+                            # read what enforcement WOULD have done to one source, then add that
+                            # one source here. Empty (the default) arms nothing: an unset
+                            # allowlist means none, never all. enforce = true still arms
+                            # everything and a list beside it is redundant, never a restriction —
+                            # the preview reports it as `redundant_sources`. A typo arms nothing
+                            # and surfaces as `armed_unseen` rather than as a quiet non-rollout.
+                            # `enabled = false` above remains the absolute off.
+                            # Disarming is deleting a line; it needs no rebuild.
 min_cohort_docs = 30        # documents a run needs before distributional tests apply. A run below
                             # it is recorded `below_cohort`: not judged, and NOT baseline material
                             # (a source that never reaches the floor reads `monitored: false`)

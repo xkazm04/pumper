@@ -929,6 +929,63 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+// ---- arming: which sources a verdict may act on ----------------------------
+
+/// Whether enforcement is armed for one source — the single predicate between
+/// `[resilience]` config and any enforcement consequence.
+///
+/// Deliberately the same shape as [`retirement_enrolled`] below: one pure
+/// function over the configured list and the source id, matched verbatim. The
+/// asymmetry this removes is that retirement, which *stops scheduling a source
+/// entirely*, was already opt-in per source, while enforcement, which at worst
+/// diverts writes into a shadow dataset every existing tool can read, was one
+/// fleet-wide boolean.
+///
+/// The composition is `enforce || listed`, and the order of those two terms is
+/// the policy:
+///
+/// - **`enforce = true` arms everything, always.** It is the allow-any flag and
+///   it keeps its old meaning exactly, so no deployment's behaviour moves. An
+///   allowlist may widen arming from nothing; it may never narrow it from all.
+///   A list set beside `enforce = true` is therefore redundant, and is
+///   *reported* as redundant rather than silently un-enforcing a fleet.
+/// - **An empty list arms nothing.** An unset allowlist means none, never all:
+///   nobody who has not named a source has asked for that source to be gated.
+///
+/// `[resilience] enabled` is NOT a term here. It fronts this predicate at the
+/// call site ([`super::store::Resilience::armed`]) and stays the absolute off,
+/// because an absolute kill switch that any later key can participate in is not
+/// one.
+pub fn enforcement_armed(enforce: bool, enforce_sources: &[String], source_id: &str) -> bool {
+    enforce || enforce_sources.iter().any(|s| s == source_id)
+}
+
+/// Whether *any* source could be armed, without naming one.
+///
+/// This is what the cheap short-circuits ask. Four worker gates and the health
+/// routes need to know "is there any point looking at health at all" before
+/// they walk their per-pair loops, and answering that per pair would turn a
+/// zero-read no-op into one read per dataset on every job in soak mode.
+pub fn enforcement_armed_anywhere(enforce: bool, enforce_sources: &[String]) -> bool {
+    enforce || !enforce_sources.is_empty()
+}
+
+/// `enforce_sources` entries that match no known source id, in configured
+/// order and de-duplicated.
+///
+/// A typo arms nothing, and arming nothing looks exactly like a fleet that is
+/// already fine. Naming the unmatched entries is what keeps a failed rollout
+/// from reading as a successful one.
+pub fn unseen_armed_sources(enforce_sources: &[String], known: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for want in enforce_sources {
+        if !known.iter().any(|k| k == want) && !out.iter().any(|o| o == want) {
+            out.push(want.clone());
+        }
+    }
+    out
+}
+
 // ---- retirement: a dead source, on its own denominator ---------------------
 
 /// Share of a run's attempted fetches that must be permanent failures, and
@@ -1923,6 +1980,63 @@ mod tests {
             dead_run(0, 40, 40, 40),
         ];
         assert!(retirement_due(&unknown, None));
+    }
+
+    #[test]
+    fn an_empty_arming_list_arms_nothing_not_everything() {
+        // The one design decision in per-source arming, and the direction it
+        // must never be taken: an unset allowlist admitting everything would
+        // turn an upgrade into a fleet-wide enforcement rollout nobody asked
+        // for.
+        assert!(!enforcement_armed(false, &[], "extractor/hn-items"));
+        assert!(!enforcement_armed_anywhere(false, &[]));
+    }
+
+    #[test]
+    fn a_list_widens_arming_from_nothing_and_never_narrows_it_from_all() {
+        let listed = vec!["extractor/hn-items".to_string()];
+        // enforce = false: exactly the listed source, and only it.
+        assert!(enforcement_armed(false, &listed, "extractor/hn-items"));
+        assert!(!enforcement_armed(false, &listed, "extractor/other"));
+        assert!(enforcement_armed_anywhere(false, &listed));
+        // enforce = true: everything, list or no list. A list beside it is
+        // redundant, NOT a restriction — reading it as one would silently
+        // un-enforce every source an existing deployment enforces today.
+        assert!(enforcement_armed(true, &listed, "extractor/other"));
+        assert!(enforcement_armed(true, &[], "extractor/other"));
+        assert!(enforcement_armed_anywhere(true, &[]));
+    }
+
+    #[test]
+    fn a_prefix_is_not_an_arming_and_neither_is_a_suffix() {
+        // Matched verbatim, exactly like `auto_retire`: arming "extractor" must
+        // not arm every dataset under the extractor app.
+        let listed = vec!["extractor/hn-items".to_string()];
+        assert!(!enforcement_armed(false, &listed, "extractor"));
+        assert!(!enforcement_armed(false, &listed, "extractor/hn"));
+        assert!(!enforcement_armed(false, &listed, "extractor/hn-items-2"));
+        assert!(!enforcement_armed(false, &listed, "other/hn-items"));
+    }
+
+    #[test]
+    fn an_unmatched_arming_entry_is_named_not_dropped() {
+        let listed = vec![
+            "extractor/hn-items".to_string(),
+            "extractr/hn-items".to_string(),
+            "extractr/hn-items".to_string(),
+        ];
+        let known = vec![
+            "extractor/hn-items".to_string(),
+            "grants/unified".to_string(),
+        ];
+        // The typo is reported once, in configured order; the real entry is not.
+        assert_eq!(
+            unseen_armed_sources(&listed, &known),
+            vec!["extractr/hn-items".to_string()]
+        );
+        assert!(unseen_armed_sources(&[], &known).is_empty());
+        // Nothing known yet (an empty fleet) does not excuse the silence.
+        assert_eq!(unseen_armed_sources(&listed, &[]).len(), 2);
     }
 
     #[test]
