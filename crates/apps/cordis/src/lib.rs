@@ -1895,6 +1895,61 @@ mod walk_tests {
         );
     }
 
+    /// **The refuted proof, end to end.** The last page of the corpus is served
+    /// short — 4 of 10 — by a rate-limited upstream. The offset arithmetic says
+    /// `5 * 10 = 50 >= 50`, so a walk that proves coverage from rows *requested*
+    /// calls this a complete sweep, reports `corpus_swept: true`, and wraps the
+    /// resume cursor to 0 — the exact wipe the module doc says cost "~46 weeks
+    /// of accumulated progress".
+    ///
+    /// `grants_common::walk_end` proves coverage from rows that ARRIVED
+    /// (`collected >= total`), and 44 of 50 is not a sweep. Its own doc names
+    /// the requested-rows form as the refuted one. This case is what the port
+    /// buys: the short tail stays visible and the cursor keeps its place.
+    #[tokio::test]
+    async fn a_short_last_page_is_not_a_sweep_even_when_the_offset_says_so() {
+        let store = TempStore::new("cordis-short-tail").await;
+        let api = ScriptedCordis {
+            // Page 5 of 5 comes back 4-of-10: offset 50 >= total 50, but only
+            // 44 of the 50 projects ever arrived.
+            short_page: Some((5, 4)),
+            ..ScriptedCordis::of(50)
+        };
+        let out = run(&store, api, json!({ "pageSize": 10, "maxProjects": 100 }))
+            .await
+            .expect("run");
+
+        assert_eq!(
+            out["sweep"], "short_page",
+            "rows REQUESTED reached the total; rows RECEIVED did not — a truncated \
+             tail must not read as the end of the corpus: {out}"
+        );
+        assert_eq!(out["corpus_swept"], false);
+        assert_eq!(out["ids_enumerated"], 44, "40 full + 4 short");
+        assert_eq!(
+            out["cursor_next_offset"], 44,
+            "the resume cursor keeps the place this run reached — wrapping to 0 \
+             here is the ~46-week wipe"
+        );
+        assert_ne!(out["cursor_next_offset"], json!(0), "no wipe");
+        assert!(
+            out["warnings"][0]
+                .as_str()
+                .expect("a truncated tail is reported, not swallowed")
+                .contains("TRUNCATED"),
+            "{out}"
+        );
+        // The persisted row agrees with the reported cursor: the NEXT run picks
+        // up the six projects this one never saw.
+        let state = store
+            .datasets()
+            .get("cordis", "state", "cursor")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.data["next_offset"], 44);
+    }
+
     /// The honest complete case still works: a walk that reaches the listing's
     /// arithmetic end wraps, and says so.
     #[tokio::test]
