@@ -16,43 +16,13 @@ use pumper_core::testing::TempStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
-/// Every table the full migration chain must leave behind. Add the new table
-/// here in the same change that adds the migration that creates it.
-const EXPECTED_TABLES: &[&str] = &[
-    "_sqlx_migrations",
-    "api_recipes",
-    "body_pins",
-    "checkpoints",
-    "cost_events",
-    "datahub_govern_actions",
-    "datahub_govern_levels",
-    "derived",
-    "doc_fingerprints",
-    "field_invariants",
-    "field_sketches",
-    "golden_docs",
-    "job_stages",
-    "job_yield",
-    "http_cache",
-    "ingress_sources",
-    "jobs",
-    "record_revisions",
-    "records",
-    "research_cache",
-    "revalidations",
-    "rules_versions",
-    "saved_search_seen",
-    "saved_searches",
-    "schedules",
-    "source_rulesets",
-    "source_runs",
-    "sources",
-    "tier_memory",
-    "trigger_runs",
-    "triggers",
-    "watches",
-    "webhook_deliveries",
-];
+/// Re-exported from the crate, not re-declared here. `EXPECTED_TABLES` used
+/// to live in this file, which meant the boot path could not reach the only
+/// manifest of what the schema should be: CI knew, and the running binary did
+/// not. It now lives in `pumper_core::schema` and `Storage::connect` refuses a
+/// store that is missing one of these - so a migration that creates a table
+/// without updating the constant fails this test AND a real boot.
+use pumper_core::schema::EXPECTED_TABLES;
 
 async fn table_names(pool: &SqlitePool) -> BTreeSet<String> {
     sqlx::query_scalar::<_, String>(

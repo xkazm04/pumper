@@ -47,6 +47,7 @@ pub mod recipes;
 pub mod resilience;
 #[cfg(feature = "storage")]
 pub mod retention;
+pub mod schema;
 pub mod search;
 pub mod simhash;
 
@@ -149,6 +150,10 @@ pub use plugin::{NoPlugins, Plugins};
 #[cfg(feature = "storage")]
 pub use recipes::RecipeStore;
 pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
+pub use schema::{
+    ahead_refusal, classify, missing_tables_refusal, table_drift, LedgerVerdict, SchemaReport,
+    TableDrift, EXPECTED_TABLES,
+};
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
     SearchRequest, SearchResponse, SearchSort,
