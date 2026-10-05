@@ -791,3 +791,89 @@ async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
     let baseline = store.baseline("extractor/products", 3).await.unwrap();
     assert_eq!(baseline.runs("price"), 3);
 }
+
+// ---- arming: which sources a stored verdict is allowed to act on -----------
+//
+// These two are GUARD tests. They pin the behaviour per-source arming must not
+// alter: the shipping default reads nothing on the write path, and
+// `[resilience] enabled = false` is an absolute kill switch that no arming key
+// can talk its way past. Both are green before per-source arming exists, by
+// design — that is what makes them worth having afterwards.
+
+/// Soak mode does not merely *answer* `Healthy`; it never asks.
+///
+/// Proving "zero state reads" without a mock: close the pool first. A read that
+/// happened would fail and `state` would report `Unknown` (the honest fail-open
+/// name for a failed read). `enforced_state` answering `Healthy` on a closed
+/// pool therefore proves the short-circuit returned *before* the read, which is
+/// the property the four worker gates depend on for their cheapness.
+#[tokio::test]
+async fn soak_mode_answers_healthy_without_reading_the_state_at_all() {
+    let store = fresh_db("resilience-soak-no-read").await;
+    let storage = &store.storage;
+    // The shipping default: detection on, nothing armed.
+    let health = Resilience::new(storage.pool(), &cfg());
+    let hstore = health.store().unwrap();
+    hstore.ensure_source("extractor", "products").await.unwrap();
+    hstore
+        .set_state_manual("extractor/products", SourceState::Quarantined, "test")
+        .await
+        .unwrap();
+
+    storage.pool().close().await;
+
+    assert_eq!(
+        health.state("extractor", "products").await,
+        SourceState::Unknown,
+        "a read against a closed pool must report `unknown` — if this is not \
+         Unknown the rest of this test proves nothing"
+    );
+    assert_eq!(
+        health.enforced_state("extractor", "products").await,
+        SourceState::Healthy,
+        "soak mode must short-circuit BEFORE the read, not fail-open after it"
+    );
+}
+
+/// `[resilience] enabled = false` is the absolute off. It fronts every other
+/// arming decision, so no later key — including a per-source arming list — can
+/// reach a consequence past it.
+#[tokio::test]
+async fn detection_disabled_is_the_absolute_kill_switch() {
+    let store = fresh_db("resilience-kill-switch").await;
+    let storage = &store.storage;
+    let health = Resilience::new(
+        storage.pool(),
+        &ResilienceConfig {
+            enabled: false,
+            // Deliberately contradictory: the loudest possible "enforce", under
+            // the master off.
+            enforce: true,
+            ..cfg()
+        },
+    );
+    assert!(!health.enabled(), "enabled = false must disable the store");
+    assert!(
+        !health.enforcing(),
+        "enforce = true under enabled = false must not report as enforcing"
+    );
+    let ctx = ctx(storage, Arc::new(health));
+    let datasets = Datasets::new(storage.pool());
+
+    // A quarantined verdict cannot even be recorded (there is no store), so the
+    // write path is plainly ungated: live dataset, no stamp, removals detected.
+    ctx.sync_many("products", &items(&["a", "b"]))
+        .await
+        .unwrap();
+    let summary = ctx.sync_many("products", &items(&["a"])).await.unwrap();
+    assert_eq!(summary.removed, vec!["b".to_string()]);
+    assert_eq!(
+        datasets
+            .get("extractor", "products", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
+}
