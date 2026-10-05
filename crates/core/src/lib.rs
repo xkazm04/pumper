@@ -114,8 +114,9 @@ pub use catalog::{
 pub use completeness::{judge, Completeness, Disposition, Expectation, Verdict};
 pub use config::Config;
 pub use crawl::{
-    change_weight, crawl, due_score, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot,
-    CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence, RevisitSeed,
+    change_weight, crawl, due_score, plan_revisit, CrawlConfig, CrawlPageRecord,
+    CrawlProgressSnapshot, CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence,
+    RevisitPlan, RevisitSeed, ScoredSeed,
 };
 pub use engine::{
     filled_fields_js, interaction_outcome, is_sensitive_input, parse_filled_fields,
