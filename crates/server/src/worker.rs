@@ -1402,10 +1402,10 @@ async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
 /// through `finalize` so their callback + terminal triggers fire like any other
 /// failure. Piggybacks the scheduler tick (`stale_after_secs == 0` disables it).
 pub async fn reap_once(state: &AppState) {
-    // The trigger decision ledger rides this tick (see `prune_trigger_ledger`)
+    // Both decision ledgers ride this tick (see `prune_decision_ledgers`)
     // — before the `stale_after_secs == 0` early return, because a deployment
     // with the reaper disabled still writes decisions.
-    prune_trigger_ledger(state).await;
+    prune_decision_ledgers(state).await;
     let stale = state.config.worker.stale_after_secs;
     if stale == 0 {
         return;
@@ -1463,10 +1463,14 @@ fn prune_is_due(
     }
 }
 
-/// Bounds `trigger_runs` by age, at most once per [`TRIGGER_RUN_PRUNE_EVERY`].
-/// Fail-open and quiet: a ledger that could not be pruned is a disk-space
-/// concern, never a reason to disturb the queue.
-async fn prune_trigger_ledger(state: &AppState) {
+/// Bounds `trigger_runs` and `schedule_runs` by age, at most once per
+/// [`TRIGGER_RUN_PRUNE_EVERY`]. Fail-open and quiet: a ledger that could not be
+/// pruned is a disk-space concern, never a reason to disturb the queue.
+///
+/// One function for both on purpose. A second ledger with its own clock and its
+/// own due-check is how one of them ends up swept and the other growing
+/// forever; the bound is the same and the sweep is one indexed `DELETE` each.
+async fn prune_decision_ledgers(state: &AppState) {
     let now = std::time::Instant::now();
     {
         // The guard is dropped before the await: a std Mutex must never be held
@@ -1497,6 +1501,24 @@ async fn prune_trigger_ledger(state: &AppState) {
         ),
         Ok(_) => {}
         Err(e) => warn!("trigger decision ledger prune failed: {e}"),
+    }
+    // The schedule decision ledger (migration 0047) is bounded on the SAME
+    // clock and inside the SAME due-check, so the two diagnostic ledgers cannot
+    // drift into one being swept and the other growing forever. The pass
+    // heartbeat is exempt from the sweep by the query itself -- see
+    // `Storage::prune_schedule_runs`.
+    match state
+        .storage
+        .prune_schedule_runs(TRIGGER_RUN_RETENTION_DAYS)
+        .await
+    {
+        Ok(n) if n > 0 => info!(
+            pruned = n,
+            days = TRIGGER_RUN_RETENTION_DAYS,
+            "pruned old schedule decisions"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("schedule decision ledger prune failed: {e}"),
     }
 }
 
