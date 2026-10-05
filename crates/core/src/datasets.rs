@@ -113,6 +113,18 @@ pub fn weakest_trust<'a>(labels: impl IntoIterator<Item = Option<&'a str>>) -> O
 const TRUST_PREDICATE: &str =
     "(?T IS NULL OR (CASE WHEN ?T = 'stable' THEN COALESCE(trust, 'stable') ELSE trust END) = ?T)";
 
+/// What makes a revision **replayable**: both halves of the provenance pin, plus
+/// the two `data` keys that locate the archived body.
+///
+/// One expression, shared by the listing and the count
+/// ([`Datasets::replayable_revisions`] / [`Datasets::replayable_revision_count`]),
+/// because the doctor publishes the two as one fraction ("5000 of 42117 stat'd")
+/// and a count whose predicate drifted from the listing's would be a different
+/// population wearing the same name.
+const REPLAYABLE_PREDICATE: &str = "artifact_sha IS NOT NULL AND rules_hash IS NOT NULL \
+     AND json_extract(data, '$.job_id') IS NOT NULL \
+     AND json_extract(data, '$.artifact_path') IS NOT NULL";
+
 /// [`TRUST_PREDICATE`] with its placeholder bound to parameter index `n`.
 fn trust_predicate(n: usize) -> String {
     TRUST_PREDICATE.replace("?T", &format!("?{n}"))
@@ -3217,24 +3229,42 @@ impl Datasets {
     }
 
     // ── store integrity (read-only; `datasets doctor`) ───────────────────────
+    //
+    // `REPLAYABLE_PREDICATE` (module level) is shared by the listing and its
+    // count on purpose: the doctor publishes "N of M stat'd", and the two halves
+    // of that fraction must be the same population.
     // Every query below is a SELECT. Several are FULL SCANS of `record_revisions`
     // or `records` — the audit is an on-demand operator tool, never on a hot path
     // and never on the worker loop.
+
+    /// How many replayable revisions exist at all.
+    ///
+    /// The denominator for [`Self::replayable_revisions`], which is called with
+    /// a ceiling: a body sweep that stat'd 5,000 of 42,117 revisions and found
+    /// nothing has to be able to say so, and a count that does not share the
+    /// predicate it counts over would be a different population wearing the
+    /// same name. Hence [`REPLAYABLE_PREDICATE`] rather than a second WHERE.
+    pub async fn replayable_revision_count(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM record_revisions WHERE {REPLAYABLE_PREDICATE}"
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
 
     /// Every replayable revision with the body location it claims, newest first.
     /// The doctor pairs this with the filesystem to find revisions whose stamped
     /// body is gone — a provenance claim the store can no longer honour.
     pub async fn replayable_revisions(&self, limit: i64) -> Result<Vec<ReplayableRevision>> {
-        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(&format!(
             "SELECT app, dataset, key, revision, \
                     json_extract(data, '$.job_id'), \
                     json_extract(data, '$.artifact_path') \
              FROM record_revisions \
-             WHERE artifact_sha IS NOT NULL AND rules_hash IS NOT NULL \
-               AND json_extract(data, '$.job_id') IS NOT NULL \
-               AND json_extract(data, '$.artifact_path') IS NOT NULL \
-             ORDER BY created_at DESC LIMIT ?1",
-        )
+             WHERE {REPLAYABLE_PREDICATE} \
+             ORDER BY created_at DESC LIMIT ?1"
+        ))
         .bind(limit.max(0))
         .fetch_all(&self.pool)
         .await?;
