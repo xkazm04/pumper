@@ -64,6 +64,11 @@ export interface PumperRevision<T = unknown> {
   rules_hash: string | null;
 }
 
+/** Direction of the change feed. `desc` (newest first) is the default and the
+ *  historical shape; `asc` is a forward drain a mirror can checkpoint page by
+ *  page. Anything else is a 400 from the server, never a silent fallback. */
+export type FeedOrder = "asc" | "desc";
+
 /** A keyset page of the change feed (cursor-mode response shape). */
 export interface RevisionPage<T = unknown> {
   items: PumperRevision<T>[];
@@ -71,8 +76,16 @@ export interface RevisionPage<T = unknown> {
 }
 
 /** Where the SDK persists its per-dataset sync watermark. The product owns
- *  storage (a row, a KV entry, a file) — the SDK only reads/advances it. The
- *  value is an opaque RFC3339 timestamp; treat it as a token, not a date. */
+ *  storage (a row, a KV entry, a file) — the SDK only reads/advances it.
+ *
+ *  The value is an OPAQUE POSITION in the change feed — `<created_at>|<rowid>`,
+ *  the same tuple the feed pages by — not a date. Never parse it, compare it
+ *  or derive one: a bare instant cannot name a boundary inside an
+ *  `upsert_many` chunk, where up to 500 revisions share one `created_at`, and
+ *  resuming from one skips the siblings the last run did not reach.
+ *
+ *  A value written by an earlier SDK version (a bare RFC3339 instant) is still
+ *  accepted and is upgraded in place on the first run: no resync. */
 export interface WatermarkStore {
   get(dataset: DatasetRef): Promise<string | null>;
   set(dataset: DatasetRef, watermark: string): Promise<void>;
@@ -101,8 +114,16 @@ export interface SyncResult {
   upserted: number;
   tombstoned: number;
   /** The watermark persisted at the end of this run (null if the dataset was
-   *  empty and nothing advanced it). */
+   *  empty and nothing advanced it). Opaque — see `WatermarkStore`. */
   watermark: string | null;
+  /** Feed items the SDK refused to apply (today: a non-`removed` revision with
+   *  a null post-image). Previously these were dropped with no signal at all;
+   *  a non-zero count means the mirror is behind on purpose, not quietly. */
+  anomalies?: number;
+  /** True when the drain stopped at an anomaly rather than reaching the end of
+   *  the feed. The watermark is left BEFORE the offending revision, so the run
+   *  is repeatable once the feed is fixed. */
+  stalled?: boolean;
 }
 
 export interface SyncProgress {

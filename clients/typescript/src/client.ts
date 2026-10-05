@@ -4,7 +4,7 @@
 // changes); use `createPumperSync` for continuous mirroring.
 
 import { getJson, streamNdjson, type HttpOptions } from "./http.js";
-import type { DatasetRef, PumperRecord, RevisionPage } from "./types.js";
+import type { DatasetRef, FeedOrder, PumperRecord, RevisionPage } from "./types.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8088";
 
@@ -53,9 +53,17 @@ export class PumperClient {
     return streamNdjson<PumperRecord<T>>(url, { ...this.http, signal });
   }
 
-  /** One keyset page of the change feed (newest-first). `since` is an exclusive
-   *  RFC3339 lower bound; `cursor` (even empty) selects the paged response shape
-   *  and walks the full feed past the legacy 1000-row clamp.
+  /** One keyset page of the change feed. `since` is an exclusive RFC3339 lower
+   *  bound; `cursor` (even empty) selects the paged response shape and walks
+   *  the full feed past the legacy 1000-row clamp.
+   *
+   *  `order` is newest-first (`desc`) unless given. Pass `"asc"` for a forward
+   *  drain a mirror can checkpoint page by page — then `cursor` is the only
+   *  position that matters and `since` should be left null, because a bare
+   *  instant has no tiebreak and would skip the siblings of its own boundary
+   *  stamp. An ascending page carries a `next_cursor` whenever it is
+   *  non-empty, including the last short one, so there is always a position to
+   *  store.
    *
    *  Explicitly requests `trust=stable` (the server default) — an incremental
    *  mirror should apply only revisions Pumper stands behind; a consumer that
@@ -68,12 +76,17 @@ export class PumperClient {
     cursor: string,
     limit = 1000,
     trust: string = "stable",
+    order?: FeedOrder,
   ): Promise<RevisionPage<T>> {
     const q = new URLSearchParams();
     if (since) q.set("since", since);
     q.set("cursor", cursor);
     q.set("limit", String(limit));
     q.set("trust", trust);
+    // Omitted entirely unless asked for, so the default request — and
+    // therefore the default response body — is byte-identical to what every
+    // existing consumer already gets.
+    if (order !== undefined) q.set("order", order);
     const url = `${this.dataset(ds)}/changes?${q.toString()}`;
     return getJson<RevisionPage<T>>(url, this.http);
   }

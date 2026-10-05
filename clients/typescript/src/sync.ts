@@ -5,9 +5,11 @@
 // commits — so a crash mid-run re-processes idempotently rather than skipping.
 
 import { PumperClient, type PumperClientConfig } from "./client.js";
+import { formatWatermark, normalizeStamp, parseWatermark } from "./watermark.js";
 import type {
   DatasetRef,
   MapContext,
+  PumperRevision,
   SyncProgress,
   SyncResult,
   SyncSink,
@@ -26,7 +28,12 @@ export interface PumperSyncConfig<TRaw = unknown, TOut = TRaw> extends PumperCli
   /** Optional per-record transform on the way into the sink. Return null to drop
    *  a record. Omit for a straight canonical mirror. */
   map?: (raw: TRaw, ctx: MapContext) => TOut | null;
-  /** Flush the sink every N records (snapshot mode). Default 500. */
+  /** Page size: the snapshot flushes the sink every N records, and the
+   *  incremental drain requests N revisions per page and checkpoints after
+   *  each one. Default 500. (Before the feed gained a forward order the
+   *  incremental path ignored this and buffered the whole backlog — it had
+   *  to: a watermark taken from a newest-first page jumps over the older
+   *  pages not yet applied.) */
   batchSize?: number;
   onProgress?: (p: SyncProgress) => void;
   /** Stop a long snapshot stream. */
@@ -37,6 +44,47 @@ export interface PumperSyncConfig<TRaw = unknown, TOut = TRaw> extends PumperCli
  *  fixed-width UTC micros, so string order == chronological order. */
 function laterIso(a: string | null, b: string): string {
   return a === null || b > a ? b : a;
+}
+
+/** What one ascending feed page means for the sink, decided in memory before
+ *  anything is written.
+ *
+ *  Two anti-patterns it exists to forbid, both of which were inline in the
+ *  paging loop:
+ *
+ *  - `seen.add(key)` ran BEFORE the `data !== null` test, so a `changed`
+ *    revision whose post-image was null consumed the key for the rest of the
+ *    run AND let the watermark advance past it. The record was then neither
+ *    written nor reachable again: permanent divergence, no error, no counter.
+ *  - "first wins" dedupe, which is only correct on a newest-first feed. Going
+ *    forward, the LAST revision for a key in the page is its latest.
+ *
+ *  A null post-image on a non-`removed` revision is a contradiction in the
+ *  feed, so the page STALLS: nothing from it is applied, the caller does not
+ *  checkpoint, and the anomaly is counted rather than swallowed. */
+export function planPage<TRaw, TOut>(
+  items: PumperRevision<TRaw>[],
+  toOut: (raw: TRaw, ctx: MapContext) => TOut | null,
+): { upserts: Array<{ key: string; data: TOut }>; tombstones: string[]; anomalies: number; stalled: boolean } {
+  const latest = new Map<string, { kind: "upsert"; data: TOut } | { kind: "tombstone" } | { kind: "drop" }>();
+  for (const rev of items) {
+    if (rev.change === "removed") {
+      latest.set(rev.key, { kind: "tombstone" });
+      continue;
+    }
+    if (rev.data === null) {
+      return { upserts: [], tombstones: [], anomalies: 1, stalled: true };
+    }
+    const out = toOut(rev.data, { key: rev.key, updatedAt: rev.created_at, change: rev.change });
+    latest.set(rev.key, out === null ? { kind: "drop" } : { kind: "upsert", data: out });
+  }
+  const upserts: Array<{ key: string; data: TOut }> = [];
+  const tombstones: string[] = [];
+  for (const [key, verdict] of latest) {
+    if (verdict.kind === "upsert") upserts.push({ key, data: verdict.data });
+    else if (verdict.kind === "tombstone") tombstones.push(key);
+  }
+  return { upserts, tombstones, anomalies: 0, stalled: false };
 }
 
 class PumperSync<TRaw, TOut> {
@@ -90,43 +138,73 @@ class PumperSync<TRaw, TOut> {
     }
     await flush();
 
-    if (watermark !== null) await this.cfg.watermark.set(dataset, watermark);
-    return { mode: "snapshot", upserted, tombstoned, watermark };
+    // A snapshot has no feed position to stand on, so it writes the oldest
+    // position at or below the newest record stamp it saw: rowid 0, which
+    // re-reads that stamp's whole chunk on the next incremental run instead
+    // of skipping the siblings committed after this stream started.
+    const position = watermark === null ? null : `${normalizeStamp(watermark)}|0`;
+    if (position !== null) await this.cfg.watermark.set(dataset, position);
+    return { mode: "snapshot", upserted, tombstoned, watermark: position, anomalies: 0, stalled: false };
   }
 
-  private async incremental(since: string): Promise<SyncResult> {
+  /** Drain the feed FORWARD from the stored position, applying and
+   *  checkpointing one page at a time.
+   *
+   *  Forward is what makes the checkpoint sound. On the newest-first feed the
+   *  only safe strategy was to buffer everything and write one watermark at
+   *  the end, so a consumer that could not finish a single run never made any
+   *  progress at all. Oldest-first, the last row of each applied page is a
+   *  position every earlier revision is behind, so a crash costs at most one
+   *  page of re-delivery. */
+  private async incremental(stored: string): Promise<SyncResult> {
     const { dataset, sink } = this.cfg;
-    // The feed is newest-first, so the FIRST revision we see for a key is its
-    // latest — track seen keys and skip older duplicates so the latest wins.
-    const seen = new Set<string>();
-    const upserts: Array<{ key: string; data: TOut }> = [];
-    const tombstones: string[] = [];
-    let watermark = since;
-    let cursor = "";
+    const start = parseWatermark(stored);
+    let watermark = start === null ? stored : formatWatermark(start);
+    let upserted = 0;
+    let tombstoned = 0;
+    let anomalies = 0;
+    let stalled = false;
 
     for (;;) {
-      const page = await this.client.changesPage<TRaw>(dataset, since, cursor);
-      for (const rev of page.items) {
-        watermark = laterIso(watermark, rev.created_at);
-        if (seen.has(rev.key)) continue;
-        seen.add(rev.key);
-        if (rev.change === "removed") {
-          tombstones.push(rev.key);
-        } else if (rev.data !== null) {
-          const out = this.toOut(rev.data, { key: rev.key, updatedAt: rev.created_at, change: rev.change });
-          if (out !== null) upserts.push({ key: rev.key, data: out });
-        }
+      // The stored watermark IS the cursor: one token, one meaning.
+      const page = await this.client.changesPage<TRaw>(
+        dataset,
+        null,
+        watermark,
+        this.batchSize,
+        "stable",
+        "asc",
+      );
+      if (page.items.length === 0) break;
+
+      const plan = planPage<TRaw, TOut>(page.items, (raw, ctx) => this.toOut(raw, ctx));
+      anomalies += plan.anomalies;
+      if (plan.stalled) {
+        // Nothing from this page is applied and the watermark does not move
+        // past the anomaly: a revision the SDK cannot interpret must not be
+        // silently consumed. The run reports it instead of diverging.
+        stalled = true;
+        break;
       }
-      if (!page.next_cursor) break;
-      cursor = page.next_cursor;
+      if (plan.upserts.length) upserted += await sink.upsert(plan.upserts);
+      if (plan.tombstones.length) tombstoned += await sink.tombstone(plan.tombstones);
+      this.cfg.onProgress?.({ mode: "incremental", upserted, tombstoned });
+
+      // Checkpoint only after the sink settled for THIS page.
+      if (page.next_cursor === null) break;
+      watermark = page.next_cursor;
+      await this.cfg.watermark.set(dataset, watermark);
+      if (page.items.length < this.batchSize) break;
     }
 
-    const upserted = upserts.length ? await sink.upsert(upserts) : 0;
-    const tombstoned = tombstones.length ? await sink.tombstone(tombstones) : 0;
-    this.cfg.onProgress?.({ mode: "incremental", upserted, tombstoned });
+    // One final write even when nothing moved: it upgrades a legacy bare
+    // RFC3339 value to a position in place (no resync for anyone already
+    // mirroring), and it keeps `result.watermark` equal to what is actually
+    // stored. Skipped on a stall, where the stored value must stay BEFORE the
+    // revision the drain refused.
+    if (!stalled) await this.cfg.watermark.set(dataset, watermark);
 
-    await this.cfg.watermark.set(dataset, watermark);
-    return { mode: "incremental", upserted, tombstoned, watermark };
+    return { mode: "incremental", upserted, tombstoned, watermark, anomalies, stalled };
   }
 }
 
