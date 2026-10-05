@@ -50,18 +50,28 @@
 //! hammering the API in one go.
 //!
 //! **Sweep honesty.** The cursor is an *offset into the listing*, not a page
-//! number, and only a walk that provably reached the end wraps it. See
-//! [`SweepEnd`]: a page shorter than `pageSize` while the listing's own reported
-//! total says more remains is a truncation, not the end of the corpus — treating
-//! it as the end used to reset ~46 weeks of accumulated progress to page 1 while
-//! reporting `corpus_swept: true`. And because the cursor counts *consumed ids*,
-//! a `maxProjects` that is not a multiple of `pageSize` re-visits the truncated
-//! tail on the next run instead of stepping over it for a whole corpus cycle.
+//! number, and only a walk that provably reached the end wraps it. The judge is
+//! [`grants_common::walk_end`] — the grants family's one sweep vocabulary, not a
+//! copy of it: a page shorter than `pageSize` while the listing's own reported
+//! total says more remains is a truncation, not the end of the corpus, and
+//! treating it as the end used to reset ~46 weeks of accumulated progress to
+//! page 1 while reporting `corpus_swept: true`.
+//!
+//! What proves the end is **records received**, never the offset requested.
+//! This app carried a private fork that asked `page * page_size >= total` — the
+//! rows it *asked* for — so a final page served 12-of-100 by a rate-limited
+//! upstream still cleared the total and wrapped the cursor. The shared judge
+//! asks `collected >= total`, counted in listing positions consumed. And
+//! because the cursor counts *consumed ids*, a `maxProjects` that is not a
+//! multiple of `pageSize` re-visits the truncated tail on the next run instead
+//! of stepping over it for a whole corpus cycle.
 
 use std::collections::{HashMap, HashSet};
 
-use app_eu_sedia::topic_lineage;
 use async_trait::async_trait;
+use grants_common::{
+    empty_listing_is_drift, empty_page_is_drift, topic_lineage, walk_end, SweepEnd,
+};
 use pumper_core::{
     AppContext, AppManifest, ChangeKind, CostClass, Error, HttpRequest, ManifestExample,
     Provenance, Result, ScrapeApp,
@@ -255,7 +265,7 @@ impl ScrapeApp for Cordis {
             })?;
             total = page_total;
             let got = hits.len() as u64;
-            if pages_fetched == 0 && empty_first_page_is_drift(page, page_size, total, got) {
+            if pages_fetched == 0 && empty_page_is_drift(page, page_size, total, got) {
                 // `SourceDrift`, not `App`: terminal for the job.
                 return Err(Error::SourceDrift(format!(
                     "cordis: API reported {total} results but listing page {page} parsed 0 \
@@ -285,13 +295,20 @@ impl ScrapeApp for Cordis {
             consumed += taken;
             pages_fetched += 1;
             let leftover = got.saturating_sub(skip_here).saturating_sub(taken);
+            // Coverage is proved by listing positions CONSUMED, never by the
+            // offset this page was requested at: a page that asked for 100 and
+            // served 12 still advances the offset by 100, and reading
+            // `page * page_size >= total` off that is how a truncated tail used
+            // to report a complete sweep and wrap the cursor. `capped` carries
+            // cordis's own budget, which is projects rather than pages: an
+            // untaken `leftover` means the cap cut this page mid-way, and
+            // `full` means the run has its `maxProjects`.
             if let Some(reason) = walk_end(
-                page,
                 page_size,
                 total,
                 got,
-                leftover,
-                ids.len() as u64 >= max_projects,
+                start_offset + consumed,
+                leftover > 0 || ids.len() as u64 >= max_projects,
             ) {
                 end = reason;
                 break;
@@ -515,123 +532,6 @@ impl ScrapeApp for Cordis {
         }
         Ok(out)
     }
-}
-
-/// How the listing walk ended — the four-way distinction the single
-/// `exhausted` flag used to collapse into one lie.
-///
-/// The arm-set (and its `as_str` spellings) is deliberately kept in lockstep
-/// with the sibling grants apps' `SweepEnd` — `grants-common`, `grants-gov`,
-/// `ca-grants` all publish the same four names. cordis was the last copy still
-/// missing [`SweepEnd::UnknownTotal`], and that gap let a `total:0` served
-/// alongside real records read as a proven-complete sweep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepEnd {
-    /// Page arithmetic against the listing's OWN reported total proves the walk
-    /// reached the end of the corpus. The only ending that wraps the resume
-    /// cursor and reports `corpus_swept: true`.
-    Complete,
-    /// Stopped at the per-run `maxProjects` cap with corpus left to walk.
-    Capped,
-    /// A page came back shorter than `pageSize` while the reported total says
-    /// more remains. A transient truncation, NOT the end of the corpus.
-    ShortPage,
-    /// Records were served under a reported total of 0 — the total field is
-    /// absent, renamed, or the query grammar drifted. Nothing can prove the end
-    /// arithmetically (`page * page_size >= 0` is trivially true), so the walk
-    /// runs on until a short page or the cap and reports coverage as UNPROVEN
-    /// rather than wrapping the cursor on a phantom "complete".
-    UnknownTotal,
-}
-
-impl SweepEnd {
-    fn as_str(self) -> &'static str {
-        match self {
-            SweepEnd::Complete => "complete",
-            SweepEnd::Capped => "capped",
-            SweepEnd::ShortPage => "short_page",
-            SweepEnd::UnknownTotal => "unknown_total",
-        }
-    }
-}
-
-/// Whether page arithmetic proves the walk reached the listing's end: the
-/// 1-based `page` just fetched covers the listing's own reported `total`.
-///
-/// This — and ONLY this — is proof of the end. A short page is evidence of
-/// nothing: the same shape arrives from a rate-limited or half-broken upstream.
-fn reached_listing_end(page: u64, page_size: u64, total: u64) -> bool {
-    page.saturating_mul(page_size) >= total
-}
-
-/// How the walk ends after fetching `page`, or `None` to keep walking.
-///
-/// - `got` — hits the page returned.
-/// - `leftover` — hits on this page the per-run cap left unconsumed (>0 can only
-///   happen when the cap cut the page mid-way, which is never the corpus end).
-/// - `full` — the run has collected its `maxProjects` ids.
-fn walk_end(
-    page: u64,
-    page_size: u64,
-    total: u64,
-    got: u64,
-    leftover: u64,
-    full: bool,
-) -> Option<SweepEnd> {
-    if leftover > 0 {
-        // The cap truncated this page: whatever the arithmetic says about the
-        // corpus, THIS run did not consume the tail it is standing on.
-        Some(SweepEnd::Capped)
-    } else if total == 0 {
-        // No usable total to measure against. `reached_listing_end(_, _, 0)` is
-        // trivially true, so the old ladder fell straight to `Complete` here —
-        // the bug this arm closes. Decide on the SAME response's own evidence:
-        if got == 0 {
-            // Self-consistent — no total, no records. An honestly empty result
-            // set IS fully swept. (The post-loop `empty_listing_is_drift` guard
-            // separately catches the case where a corpus is already stored.)
-            Some(SweepEnd::Complete)
-        } else if full {
-            // Records under a zero total, but the run hit its cap first.
-            Some(SweepEnd::Capped)
-        } else if got < page_size {
-            // Records served under a zero total and the page ran short: keep it
-            // honest — coverage is UNPROVEN, never `Complete`.
-            Some(SweepEnd::UnknownTotal)
-        } else {
-            // A full page under a zero total: keep walking (the `maxProjects`
-            // cap still bounds the loop via `full`).
-            None
-        }
-    } else if reached_listing_end(page, page_size, total) {
-        Some(SweepEnd::Complete)
-    } else if full {
-        Some(SweepEnd::Capped)
-    } else if got < page_size {
-        Some(SweepEnd::ShortPage)
-    } else {
-        None
-    }
-}
-
-/// Whether the FIRST page of this run coming back empty is contract drift.
-///
-/// It is drift when the listing says there are results AND the arithmetic puts
-/// this page inside the corpus. A resume cursor that has run past a shrunken
-/// listing produces the same empty page and is NOT drift — it is the ordinary
-/// end of a sweep, which [`reached_listing_end`] then wraps.
-fn empty_first_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> bool {
-    total > 0 && got == 0 && page.saturating_sub(1).saturating_mul(page_size) < total
-}
-
-/// Whether an empty listing result is contract drift rather than an honest
-/// empty corpus: the API reported nothing at all while projects are already
-/// stored locally. The verified-then-drifted query grammar (`total: 0` for a
-/// syntactically valid but wrong query) lands exactly here, and it used to walk
-/// straight through the stage-2 drift guard — that guard is gated on
-/// `attempted > 0`, and a listing with no ids attempts no detail fetch.
-fn empty_listing_is_drift(total: u64, enumerated: usize, stored_corpus: i64) -> bool {
-    total == 0 && enumerated == 0 && stored_corpus > 0
 }
 
 /// The persisted resume cursor. `next_offset` is the canonical field — an
@@ -959,7 +859,7 @@ fn rollup_is_complete(corpus_rows: usize, limit: i64) -> bool {
 /// Per-topic-family win stats over the project corpus. Only projects whose
 /// `topic` (sub-call, falling back to master-call identifier) yields a Horizon
 /// lineage family participate (non-Horizon topics have no family — see
-/// [`app_eu_sedia::topic_lineage`]). Contribution stats are computed over the
+/// [`grants_common::topic_lineage`]). Contribution stats are computed over the
 /// projects whose contribution parsed; when NONE parsed the totals are `Null`,
 /// never a fabricated zero, and `contribution_known` says how many the money
 /// numbers actually rest on. Participant leaderboard counts each org (any
@@ -1107,34 +1007,48 @@ mod tests {
     #[test]
     fn a_short_page_is_not_proof_the_corpus_was_swept() {
         // Page 3 of 234 comes back with 40 of 100 while the API still reports
-        // 23,361 results. Nothing about the end of the corpus is proven.
+        // 23,361 results: 240 records in hand. Nothing about the end of the
+        // corpus is proven.
         assert_eq!(
-            walk_end(3, 100, 23_361, 40, 0, false),
+            walk_end(100, 23_361, 40, 240, false),
             Some(SweepEnd::ShortPage)
         );
-        assert!(!reached_listing_end(3, 100, 23_361));
         // An EMPTY page in the middle of the corpus is the same story.
         assert_eq!(
-            walk_end(3, 100, 23_361, 0, 0, false),
+            walk_end(100, 23_361, 0, 200, false),
             Some(SweepEnd::ShortPage)
         );
     }
 
+    /// THE REFUTED PROOF, retired. cordis used to prove the end with
+    /// `reached_listing_end(page, page_size, total)` = `page * page_size >=
+    /// total` — the rows it *asked* for. `grants_common::walk_end` proves it
+    /// with `collected >= total` — the rows that *arrived*. The two agree on
+    /// every page served in full and disagree on exactly the page that was not,
+    /// which is the page that matters.
     #[test]
-    fn only_page_arithmetic_proves_the_end_of_the_corpus() {
-        // The real last page: 234 * 100 = 23,400 >= 23,361. Short AND proven.
-        assert!(reached_listing_end(234, 100, 23_361));
+    fn the_end_is_proved_by_records_received_not_by_the_offset_requested() {
+        // The real last page: 23,361 of 23,361 in hand. Short AND proven.
         assert_eq!(
-            walk_end(234, 100, 23_361, 61, 0, false),
+            walk_end(100, 23_361, 61, 23_361, false),
             Some(SweepEnd::Complete)
         );
-        // A cursor that ran past a shrunken listing is also an honest end.
+        // The SAME listing position, served short by a rate-limited upstream:
+        // 234 * 100 = 23,400 clears the total, so the old arithmetic called this
+        // a complete sweep and wrapped the cursor on 23,312 of 23,361 records.
         assert_eq!(
-            walk_end(300, 100, 23_361, 0, 0, false),
+            walk_end(100, 23_361, 12, 23_312, false),
+            Some(SweepEnd::ShortPage),
+            "a truncated final page is not the end of the corpus"
+        );
+        // A cursor that ran past a shrunken listing is still an honest end: the
+        // positions consumed exceed everything the listing claims to hold.
+        assert_eq!(
+            walk_end(100, 23_361, 0, 29_900, false),
             Some(SweepEnd::Complete)
         );
         // Mid-corpus with a full page: keep walking, decide nothing.
-        assert_eq!(walk_end(3, 100, 23_361, 100, 0, false), None);
+        assert_eq!(walk_end(100, 23_361, 100, 300, false), None);
     }
 
     #[test]
@@ -1142,19 +1056,20 @@ mod tests {
         // Cap hit mid-page: `leftover` hits are still sitting on the page we
         // are standing on, so this can never be the end — even if the page
         // arithmetic would otherwise say so.
+        // (`capped` carries cordis's project budget: `leftover > 0 || full`.)
         assert_eq!(
-            walk_end(5, 100, 450, 100, 50, true),
+            walk_end(100, 23_361, 100, 450, true),
             Some(SweepEnd::Capped),
             "an untaken tail must never read as a complete sweep"
         );
         // Cap hit exactly on a page boundary, mid-corpus.
         assert_eq!(
-            walk_end(5, 100, 23_361, 100, 0, true),
+            walk_end(100, 23_361, 100, 500, true),
             Some(SweepEnd::Capped)
         );
         // But a page that BOTH finishes the corpus and was fully consumed is
-        // complete, cap or no cap.
-        assert_eq!(walk_end(5, 100, 450, 50, 0, true), Some(SweepEnd::Complete));
+        // complete, cap or no cap — proof of coverage outranks the budget.
+        assert_eq!(walk_end(100, 450, 50, 450, true), Some(SweepEnd::Complete));
     }
 
     #[test]
@@ -1173,17 +1088,17 @@ mod tests {
     #[test]
     fn an_empty_first_page_inside_the_corpus_is_drift_but_past_the_end_is_not() {
         // Page 1 empty while 23,361 results are claimed: drift (the old guard).
-        assert!(empty_first_page_is_drift(1, 100, 23_361, 0));
+        assert!(empty_page_is_drift(1, 100, 23_361, 0));
         // …and now ALSO drift when the run resumed mid-corpus, which the old
         // `start_page == 1` gate silently exempted — i.e. every scheduled run
         // after the first.
-        assert!(empty_first_page_is_drift(50, 100, 23_361, 0));
+        assert!(empty_page_is_drift(50, 100, 23_361, 0));
         // A cursor past the end of a shrunken listing is an ordinary sweep end.
-        assert!(!empty_first_page_is_drift(300, 100, 23_361, 0));
+        assert!(!empty_page_is_drift(300, 100, 23_361, 0));
         // A page with hits is never this kind of drift, and neither is an
         // honestly empty corpus.
-        assert!(!empty_first_page_is_drift(1, 100, 23_361, 100));
-        assert!(!empty_first_page_is_drift(1, 100, 0, 0));
+        assert!(!empty_page_is_drift(1, 100, 23_361, 100));
+        assert!(!empty_page_is_drift(1, 100, 0, 0));
     }
 
     /// The `attempted == 0` hole: the stage-2 drift guard only fires once a
@@ -1212,26 +1127,36 @@ mod tests {
         // Page 1: 40 records under a reported total of 0 (short page). Coverage
         // is UNPROVEN — the exact scenario that must not wrap the cursor.
         assert_eq!(
-            walk_end(1, 100, 0, 40, 0, false),
+            walk_end(100, 0, 40, 40, false),
             Some(SweepEnd::UnknownTotal),
             "records under total:0 must never read as a complete sweep"
         );
-        assert_ne!(walk_end(1, 100, 0, 40, 0, false), Some(SweepEnd::Complete));
+        assert_ne!(walk_end(100, 0, 40, 40, false), Some(SweepEnd::Complete));
         // A FULL page under total:0 keeps walking (bounded by the cap), never
         // deciding the corpus is done.
-        assert_eq!(walk_end(1, 100, 0, 100, 0, false), None);
-        // Cap reached first under total:0 → Capped, still not Complete.
-        assert_eq!(walk_end(5, 100, 0, 100, 0, true), Some(SweepEnd::Capped));
+        assert_eq!(walk_end(100, 0, 100, 100, false), None);
+        // Cap reached first under total:0. The shared judge names this
+        // `unknown_total` where cordis's fork named it `capped` — a DELIBERATE
+        // flip, and the more honest of the two: with no total there is nothing
+        // the cap could have fallen short OF, so the operator action is "find
+        // the renamed total field", not "raise maxProjects". Both are truncated
+        // and neither wraps the cursor, so no consumer reading `corpus_swept`
+        // changes behaviour.
+        assert_eq!(
+            walk_end(100, 0, 100, 500, true),
+            Some(SweepEnd::UnknownTotal)
+        );
         // The one total:0 case that IS a complete sweep: no records either.
         // (The post-loop `empty_listing_is_drift` guard covers the stored-corpus
         // variant of this.)
-        assert_eq!(walk_end(1, 100, 0, 0, 0, false), Some(SweepEnd::Complete));
+        assert_eq!(walk_end(100, 0, 0, 0, false), Some(SweepEnd::Complete));
     }
 
-    /// The sweep vocabulary is a copy of the sibling grants apps' `SweepEnd`;
-    /// cordis was the last to drift (three arms vs four). Pin the arm-set and its
-    /// wire spellings so all sites agree — the same "one authority per
-    /// vocabulary" guard the siblings carry.
+    /// The sweep vocabulary IS the sibling grants apps' now — one definition in
+    /// `grants-common`, not a private fork kept in lockstep by a comment. The
+    /// wire spellings stay pinned here because `sweep` is a published result
+    /// field: a shared enum renaming an arm would change this app's output
+    /// without touching this app's source.
     #[test]
     fn sweep_vocabulary_agrees_with_the_sibling_grants_apps() {
         assert_eq!(SweepEnd::Complete.as_str(), "complete");

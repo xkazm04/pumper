@@ -249,12 +249,11 @@ impl ScrapeApp for EuSedia {
             // COLLECTED (a page that asks for 100 and serves 12 still advanced
             // the offset by 100) and names which of the four endings happened.
             if let Some(reached) = grants_common::walk_end(
-                pages_fetched,
                 page_size,
                 total,
                 got,
                 records.len() as u64,
-                max_pages,
+                pages_fetched >= max_pages,
             ) {
                 end = reached;
                 break;
@@ -461,43 +460,18 @@ fn history_block(family: &str, rec: Record) -> Option<Value> {
     }))
 }
 
-/// Horizon topic-family key: the identifier with its call-year segment removed,
-/// so successor topics across work programmes collapse onto one lineage key
-/// (`HORIZON-CL4-2026-DATA-01` and `HORIZON-CL4-2024-DATA-01` →
-/// `HORIZON-CL4-DATA-01`). This is the join key between open SEDIA topics and
-/// funded CORDIS outcomes (the `cordis` app aggregates `topic_stats` per family).
+/// Horizon topic-family key — **re-exported from [`grants_common`]**, which is
+/// where it now lives.
 ///
-/// **Horizon-only by design**: identifiers must start with `HORIZON-` and carry
-/// exactly one plausible call-year segment (2020–2039). Other programmes
-/// (Erasmus+, LIFE, CERV, …) use different, less regular grammars — returning
-/// `None` there is honest; guessing a family would fabricate lineage. Counter
-/// segments (`-01`, `-01-05`) are kept: they distinguish topics within a
-/// destination, which is exactly the granularity predecessor matching needs.
-/// If a second year-like segment appears, only the first is removed.
-pub fn topic_lineage(identifier: &str) -> Option<String> {
-    let id = identifier.trim();
-    let segments: Vec<&str> = id.split('-').collect();
-    if segments.first() != Some(&"HORIZON") || segments.len() < 3 {
-        return None;
-    }
-    let is_year = |s: &str| {
-        s.len() == 4
-            && s.chars().all(|c| c.is_ascii_digit())
-            && (2020..=2039).contains(&s.parse::<u32>().unwrap_or(0))
-    };
-    let year_pos = segments.iter().position(|s| is_year(s))?;
-    let family: Vec<&str> = segments
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != year_pos)
-        .map(|(_, s)| *s)
-        .collect();
-    // A family must still name something beyond the programme prefix.
-    if family.len() < 2 {
-        return None;
-    }
-    Some(family.join("-"))
-}
+/// It is a join key with two sides: this app derives it for open SEDIA topics
+/// and `cordis` derives it for funded CORDIS outcomes, so one definition is the
+/// only way they can agree. It used to be defined here, which forced `cordis`
+/// to declare `app-eu-sedia` as a dependency — an app->app edge the repo's
+/// layering rule forbids (now pinned by
+/// `grants-common/tests/no_app_depends_on_an_app.rs`). Kept re-exported so no
+/// consumer of `app_eu_sedia::topic_lineage` sees a removal; the grammar and
+/// its tests moved verbatim.
+pub use grants_common::topic_lineage;
 
 /// Reads a params array of strings, or a fallback. Accepts `["1","2"]`.
 fn string_array(params: &Value, key: &str, fallback: &[&str]) -> Vec<String> {
@@ -664,12 +638,12 @@ mod tests {
         // it could not fire, and `truncated` needed `pages >= max_pages` so it
         // stayed false. Green, forever.
         assert_eq!(
-            walk_end(1, PAGE_SIZE, 0, 100, 100, MAX_PAGES),
+            walk_end(PAGE_SIZE, 0, 100, 100, 1 >= MAX_PAGES),
             None,
             "a full page under a zero total must keep walking"
         );
         // It walks on to a real end signal, and never claims a complete sweep.
-        let end = walk_end(50, PAGE_SIZE, 0, 100, 5000, MAX_PAGES).unwrap();
+        let end = walk_end(PAGE_SIZE, 0, 100, 5000, 50 >= MAX_PAGES).unwrap();
         assert_eq!(end, SweepEnd::UnknownTotal);
         assert!(end.truncated(), "unproven coverage is not a clean run");
         assert_eq!(end.as_str(), "unknown_total");
@@ -677,7 +651,7 @@ mod tests {
         // And the honest boundary stays honest: no total AND no rows is an
         // empty result set, fully swept — not drift, not truncation.
         assert_eq!(
-            walk_end(1, PAGE_SIZE, 0, 0, 0, MAX_PAGES),
+            walk_end(PAGE_SIZE, 0, 0, 0, 1 >= MAX_PAGES),
             Some(SweepEnd::Complete)
         );
     }
@@ -691,17 +665,17 @@ mod tests {
         // no stable sort, so a partially-served page is indistinguishable in
         // shape from a genuine tail — which is exactly why it must not be
         // reported as one.
-        let end = walk_end(2, PAGE_SIZE, 2000, 12, 112, MAX_PAGES).unwrap();
+        let end = walk_end(PAGE_SIZE, 2000, 12, 112, 2 >= MAX_PAGES).unwrap();
         assert_eq!(end, SweepEnd::ShortPage);
         assert!(end.truncated());
         // The genuine tail — collected reaches the total — still reads complete.
         assert_eq!(
-            walk_end(20, PAGE_SIZE, 2000, 100, 2000, MAX_PAGES),
+            walk_end(PAGE_SIZE, 2000, 100, 2000, 20 >= MAX_PAGES),
             Some(SweepEnd::Complete)
         );
         // ...and the page cap is a THIRD, separately named ending.
         assert_eq!(
-            walk_end(50, PAGE_SIZE, 10_000, 100, 5000, MAX_PAGES),
+            walk_end(PAGE_SIZE, 10_000, 100, 5000, 50 >= MAX_PAGES),
             Some(SweepEnd::Capped)
         );
     }

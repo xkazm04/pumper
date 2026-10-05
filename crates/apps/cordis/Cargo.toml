@@ -5,10 +5,12 @@ edition.workspace = true
 
 [dependencies]
 pumper-core.workspace = true
-# `topic_lineage` (the Horizon identifier grammar) lives in eu-sedia so the
-# join side and the aggregation side share one implementation without a new
-# workspace-dependency entry (app-eu-sedia is already registered there).
-app-eu-sedia.workspace = true
+# The grants family's shared app-layer helper crate: `SweepEnd`/`walk_end` (the
+# sweep-honesty vocabulary), the drift predicates, and `topic_lineage` — the
+# Horizon identifier grammar that joins open SEDIA topics to funded CORDIS
+# outcomes. This used to be `app-eu-sedia.workspace = true`, an app->app edge
+# the layering rule forbids, bought for that one 23-line function.
+grants-common.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 url.workspace = true
