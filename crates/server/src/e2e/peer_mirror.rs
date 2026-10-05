@@ -591,3 +591,60 @@ async fn a_watch_on_the_mirror_namespace_fires_on_a_pull() {
     assert_eq!(payload["dataset"], DATASET);
     assert_eq!(payload["count"], 2);
 }
+
+/// The control for the write/declaration diff: a `peer` run writes under
+/// `peer_fake`, an app that is NOT `job.app` — and reports NOTHING undeclared,
+/// because the peer app names every `(namespace, dataset)` it wrote in its
+/// result's `index_datasets`.
+///
+/// Without this arm the detector could degenerate into "any write outside
+/// `job.app`", which would fire on every mirror pull, every `ca-grants` run and
+/// every MPSV run — a signal that is always on is not a signal.
+#[tokio::test]
+async fn a_mirror_run_declares_the_namespace_it_writes_and_reports_nothing_undeclared() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+
+    origin_sync(&origin, &[("k1", json!({"v": 1})), ("k2", json!({"v": 1}))]).await;
+    let job = pull(&mirror, &base, json!({})).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+
+    let coverage = receipt_coverage(&mirror, job.id).await;
+    assert_eq!(
+        coverage["undeclared"],
+        json!([]),
+        "the mirror declared `{NAMESPACE}/{DATASET}`, so writing it is not a \
+         rogue write — the detector must not reduce to `app != job.app`: \
+         {coverage}"
+    );
+    let declared = coverage["declared"]
+        .as_array()
+        .unwrap_or_else(|| panic!("coverage.declared is absent: {coverage}"));
+    assert!(
+        declared.iter().any(|a| a == NAMESPACE),
+        "the mirror namespace is part of the run's declared scope: {coverage}"
+    );
+}
+
+/// `GET /jobs/{id}/receipt` → its `coverage` block, over the real router.
+async fn receipt_coverage(state: &AppState, id: uuid::Uuid) -> Value {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let router = routes::router(state.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jobs/{id}/receipt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let receipt: Value = serde_json::from_slice(&bytes).expect("receipt is JSON");
+    receipt["coverage"].clone()
+}
