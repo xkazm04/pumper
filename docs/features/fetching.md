@@ -263,7 +263,23 @@ One deadline (`[claude] timeout_secs`, default 600; per-request `timeout_secs` o
 | `unmetered_timeout` | killed by the deadline; no envelope exists | `0` — a paid call vanished |
 | `cost_unreported` | a **successful** envelope with no `total_cost_usd` | `0` — unknown, not free |
 
-A failure that never started a process (a bad `binary`) writes no row at all — inventing one would be its own lie. Tier-3 has different plumbing (the fetcher drives the researcher itself and `ctx.fetch` meters the *outcome*, which does not exist when the ladder fails), so the paid tier's spend rides out on the `all fetch tiers exhausted …` error and is metered from there; the message is identical either way.
+A failure that never started a process (a bad `binary`) writes no row at all — inventing one would be its own lie.
+
+**Every way a run can end has one name, decided in one place.** `<class>` above is a closed vocabulary (`pumper_core::error::ClaudeFailure`), and the engine no longer picks a member at each return site: every ending of a run that *started* goes through a single classifier (`crates/engine-claude/src/outcome.rs`), so the class — and therefore the `cost_events` row derived from it — cannot drift between call sites. Four endings used to be fitted to whichever of five members was nearest, and since the ledger row comes from the member, each was a mislabelled **spend**.
+
+| `<class>` | the run ended because | `cost_usd` | ledger row |
+| --- | --- | --- | --- |
+| `spawn` | refused **before** anything spawned: unknown `role`, a non-plain `model`, a cmd.exe-shim refusal, an unwritable `isolation_dir`, or `claude` not on PATH | — | **none** — no process, no spend |
+| `prompt_undelivered` | the prompt never reached the CLI's stdin (write failed, EOF failed, or the task doing both did). The CLI then reads an empty question, answers it and exits 0 with a valid envelope — so this used to return `Ok` with a real bill for an answer to nothing | unknown | `failed_spend_unreported (prompt_undelivered)` |
+| `pipe_failure` | a pipe the host needs failed **after** a successful spawn: a missing stdin/stdout/stderr handle on a live child, an io error mid-drain (a truncated buffer must never be parsed as a whole envelope), or a drain task that did not finish | unknown | `failed_spend_unreported (pipe_failure)` |
+| `wait_failed` | `child.wait()` itself returned an io error. Nothing was killed and no deadline elapsed — reporting it as a timeout claimed a paid call had vanished | unknown | `failed_spend_unreported (wait_failed)` |
+| `timeout` | the engine deadline elapsed and the process tree was killed mid-run | unknown | `unmetered_timeout` |
+| `interrupted` | a signal ended the process (`ExitStatus::code()` is `None`; unix). It did not choose an exit code, so it is not a `nonzero_exit` | from the envelope, if one printed | `failed_spend (interrupted)` / `failed_spend_unreported (interrupted)` |
+| `nonzero_exit` | the CLI exited with a non-zero code. Its stdout may still hold a complete, billed envelope | from the envelope, if one printed | `failed_spend (nonzero_exit)` / `failed_spend_unreported (nonzero_exit)` |
+| `unparseable` | exit 0, but stdout is not an envelope. Exit 0 means the model answered, so the call *was* billed and the amount is merely unreadable — not free | unknown | `failed_spend_unreported (unparseable)` |
+| `is_error` | exit 0 and a well-formed envelope with `is_error: true` — the most expensive shape, because the run happened in full | what the CLI reported | `failed_spend (is_error)` |
+
+`spawn` is the only class that writes no row, and it means it literally. Every other class means a child existed and may have been spending, so the ledger says *unknown*, never *free* — a silent `$0` reads identically to a call that was never made, and the per-job `budget_usd` clamp cannot tell them apart either. Tier-3 has different plumbing (the fetcher drives the researcher itself and `ctx.fetch` meters the *outcome*, which does not exist when the ladder fails), so the paid tier's spend rides out on the `all fetch tiers exhausted …` error and is metered from there; the message is identical either way.
 
 **Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
 
