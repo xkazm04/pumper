@@ -66,7 +66,7 @@ fn seed_url(i: usize) -> String {
 async fn plant_corpus(store: &TempStore) -> Arc<StubSite> {
     let now = now_epoch();
     let mut site = StubSite::new();
-    for i in 0..5 {
+    for (i, elapsed) in ELAPSED.iter().enumerate() {
         let url = seed_url(i);
         site = site.page(&url, &[]);
         let cadence = if i == 0 {
@@ -79,7 +79,7 @@ async fn plant_corpus(store: &TempStore) -> Arc<StubSite> {
                 "interval_secs": Value::Null,
             })
         } else {
-            let checked = now - ELAPSED[i] as i64;
+            let checked = now - *elapsed as i64;
             json!({
                 "checks": 3,
                 "changes": 2.0,
