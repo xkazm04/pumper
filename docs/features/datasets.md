@@ -8,7 +8,7 @@ Persistent, queryable record store (`records` table): apps upsert typed JSON rec
 - **Removal detection** (inferred): `AppContext::sync_many` treats the batch as a **full snapshot** — previously-live keys absent from it get `records.removed_at` set + a `removed` revision; reappearing records are revived and reported Changed. `upsert_many` (partial batches) never marks removals — do not conflate them. `detect_removed` refuses an **empty** batch outright (a failed scrape must not tombstone everything), and `sync_many` downgrades itself to `upsert_many` when the source's health state suppresses removals — a *partial* batch is the case the empty-batch guard does not cover.
   - **The health check is a precondition of the store, not a courtesy of the caller.** `Datasets::detect_removed` takes a `RemovalGuard`, and the only public way to obtain one is `RemovalGuard::for_source_state(state)`, which returns `None` for a degrading source. An app that hand-rolls `upsert_many` + removal detection therefore cannot skip the check — it has to ask the health state to get the token. An inventory test (`crates/core/tests/removal_guard.rs`) pins the call sites.
 - **Removal by name** (not inferred): `Datasets::tombstone_keys(app, dataset, keys)` tombstones exactly the keys given — same `removed_at` + `removed` revision, same change-feed signal — for callers that already hold the per-record removal fact (the `peer` app applying an origin feed's `removed` revisions — see [peering.md](peering.md)). Nothing is inferred from a snapshot, so no guard applies; a caller who wants "everything except this list" wants `sync_many`.
-- **APIs**: `GET /datasets/{app}/{ds}/changes?since=&limit=&trust=` (change feed, newest first, diffs included), `GET /datasets/{app}/{ds}/history?key=` (per-record revision trail).
+- **APIs**: `GET /datasets/{app}/{ds}/changes?since=&limit=&cursor=&trust=&order=` (change feed, newest first by default, diffs included; `order=asc` drains oldest-first for a resumable mirror), `GET /datasets/{app}/{ds}/history?key=` (per-record revision trail).
 
 ### Derived paths — a producer can say which fields aren't its own news
 
@@ -47,6 +47,7 @@ Stored `NULL` **means** `stable`. That is a semantic default, not a sentinel: ev
 Filtering follows push-versus-pull: **pushes suppress, pulls filter**. A webhook cannot be recalled, so watches/triggers are dropped at the source; a pull API is re-readable, so it filters and stays inspectable.
 
 - `GET /datasets/{app}/{ds}/changes?trust=` defaults to **`stable`** — accepts `all`, `provisional`, `quarantined`.
+- `GET /datasets/{app}/{ds}/changes?order=` defaults to **`desc`** (newest first — the historical shape, unchanged byte for byte) and accepts `asc`. Anything else is a `400` naming the allowed set, never a silent fallback. `order=asc` requires `cursor=` (send it empty to start at the oldest revision), because the uncursored `{app, dataset, count, changes}` body carries no position to resume from.
 - `GET /datasets/{app}/{ds}?trust=` defaults to **`all`**: each record carries its own stamp, so the raw dataset view stays complete. Honored identically whether or not `filter=` is present — see the read-path unification below.
 - `GET /datasets/{app}/{ds}/export?trust=` defaults to **`all`** (a complete copy by default; the stamp rides in the payload) but now honors an explicit value instead of silently ignoring it.
 - `GET /grants?trust=` defaults to **`all`**, same vocabulary.
@@ -73,7 +74,29 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 ## Conventions
 
 - Keys are stable external ids (opportunity id, URL, `czisco|kraj|org`). Timestamps are fixed-width RFC 3339 UTC micros (`ts()` helpers) so lexicographic SQL comparison = chronological.
-- **Batch writes are set-shaped.** `upsert_many` commits in chunks of 500 on one held connection, and within a chunk issues a bounded number of statements (two batched reads + multi-row writes) rather than one triple per record — the statement count per chunk *is* the write-lock hold time other apps wait on. Consequence for consumers: **every record in one chunk shares one `last_seen`/`updated_at`/revision `created_at` stamp**. Ordered reads already tiebreak that — `/datasets/{app}/{ds}` by `key`, `/changes` by rowid — so paging stays stable; do not rely on records within a batch having distinct timestamps.
+- **Batch writes are set-shaped.** `upsert_many` commits in chunks of 500 on one held connection, and within a chunk issues a bounded number of statements (two batched reads + multi-row writes) rather than one triple per record — the statement count per chunk *is* the write-lock hold time other apps wait on. Consequence for consumers: **every record in one chunk shares one `last_seen`/`updated_at`/revision `created_at` stamp**. Ordered reads already tiebreak that — `/datasets/{app}/{ds}` by `key`, `/changes` by rowid — so paging stays stable; do not rely on records within a batch having distinct timestamps. **And do not resume a mirror from a timestamp:** `since=` is a bare `created_at > S` with no tiebreak, so a consumer that stores "the newest stamp I saw" and comes back with it skips every sibling of S it had not read — up to 499 revisions per occurrence, with no error on either side. Resume from the opaque `<created_at>|<rowid>` cursor instead (`order=asc&cursor=`), which compares the same tuple the feed orders by. Pinned by `keyset_resume_returns_stamp_siblings_that_since_silently_drops` in `crates/core/tests/change_feed_keyset.rs`.
+
+### Draining the feed forward (`order=asc`)
+
+`order=asc&cursor=<token>` returns the feed oldest-first, with the keyset
+predicate flipped to match (`created_at > ?` **or** equal-stamp-and-higher-rowid)
+and `ORDER BY created_at ASC, rowid ASC`. `next_cursor` names the **last**
+(newest) row of the page.
+
+The direction is what makes a mirror resumable. On the default newest-first
+feed, page 1 is the newest, so a position taken from it jumps over every older
+page not yet applied — the only sound strategy is to buffer the whole backlog
+and commit once, which is why a consumer that cannot finish one run never makes
+progress. Ascending, the last row of each page is a position every earlier
+revision is behind, so a consumer may apply the page, store that position, and
+resume there.
+
+One deliberate asymmetry: an ascending page carries a `next_cursor` whenever it
+is **non-empty**, including the final short one, while a descending page only
+carries one when it is full. For a browse order a short page means "stop
+asking"; for a drain it means "you are caught up HERE", and the consumer needs
+that position for the next run. Re-reading it later returns an empty page,
+which is the correct answer.
 - **Virtual namespaces**: several apps may feed one cross-source dataset by passing an explicit app name to `ctx.datasets` (e.g. `grants/unified`, `census/market_blend`, `cz-labour/salary_gap`). The key shape is whatever makes concurrent writers agree rather than collide, and it differs per namespace: `grants/unified` prefixes the source (`<source>:<id>`) because two sources can list the same grant; `census/market_blend` keys on the join's own dimensions (`{naics4}:{state_fips}`), `census/saturation` on `{geo}|{denominator_kind}|{place}` and `cz-labour/salary_gap` on `{isco4}|{sphere}` — there every writer recomputes the same cell, so a source prefix would fork one cell into several. Writing through `ctx.datasets` bypasses `AppContext`'s automatic provenance stamping, so a virtual-namespace writer must pass its own `Provenance` (`upsert_many_stamped`) or every revision it appends is anonymous.
 - Big payloads go to `ctx.save_artifact` (files under `data/artifacts/<app>/<job>/`); records and results stay compact.
 
