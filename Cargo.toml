@@ -67,7 +67,7 @@ tower-http = { version = "0.7", features = ["catch-panic", "trace", "cors", "com
 
 # OpenAPI spec generation (machine-readable route surface at /openapi.json)
 utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
-utoipa-axum = "0.2"
+utoipa-axum = "0.3"
 
 # storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
