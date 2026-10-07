@@ -121,7 +121,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # pull a second reqwest MAJOR (0.13 alongside the workspace's 0.12), which is the
 # accepted cost of a supported transport. `sentry-tracing` bridges the existing
 # `tracing::error!` sites into Sentry rather than replacing stdout logging.
-sentry = "0.48"
+sentry = "0.49"
 sentry-tracing = "0.49"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
