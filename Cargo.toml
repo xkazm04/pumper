@@ -73,7 +73,7 @@ utoipa-axum = "0.2"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 
 # scraping engines
-reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "socks"] }
+reqwest = { version = "0.13", features = ["json", "cookies", "gzip", "brotli", "socks"] }
 # Serializable cookie jar behind reqwest's `cookie_provider` (session vault).
 # Already in the tree as reqwest's own cookie store — this is a direct edge, not
 # a new dependency.
