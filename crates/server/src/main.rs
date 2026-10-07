@@ -126,14 +126,14 @@ fn sentry_plan(dsn: Option<&str>, environment: Option<&str>, release: Option<&st
         .filter(|r| !r.is_empty())
         .unwrap_or(env!("CARGO_PKG_VERSION"))
         .to_string();
-    SentryPlan::Enabled(Box::new(sentry::ClientOptions {
-        dsn: Some(dsn),
-        environment: Some(environment.into()),
-        release: Some(release.into()),
-        traces_sample_rate: 0.0,
-        send_default_pii: false,
-        ..Default::default()
-    }))
+    // `ClientOptions` is `#[non_exhaustive]` since sentry 0.49, so it is built by
+    // mutating the default rather than with a struct expression.
+    let mut options = sentry::ClientOptions::default();
+    options.dsn = Some(dsn);
+    options.environment = Some(environment.into());
+    options.release = Some(release.into());
+    options.send_default_pii = false;
+    SentryPlan::Enabled(Box::new(options.traces_sample_rate(0.0)))
 }
 
 /// Reads the environment, applies [`sentry_plan`], and initializes Sentry if it
@@ -823,7 +823,10 @@ mod sentry_tests {
         assert_eq!(opts.release.as_deref(), Some("abc123"));
         assert_eq!(opts.environment.as_deref(), Some("staging"));
         // Performance tracing is out of scope; errors are the accepted surface.
-        assert_eq!(opts.traces_sample_rate, 0.0);
+        assert!(matches!(
+            opts.traces_sampling_strategy,
+            sentry::TracesSamplingStrategy::FixedRate(rate) if rate == 0.0
+        ));
         assert!(!opts.send_default_pii);
 
         let SentryPlan::Enabled(opts) = sentry_plan(Some(FAKE_DSN), None, Some(" ")) else {
