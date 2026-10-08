@@ -66,8 +66,8 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["catch-panic", "trace", "cors", "compression-gzip", "compression-br"] }
 
 # OpenAPI spec generation (machine-readable route surface at /openapi.json)
-utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
-utoipa-axum = "0.2"
+utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.3"
 
 # storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
