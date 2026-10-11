@@ -126,7 +126,8 @@ clients:
 # change that was not regenerated fails the build instead of shipping clients
 # built from the previous contract. Part of `sdk`, so `just ci` blocks on it.
 #
-# The generated-client drift gate: exit 1 when the clients are stale.
+# The generated-client drift gate: exit 1 when the clients are stale, exit 3
+# (cannot check, not a pass) when the generator toolchain is not installed.
 clients-check:
     node scripts/gen/generate-clients.mjs --check
 
@@ -384,6 +385,7 @@ harness-test:
     node --test scripts/ci/disk-check.test.mjs
     node --test scripts/ci/gate-inventory.test.mjs
     node --test scripts/ci/quality-report.test.mjs
+    node --test scripts/ci/generate-clients.test.mjs
 
 # Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
 # through the recorder (so the --ignored set finally accumulates history), then
