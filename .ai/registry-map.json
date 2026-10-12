@@ -1147,7 +1147,11 @@
           "revision": 30,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:330 The tools/call dispatch door admits callers without authentication tokens or scopes, and uses a hardcoded match statement rather than an authoritative registry.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
+          "evaluatedRevision": 31
         },
         {
           "subject": "prompt-assembly",
@@ -3189,7 +3193,11 @@
           "revision": 30,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0001_init.sql:1 The core-schema-migrations context manages internal SQLite tables and has no MCP tool protocol or tool execution surface.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
+          "evaluatedRevision": 31
         },
         {
           "subject": "billing-revenue-normalization",
@@ -3870,7 +3878,11 @@
           "revision": 30,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/mcp.rs:103 The integration test suite exercises tool calls without caller tokens or authentication, asserting that unauthenticated execution succeeds.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
+          "evaluatedRevision": 31
         },
         {
           "subject": "test-harness",

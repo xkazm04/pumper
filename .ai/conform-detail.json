@@ -331,6 +331,161 @@
           "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string."
         }
       ]
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/mcp-tools": {
+      "context": "api-server-core",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
+      "techniques": [
+        {
+          "technique": "authentication-and-scoping",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:330 The tools/call dispatch door executes requests without authenticating caller identity or verifying capability tokens and scopes."
+        },
+        {
+          "technique": "caller-differentiated-capability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:372 The refusal explicitly names the MCP surface when actuating tools are withheld, enforcing an agent-specific capability restriction."
+        },
+        {
+          "technique": "server-composition",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:361 Uses a parallel match expression in tools_call rather than deriving dispatch from a single authoritative tool registry."
+        },
+        {
+          "technique": "transport-selection",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:52 Mounts a streamable HTTP listener without token authentication or origin validation, falling into the local-port exposure trap."
+        },
+        {
+          "technique": "tool-schema-design",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:149 Tool definitions omit behavior annotations across all axes (read-only, destructive, idempotent) needed for host consent tiering."
+        },
+        {
+          "technique": "tool-identity-vs-tool-name",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:144 Tools declare only ephemeral names without publishing rename-stable identifiers on tool definitions or call results."
+        },
+        {
+          "technique": "catalog-projection-modes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/mod.rs:262 Withholding is used to conditionally omit actuating tools, but the catalog fits within standard ceilings without altitude compression modes."
+        },
+        {
+          "technique": "suspendable-request-classes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/live.rs:215 Long operations use bounded status polling via wait_job rather than suspending requests for human interaction."
+        }
+      ]
+    },
+    "b6cad188-6215-4135-aa56-8f84711e4744/mcp-tools": {
+      "context": "e2e-integration",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
+      "techniques": [
+        {
+          "technique": "authentication-and-scoping",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/mcp.rs:103 Integration test harness constructs and sends tool calls with no capability tokens or credentials."
+        },
+        {
+          "technique": "caller-differentiated-capability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/mcp.rs:183 Asserts that calling a withheld actuating tool returns a tool error explicitly naming the operator switch."
+        },
+        {
+          "technique": "tool-schema-design",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/mcp.rs:449 Tests door-level schema validation of arguments against inputSchema, asserting in-band error delivery for argument errors."
+        },
+        {
+          "technique": "server-composition",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/mcp.rs:121 Tests version negotiation under legacy initialize handshake without testing modern cacheable server/discover discovery requests."
+        },
+        {
+          "technique": "transport-selection",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/mcp_live.rs:84 Connects to streamable HTTP SSE notification stream without credentials or origin validation headers."
+        }
+      ]
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/mcp-tools": {
+      "context": "core-platform-services",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "techniques": [
+        {
+          "technique": "server-composition",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/catalog.rs:1 The data-source catalog in core manages data pipeline metadata rather than an MCP tool registry."
+        },
+        {
+          "technique": "caller-differentiated-capability",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/plugin.rs:1 Provides in-process WASM sandboxing rather than an agent-facing MCP tool capability surface."
+        }
+      ],
+      "withdrawn": {
+        "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
+        "state": "not-applicable",
+        "at": "2026-10-12T20:57:39.254743+00:00",
+        "reason": "reviewer (sonnet): The not-applicable rests on a line-1 module doc of catalog.rs, which does not show that MCP is absent from the context. The core crate holds `McpConfig` (config.rs) and the app manifest that is published as MCP tool definitions (app.rs:1003)."
+      }
+    },
+    "2d713bf8-16d5-4c0f-aa09-ce602aa575db/mcp-tools": {
+      "context": "core-schema-migrations",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
+      "techniques": [
+        {
+          "technique": "sanctioned-session-state",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0001_init.sql:1 Database migrations manage persistence tables and define no session or affinity state for MCP tools."
+        }
+      ]
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/mcp-tools": {
+      "context": "web-crawl-extraction",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "techniques": [
+        {
+          "technique": "orchestration-to-tool-migration",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/crawl/src/lib.rs:24 The crawl app is a batch ScrapeApp pipeline rather than an agent-facing MCP tool surface."
+        },
+        {
+          "technique": "tool-schema-design",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:21 The extractor app runs batch HTML rule extraction rather than defining MCP tool schemas."
+        }
+      ],
+      "withdrawn": {
+        "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
+        "state": "not-applicable",
+        "at": "2026-10-12T20:57:39.275771+00:00",
+        "reason": "reviewer (sonnet): The claim that these apps are not an MCP tool surface is contradicted by the code. The extractor's `mode_door.rs` tests `mcp::validate_app_params`, and the apps' manifests are published verbatim as MCP tool definitions (`result_contract.rs` tests). The anchors at crawl/src/lib.rs:24 and extractor/sr"
+      }
     }
   }
 }
