@@ -1564,7 +1564,11 @@
           "revision": 46,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:2 A search of the twelve gate scripts for memory, episodic, consolidation, belief, recall, and distill found no matches; they judge a flake register, a build-cache ceiling, lane artifacts, and MCP tool-name spelling.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
+          "evaluatedRevision": 47
         },
         {
           "subject": "agent-instruction-files",
@@ -3181,7 +3185,11 @@
           "revision": 46,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0025 the word memory is only the HTTP-versus-browser strike table, and the other nearby tables are a TTL cache of Claude responses, per-job checkpoint blobs, and discovered API URL templates, with no episode or belief table.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
+          "evaluatedRevision": 47
         },
         {
           "subject": "mcp-tools",
@@ -3743,7 +3751,11 @@
           "revision": 46,
           "changedAt": "2026-09-29",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 A search of these eight files for memory, episodic, consolidation, recall, belief, and distill found a wasm linear-memory export, a dataset-provenance comment, and a VCR replay stamp, and no agent belief, episode, or recall pipeline.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
+          "evaluatedRevision": 47
         },
         {
           "subject": "mcp-tools",
@@ -4818,7 +4830,11 @@
           "revision": 46,
           "changedAt": "2026-09-29",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "clients/typescript/README.md:27 The package is a stateless dataset client plus a watermarked change-feed mirror, and the only memory hits are an in-process Map of feed positions and a constant-RAM ndjson stream.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
+          "evaluatedRevision": 47
         },
         {
           "subject": "bounded-enumeration",

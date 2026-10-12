@@ -1,0 +1,353 @@
+{
+  "schema": "conform-run/1",
+  "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+  "subject": "agent-memory",
+  "evaluatedAt": "2026-10-12T23:01:40.578521+00:00",
+  "provider": "grok",
+  "model": "grok-4.7",
+  "pairs": [
+    {
+      "context": "e2e-data-integrity",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/e2e/dataset_reads.rs:1 A search of these eight files for memory, episodic, consolidation, recall, belief, and distill found a wasm linear-memory export, a dataset-provenance comment, and a VCR replay stamp, and no agent belief, episode, or recall pipeline.",
+      "techniques": [
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The empty-versus-miss distinction is a dataset search page for an MCP caller, not a memory store that failed to parse."
+        },
+        {
+          "technique": "lane-reconciliation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/store_reports.rs:8 The doctor gap is the scrape search index versus the dataset store, not memory retrieval lanes."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/vcr_attempts.rs:451 Provenance here is a VCR replay stamp on a job result, not an episode record."
+        },
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:488 Session here is an HTTP profile cookie jar, not operative task state."
+        },
+        {
+          "technique": "addresses-not-atoms",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23 The only memory token in this file is a wasm linear-memory export."
+        },
+        {
+          "technique": "memory-governance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/target_exclusion.rs:191 Provenance is a dataset row an operator can check after a run, not a belief write lane."
+        },
+        {
+          "technique": "loss-site-inventory",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:5 The disagreement is among dataset read shapes, not memory failing to reach an agent."
+        },
+        {
+          "technique": "recall-injection",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:1 Labeling a search hit's index is not a budgeted recall injection of beliefs."
+        },
+        {
+          "technique": "coverage-instrumentation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/store_reports.rs:11 The doctor reports an empty scrape index, not uncovered agent-memory subjects."
+        },
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_delete_gate.rs:1 This is the dataset delete gate, not a belief demotion or expiry policy."
+        },
+        {
+          "technique": "baseline-ladder",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:1 The battery probes engine capabilities, not memory-pipeline rungs."
+        }
+      ]
+    },
+    {
+      "context": "pumper-sync-sdk",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "clients/typescript/README.md:27 The package is a stateless dataset client plus a watermarked change-feed mirror, and the only memory hits are an in-process Map of feed positions and a constant-RAM ndjson stream.",
+      "techniques": [
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:69 memoryWatermark is a process-local Map of feed cursors that a restart drops."
+        },
+        {
+          "technique": "observation-clock",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:2 The watermark is a (created_at, rowid) feed position, not a distillation clock."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/client.ts:2 The client is a stateless read wrapper and stores no episode."
+        },
+        {
+          "technique": "probe-without-write-back",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/sync.ts:4 The write-back is the consumer's change-feed cursor after the sink commits, not a recall usage counter."
+        },
+        {
+          "technique": "owner-and-counterpart-scope",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:66 The cursor key is app/dataset, not an owner and a counterpart."
+        },
+        {
+          "technique": "recall-injection",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/http.ts:85 Constant memory is a stream buffer bound, not a recall budget."
+        },
+        {
+          "technique": "addresses-not-atoms",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/client.ts:35 The word memory is RAM used while streaming snapshot rows."
+        },
+        {
+          "technique": "consolidation",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/sync.ts:1 The module mirrors dataset revisions; it does not distill beliefs."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/README.md:22 The silent-empty case described is a response-shape drift in a hand-rolled parser, not a corrupt memory store."
+        }
+      ]
+    },
+    {
+      "context": "core-schema-migrations",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0025 the word memory is only the HTTP-versus-browser strike table, and the other nearby tables are a TTL cache of Claude responses, per-job checkpoint blobs, and discovered API URL templates, with no episode or belief table.",
+      "techniques": [
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:7 The TTL ages fetch-tier strikes, not beliefs."
+        },
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0022_checkpoints.sql:2 The blob is a scrape job's resume snapshot, not an agent's operative synthesis."
+        },
+        {
+          "technique": "consolidation",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:2 Identical Claude requests are cached by hash; nothing is distilled into a belief."
+        },
+        {
+          "technique": "observation-clock",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:3 The cache key keeps the raw prompt fields and does not ground relative time."
+        },
+        {
+          "technique": "procedure-promotion",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0025_api_recipes.sql:2 Recipes are discovered URL templates, not procedures promoted from agent episodes."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0005_change_intelligence.sql:1 Revisions are dataset change history, not episodes of an agent."
+        },
+        {
+          "technique": "memory-value-model",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0025_api_recipes.sql:11 The score is extracted-value overlap of an API recipe, not trust, half-life, and usage."
+        },
+        {
+          "technique": "stale-served-versus-stale-answered",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0005_change_intelligence.sql:10 Change kinds append dataset revisions; they are not superseded beliefs served to a reader."
+        }
+      ]
+    },
+    {
+      "context": "ci-quality-gates",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/ci/flake-check.mjs:2 A search of the twelve gate scripts for memory, episodic, consolidation, belief, recall, and distill found no matches; they judge a flake register, a build-cache ceiling, lane artifacts, and MCP tool-name spelling.",
+      "techniques": [
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:14 Expiry is a flake-quarantine rule, not belief demotion."
+        },
+        {
+          "technique": "coverage-instrumentation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:1 The denominator is package manifests claimed by CI, not memory subjects."
+        },
+        {
+          "technique": "baseline-ladder",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:16 The artifact is a lane measurement, not a memory-pipeline rung."
+        },
+        {
+          "technique": "probe-without-write-back",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-record.mjs:2 The wrapper records test outcomes and does not increment a recall counter."
+        },
+        {
+          "technique": "diagnosis-withheld-from-the-executor",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-canary.mjs:2 The canary checks that the lane judge still fires; there is no executor and reviser."
+        },
+        {
+          "technique": "memory-governance",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:2 The gate checks tool-name spelling, not who may write a belief."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:33 An unreadable quarantine register exits 3; that register is not a memory store."
+        },
+        {
+          "technique": "addresses-before-compression",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:14 The ceiling prunes cargo build artifacts, not redundant memory items."
+        },
+        {
+          "technique": "rollup-compaction",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:21 supersededFiles are stale build artifacts, not a family of beliefs."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "agent-memory",
+      "context": "api-server-core",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor crates/server/src/mcp/mod.rs:22 is `mod live;`, which doesn't show the tool list the evidence cites. The module doc there names only enqueue_job, fetch_readable and deep_research, so I could not confirm list_apps, query_dataset, search or wait_job from the line. The memory greps did confi"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-12T23:01:40.578521+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [
+        "addresses-not-atoms",
+        "baseline-ladder",
+        "coverage-instrumentation",
+        "decay-and-forgetting",
+        "durable-store-failure-posture",
+        "episodic-capture",
+        "lane-reconciliation",
+        "loss-site-inventory",
+        "memory-governance",
+        "recall-injection",
+        "working-memory"
+      ],
+      "deviations": 0,
+      "context": "e2e-data-integrity",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-12T23:01:40.578521+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [
+        "addresses-not-atoms",
+        "consolidation",
+        "durable-store-failure-posture",
+        "episodic-capture",
+        "observation-clock",
+        "owner-and-counterpart-scope",
+        "probe-without-write-back",
+        "recall-injection",
+        "working-memory"
+      ],
+      "deviations": 0,
+      "context": "pumper-sync-sdk",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-12T23:01:40.578521+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [
+        "consolidation",
+        "decay-and-forgetting",
+        "episodic-capture",
+        "memory-value-model",
+        "observation-clock",
+        "procedure-promotion",
+        "stale-served-versus-stale-answered",
+        "working-memory"
+      ],
+      "deviations": 0,
+      "context": "core-schema-migrations",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-12T23:01:40.578521+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [
+        "addresses-before-compression",
+        "baseline-ladder",
+        "coverage-instrumentation",
+        "decay-and-forgetting",
+        "diagnosis-withheld-from-the-executor",
+        "durable-store-failure-posture",
+        "memory-governance",
+        "probe-without-write-back",
+        "rollup-compaction"
+      ],
+      "deviations": 0,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-12T23:01:40.578521+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [
+        "cross-context-promotion",
+        "decay-and-forgetting",
+        "durable-store-failure-posture",
+        "episodic-capture",
+        "lane-reconciliation",
+        "memory-governance",
+        "memory-value-model",
+        "procedure-promotion",
+        "recall-injection",
+        "rollup-compaction",
+        "working-memory"
+      ],
+      "deviations": 0,
+      "context": "api-server-core",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    }
+  ]
+}

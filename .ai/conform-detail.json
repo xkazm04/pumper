@@ -625,6 +625,306 @@
           "evidence": "scripts/docs/check-doc-sync.mjs:315 A detected doc mismatch reaches exit 2, while cannot-check uses exit 3; the code explicitly describes the hook as a reminder rather than merge enforcement."
         }
       ]
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/agent-memory": {
+      "context": "e2e-data-integrity",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "techniques": [
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The empty-versus-miss distinction is a dataset search page for an MCP caller, not a memory store that failed to parse."
+        },
+        {
+          "technique": "lane-reconciliation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/store_reports.rs:8 The doctor gap is the scrape search index versus the dataset store, not memory retrieval lanes."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/vcr_attempts.rs:451 Provenance here is a VCR replay stamp on a job result, not an episode record."
+        },
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:488 Session here is an HTTP profile cookie jar, not operative task state."
+        },
+        {
+          "technique": "addresses-not-atoms",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23 The only memory token in this file is a wasm linear-memory export."
+        },
+        {
+          "technique": "memory-governance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/target_exclusion.rs:191 Provenance is a dataset row an operator can check after a run, not a belief write lane."
+        },
+        {
+          "technique": "loss-site-inventory",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:5 The disagreement is among dataset read shapes, not memory failing to reach an agent."
+        },
+        {
+          "technique": "recall-injection",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:1 Labeling a search hit's index is not a budgeted recall injection of beliefs."
+        },
+        {
+          "technique": "coverage-instrumentation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/store_reports.rs:11 The doctor reports an empty scrape index, not uncovered agent-memory subjects."
+        },
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_delete_gate.rs:1 This is the dataset delete gate, not a belief demotion or expiry policy."
+        },
+        {
+          "technique": "baseline-ladder",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:1 The battery probes engine capabilities, not memory-pipeline rungs."
+        }
+      ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/agent-memory": {
+      "context": "pumper-sync-sdk",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "techniques": [
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:69 memoryWatermark is a process-local Map of feed cursors that a restart drops."
+        },
+        {
+          "technique": "observation-clock",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:2 The watermark is a (created_at, rowid) feed position, not a distillation clock."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/client.ts:2 The client is a stateless read wrapper and stores no episode."
+        },
+        {
+          "technique": "probe-without-write-back",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/sync.ts:4 The write-back is the consumer's change-feed cursor after the sink commits, not a recall usage counter."
+        },
+        {
+          "technique": "owner-and-counterpart-scope",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/watermark.ts:66 The cursor key is app/dataset, not an owner and a counterpart."
+        },
+        {
+          "technique": "recall-injection",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/http.ts:85 Constant memory is a stream buffer bound, not a recall budget."
+        },
+        {
+          "technique": "addresses-not-atoms",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/client.ts:35 The word memory is RAM used while streaming snapshot rows."
+        },
+        {
+          "technique": "consolidation",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/sync.ts:1 The module mirrors dataset revisions; it does not distill beliefs."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/README.md:22 The silent-empty case described is a response-shape drift in a hand-rolled parser, not a corrupt memory store."
+        }
+      ]
+    },
+    "2d713bf8-16d5-4c0f-aa09-ce602aa575db/agent-memory": {
+      "context": "core-schema-migrations",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "techniques": [
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:7 The TTL ages fetch-tier strikes, not beliefs."
+        },
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0022_checkpoints.sql:2 The blob is a scrape job's resume snapshot, not an agent's operative synthesis."
+        },
+        {
+          "technique": "consolidation",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:2 Identical Claude requests are cached by hash; nothing is distilled into a belief."
+        },
+        {
+          "technique": "observation-clock",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:3 The cache key keeps the raw prompt fields and does not ground relative time."
+        },
+        {
+          "technique": "procedure-promotion",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0025_api_recipes.sql:2 Recipes are discovered URL templates, not procedures promoted from agent episodes."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0005_change_intelligence.sql:1 Revisions are dataset change history, not episodes of an agent."
+        },
+        {
+          "technique": "memory-value-model",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0025_api_recipes.sql:11 The score is extracted-value overlap of an API recipe, not trust, half-life, and usage."
+        },
+        {
+          "technique": "stale-served-versus-stale-answered",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0005_change_intelligence.sql:10 Change kinds append dataset revisions; they are not superseded beliefs served to a reader."
+        }
+      ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/agent-memory": {
+      "context": "ci-quality-gates",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "techniques": [
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:14 Expiry is a flake-quarantine rule, not belief demotion."
+        },
+        {
+          "technique": "coverage-instrumentation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:1 The denominator is package manifests claimed by CI, not memory subjects."
+        },
+        {
+          "technique": "baseline-ladder",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:16 The artifact is a lane measurement, not a memory-pipeline rung."
+        },
+        {
+          "technique": "probe-without-write-back",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-record.mjs:2 The wrapper records test outcomes and does not increment a recall counter."
+        },
+        {
+          "technique": "diagnosis-withheld-from-the-executor",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-canary.mjs:2 The canary checks that the lane judge still fires; there is no executor and reviser."
+        },
+        {
+          "technique": "memory-governance",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:2 The gate checks tool-name spelling, not who may write a belief."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:33 An unreadable quarantine register exits 3; that register is not a memory store."
+        },
+        {
+          "technique": "addresses-before-compression",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:14 The ceiling prunes cargo build artifacts, not redundant memory items."
+        },
+        {
+          "technique": "rollup-compaction",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:21 supersededFiles are stale build artifacts, not a family of beliefs."
+        }
+      ]
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/agent-memory": {
+      "context": "api-server-core",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "techniques": [
+        {
+          "technique": "working-memory",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/progress.rs:7 The map holds the latest job-progress snapshot and is dropped on restart."
+        },
+        {
+          "technique": "decay-and-forgetting",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/main.rs:578 The janitor deletes stale tier_memory rows, which are HTTP host strike records."
+        },
+        {
+          "technique": "recall-injection",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/state.rs:297 Claude is given an isolated cwd so a project instruction file is not inherited; there is no recall budget."
+        },
+        {
+          "technique": "procedure-promotion",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/mod.rs:145 The published agent tools are scrape-app definitions, not procedures promoted from memory."
+        },
+        {
+          "technique": "episodic-capture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/live.rs:8 The ring replays missed SSE notifications; it is not an episode store."
+        },
+        {
+          "technique": "rollup-compaction",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/maintenance.rs:3 Maintenance folds the SQLite WAL, not redundant beliefs."
+        },
+        {
+          "technique": "cross-context-promotion",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/registry.rs:6 The registry lists scrape apps; a search of the file found no memory store."
+        },
+        {
+          "technique": "memory-governance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/state.rs:43 The delete clears a host politeness penalty, not a proposed belief."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/mod.rs:7 Each MCP POST is one JSON response, so there is no durable memory artifact to parse."
+        },
+        {
+          "technique": "lane-reconciliation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/state.rs:357 Tantivy is the dataset search index wired beside Storage, not a lane over a belief record."
+        },
+        {
+          "technique": "memory-value-model",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/main.rs:467 Host rows age by a TTL clock, not a shared trust, half-life, and usage score."
+        }
+      ],
+      "withdrawn": {
+        "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+        "state": "not-applicable",
+        "at": "2026-10-12T23:02:57.347779+00:00",
+        "reason": "reviewer (sonnet): The anchor crates/server/src/mcp/mod.rs:22 is `mod live;`, which doesn't show the tool list the evidence cites. The module doc there names only enqueue_job, fetch_readable and deep_research, so I could not confirm list_apps, query_dataset, search or wait_job from the line. The memory greps did confi"
+      }
     }
   }
 }
