@@ -1520,7 +1520,11 @@
           "revision": 24,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/ci/flake-record.mjs:217 A recorded run that parses zero tests only warns and then exits with cargo's status, so a broken reader stays a green process.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:5521806124d93882",
+          "evaluatedRevision": 26
         },
         {
           "subject": "eval-harness",
@@ -2785,7 +2789,11 @@
           "revision": 24,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 The test writes secrets into the process environment and returns without clearing them, so later tests in the same process inherit that world.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:5521806124d93882",
+          "evaluatedRevision": 26
         },
         {
           "subject": "mcp-tools",
@@ -3679,7 +3687,11 @@
           "revision": 24,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export check counts lines and compares a header string, and the comment says quoted CSV is not parsed, so a quoting bug stays green on this fixture.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:5521806124d93882",
+          "evaluatedRevision": 26
         },
         {
           "subject": "quality-gates",
@@ -3874,7 +3886,11 @@
           "revision": 24,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:1449 The e2e census blanks comments, keeps a module-count floor, and chains the panic hook so a scanner or a quiet hook cannot report a clean tree.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:5521806124d93882",
+          "evaluatedRevision": 26
         },
         {
           "subject": "agent-instruction-files",
@@ -4742,7 +4758,11 @@
           "revision": 24,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:5521806124d93882",
+          "evaluatedRevision": 26
         },
         {
           "subject": "docs-sync",

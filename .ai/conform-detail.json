@@ -1,0 +1,336 @@
+{
+  "schema": "conform-detail/1",
+  "pairs": {
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/test-harness": {
+      "context": "ci-quality-gates",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T19:27:37.490Z",
+      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "techniques": [
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:221 Zero gated tools parsed from the source is cannot-check, not a clean gate."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:16 This file judges an emitted artifact; it does not build a schema or environment per test."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-canary.mjs:39 The canary writes a constant artifact and does not drive a shipped process."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/flake-record.mjs:217 The wrapper says a zero parse means the reader broke, then leaves cargo's exit code unchanged, including zero."
+        },
+        {
+          "technique": "flake-lifecycle",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-check.mjs:75 Quarantine rows require a person-owned, dated, caused, evidenced decision; same-commit transitions label and unlabel without a stored flag."
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/lane-certify.mjs:428 Percentile and second-half slope are judged from predeclared bounds, and a lane that has never passed is its own health category."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/lane-canary.mjs:29 The canary emits a value outside its declared bound so the judge is proved by catching that planted breach."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:77 A manifest directory is claimed when its path string occurs anywhere in ci.yml or the justfile, so a comment counts as a job that builds and tests it."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/lane-certify.mjs:119 A missing series is cannot-see, not a pass on a default."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-id.mjs:172 The ignore scanner matches only an attribute at the start of a line, so prose that mentions #[ignore] is not a quarantine."
+        }
+      ],
+      "registryProposal": "platform-quirk-absorption makes a zero-test run fatal, while flake-record.mjs is required not to change cargo's exit code. The standard should say which duty wins for a recorder placed in front of a required check."
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/test-harness": {
+      "context": "core-platform-services",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T19:27:37.490Z",
+      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "techniques": [
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/testing.rs:61 Every TempStore builds its schema by connecting and migrating; this constructor does not copy a built template."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/testing.rs:7 The shared harness is in-process stubs, not a driver of the shipped binary."
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 The test mutates the shared process environment and the function ends with those variables still set."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/process_env.rs:31 The Windows allowlist is product behaviour for child processes, not a repair in the test runner."
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/lane_artifact/mod.rs:21 The Rust side emits raw series and panics if it cannot write; it does not decide pass or fail."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/catalog.rs:1105 Coverage status carries named uncovered apps and a live-source denominator, not only a declared count."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/testing.rs:119 ScriptedResearcher is an in-process prompt script, not a captured remote exchange."
+        },
+        {
+          "technique": "context-starved-executor",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/testing.rs:12 These modules are library doubles with no human-facing journey."
+        },
+        {
+          "technique": "approval-snapshots-with-guarded-update",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/catalog.rs:866 Catalog tests embed expected TOML in the test; they do not record an output snapshot."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/testing.rs:88 Dead overrides trait defaults that returned a typed error, so an engine call panics instead of looking like the refusal under test."
+        }
+      ]
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/test-harness": {
+      "context": "e2e-data-integrity",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T19:27:37.490Z",
+      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "techniques": [
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:722 A battery entry that the source walk no longer finds fails, so the list cannot outlive the engines."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:90 The search tests call the in-process router, not a shipped process."
+        },
+        {
+          "technique": "configuration-axes-cross-the-ladder",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:23 The axes here are response fields of a test double, not build-configuration cells."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:706 The HttpClient population is walked from workspace sources and then compared with the battery and exemption lists."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/vcr_attempts.rs:429 An app whose work does not cross the cassette seam is refused before it runs, and the replay must not reach the app."
+        },
+        {
+          "technique": "context-starved-executor",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The sentence names an API caller; these files do not run a context-starved UI agent."
+        },
+        {
+          "technique": "constraint-injection-for-unreachable-tiers",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:26 SizedSearch is a stub of an empty index, not an override of a hardware capacity probe."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/search_degraded.rs:110 An empty hit list must carry a degraded index flag, so a wiped index is not asserted as an honest miss."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:754 The wiring pin drops comment lines before matching the HttpEngine::new call text."
+        },
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 CSV is checked by line count because the fixture has no commas or quotes, so the CSV reader is never run."
+        }
+      ]
+    },
+    "b6cad188-6215-4135-aa56-8f84711e4744/test-harness": {
+      "context": "e2e-integration",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "conformant",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T19:27:37.490Z",
+      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "techniques": [
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:1374 The footer census fails when the directory walk is below its floor, so an empty scan is not a clean tree."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mod.rs:8 The suite states it runs headless over AppState and does not claim to drive the shipped process."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:747 The panic hook chains the default hook and adds a named footer, including when libtest did not name the thread."
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/harness.rs:505 Claim is a per-test timing bound, not a scheduled statistical lane."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:1437 A seeded raw wall-clock assertion is required to be found, so the census is shown able to go red."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mod.rs:7 These tests are compiled inside the server binary, not a detached shipped package."
+        },
+        {
+          "technique": "configuration-axes-cross-the-ladder",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/harness.rs:513 Speedup claims use a ratio so machine speed is not a build cell of this suite."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:774 The e2e inventories are derived from the directory listing, not from a hand-written module list."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:309 Replay is run on Dead engines, so a cassette miss that reaches the network panics instead of passing."
+        },
+        {
+          "technique": "context-starved-executor",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mod.rs:9 The suite is headless API composition with no prose UI journey."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:337 The replay path is given engines that panic, so only the cassette can produce the recorded body."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:1449 A comment that names the timing rule does not hide a raw comparison, and a violation that exists only in a comment is not a hit."
+        }
+      ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/test-harness": {
+      "context": "pumper-sync-sdk",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T19:27:37.490Z",
+      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "techniques": [
+        {
+          "technique": "suite-partitioning",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/package.json:26 The package has one test script over the compiled test directory, matching one small suite."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:5 Wire fixtures are hand-authored against current server shapes and the loader does not check a schema fingerprint before use."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:13 The file says this suite does not drive a live server."
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/sync-report.test.ts:127 The test supplies its own sink; there is no shared machine resource to isolate."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/package.json:25 npm test copies JSON fixtures into the emit directory because tsc does not, in the one pretest in front of the suite."
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/package.json:24 Package scripts are build, typecheck, and node:test; there is no scheduled statistical lane."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 \"Every field PumperRecord requires\" is checked by a hand-written list, and the JSON is only cast to the type."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:91 HTTP is a stub that returns a supplied body, not a record/playback seam against a remote service."
+        },
+        {
+          "technique": "context-starved-executor",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/package.json:4 The package is a library with no human-facing interface."
+        },
+        {
+          "technique": "approval-snapshots-with-guarded-update",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:6 The JSON files are hand-authored inputs shaped like server types, not recorded SDK outputs."
+        },
+        {
+          "technique": "far-side-oracle",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/sync-report.test.ts:178 The effect under test is a caller-supplied sink, and the test asserts that sink rather than an external system."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/sync-report.test.ts:184 Zero upserts caused by the mapper is reported as droppedByMap, not as an idle feed."
+        },
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string."
+        }
+      ]
+    }
+  }
+}
