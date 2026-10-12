@@ -1199,7 +1199,11 @@
           "revision": 26,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/registry.rs:6 Searching crates/server/src/ for agent runtime assembly terms confirmed that api-server-core bootstraps a web scraping server, an app registry, and an MCP tool server for external clients, rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
+          "evaluatedRevision": 27
         },
         {
           "subject": "agent-instruction-files",
@@ -3451,7 +3455,11 @@
           "revision": 26,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:2 Searching scripts/docs/ for agent runtime assembly terms confirmed that docs-and-ops-scripts implements a Claude Code developer stop hook for git documentation sync discipline rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
+          "evaluatedRevision": 27
         },
         {
           "subject": "agent-memory",
@@ -4333,7 +4341,11 @@
           "revision": 26,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 Searching crates/server/src/triggers.rs and its e2e test suite for agent runtime assembly terms confirmed the pipeline coordinates event-driven scraping job triggers rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
+          "evaluatedRevision": 27
         },
         {
           "subject": "convergence-loop-and-requeue",
@@ -4882,7 +4894,11 @@
           "revision": 26,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "clients/typescript/package.json:4 Searching clients/typescript for agent runtime assembly terms confirmed that @pumper/sync is a TypeScript consumer client for dataset change feeds and watermark mirroring rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
+          "evaluatedRevision": 27
         },
         {
           "subject": "prompt-assembly",
@@ -5000,7 +5016,11 @@
           "revision": 26,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:75 Searching plugins-src/ for agent runtime assembly terms confirmed that wasm-plugins provides HTML extraction and trigger filtering WASM modules under the pumper-engine-wasm ABI rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
+          "evaluatedRevision": 27
         },
         {
           "subject": "test-harness",
