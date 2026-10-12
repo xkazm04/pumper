@@ -1508,7 +1508,11 @@
           "revision": 52,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:178 Lane certification can return pass for malformed or non-finite measurements because its comparisons leave ok true.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
+          "evaluatedRevision": 53
         },
         {
           "subject": "test-harness",
@@ -3371,7 +3375,11 @@
           "revision": 52,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:167 The hook silently skips malformed transcript records and can exit clean after parsing no usable events.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
+          "evaluatedRevision": 53
         },
         {
           "subject": "prompt-assembly",
@@ -3715,7 +3723,11 @@
           "revision": 52,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 The production-engine inventory recognizes literal implementation spellings and silently misses equivalent aliased or multiline implementations.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
+          "evaluatedRevision": 53
         },
         {
           "subject": "agent-memory",
@@ -4952,7 +4964,11 @@
           "revision": 52,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 A present but nonnumeric count becomes indistinguishable from an absent field, so the predicate can pass an input it could not classify.",
+          "evaluatedAt": "2026-10-12",
+          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
+          "evaluatedRevision": 53
         },
         {
           "subject": "agent-runtime-assembly",

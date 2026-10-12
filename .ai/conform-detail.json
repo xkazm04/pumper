@@ -486,6 +486,145 @@
         "at": "2026-10-12T20:57:39.275771+00:00",
         "reason": "reviewer (sonnet): The claim that these apps are not an MCP tool surface is contradicted by the code. The extractor's `mode_door.rs` tests `mcp::validate_app_params`, and the apps' manifests are published verbatim as MCP tool definitions (`result_contract.rs` tests). The anchors at crawl/src/lib.rs:24 and extractor/sr"
       }
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/quality-gates": {
+      "context": "ci-quality-gates",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T21:56:36.968Z",
+      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "techniques": [
+        {
+          "technique": "gate-liveness",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/disk-check.mjs:124 measure catches directory and stat failures without reporting lost coverage; an unreadable population can become zero bytes and no findings."
+        },
+        {
+          "technique": "instrument-answers-only-its-own-question",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-check.test.mjs:477 The fixture emits an apparently successful test record while independently varying the command's exit code, proving recording cannot replace the command's verdict."
+        },
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:217 The checker matches raw Rust text without removing comments; an in-memory probe removed a dispatch guard, retained its spelling in a block comment, and produced no findings."
+        },
+        {
+          "technique": "severity-by-construction",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-check.mjs:434 In verdict mode, a nonempty findings population reaches EXIT_FINDINGS; paired process fixtures assert exit 2."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:169 There is no finite-number validation before comparison; read-only probes returned pass for a percentile measured as 'bad' and a slope measured as NaN."
+        },
+        {
+          "technique": "unparseable-form-is-a-finding",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:163 An unguarded Rust binding pattern such as name @ \"deep_research\" is neither recognized nor rejected; the in-memory probe demonstrated this escape."
+        },
+        {
+          "technique": "waiver-names-its-finding",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-check.mjs:132 Exemption rows join mechanically to scanned test identities, and unmatched rows produce an orphan finding instead of granting a blanket exemption."
+        }
+      ]
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/quality-gates": {
+      "context": "e2e-data-integrity",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T21:56:36.968Z",
+      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "techniques": [
+        {
+          "technique": "instrument-answers-only-its-own-question",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:301 The paired cheap and full requests explicitly prevent a skipped artifact sweep from licensing a clean full-report verdict."
+        },
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:761 The wiring assertion searches normalized source text after removing only whole-line // comments; block comments or string literals containing the expected expressions can satisfy it."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:141 The tests require an incomplete verdict, healthy false, and an unverifiable roster entry when the artifact sweep was skipped."
+        },
+        {
+          "technique": "unparseable-form-is-a-finding",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 The scanner accepts only two literal trait spellings and has no finding for alias-based, generic, or multiline implementations outside those patterns."
+        },
+        {
+          "technique": "waiver-names-its-finding",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:730 The exemption table names exact path-and-type identities with reasons, and reverse reconciliation rejects exemptions whose named implementor disappeared."
+        }
+      ]
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/quality-gates": {
+      "context": "wasm-plugins",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T21:56:36.968Z",
+      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "techniques": [
+        {
+          "technique": "gate-liveness",
+          "verdict": "conformant",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:257 The predicate's test supplies a known count-bar violation and requires a veto; a separate assertion also exercises a dataset mismatch."
+        },
+        {
+          "technique": "severity-by-construction",
+          "verdict": "conformant",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:111 A present numeric count below the bar directly produces pass false, which extract_v2 serializes into the predicate result."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:116 For valid JSON containing count:\"bad\", numeric conversion returns None and this branch announces a missing field before returning true; an executed but unclassifiable input should fail closed."
+        }
+      ]
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/quality-gates": {
+      "context": "docs-and-ops-scripts",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-12",
+      "evaluatedTs": "2026-10-12T21:56:36.968Z",
+      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "techniques": [
+        {
+          "technique": "gate-liveness",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:167 No parsed-event assertion distinguishes an unreadable transcript from a no-edit turn; a read-only invocation using Cargo.toml as the transcript exited 0 silently."
+        },
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:220 The reminder names each mapped document, all current targets resolve in the checkout, and editing that exact document clears its own finding."
+        },
+        {
+          "technique": "self-reported-gate-inputs",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:174 The population depends on the author's choice of editing tool: Bash-driven source writes leave no recognized edit, and no independent filesystem or diff check recovers them."
+        },
+        {
+          "technique": "severity-by-construction",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:315 A detected doc mismatch reaches exit 2, while cannot-check uses exit 3; the code explicitly describes the hook as a reminder rather than merge enforcement."
+        }
+      ]
     }
   }
 }
