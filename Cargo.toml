@@ -90,7 +90,7 @@ futures = "0.3"
 # high-throughput extraction (no-GIL parallelism + SIMD)
 regex = "1"
 rayon = "1"
-simd-json = "0.14"
+simd-json = "0.18"
 url = "2"
 
 # sandboxed WASM plugin runtime

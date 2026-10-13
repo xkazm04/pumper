@@ -17,4 +17,4 @@ hex.workspace = true
 # CMS ships the RVU release as a ZIP; deflate is the only method those archives
 # use. Not hoisted to [workspace.dependencies] — this is currently the only
 # consumer (hoist when a second binary-archive app lands).
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
