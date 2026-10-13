@@ -625,7 +625,11 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:4 Searched engine-wasm, engine-claude and engine-search for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; wasm plugins declare no imports and one call is synchronous, Claude is a CLI subprocess, and search is Tantivy.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
+          "evaluatedRevision": 2
         },
         {
           "subject": "quality-gates",
@@ -2112,7 +2116,11 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:2 Searched crates/core/src and crates/core/tests for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; the engines named on this line are HTTP, browser and Claude research traits wired by the server.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
+          "evaluatedRevision": 2
         },
         {
           "subject": "voice-io",
@@ -3349,7 +3357,11 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Searched crates/core/migrations for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; a host profile here is persisted HTTP-versus-browser tier memory.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
+          "evaluatedRevision": 2
         },
         {
           "subject": "quality-gates",
@@ -3907,7 +3919,11 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Searched crates/server/src/e2e for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; this battery's engine is one of five scrape capability traits, and a discovered wasm module is listed as not runnable.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
+          "evaluatedRevision": 2
         },
         {
           "subject": "conformance-checking",
@@ -4611,7 +4627,11 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:256 Searched crates/server/src for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; shutdown re-queues the job from a durable checkpoint, so these jobs are stored work rather than in-memory promise reactions.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
+          "evaluatedRevision": 2
         },
         {
           "subject": "job-coordination",
