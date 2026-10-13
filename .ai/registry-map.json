@@ -657,7 +657,11 @@
           "revision": 6,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-wasm/src/lib.rs:734 In describe_manifest, the host evaluates the untrusted guest module's describe() function to discover its manifest rather than extracting metadata statically or verifying an approved byte digest, deviating from reading-is-not-running where read operations must not execute unapproved code.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:f5666db1094acd9f",
+          "evaluatedRevision": 6
         }
       ],
       "governance": "governed"

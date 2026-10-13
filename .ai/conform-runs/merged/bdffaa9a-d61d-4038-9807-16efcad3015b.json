@@ -1,0 +1,131 @@
+{
+  "schema": "conform-run/1",
+  "worker": "bdffaa9a-d61d-4038-9807-16efcad3015b",
+  "subject": "supply-chain",
+  "evaluatedAt": "2026-10-13T03:06:37.564962+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [
+    {
+      "context": "ai-extraction-engines",
+      "subject": "supply-chain",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/engine-wasm/src/lib.rs:734 In describe_manifest, the host evaluates the untrusted guest module's describe() function to discover its manifest rather than extracting metadata statically or verifying an approved byte digest, deviating from reading-is-not-running where read operations must not execute unapproved code.",
+      "techniques": [
+        {
+          "technique": "reading-is-not-running",
+          "verdict": "deviation",
+          "evidence": "crates/engine-wasm/src/lib.rs:734 Reading a WASM plugin's self-describing manifest evaluates untrusted guest code via describe.call without static extraction or digest approval."
+        },
+        {
+          "technique": "permission-manifest-scoping",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:120 ClaudeEngine passes --dangerously-skip-permissions and omits tool restrictions when allowed_tools is empty instead of enforcing least-privilege scoping by default."
+        },
+        {
+          "technique": "archive-extraction-safety",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:526 The WASM host only inspects bare .wasm binary files in the configured directory, never downloading or extracting archive bundles."
+        },
+        {
+          "technique": "unsafe-deserialization-off-by-default",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/src/lib.rs:738 WASM plugin outputs and manifests are deserialized strictly as structured JSON data, avoiding unsafe object instantiation."
+        }
+      ],
+      "registryProposal": "The reading-is-not-running technique does not distinguish metered in-memory bytecode sandboxes (e.g. wasmtime with CPU fuel and memory ceilings) from unconstrained native/script evaluation; it should clarify whether metered guest manifest probes with zero host imports require digest approval or static metadata sections."
+    }
+  ],
+  "declined": [
+    {
+      "subject": "supply-chain",
+      "context": "core-platform-services",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "supply-chain",
+      "context": "ci-quality-gates",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor (gates.json:19) is a scan-root/fixture list that cannot show the absence of supply-chain gates, and ship-inventory.test.mjs enumerates tracked Cargo.toml/package.json manifests, which is dependency-adjacent."
+    },
+    {
+      "subject": "supply-chain",
+      "context": "web-crawl-extraction",
+      "reason": "withdrawn after review: reviewer (sonnet): Both anchors are Cargo.toml dependency lines (extractor:19 is the pumper-engine-archive dep; grants-common:6 is the [dependencies] header), which do not show the absence of supply-chain preconditions, and workspace deps are still third-party resolution."
+    },
+    {
+      "subject": "supply-chain",
+      "context": "grants-intelligence",
+      "reason": "withdrawn after review: reviewer (sonnet): Both anchors are Cargo.toml dependency lines (extractor:19 is the pumper-engine-archive dep; grants-common:6 is the [dependencies] header), which do not show the absence of supply-chain preconditions, and workspace deps are still third-party resolution."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-13T03:06:37.564962+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "supply-chain"
+      ],
+      "techniques": [
+        "archive-extraction-safety",
+        "dependency-policy-gates",
+        "lockfile-freshness-oracle",
+        "scheduled-deep-analysis",
+        "secret-scanning-architecture"
+      ],
+      "deviations": 0,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T03:06:37.564962+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "supply-chain"
+      ],
+      "techniques": [
+        "archive-extraction-safety",
+        "dependency-policy-gates",
+        "unsafe-deserialization-off-by-default"
+      ],
+      "deviations": 0,
+      "context": "web-crawl-extraction",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T03:06:37.564962+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "supply-chain"
+      ],
+      "techniques": [
+        "archive-extraction-safety",
+        "dependency-policy-gates",
+        "secret-scanning-architecture"
+      ],
+      "deviations": 0,
+      "context": "grants-intelligence",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T03:06:37.564962+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "supply-chain"
+      ],
+      "techniques": [
+        "archive-extraction-safety",
+        "permission-manifest-scoping",
+        "reading-is-not-running",
+        "unsafe-deserialization-off-by-default"
+      ],
+      "deviations": 1,
+      "context": "ai-extraction-engines",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}

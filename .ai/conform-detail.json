@@ -1597,6 +1597,141 @@
         "at": "2026-10-13T02:06:49.165536+00:00",
         "reason": "reviewer (sonnet): The technique claim that 'the hook's own comment says it never blocks' is not in the file. check-doc-sync.mjs has no such comment, and main() writes the reminder to stderr and calls process.exit(2) at line 315, which blocks the Stop event."
       }
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/supply-chain": {
+      "context": "ci-quality-gates",
+      "subject": "supply-chain",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T03:06:37.564Z",
+      "techniques": [
+        {
+          "technique": "dependency-policy-gates",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/gates.json:19 The gate manifest enumerates internal Node test and cache gates, with no dependency policy gating."
+        },
+        {
+          "technique": "secret-scanning-architecture",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/gates.json:17 The scan roots define test and doc synchronization checks, with no commit-time secret scanning gate."
+        },
+        {
+          "technique": "archive-extraction-safety",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:29 The disk checker inspects local build cache ceilings, not archive extraction."
+        },
+        {
+          "technique": "lockfile-freshness-oracle",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:38 The inventory test checks that package manifests are claimed by CI jobs, but does not evaluate lockfile freshness against external upstreams."
+        },
+        {
+          "technique": "scheduled-deep-analysis",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:7 Scheduled long lanes certify statistical test performance, not clock-triggered security analysis."
+        }
+      ],
+      "withdrawn": {
+        "worker": "bdffaa9a-d61d-4038-9807-16efcad3015b",
+        "state": "not-applicable",
+        "at": "2026-10-13T03:07:45.356269+00:00",
+        "reason": "reviewer (sonnet): The anchor (gates.json:19) is a scan-root/fixture list that cannot show the absence of supply-chain gates, and ship-inventory.test.mjs enumerates tracked Cargo.toml/package.json manifests, which is dependency-adjacent."
+      }
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/supply-chain": {
+      "context": "web-crawl-extraction",
+      "subject": "supply-chain",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T03:06:37.564Z",
+      "techniques": [
+        {
+          "technique": "archive-extraction-safety",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:221 The term archive in this context refers to crawl page versioning in datasets rather than software archive extraction."
+        },
+        {
+          "technique": "dependency-policy-gates",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/Cargo.toml:19 The manifest pulls in internal workspace engines for web crawling, with no dependency policy gate owned by this context."
+        },
+        {
+          "technique": "unsafe-deserialization-off-by-default",
+          "verdict": "conformant",
+          "evidence": "crates/apps/extractor/Cargo.toml:10 Extracted records and checkpoints use standard Serde JSON data models, avoiding unsafe object deserialization."
+        }
+      ],
+      "withdrawn": {
+        "worker": "bdffaa9a-d61d-4038-9807-16efcad3015b",
+        "state": "not-applicable",
+        "at": "2026-10-13T03:07:45.373937+00:00",
+        "reason": "reviewer (sonnet): Both anchors are Cargo.toml dependency lines (extractor:19 is the pumper-engine-archive dep; grants-common:6 is the [dependencies] header), which do not show the absence of supply-chain preconditions, and workspace deps are still third-party resolution."
+      }
+    },
+    "d757edd3-47f7-4e38-850b-62b56a7c6740/supply-chain": {
+      "context": "grants-intelligence",
+      "subject": "supply-chain",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T03:06:37.564Z",
+      "techniques": [
+        {
+          "technique": "archive-extraction-safety",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/grants-common/src/lib.rs:1957 The term archived in this context refers to grant opportunity lifecycle states, not software archive extraction."
+        },
+        {
+          "technique": "dependency-policy-gates",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/grants-common/Cargo.toml:7 The crate consumes only in-tree workspace dependencies without managing its own third-party dependency policy gate."
+        },
+        {
+          "technique": "secret-scanning-architecture",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/grants-gov/src/lib.rs:1565 The scraper configures HTTP fetching parameters without handling or scanning commit-time credentials."
+        }
+      ],
+      "withdrawn": {
+        "worker": "bdffaa9a-d61d-4038-9807-16efcad3015b",
+        "state": "not-applicable",
+        "at": "2026-10-13T03:07:45.373937+00:00",
+        "reason": "reviewer (sonnet): Both anchors are Cargo.toml dependency lines (extractor:19 is the pumper-engine-archive dep; grants-common:6 is the [dependencies] header), which do not show the absence of supply-chain preconditions, and workspace deps are still third-party resolution."
+      }
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/supply-chain": {
+      "context": "ai-extraction-engines",
+      "subject": "supply-chain",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T03:06:37.564Z",
+      "worker": "bdffaa9a-d61d-4038-9807-16efcad3015b",
+      "techniques": [
+        {
+          "technique": "reading-is-not-running",
+          "verdict": "deviation",
+          "evidence": "crates/engine-wasm/src/lib.rs:734 Reading a WASM plugin's self-describing manifest evaluates untrusted guest code via describe.call without static extraction or digest approval."
+        },
+        {
+          "technique": "permission-manifest-scoping",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:120 ClaudeEngine passes --dangerously-skip-permissions and omits tool restrictions when allowed_tools is empty instead of enforcing least-privilege scoping by default."
+        },
+        {
+          "technique": "archive-extraction-safety",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:526 The WASM host only inspects bare .wasm binary files in the configured directory, never downloading or extracting archive bundles."
+        },
+        {
+          "technique": "unsafe-deserialization-off-by-default",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/src/lib.rs:738 WASM plugin outputs and manifests are deserialized strictly as structured JSON data, avoiding unsafe object instantiation."
+        }
+      ],
+      "registryProposal": "The reading-is-not-running technique does not distinguish metered in-memory bytecode sandboxes (e.g. wasmtime with CPU fuel and memory ceilings) from unconstrained native/script evaluation; it should clarify whether metered guest manifest probes with zero host imports require digest approval or static metadata sections."
     }
   }
 }
