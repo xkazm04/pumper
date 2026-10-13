@@ -383,7 +383,11 @@ fn find_pprrvu_entry(names: &[String]) -> Option<String> {
 fn extract_pprrvu_csv(zip_bytes: &[u8]) -> Result<(String, String)> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
         .map_err(|e| Error::App(format!("RVU ZIP unreadable (not a ZIP, or corrupt): {e}")))?;
-    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.map(|n| n.to_string()))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::App(format!("RVU ZIP entry name unreadable: {e}")))?;
     let entry = find_pprrvu_entry(&names).ok_or_else(|| {
         Error::App(format!(
             "PPRRVU layout drift: no PPRRVU*.csv entry in the release ZIP — entries: {names:?}"
