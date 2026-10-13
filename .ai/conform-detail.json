@@ -1448,6 +1448,155 @@
           "evidence": "crates/apps/provisioner/src/lib.rs:1142 Scraped page content enters an ordinary formatting slot with no template-level declaration of its untrusted class or mechanically enforced insertion-point policy."
         }
       ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/agent-instruction-files": {
+      "context": "pumper-sync-sdk",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+      "techniques": []
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/agent-instruction-files": {
+      "context": "ci-quality-gates",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+      "techniques": []
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/agent-instruction-files": {
+      "context": "core-platform-services",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "techniques": [],
+      "withdrawn": {
+        "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+        "state": "not-applicable",
+        "at": "2026-10-13T02:06:49.148946+00:00",
+        "reason": "reviewer (sonnet): The anchor, crates/core/src/catalog.rs:2, is only the catalog module's doc line. It does not show that the other core modules and tests lack an instruction-file surface, so it is an incidental anchor for a not-applicable verdict."
+      }
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/agent-instruction-files": {
+      "context": "api-server-core",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+      "techniques": [
+        {
+          "technique": "workspace-ancestry-isolation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/state.rs:303 The launch directory stays under the storage root; leaving the instruction ancestry is an operator relocation, not the layout."
+        },
+        {
+          "technique": "capability-coverage-contract",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:393 list_apps builds the agent-facing app catalog from the live registry rather than a handwritten name list."
+        },
+        {
+          "technique": "enforcement-demotion",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:341 Advertised tool-argument constraints are checked in code instead of left for the model to obey."
+        },
+        {
+          "technique": "capability-before-steering",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/registry.rs:420 A test requires a worked example whenever a params schema exists, so the agent is not steered at a call shape the manifest never supplies."
+        }
+      ],
+      "registryProposal": "workspace-ancestry-isolation's fallbacks are path exclusion or moving the directory; they do not name a host flag that disables instruction discovery when the scratch directory must stay under a storage root inside the checkout."
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/agent-instruction-files": {
+      "context": "docs-and-ops-scripts",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "techniques": [
+        {
+          "technique": "enforcement-demotion",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:222 A program decides to speak from the edited-path set; the hook's own comment says it never blocks."
+        },
+        {
+          "technique": "capability-before-steering",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:29 Uniform silence was a transcript-shape gap; the repair is isToolResultEntry, not a sharper reminder."
+        },
+        {
+          "technique": "restraint-amplifier-balance",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:240 The update obligation is paired with an explicit dismiss outlet for internal-only edits."
+        },
+        {
+          "technique": "inherited-default-ownership",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:285 Stop re-entry is pinned off in the hook so the harness does not deliver a second reminder."
+        },
+        {
+          "technique": "instruction-freshness",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:286 The transcript-shape claim the hook trusts is re-checked against live transcripts and fails when that shape moves."
+        },
+        {
+          "technique": "line-earning",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:189 These files are a conditional hook, not the always-loaded instruction file line-earning admits into."
+        },
+        {
+          "technique": "capability-coverage-contract",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:207 Unmapped silence is the source-to-doc map's scope; scripts/docs has no runtime tool or skill registry."
+        },
+        {
+          "technique": "host-contract-compilation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:11 One Stop wiring; scripts/docs has no second host contract or compiled render."
+        },
+        {
+          "technique": "machine-owned-regions",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/feature-doc-map.json:3 The map tells a person to edit the script; nothing marks a generator fence."
+        },
+        {
+          "technique": "write-back-sink-class",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:18 Dismissal is a chat sentence; these files name no append-only agent log."
+        },
+        {
+          "technique": "workspace-ancestry-isolation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:72 This resolves a repo root for path matching and does not place or load instruction files."
+        },
+        {
+          "technique": "sibling-floor-ownership",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:272 The hook is repository Stop wiring, not an installed-capability catalog."
+        },
+        {
+          "technique": "substrate-coupled-expiry",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/fixtures/README.md:7 The only version pin is the fixture CLI that recorded the transcript shape, not a judgment rule's model generation."
+        }
+      ],
+      "registryProposal": "enforcement-demotion tells a conditional hook to carry the interaction contract, while single-source-topology forbids restating instruction content in any harness-required file; the doc-sync reminder does both and the standard does not say which rule wins.",
+      "withdrawn": {
+        "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+        "state": "conformant",
+        "at": "2026-10-13T02:06:49.165536+00:00",
+        "reason": "reviewer (sonnet): The technique claim that 'the hook's own comment says it never blocks' is not in the file. check-doc-sync.mjs has no such comment, and main() writes the reminder to stderr and calls process.exit(2) at line 315, which blocks the Stop event."
+      }
     }
   }
 }

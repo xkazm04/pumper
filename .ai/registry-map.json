@@ -1223,7 +1223,11 @@
           "revision": 31,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/state.rs:303 The research CLI is given a workdir derived under the storage root, and the same comment says total isolation from a Claude Code project's instruction files still requires moving database_path.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:25b61236a62604b0",
+          "evaluatedRevision": 31
         },
         {
           "subject": "node-boot-and-declarative-bootstrap",
@@ -1592,7 +1596,11 @@
           "revision": 31,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-id.mjs:53 The only harness token in these gate scripts is CLAUDE_PROJECT_DIR used as a checkout root for test identity; a search found no instruction file, skill manifest, or agent brief, and mcp-gate-parity only checks spellings of gated MCP tool names.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:25b61236a62604b0",
+          "evaluatedRevision": 31
         },
         {
           "subject": "supply-chain",
@@ -4942,7 +4950,11 @@
           "revision": 31,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "clients/typescript/package.json:4 A search of the listed TypeScript sources, tests, fixtures, and README for CLAUDE.md, AGENTS.md, instruction, skill, agent, and prompt found no matches, so this package does not author or load a coding-agent instruction file.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:25b61236a62604b0",
+          "evaluatedRevision": 31
         },
         {
           "subject": "sync-replication",
