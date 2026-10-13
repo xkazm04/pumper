@@ -3697,6 +3697,141 @@
           "evidence": "crates/apps/state-tax/src/lib.rs:340 An empty answer fails the app run. These files do not sweep orphaned job rows."
         }
       ]
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/structured-output": {
+      "context": "web-crawl-extraction",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T13:02:04.905Z",
+      "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:3 Precondition does not hold as extraction uses DOM heuristics without generative models."
+        }
+      ]
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/structured-output": {
+      "context": "wasm-plugins",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T13:02:04.905Z",
+      "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:39 Precondition does not hold as WASM extraction uses deterministic substring matching without generative models."
+        }
+      ]
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/structured-output": {
+      "context": "core-extraction",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T13:02:04.905Z",
+      "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:10 Returns an Option<Value> discarding the fired strategy, omits size and opener bounds on balanced-span detection, and stops on the first brace rather than trying subsequent openers."
+        },
+        {
+          "technique": "extraction-observability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:20 Emits no strategy-fired counter, repair-loop depth, or failure diagnostic samples from the salvage ladder."
+        },
+        {
+          "technique": "schema-validation-and-repair",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:12 Accepts any arbitrary unvalidated Value without enforcing a schema or generating path-addressed errors for a bounded repair loop."
+        }
+      ]
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/structured-output": {
+      "context": "ai-extraction-engines",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T13:02:04.905Z",
+      "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+      "techniques": [
+        {
+          "technique": "constraint-and-tool-channel-exclusion",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:135 Appends --json-schema without asserting that allowed_tools is empty, allowing schema constraints to suppress tool emissions on acting turns."
+        },
+        {
+          "technique": "extraction-strategies",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:433 Collapses loose JSON parsing into an anonymous Option<Value> without recording which strategy fired and runs an unbounded substring loop."
+        },
+        {
+          "technique": "output-budget-signal",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:445 Records dollar cost and CLI turns but collects no output size metric against the model ceiling to detect approaching truncation."
+        },
+        {
+          "technique": "extraction-observability",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:438 Logs a single boolean structured flag instead of emitting chokepoint metrics for strategy rungs or failure categories."
+        },
+        {
+          "technique": "constrained-decoding-is-a-shared-budget",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-claude/src/lib.rs:134 Precondition does not hold as the engine is the sole schema claimant on each request rather than contended independently authored constraints requiring priority shedding."
+        }
+      ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/structured-output": {
+      "context": "content-monitoring",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T13:02:04.905Z",
+      "techniques": [
+        {
+          "technique": "schema-validation-and-repair",
+          "verdict": "deviation",
+          "evidence": "crates/apps/connector-api-watch/src/lib.rs:515 Manufactures a valid artifact out of unparseable or empty model output by substituting a default fallback rather than returning an extraction failure."
+        },
+        {
+          "technique": "extraction-strategies",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:550 Falls back to salvage_json without recording which strategy fired and drops all strategy metadata before building the final result."
+        },
+        {
+          "technique": "display-vs-machine-channels",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:592 When structured extraction fails, raw uncleaned conversational model prose is coerced directly into the machine artifact's report slot."
+        },
+        {
+          "technique": "graded-span-grounding",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:641 Accepts candidate citations as arbitrary strings without aligning or grounding them against the source documents or classifying derived locations."
+        },
+        {
+          "technique": "answer-coverage-gating",
+          "verdict": "deviation",
+          "evidence": "crates/apps/connector-api-watch/src/lib.rs:467 The request enumerates added and removed diff lines to summarize but the parser enforces no answer-coverage floor over the input units before accepting the summary."
+        }
+      ],
+      "withdrawn": {
+        "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+        "state": "deviation",
+        "at": "2026-10-13T13:03:54.281470+00:00",
+        "reason": "reviewer (sonnet): The technique anchor research/src/lib.rs:641 is `is_report_shaped` and says nothing about citations or grounding (the word 'citation' never appears in that file), so that claim is unsupported. The 515, 550 and 592 anchors did check out."
+      }
     }
   }
 }

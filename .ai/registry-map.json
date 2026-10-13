@@ -601,7 +601,11 @@
           "revision": 15,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:135 engine-claude passes --json-schema on argv alongside --allowedTools without asserting mutual exclusion at the assembly boundary, allowing schema constraints to suppress tool emissions on acting turns.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:d51aec71411ccb2b",
+          "evaluatedRevision": 15
         },
         {
           "subject": "agent-memory",
@@ -2362,7 +2366,11 @@
           "revision": 15,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:10 salvage_json recovers JSON from raw agent text but returns an anonymous Option<Value> that discards the fired strategy, omits bounds on input text and openers, and fails to continue past a malformed first brace.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:d51aec71411ccb2b",
+          "evaluatedRevision": 15
         },
         {
           "subject": "web-scraping",
@@ -5196,7 +5204,11 @@
           "revision": 15,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:39 Grep for prompt, salvage, claude, and llm across plugins-src returned zero hits, as plugins execute compiled WebAssembly modules for deterministic string slicing and JSON manipulation without generative model output.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:d51aec71411ccb2b",
+          "evaluatedRevision": 15
         },
         {
           "subject": "sidecar-provisioning",
@@ -5338,7 +5350,11 @@
           "revision": 15,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:3 Grep for prompt, salvage, and json_schema in web-crawl-extraction returned zero hits, as extraction is performed via compiled deterministic selector rules and statistical DOM induction without generative model pipelines.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:d51aec71411ccb2b",
+          "evaluatedRevision": 15
         },
         {
           "subject": "test-harness",
