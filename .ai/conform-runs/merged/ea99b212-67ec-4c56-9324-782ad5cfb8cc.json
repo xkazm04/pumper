@@ -1,0 +1,27 @@
+{
+ "schema": "conform-run/1",
+ "worker": "ea99b212-67ec-4c56-9324-782ad5cfb8cc",
+ "subject": "fleet-orchestration",
+ "evaluatedAt": "2026-10-13T21:11:23.431451+00:00",
+ "provider": "grok",
+ "model": "grok-4.7",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "fleet-orchestration",
+   "context": "job-worker",
+   "reason": "curator-multi refused the seat's answer: the seat disclaimed its own answer: Job heartbeats, checkpoint reset, fan-out placement, and state-licensing's sequential ResearchRequest loop resemble slot caps and resume, and were not scored as"
+  },
+  {
+   "subject": "fleet-orchestration",
+   "context": "api-server-core",
+   "reason": "curator-multi refused the seat's answer: the seat disclaimed its own answer: Job heartbeats, checkpoint reset, fan-out placement, and state-licensing's sequential ResearchRequest loop resemble slot caps and resume, and were not scored as"
+  },
+  {
+   "subject": "fleet-orchestration",
+   "context": "pricing-valuation",
+   "reason": "curator-multi refused the seat's answer: the seat disclaimed its own answer: Job heartbeats, checkpoint reset, fan-out placement, and state-licensing's sequential ResearchRequest loop resemble slot caps and resume, and were not scored as"
+  }
+ ],
+ "consults": []
+}
