@@ -1,0 +1,32 @@
+{
+ "schema": "conform-run/1",
+ "worker": "3b70e84e-5277-4186-b7e2-59378b5f8af1",
+ "subject": "release-pipeline",
+ "evaluatedAt": "2026-10-13T21:34:25.909890+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "release-pipeline",
+   "context": "e2e-api-contract",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "release-pipeline",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "release-pipeline",
+   "context": "job-scheduler",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "release-pipeline",
+   "context": "core-extraction",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
