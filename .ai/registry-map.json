@@ -1572,7 +1572,11 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:169 These scripts check deterministic contracts and numeric lane bounds; searches found no rubric, holdout, or pairwise occurrences in scripts/ci, placing this machinery outside model-evaluation scope.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:7ccead00b7f92aba",
+          "evaluatedRevision": 37
         },
         {
           "subject": "agent-memory",
@@ -2917,7 +2921,11 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:488 The extraction eval gates each case against its recording-time score, violating metric-role-contract's explicit prohibition on deriving a threshold from the baseline being preserved.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:7ccead00b7f92aba",
+          "evaluatedRevision": 37
         },
         {
           "subject": "agent-instruction-files",
@@ -3483,7 +3491,11 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:222 The hook deterministically identifies unmatched documentation edits rather than running scored model scenarios, and searches found no rubric, holdout, or pairwise occurrences in scripts/docs.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:7ccead00b7f92aba",
+          "evaluatedRevision": 37
         },
         {
           "subject": "docs-content-model",

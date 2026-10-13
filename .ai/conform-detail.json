@@ -2343,6 +2343,111 @@
           "evidence": "crates/server/src/worker.rs:862 Elapsed run time is one std Instant for a host job deadline, not a guest timer type beside a guest date type."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/eval-harness": {
+      "context": "ci-quality-gates",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T09:47:49.107Z",
+      "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
+      "techniques": [
+        {
+          "technique": "certification-levels",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:7 These are test-harness long-lane certifications, rather than theoretical and empirical certification of agent journeys."
+        },
+        {
+          "technique": "judge-stability",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:127 The function called judge applies numeric bounds; it does not invoke a model judge."
+        },
+        {
+          "technique": "reliability-aggregation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:84 This aggregation selects a percentile of measured samples, rather than any-of-N or all-of-N model-trial success."
+        },
+        {
+          "technique": "selection-over-noise",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-record.mjs:18 The recorder retains test outcomes rather than selecting a maximum over scored model attempts."
+        }
+      ]
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/eval-harness": {
+      "context": "docs-and-ops-scripts",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T09:47:49.107Z",
+      "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
+      "techniques": [
+        {
+          "technique": "monitor-inside-the-loop",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:311 The reviewer is a deterministic path-map check, not a model monitor gating a scored optimization loop."
+        }
+      ]
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/eval-harness": {
+      "context": "core-platform-services",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T09:47:49.107Z",
+      "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
+      "techniques": [
+        {
+          "technique": "assertion-vs-judgment",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:435 Mechanical pipeline invariants gate the deterministic extraction scorer; the suite also checks trace fields, Markdown, call count, cost propagation, and fixture-grounded terms without a model judge."
+        },
+        {
+          "technique": "judge-stability",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:314 The inspected extraction eval uses a deterministic scorer over recorded text, not a model judge."
+        },
+        {
+          "technique": "metric-role-contract",
+          "verdict": "deviation",
+          "evidence": "evals/tier3-extraction/manifest.json:26 The manifest explicitly derives the gate threshold from the first measurement, a failure named by this technique."
+        },
+        {
+          "technique": "resolution-precondition",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:516 This replay reports a corpus mean and per-case regression results, rather than a ranking of model or prompt conditions."
+        }
+      ],
+      "registryProposal": "Clarify whether metric-role-contract's prohibition on baseline-derived thresholds covers frozen regression ratchets, which comparison-modes otherwise recognizes as absolute gates."
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/eval-harness": {
+      "context": "e2e-data-integrity",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T09:47:49.107Z",
+      "techniques": [
+        {
+          "technique": "comparison-modes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:9 The matrix varies deterministic API read parameters; it does not compare model candidates or sampled quality outcomes."
+        },
+        {
+          "technique": "judge-stability",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:31 The conformance battery uses typed mechanical outcomes rather than model judgments."
+        }
+      ],
+      "withdrawn": {
+        "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
+        "state": "not-applicable",
+        "at": "2026-10-13T09:48:26.683899+00:00",
+        "reason": "reviewer (sonnet): The primary anchor engine_conformance.rs:289 is a doc comment opening a Browser-stub description, so it does not itself show that model-quality measurement is absent; only the technique anchors (lines 31 and dataset_reads.rs:9) carry the claim, and the other listed e2e files (vcr_attempts, search_de"
+      }
     }
   }
 }
