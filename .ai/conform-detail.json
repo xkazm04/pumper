@@ -2100,6 +2100,48 @@
         "at": "2026-10-13T08:04:51.752935+00:00",
         "reason": "reviewer (sonnet): The loop at crawl/src/lib.rs:719-786 does read history and call upsert_stamped once per changed URL, but the comment at lines 703-708 deliberately justifies that as a changed-pages-only path that adds no new write pattern, while the 'not one write per page' rule at line 685 governs the page batch, w"
       }
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/docs-sync": {
+      "context": "docs-and-ops-scripts",
+      "subject": "docs-sync",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T08:33:47.709Z",
+      "worker": "c828c681-adae-4c85-8b53-3edc5a12913b",
+      "techniques": [
+        {
+          "technique": "same-change-enforcement",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:56 The collector accepts only these transcript tool names rather than a VCS change record, leaving shell-driven changes, deletions and rename origins outside its observation."
+        },
+        {
+          "technique": "source-as-data-without-the-app",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:302 This checker consumes a standalone JSON map; it does not need to extract a registry from application source."
+        },
+        {
+          "technique": "source-doc-mapping",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/feature-doc-map.json:3 These recorded couplings have no effective enforcement; in-memory evaluation confirmed both paths return skipped-only."
+        }
+      ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/docs-sync": {
+      "context": "pumper-sync-sdk",
+      "subject": "docs-sync",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T08:33:47.709Z",
+      "worker": "c828c681-adae-4c85-8b53-3edc5a12913b",
+      "techniques": [
+        {
+          "technique": "dated-corrections",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/README.md:140 Lines 138–143 retain the false claim and explain the corrected boundary, but supply no correction date; the linked feature-document correction is also undated."
+        }
+      ]
     }
   }
 }

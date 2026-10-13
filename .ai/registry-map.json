@@ -3395,7 +3395,11 @@
           "revision": 14,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/docs/feature-doc-map.json:3 Declared catalog and plugin couplings are excluded before matching, so their documentation obligations cannot trigger the reminder.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fd96220db75846a1",
+          "evaluatedRevision": 14
         },
         {
           "subject": "test-harness",
@@ -4870,7 +4874,11 @@
           "revision": 14,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/README.md:140 The README preserves and corrects its false watermark-risk claim without dating the correction, preventing readers from establishing its chronology.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fd96220db75846a1",
+          "evaluatedRevision": 14
         },
         {
           "subject": "agent-memory",
