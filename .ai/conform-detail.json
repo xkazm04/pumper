@@ -2448,6 +2448,323 @@
         "at": "2026-10-13T09:48:26.683899+00:00",
         "reason": "reviewer (sonnet): The primary anchor engine_conformance.rs:289 is a doc comment opening a Browser-stub description, so it does not itself show that model-quality measurement is absent; only the technique anchors (lines 31 and dataset_reads.rs:9) carry the claim, and the other listed e2e files (vcr_attempts, search_de"
       }
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/module-design": {
+      "context": "core-platform-services",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T10:28:44.015Z",
+      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/catalog.rs:405 status is a String matched on the literal live; STATUSES is a runtime table, so a constructed Source can still carry a value the type does not close."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/search.rs:258 NoSearch type-checks as Search and no-ops query, index, and delete; NoPlugins in the same context errors instead."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:214 strike_verdict takes the counters and thresholds and returns a verdict; RecipeStore only applies it."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/crawl.rs:1052 The bounded in-flight set is the crawl's backpressure rule, not a keyword sprinkled over ordinary work."
+        },
+        {
+          "technique": "locality-and-leverage",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/crawl.rs:180 The change-weight judgment was restated by several apps and now lives once, with the crawler delegating."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/catalog.rs:234 Contract checks are one-input counts, written as filters rather than a multi-output loop."
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/recipes.rs:668 SQL in these files is bound with placeholders; no unsafe or assembled statement showed up."
+        },
+        {
+          "technique": "mirror-type-at-the-edge",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/plugin.rs:81 The plugin contract takes strings and JSON; no host-minted wasmtime type is accepted here."
+        },
+        {
+          "technique": "state-carrier-decides-the-lane",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/costs.rs:328 Job spend is an atomic shared across metered calls, so a concurrent lane does not add into a discarded copy."
+        },
+        {
+          "technique": "host-primitive-facade",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/process_env.rs:31 The cfg split is an environment allowlist, not a facade over spawn, sleep, and timers for two runtimes."
+        }
+      ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/module-design": {
+      "context": "pumper-sync-sdk",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T10:28:44.015Z",
+      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/watermark.ts:18 Callers learn a feed position, not the chunk-boundary rule that makes a bare instant skip siblings."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/sync.ts:159 Dry-run and the product sink are two adapters of SyncSink, chosen at one point."
+        },
+        {
+          "technique": "borrowed-surface",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/http.ts:16 PumperHttpError stays an Error and names the field callers must branch on."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/sync.ts:86 planPage decides upserts, tombstones, and stalls from the page alone; the drain applies the result afterward."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/sync.ts:101 The page decision is synchronous; async stays on the fetch and sink driver."
+        },
+        {
+          "technique": "locality-and-leverage",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/client.ts:1 One-off reads and the watermark loop are separate modules because they change for different reasons."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/sync.ts:137 One pass fills several results, so the page planner is an explicit loop rather than a single pipeline."
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/src/http.ts:79 The cast is not a named construct and states no invariant; the same assertion is also used in the conformance fixture loader."
+        },
+        {
+          "technique": "mirror-type-at-the-edge",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:93 Tests construct Response and the feed JSON directly, so the host input is not unconstructible."
+        },
+        {
+          "technique": "state-carrier-decides-the-lane",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/sync.ts:313 The sink receives a plan built for that call; counters stay on the caller and are not copied into the message."
+        },
+        {
+          "technique": "host-primitive-facade",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/http.ts:2 The listed hosts share the web fetch and timer primitives; the file does not target two hosts that disagree about spawn or sleep."
+        }
+      ],
+      "registryProposal": "marked-unverifiable-region lists a cast the checker cannot prove, but it does not say whether a TypeScript `as T` on JSON.parse is that region or ordinary typed I/O; this seat treated an unannotated cast, also present outside the transport, as missing the mark and the invariant."
+    },
+    "fc25f145-0e20-4ffc-801f-4c2dfb7780ee/module-design": {
+      "context": "core-engine-contract",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T10:28:44.015Z",
+      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/engine.rs:470 interaction_outcome hides the found-versus-acted matrix behind one function so callers do not re-encode it."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/engine.rs:1193 The default method throws for a verb most engines do not implement; Browser::transact does the same. The trait is one capability wider than its adapters."
+        },
+        {
+          "technique": "borrowed-surface",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/fetcher.rs:200 Egress attribution uses a header name this crate owns, so an origin echo cannot forge a peer-served fetch."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/tiers.rs:432 plan_weather_import returns what to adopt and returns no I/O; the caller applies the plan."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/governor.rs:143 Spacing is the governor's policy, and the one non-blocking caller is a single try_acquire rather than a second pipeline."
+        },
+        {
+          "technique": "locality-and-leverage",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/fetcher.rs:219 The egress sentence is one constant beside its only reader, because core cannot depend on the remote engine."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/tiers.rs:446 The import rules are an ordered sequence of different decisions, not a uniform map over one element type."
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/engine.rs:866 The generated page script states the fact that makes interpolation safe: selectors are JSON-encoded."
+        },
+        {
+          "technique": "mirror-type-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/engine.rs:1735 Redaction is tested from a JSON value; the test does not construct a browser DOM node."
+        },
+        {
+          "technique": "state-carrier-decides-the-lane",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/fetcher.rs:278 Egress totals are atomics shared across Fetcher clones, so a clone does not keep a private counter."
+        },
+        {
+          "technique": "emitted-code-names-from-a-root",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/engine.rs:876 Caller-supplied selectors enter the generated script as JSON literals, so they cannot break out as code."
+        },
+        {
+          "technique": "host-primitive-facade",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/governor.rs:18 The governor calls one runtime's clock directly; these files do not run the same logic on a second host."
+        }
+      ],
+      "registryProposal": "seams-and-adapters treats a default that throws on an unsupported verb as a broken substitute and says to split the trait. It does not say how to score a Rust default whose error is the documented terminal refusal while a split is explicitly deferred, and this seat still scored that default as the named failure."
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/module-design": {
+      "context": "api-server-core",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T10:28:44.015Z",
+      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/main.rs:86 Sentry boot distinguishes absent from malformed instead of collapsing both into one optional."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/state.rs:359 This is the enabling point: disabled search is wired as a successful no-op, while disabled plugins on the previous lines are wired as NoPlugins."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/main.rs:101 sentry_plan decides from the raw env strings; init_sentry is the only caller that touches the process."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/state.rs:81 Webhook delivery moved off bare spawns onto one bounded pool owned by AppState."
+        },
+        {
+          "technique": "locality-and-leverage",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:707 Tool-argument checks go through validate_tool_args so each handler does not keep its own subset."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/maintenance.rs:156 The maintenance gate is an ordered sequence of different rungs, each returning a different decision."
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:701 An uncompilable schema skips the check inside the one validator, and the comment states why that skip is valid."
+        },
+        {
+          "technique": "state-carrier-decides-the-lane",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/activity.rs:65 Every request lane updates one atomic gauge; the count is not copied into the handler."
+        }
+      ]
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/module-design": {
+      "context": "pricing-valuation",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "conformant",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T10:28:44.015Z",
+      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:103 income_tax_type stays open in the model schema and is closed where the record is stored, so a recoverable phrasing does not fail the paid call."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "conformant",
+          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:272 The app's tests substitute StubHttp for HttpClient rather than calling the live source."
+        },
+        {
+          "technique": "borrowed-surface",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:62 Model phrasings are restated in a table this app owns, so an upstream wording change shows up in this file."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:258 removal_suppression_reason takes the parse and returns whether tombstones are allowed."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:248 The run awaits one research call and then classifies locally; these apps do not keep a worker pool of their own."
+        },
+        {
+          "technique": "locality-and-leverage",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:304 The shared normalizer lives once; each app keeps the vocabulary that changes for its own source."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/apps/valuation-multiples/src/lib.rs:252 collect_valuation_records fills three results in one pass, which is the case for an explicit loop."
+        },
+        {
+          "technique": "mirror-type-at-the-edge",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/valuation-multiples/src/lib.rs:258 Record classification takes JSON values tests can build; these apps do not accept a Claude session type."
+        },
+        {
+          "technique": "state-carrier-decides-the-lane",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-licensing/src/lib.rs:445 Resume reads a checkpoint payload written for that purpose; it is not a shared runtime aggregate copied onto another thread."
+        },
+        {
+          "technique": "emitted-code-names-from-a-root",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-licensing/src/lib.rs:463 This builds a prompt string for the model; it is not a macro expanded into a Rust caller's scope."
+        },
+        {
+          "technique": "host-primitive-facade",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-tax/src/lib.rs:179 Async is the ScrapeApp trait. These apps do not spawn, sleep, or target a second execution host."
+        }
+      ]
     }
   }
 }

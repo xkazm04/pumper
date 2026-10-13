@@ -1319,7 +1319,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/state.rs:359 With search disabled, boot installs NoSearch as the Search implementation, so index and query succeed without storing or returning documents.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
+          "evaluatedRevision": 17
         }
       ],
       "governance": "governed"
@@ -2204,7 +2208,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/engine.rs:1193 HttpClient's default fetch_bytes refuses the verb, so adapters type-check as the full client while implementing only text fetch.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
+          "evaluatedRevision": 17
         },
         {
           "subject": "agent-instruction-files",
@@ -2905,7 +2913,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/search.rs:258 NoSearch implements Search by returning a successful empty page, so a disabled index is a substitute that keeps none of the trait's behavior.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
+          "evaluatedRevision": 17
         },
         {
           "subject": "eval-harness",
@@ -4784,7 +4796,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:258 Whether a partial index may tombstone is a pure function of the parse, so the decision is tested without a database.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
+          "evaluatedRevision": 17
         },
         {
           "subject": "public-claim-provenance",
@@ -5050,7 +5066,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/src/http.ts:79 The transport asserts a parsed body is the caller's type, with no named marker and no invariant written at the cast.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
+          "evaluatedRevision": 17
         }
       ],
       "governance": "governed"
