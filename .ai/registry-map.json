@@ -695,7 +695,11 @@
           "revision": 17,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:448 Dataset delete removes the SQLite rows first and then best-effort-deletes the search index, so a failed index delete leaves a hit for a record the dataset API no longer has, and this route does not join or sweep that half-state.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:b67182492821d592",
+          "evaluatedRevision": 18
         },
         {
           "subject": "mcp-tools",
@@ -2500,7 +2504,11 @@
           "revision": 17,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/cache.rs:118 A cache hit whose headers JSON does not parse is returned as an empty header map, so a corrupt row and a row that stored no headers look the same.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:b67182492821d592",
+          "evaluatedRevision": 18
         },
         {
           "subject": "test-harness",
@@ -2865,7 +2873,11 @@
           "revision": 17,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/search.rs:258 NoSearch implements query by returning an empty success, so a disabled index looks like no matches unless a caller separately interprets doc_count.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:b67182492821d592",
+          "evaluatedRevision": 18
         },
         {
           "subject": "module-design",
@@ -3285,7 +3297,11 @@
           "revision": 17,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0002_platform.sql:15 This directory is SQLite DDL and in-database backfill; a search of crates/core/migrations for sqlx, QueryBuilder, FromRow, and push_bind found no host-language repository, row mapper, or query builder.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:b67182492821d592",
+          "evaluatedRevision": 18
         },
         {
           "subject": "test-harness",
