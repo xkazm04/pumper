@@ -2334,7 +2334,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/extract.rs:980 Extraction inserts missing or uncoercible values into records without declared required-field rejection, while the removal test confirms tombstoning on the first missing snapshot.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "quality-gates",
@@ -5182,7 +5186,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/extractor/src/lib.rs:1642 Inline rules are registered after compilation without a live preview gate, allowing unverified extraction rules to persist and execute.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "document-text-extraction",

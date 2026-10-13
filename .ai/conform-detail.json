@@ -1732,6 +1732,63 @@
         }
       ],
       "registryProposal": "The reading-is-not-running technique does not distinguish metered in-memory bytecode sandboxes (e.g. wasmtime with CPU fuel and memory ceilings) from unconstrained native/script evaluation; it should clarify whether metered guest manifest probes with zero host imports require digest approval or static metadata sections."
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/web-scraping": {
+      "context": "web-crawl-extraction",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T04:09:27.372Z",
+      "worker": "a9ba0faf-a094-4f9b-adb0-7789dc02d2e2",
+      "techniques": [
+        {
+          "technique": "dry-run-preview",
+          "verdict": "deviation",
+          "evidence": "crates/apps/extractor/src/lib.rs:1642 The inline run path compiles and registers rules without requiring a successful live preview; stored-body replay is a separate mode."
+        },
+        {
+          "technique": "extraction-rule-dsl",
+          "verdict": "deviation",
+          "evidence": "crates/apps/extractor/tests/listing_reports.rs:82 The real app accepts rules without declared required/optional failure semantics; the test successfully runs this rule and receives null prices."
+        },
+        {
+          "technique": "llm-assisted-rule-authoring",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:4 Rule induction uses Rust heuristics; searches of the app sources found no model-authored rule proposal/adoption loop."
+        },
+        {
+          "technique": "negotiated-representation-probe",
+          "verdict": "deviation",
+          "evidence": "crates/apps/extractor/src/induce.rs:171 Authoring proceeds over stored page bodies without a representation probe; searches found no weighted alternate-representation request or origin-versus-derived classification in the acquisition and app code."
+        }
+      ]
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/web-scraping": {
+      "context": "core-extraction",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T04:09:27.372Z",
+      "worker": "a9ba0faf-a094-4f9b-adb0-7789dc02d2e2",
+      "techniques": [
+        {
+          "technique": "dedup-and-datasets",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/removal_guard.rs:98 The test removes c after the first snapshot omitting it; production detect_removed immediately tombstones missing live keys rather than accumulating healthy-harvest absence evidence."
+        },
+        {
+          "technique": "extraction-rule-dsl",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/extract.rs:980 FieldRule contains a locator and transforms but no required/optional failure declaration; misses and coercion failures remain values in the returned object instead of rejecting a required-field record."
+        },
+        {
+          "technique": "llm-assisted-rule-authoring",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/induce.rs:3 Rule induction is heuristic rather than model-assisted; the inspected tier-3 eval concerns model document acquisition, not model-authored rules."
+        }
+      ]
     }
   }
 }
