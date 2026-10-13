@@ -87,7 +87,7 @@ impl HttpCache {
         if let Some(proxy) = &req.proxy {
             hasher.update(proxy.as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Returns a live (non-expired) cached response, if any. `max_age` caps read
@@ -498,7 +498,7 @@ impl ResearchCache {
         if let Some(schema) = &req.json_schema {
             hasher.update(schema.to_string().as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Fresh cached output, if any. The returned `cost_usd` is the ORIGINAL

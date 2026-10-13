@@ -396,7 +396,7 @@ pub fn req_hash(method: &str, key: &str) -> String {
     hasher.update(method.as_bytes());
     hasher.update([0]);
     hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// One recorded request/response pair.

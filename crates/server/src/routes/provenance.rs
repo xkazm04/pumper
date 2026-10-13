@@ -409,7 +409,7 @@ async fn replay_from_observation(
 
 /// 409 unless `body` IS the body `sha` names.
 fn verify_body(body: &str, sha: &str) -> Result<(), ApiError> {
-    let body_sha = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let body_sha = hex::encode(Sha256::digest(body.as_bytes()));
     if body_sha != sha {
         return Err(ApiError(
             StatusCode::CONFLICT,

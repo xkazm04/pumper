@@ -2,6 +2,8 @@
 name = "app-crawl"
 version.workspace = true
 edition.workspace = true
+# Path-only workspace member: never published to a registry.
+publish = false
 
 [dependencies]
 pumper-core.workspace = true
@@ -17,6 +19,7 @@ tokio = { workspace = true, features = ["fs", "time"] }
 # Provenance (M12): sha256 of the archived page body stamped on each
 # `page_versions` revision.
 sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 # `test-util`: `#[tokio::test(start_paused = true)]` drives a crawl past the

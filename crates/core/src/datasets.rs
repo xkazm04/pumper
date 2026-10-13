@@ -429,7 +429,7 @@ pub fn pinned_body_path(
 
 /// sha256 (hex) of a body — the `artifact_sha` / `body_sha` of a pinned body.
 pub fn body_sha256(body: &str) -> String {
-    format!("{:x}", Sha256::digest(body.as_bytes()))
+    hex::encode(Sha256::digest(body.as_bytes()))
 }
 
 /// One observation of a pinned body (`body_pins`). Bytes are deduplicated by
@@ -5344,7 +5344,7 @@ impl From<BodyPinRow> for BodyPin {
 fn hash_value(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Fixed-width RFC 3339 UTC micros — the stored timestamp format. Public so
