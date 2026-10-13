@@ -3296,6 +3296,146 @@
           "evidence": "crates/server/src/webhook.rs:25 SSE subscribers read job status, not narration controls."
         }
       ]
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/document-text-extraction": {
+      "context": "web-crawl-extraction",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T11:43:16.127Z",
+      "techniques": [
+        {
+          "technique": "unreadable-region-refusal",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:1841 Lists missing stored HTML artifact files per key, not unread regions inside a document container."
+        },
+        {
+          "technique": "extraction-yield-bands",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:1817 Reports selector match counts for a rule set, not a region yield band."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/crawl/src/link_graph.rs:66 Caps in-memory crawl-edge bookkeeping, not expansion of a document container."
+        },
+        {
+          "technique": "context-decided-escaping",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/tests/result_honesty.rs:71 Emits structured field JSON from CSS rules; no Markdown converter in this context."
+        }
+      ],
+      "withdrawn": {
+        "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
+        "state": "not-applicable",
+        "at": "2026-10-13T11:44:15.436976+00:00",
+        "reason": "reviewer (sonnet): The not-applicable anchor result_honesty.rs:71 is an assertion in a sweep-cap test (`out[\"mode\"] == \"source\"`), so it is incidental. It does not show that the crawl and extractor crates have no document-container (PDF/OCR) path, and the cited technique claim about CSS-to-JSON output rests on that sa"
+      }
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/document-text-extraction": {
+      "context": "core-extraction",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T11:43:16.127Z",
+      "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
+      "techniques": [
+        {
+          "technique": "unreadable-region-refusal",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:401 html_to_markdown returns a String and drops whole subtrees such as form, so a content-bearing region is omitted with no region list on the result."
+        },
+        {
+          "technique": "screen-then-confirm-detection",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:61 text_len_capped is a per-page character-count shortcut, not a readability screen later confirmed by extraction."
+        },
+        {
+          "technique": "extraction-yield-bands",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/markdown.rs:58 Re-acquisition is reduced to one character threshold, with no complete/sparse/corrupt/empty band and no measurement stored beside it."
+        },
+        {
+          "technique": "recognition-boundary-and-escalation",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:186 An img becomes alt Markdown; this module has no scanned-page or optical-recognition path whose boundary would need publishing."
+        },
+        {
+          "technique": "escalation-adjudication",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:357 The eval forces an empty cheap path and grades the model answer; it does not choose between two non-empty readings."
+        },
+        {
+          "technique": "structure-saturation-guard",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:189 Heading level is copied from the source tag name; there is no local-census structural classifier."
+        },
+        {
+          "technique": "band-calibration-by-construction",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:262 The length window is a bare constant with no constructed damage corpus, threshold sweep, or reader binding; the pass baseline is the recorded model's own score."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:275 The walker visits each parsed child once; this module adds no repeat or reference expansion construct."
+        },
+        {
+          "technique": "context-decided-escaping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/markdown.rs:341 Only table-cell pipes are escaped, and every pipe is escaped after the cell is assembled; push_text copies other text characters straight into the markup, including html_fragment_to_markdown output a caller will embed."
+        }
+      ],
+      "registryProposal": "The Rust application rust--context-decided-escaping.md describes a shipped lookahead escaper for this repository's Markdown converter, but markdown.rs still writes text through push_text and blanket-replaces only '|'. The application and the tree disagree, so that write-up is not evidence the technique is implemented."
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/document-text-extraction": {
+      "context": "ai-extraction-engines",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T11:43:16.127Z",
+      "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
+      "techniques": [
+        {
+          "technique": "extraction-yield-bands",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-search/src/enrich.rs:5 A missed money or date regex omits an entity field; it is not a yield band over a document region."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:2 Fuel and linear-memory limits sandbox a plugin call; they are not count and payload caps on a document expansion construct."
+        }
+      ]
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/document-text-extraction": {
+      "context": "wasm-plugins",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T11:43:16.127Z",
+      "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
+      "techniques": [
+        {
+          "technique": "unreadable-region-refusal",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:84 A missing tag becomes None via ?, then a null JSON field, not a named unread region of a container."
+        },
+        {
+          "technique": "structure-saturation-guard",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:40 h1 text is the slice between literal tags, not a census-based structure classifier."
+        },
+        {
+          "technique": "context-decided-escaping",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:39 Output is serde JSON, which the technique treats as a total quoted encoding rather than Markdown escaping."
+        }
+      ]
     }
   }
 }
