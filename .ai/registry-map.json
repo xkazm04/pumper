@@ -922,7 +922,11 @@
           "revision": 16,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/jobs.rs:591 Cancel of a running job looks up an in-memory token, and when that registry has no entry the handler reports the job as already terminal.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17
         },
         {
           "subject": "quality-gates",
@@ -2691,7 +2695,11 @@
           "revision": 16,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/storage.rs:1445 Boot recovery selects every running row and sends it through fail(), so a job heartbeated one second ago is requeued or failed with no adopt path for a live sibling.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17
         },
         {
           "subject": "agent-memory",
@@ -4319,7 +4327,11 @@
           "revision": 16,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:1081 A schedule's next firing is projected from durable last_run and last_skipped_at, admission is one closed verdict, and the tick re-reads enabled and budget before enqueue while reaping stale heartbeats.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17
         },
         {
           "subject": "quality-gates",
@@ -4852,7 +4864,11 @@
           "revision": 16,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:1872 The ARES checkpoint decoder treats a truncated or foreign snapshot as start-this-phase-fresh, so recovery cannot tell a torn checkpoint from a phase that never started.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17
         },
         {
           "subject": "measurement-honesty",

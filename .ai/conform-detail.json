@@ -3436,6 +3436,267 @@
           "evidence": "plugins-src/title-extractor/src/lib.rs:39 Output is serde JSON, which the technique treats as a total quoted encoding rather than Markdown escaping."
         }
       ]
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/job-coordination": {
+      "context": "core-job-queue",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
+      "techniques": [
+        {
+          "technique": "job-state-machines",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1412 Status is one enum and unknown strings fail parse, but retry is a separate UPDATE that leaves failed/cancelled and nulls error, with no actor."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:1523 Heartbeat extends heartbeat_at only while status is running and attempts match, and returns whether the write landed; reap_stale treats an old heartbeat as death. No holder column; attempts is the fence."
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:1520 The queue has a renewal write, so the case where no timeout is defensible because the holder cannot renew does not hold."
+        },
+        {
+          "technique": "step-position-and-resumability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:3184 Checkpoint replace is attempt-fenced total state, but an unreadable blob is returned as None, so a torn or foreign snapshot is indistinguishable from no position."
+        },
+        {
+          "technique": "in-flight-is-a-position",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:805 Claim writes running on the job row before the worker runs the effect, so recovery can tell dispatched from never-started. Re-run policy is the global attempt ladder, not a per-step field."
+        },
+        {
+          "technique": "no-unrestorable-state-at-a-suspension-point",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:774 The claim, including target exclusion, is one statement. A crash inside fail() after the read leaves the row running, which the reaper can verdict again."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1445 The sweep condition is status alone. jobs.rs the_boot_sweep_issues_the_same_verdict_the_reaper_does requeues a row whose heartbeat is 1s old. Queued rows are left; there is no adopt."
+        },
+        {
+          "technique": "job-observability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1258 JOB_COLUMNS omits heartbeat_at, and oldest-running age is started_at, so a long live job and a dead one are the same gauge. Status rollups do keep absent statuses absent."
+        },
+        {
+          "technique": "terms-travel-permission-does-not",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:715 Enqueue writes params, budget_usd, max_attempts and app onto the row. set_schedule_budget updates only the schedule. No policy-version or validity floor on the job."
+        }
+      ],
+      "registryProposal": "terminal-state-recovery requires the boot sweep to be time-bounded, while no-wall-clock forbids a wall-clock budget on the call that advances durable rows. Say whether a sweep whose work is its own counted writes may stop between rows on a clock and return a named truncated fact."
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/job-coordination": {
+      "context": "job-triggers-pipeline",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "techniques": [
+        {
+          "technique": "job-state-machines",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:77 The any-status filter uses JobStatus::is_terminal rather than a second terminal list. Specific on_status values are still raw string equality."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1346 A hop is one enqueue, not a hold long enough to need a renewed lease."
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:49 Cycle and depth are a pure function of params. There is no process identity to probe."
+        },
+        {
+          "technique": "step-position-and-resumability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:553 Each hop's dedup identity is trigger id plus source job id (dataset and batch added for dataset hops), so a re-fired hop is refused by the queue."
+        },
+        {
+          "technique": "in-flight-is-a-position",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:1420 The queue honours the key, so a second fire records dedup instead of needing an in-flight marker. The third position value is not required for this keyed enqueue."
+        },
+        {
+          "technique": "no-unrestorable-state-at-a-suspension-point",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:1391 The dedup key is part of the single enqueue. A crash after that insert leaves a durable job; a crash before it leaves nothing taken."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:855 fire_terminal_triggers runs against an already-final job. eval_set_error returns after one ledger row. Nothing here selects succeeded jobs whose hops were never enqueued."
+        },
+        {
+          "technique": "job-observability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:2312 Hook outcomes must sit in the published allowlist, both directions. The ledger is the decision trail, not a live lease view, because a fire is not a leased executor."
+        },
+        {
+          "technique": "terms-travel-permission-does-not",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:204 restamp_host_owned writes lineage and work-scope keys back over a transform. budget_usd, max_attempts and params are copied onto the hop at enqueue, which is that hop's submission."
+        }
+      ],
+      "withdrawn": {
+        "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
+        "state": "deviation",
+        "at": "2026-10-13T12:36:45.232012+00:00",
+        "reason": "reviewer (sonnet): triggers.rs:855 does show a fail-open ledger write after the hop (the hop itself is deduped by an enqueue key, not the ledger), but I found no support for the deviation's claim that nothing replays a source job whose fan-out never ran, since fan-out lives in worker.rs `finalize_fanout` and I did not"
+      }
+    },
+    "cce276df-d2da-4c20-a3ea-30f2f78316b7/job-coordination": {
+      "context": "api-job-management",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
+      "techniques": [
+        {
+          "technique": "job-state-machines",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/jobs.rs:281 List filters unknown status strings through JobStatus::parse and returns 400. Bulk retry only accepts failed or cancelled."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/jobs.rs:484 These handlers do not renew a lease. reset is an operator requeue that relies on the store's attempt fence."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/jobs.rs:591 storage.cancel only updates queued rows. A running job is cancelled by job_cancels. If that map has no token, the 409 text says the job is already terminal."
+        },
+        {
+          "technique": "job-observability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/jobs.rs:374 GET /jobs/{id} adds an in-memory progress snapshot and leaves the stored job fields unchanged, so lease holder, lease age and next action are not on the operator read after a restart."
+        },
+        {
+          "technique": "terms-travel-permission-does-not",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/jobs.rs:148 The door validates merged params and budget_usd, then copies both onto EnqueueOptions before enqueue_dedup. Idempotency-Key replays the original job."
+        }
+      ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/job-coordination": {
+      "context": "job-scheduler",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "conformant",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
+      "techniques": [
+        {
+          "technique": "job-state-machines",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:1791 Schedule ledger outcomes are checked both ways against SCHEDULE_OUTCOMES. ScheduleAdmission::health is the only spelling of the admission verdict, and admit is the one composer."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:154 This loop is the reaper's owner: each completed tick calls reap_once for heartbeat-stale running jobs. Renewal writes and TTL numbers live outside this file."
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:157 Reclaim on this tick is the heartbeat reaper, which is the expiry family. A death probe is not the mechanism."
+        },
+        {
+          "technique": "step-position-and-resumability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:1081 The cron reference is the later of durable last_run and last_skipped_at, else created_at. In-memory last_pass only sets the misfire cutoff inside one process; boot uses a two-tick grace."
+        },
+        {
+          "technique": "in-flight-is-a-position",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:500 A firing is one enqueue. Overlap looks at the latest job's queued/running status, which is the job row, not a third schedule position."
+        },
+        {
+          "technique": "no-wall-clock-in-the-advance-contract",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:250 reconcile and decide take the host's instant. They do not carry a budget that promises the pass will finish the admitted work."
+        },
+        {
+          "technique": "no-unrestorable-state-at-a-suspension-point",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:592 last_skipped_at, which consumes pending firings, is stamped only after the enqueue, so a failed enqueue cannot eat the run."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:153 The same tick that can hold a schedule on an overlapping run also requeues heartbeat-stale running jobs, so an orphan is not left as a permanent overlap block. This file does not issue the boot sweep."
+        },
+        {
+          "technique": "job-observability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:820 scheduler_liveness reads the durable pass heartbeat and treats a missing pass as stale. The decision ledger separates fired, skipped, held and refused."
+        },
+        {
+          "technique": "terms-travel-permission-does-not",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:918 Budget is copied from the live schedule row at enqueue. still_firable refuses a row disabled after the pass snapshot. Params stay the validated snapshot and are what the job is enqueued with."
+        }
+      ]
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/job-coordination": {
+      "context": "pricing-valuation",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
+      "techniques": [
+        {
+          "technique": "job-state-machines",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-tax/src/lib.rs:179 These apps return a result or an error. They do not define or transition job status."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:1021 Searched heartbeat, lease and reap in these app files. The only reap mention is the job reaper outside the app. No renewal loop here."
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:1020 Lookups are awaited HTTP calls inside run(). Death of the holder is the worker reaper's problem, not a process probe in these apps."
+        },
+        {
+          "technique": "step-position-and-resumability",
+          "verdict": "deviation",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:1872 Completed IČO records are checkpointed and skipped on resume, but any unexpected shape, including a truncated write, becomes a silent fresh start with no recorded reason."
+        },
+        {
+          "technique": "in-flight-is-a-position",
+          "verdict": "conformant",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:1048 A fetched employer is in the checkpoint and is not fetched again. An in-flight GET that never checkpointed is fetched again; the call is a read, so the two-valued protocol matches an idempotent step."
+        },
+        {
+          "technique": "no-unrestorable-state-at-a-suspension-point",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:334 A short state-tax roster suppresses removal instead of tombstoning the jurisdictions it did not return. smlouvy-dump-watch uses the same floor: a partial parse must not snapshot-delete."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-tax/src/lib.rs:340 An empty answer fails the app run. These files do not sweep orphaned job rows."
+        }
+      ]
     }
   }
 }
