@@ -1,0 +1,729 @@
+{
+ "schema": "conform-run/1",
+ "worker": "51fdfd98-b856-4de8-a6c1-c0b33ade13cb",
+ "subject": "voice-io",
+ "evaluatedAt": "2026-10-13T11:01:13.161524+00:00",
+ "provider": "grok",
+ "model": "grok-4.7",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-http/src/lib.rs:1069 HttpEngine::fetch returns an HTTP response for a page or API, and a search of engine-http, engine-browser, engine-archive, and engine-remote for microphone, whisper, dictation, utterance, and recognizer found none, so this context never captures or speaks.",
+   "techniques": [
+    {
+     "technique": "authored-voice-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No engine here builds a voice from a description, sample, or artifact."
+    },
+    {
+     "technique": "caller-scoped-voice-binding",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No speech channel is shared by automated callers."
+    },
+    {
+     "technique": "decode-time-vocabulary-biasing",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 There is no speech decoder to bias."
+    },
+    {
+     "technique": "duplex-agent-sessions",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No vendor session listens and speaks."
+    },
+    {
+     "technique": "engine-abstraction",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 These adapters fetch pages; they are not synthesis or transcription engines."
+    },
+    {
+     "technique": "engine-choice-on-decisive-terms",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No speech-recognition engine is being chosen."
+    },
+    {
+     "technique": "on-device-vs-cloud",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No voice audio is placed on-device or in the cloud."
+    },
+    {
+     "technique": "portable-provider-package",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 There is no voice-engine package to share across apps."
+    },
+    {
+     "technique": "real-time-synthesis-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 Nothing synthesizes speech on a turn loop."
+    },
+    {
+     "technique": "render-acceptance",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No synthesis buffer is returned to accept or reject."
+    },
+    {
+     "technique": "speech-ready-text",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 Fetched text is stored, not spoken."
+    },
+    {
+     "technique": "spoken-intent-parsing",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No transcript is parsed into a spoken command."
+    },
+    {
+     "technique": "stt-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No microphone capture, meter, or transcription stage exists."
+    },
+    {
+     "technique": "transcript-handoff-receipts",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 Nothing inserts a dictation into a foreign cursor."
+    },
+    {
+     "technique": "transcript-normalization",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No speech transcript is cleaned for a reader."
+    },
+    {
+     "technique": "tts-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 There is no utterance queue or playback."
+    },
+    {
+     "technique": "unattended-caller-attribution",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 Callers fetch bytes; they cannot make the machine speak."
+    },
+    {
+     "technique": "voice-setup-experience",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 There is no first-run voice install or voice picker."
+    },
+    {
+     "technique": "voice-ux-integration",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 No read-aloud control or speech arbiter is attached to content."
+    }
+   ],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "utterance",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "ai-extraction-engines",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-wasm/src/lib.rs:24 The wasm describe() manifest only publishes extractor, predicate, or transform, and a search of engine-claude, engine-wasm, and engine-search for microphone, whisper, dictation, utterance, and recognizer found none, so Claude research and Tantivy indexing are not a voice pipeline.",
+   "techniques": [
+    {
+     "technique": "authored-voice-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No plugin kind authors a voice."
+    },
+    {
+     "technique": "caller-scoped-voice-binding",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No speech channel binds a voice per caller."
+    },
+    {
+     "technique": "decode-time-vocabulary-biasing",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 There is no speech decoder."
+    },
+    {
+     "technique": "duplex-agent-sessions",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 Claude is a headless research subprocess, not a listen-and-speak session."
+    },
+    {
+     "technique": "engine-abstraction",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 The engines extract, search, and host plugins; none transcribe or synthesize."
+    },
+    {
+     "technique": "engine-choice-on-decisive-terms",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No recognition engine is compared on decisive terms."
+    },
+    {
+     "technique": "on-device-vs-cloud",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No voice residency decision exists."
+    },
+    {
+     "technique": "portable-provider-package",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 There is no reusable voice-engine package."
+    },
+    {
+     "technique": "real-time-synthesis-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No synthesis engine is admitted to a turn loop."
+    },
+    {
+     "technique": "render-acceptance",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No audio render is accepted."
+    },
+    {
+     "technique": "speech-ready-text",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 Research text is not prepared for speech."
+    },
+    {
+     "technique": "spoken-intent-parsing",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No spoken utterance becomes a command."
+    },
+    {
+     "technique": "stt-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No capture-to-transcript pipeline exists."
+    },
+    {
+     "technique": "transcript-handoff-receipts",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No dictation is pasted into another application."
+    },
+    {
+     "technique": "transcript-normalization",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No speech transcript is normalized for a reader."
+    },
+    {
+     "technique": "tts-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No text is synthesized or played."
+    },
+    {
+     "technique": "unattended-caller-attribution",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 Nothing here produces audible speech."
+    },
+    {
+     "technique": "voice-setup-experience",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 There is no voice onboarding flow."
+    },
+    {
+     "technique": "voice-ux-integration",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-wasm/src/lib.rs:24 No narration affordance is attached to search or extraction results."
+    }
+   ],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "utterance",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "core-engine-contract",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/engine.rs:1177 The engine contract's HTTP trait is page and API fetching, and a search of crates/core for microphone, whisper, dictation, utterance, and recognizer found none, so the tiered fetcher has no listen or speak direction.",
+   "techniques": [
+    {
+     "technique": "authored-voice-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 The contract stores no authored-voice specification."
+    },
+    {
+     "technique": "caller-scoped-voice-binding",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No per-caller voice binding is resolved."
+    },
+    {
+     "technique": "decode-time-vocabulary-biasing",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No decoder accepts a phrase list or prompt bias."
+    },
+    {
+     "technique": "duplex-agent-sessions",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 Researcher returns a research result, not a duplex speech session."
+    },
+    {
+     "technique": "engine-abstraction",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 HttpClient, Browser, and Researcher are scrape directions, not speech directions."
+    },
+    {
+     "technique": "engine-choice-on-decisive-terms",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 Tier choice is http, browser, or claude, not recognition quality."
+    },
+    {
+     "technique": "on-device-vs-cloud",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No voice audio residency ladder is configured."
+    },
+    {
+     "technique": "portable-provider-package",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 The seam packages scrape engines, not voice engines."
+    },
+    {
+     "technique": "real-time-synthesis-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No synthesis rate is measured."
+    },
+    {
+     "technique": "render-acceptance",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No rendered audio artifact is checked."
+    },
+    {
+     "technique": "speech-ready-text",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 Fetched text is not passed through a speakable-text door."
+    },
+    {
+     "technique": "spoken-intent-parsing",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No spoken grammar is matched."
+    },
+    {
+     "technique": "stt-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No capture lifecycle is defined."
+    },
+    {
+     "technique": "transcript-handoff-receipts",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No clipboard or keystroke handoff of a transcript exists."
+    },
+    {
+     "technique": "transcript-normalization",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No speech-to-writing normalizer exists."
+    },
+    {
+     "technique": "tts-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No playback lifecycle exists."
+    },
+    {
+     "technique": "unattended-caller-attribution",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 The contract does not expose synthesis to outside callers."
+    },
+    {
+     "technique": "voice-setup-experience",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 Config and onboarding here are fetch profiles, not voice setup."
+    },
+    {
+     "technique": "voice-ux-integration",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/engine.rs:1177 No speech arbiter or mute is part of the engine set."
+    }
+   ],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "utterance",
+    "recognizer"
+   ],
+   "registryProposal": "engine-abstraction use_when treats any engine name in surface code as in scope, so a fetch EngineSet is paired with a speech subject. Scope that trigger to a synthesis or transcription engine; HTTP, browser, and search engines are a different subject."
+  },
+  {
+   "context": "e2e-data-integrity",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The conformance battery asserts what every HttpClient owes when it fetches, and a search of crates/server/src/e2e for microphone, whisper, dictation, utterance, and recognizer found none, so these tests never exercise speech.",
+   "techniques": [
+    {
+     "technique": "authored-voice-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No test stores or re-casts an authored voice."
+    },
+    {
+     "technique": "caller-scoped-voice-binding",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No test resolves a voice per caller."
+    },
+    {
+     "technique": "decode-time-vocabulary-biasing",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No test feeds a vocabulary to a decoder."
+    },
+    {
+     "technique": "duplex-agent-sessions",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No duplex speech session is opened or scored."
+    },
+    {
+     "technique": "engine-abstraction",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The battery polices fetch and render implementors, not voice adapters."
+    },
+    {
+     "technique": "engine-choice-on-decisive-terms",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No recognition bake-off is run."
+    },
+    {
+     "technique": "on-device-vs-cloud",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No voice fallback to cloud is tested."
+    },
+    {
+     "technique": "portable-provider-package",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No shared voice-engine package is probed."
+    },
+    {
+     "technique": "real-time-synthesis-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No synthesis timing is measured."
+    },
+    {
+     "technique": "render-acceptance",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 Render here is a browser page, not audio."
+    },
+    {
+     "technique": "speech-ready-text",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No text is prepared to be spoken."
+    },
+    {
+     "technique": "spoken-intent-parsing",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No spoken command is parsed."
+    },
+    {
+     "technique": "stt-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No microphone or transcript stage is exercised."
+    },
+    {
+     "technique": "transcript-handoff-receipts",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No dictation handoff is tested."
+    },
+    {
+     "technique": "transcript-normalization",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 Dataset reads are records, not speech transcripts."
+    },
+    {
+     "technique": "tts-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No playback queue is tested."
+    },
+    {
+     "technique": "unattended-caller-attribution",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No test makes the process speak."
+    },
+    {
+     "technique": "voice-setup-experience",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No voice setup flow is covered."
+    },
+    {
+     "technique": "voice-ux-integration",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:71 No read-aloud affordance is asserted."
+    }
+   ],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "utterance",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "webhook-event-delivery",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/webhook.rs:25 A watch delivers an HMAC-signed HTTP payload, and a search of crates/server for microphone, whisper, dictation, utterance, and recognizer found none, so webhooks, SSE job events, and DataHub metadata do not speak or listen.",
+   "techniques": [
+    {
+     "technique": "authored-voice-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Payloads are job JSON, not voice specifications."
+    },
+    {
+     "technique": "caller-scoped-voice-binding",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No caller is bound to a speaking voice."
+    },
+    {
+     "technique": "decode-time-vocabulary-biasing",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No audio is decoded."
+    },
+    {
+     "technique": "duplex-agent-sessions",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 SSE and webhooks carry job events, not a live speech session."
+    },
+    {
+     "technique": "engine-abstraction",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Delivery sinks are webhook, slack, and file, not speech engines."
+    },
+    {
+     "technique": "engine-choice-on-decisive-terms",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No recognizer is selected."
+    },
+    {
+     "technique": "on-device-vs-cloud",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No voice audio leaves or stays on the machine."
+    },
+    {
+     "technique": "portable-provider-package",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 There is no voice provider package behind these routes."
+    },
+    {
+     "technique": "real-time-synthesis-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Delivery latency is HTTP, not time-to-first-audio."
+    },
+    {
+     "technique": "render-acceptance",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No audio buffer is accepted."
+    },
+    {
+     "technique": "speech-ready-text",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Event text is not converted to speakable text."
+    },
+    {
+     "technique": "spoken-intent-parsing",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No spoken command is parsed from an event."
+    },
+    {
+     "technique": "stt-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No microphone is opened."
+    },
+    {
+     "technique": "transcript-handoff-receipts",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Delivery receipts are HTTP webhook rows, not clipboard paste receipts."
+    },
+    {
+     "technique": "transcript-normalization",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 No speech transcript is rewritten."
+    },
+    {
+     "technique": "tts-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Nothing is queued for playback."
+    },
+    {
+     "technique": "unattended-caller-attribution",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 Outside callers receive JSON, not audio."
+    },
+    {
+     "technique": "voice-setup-experience",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 There is no voice setup."
+    },
+    {
+     "technique": "voice-ux-integration",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:25 SSE subscribers read job status, not narration controls."
+    }
+   ],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "utterance",
+    "recognizer"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-13T11:01:13.161524+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [
+    "authored-voice-identity",
+    "caller-scoped-voice-binding",
+    "decode-time-vocabulary-biasing",
+    "duplex-agent-sessions",
+    "engine-abstraction",
+    "engine-choice-on-decisive-terms",
+    "on-device-vs-cloud",
+    "portable-provider-package",
+    "real-time-synthesis-budget",
+    "render-acceptance",
+    "speech-ready-text",
+    "spoken-intent-parsing",
+    "stt-pipeline",
+    "transcript-handoff-receipts",
+    "transcript-normalization",
+    "tts-pipeline",
+    "unattended-caller-attribution",
+    "voice-setup-experience",
+    "voice-ux-integration"
+   ],
+   "deviations": 0,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  },
+  {
+   "ts": "2026-10-13T11:01:13.161524+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [
+    "authored-voice-identity",
+    "caller-scoped-voice-binding",
+    "decode-time-vocabulary-biasing",
+    "duplex-agent-sessions",
+    "engine-abstraction",
+    "engine-choice-on-decisive-terms",
+    "on-device-vs-cloud",
+    "portable-provider-package",
+    "real-time-synthesis-budget",
+    "render-acceptance",
+    "speech-ready-text",
+    "spoken-intent-parsing",
+    "stt-pipeline",
+    "transcript-handoff-receipts",
+    "transcript-normalization",
+    "tts-pipeline",
+    "unattended-caller-attribution",
+    "voice-setup-experience",
+    "voice-ux-integration"
+   ],
+   "deviations": 0,
+   "context": "ai-extraction-engines",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  },
+  {
+   "ts": "2026-10-13T11:01:13.161524+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [
+    "authored-voice-identity",
+    "caller-scoped-voice-binding",
+    "decode-time-vocabulary-biasing",
+    "duplex-agent-sessions",
+    "engine-abstraction",
+    "engine-choice-on-decisive-terms",
+    "on-device-vs-cloud",
+    "portable-provider-package",
+    "real-time-synthesis-budget",
+    "render-acceptance",
+    "speech-ready-text",
+    "spoken-intent-parsing",
+    "stt-pipeline",
+    "transcript-handoff-receipts",
+    "transcript-normalization",
+    "tts-pipeline",
+    "unattended-caller-attribution",
+    "voice-setup-experience",
+    "voice-ux-integration"
+   ],
+   "deviations": 0,
+   "context": "core-engine-contract",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  },
+  {
+   "ts": "2026-10-13T11:01:13.161524+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [
+    "authored-voice-identity",
+    "caller-scoped-voice-binding",
+    "decode-time-vocabulary-biasing",
+    "duplex-agent-sessions",
+    "engine-abstraction",
+    "engine-choice-on-decisive-terms",
+    "on-device-vs-cloud",
+    "portable-provider-package",
+    "real-time-synthesis-budget",
+    "render-acceptance",
+    "speech-ready-text",
+    "spoken-intent-parsing",
+    "stt-pipeline",
+    "transcript-handoff-receipts",
+    "transcript-normalization",
+    "tts-pipeline",
+    "unattended-caller-attribution",
+    "voice-setup-experience",
+    "voice-ux-integration"
+   ],
+   "deviations": 0,
+   "context": "e2e-data-integrity",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  },
+  {
+   "ts": "2026-10-13T11:01:13.161524+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [
+    "authored-voice-identity",
+    "caller-scoped-voice-binding",
+    "decode-time-vocabulary-biasing",
+    "duplex-agent-sessions",
+    "engine-abstraction",
+    "engine-choice-on-decisive-terms",
+    "on-device-vs-cloud",
+    "portable-provider-package",
+    "real-time-synthesis-budget",
+    "render-acceptance",
+    "speech-ready-text",
+    "spoken-intent-parsing",
+    "stt-pipeline",
+    "transcript-handoff-receipts",
+    "transcript-normalization",
+    "tts-pipeline",
+    "unattended-caller-attribution",
+    "voice-setup-experience",
+    "voice-ux-integration"
+   ],
+   "deviations": 0,
+   "context": "webhook-event-delivery",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  }
+ ]
+}

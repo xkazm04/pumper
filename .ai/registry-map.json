@@ -513,7 +513,11 @@
           "revision": 19,
           "changedAt": "2026-09-30",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:24 The wasm describe() manifest only publishes extractor, predicate, or transform, and a search of engine-claude, engine-wasm, and engine-search for microphone, whisper, dictation, utterance, and recognizer found none, so Claude research and Tantivy indexing are not a voice pipeline.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
+          "evaluatedRevision": 20
         },
         {
           "subject": "search",
@@ -2144,7 +2148,11 @@
           "revision": 19,
           "changedAt": "2026-09-30",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1177 The engine contract's HTTP trait is page and API fetching, and a search of crates/core for microphone, whisper, dictation, utterance, and recognizer found none, so the tiered fetcher has no listen or speak direction.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
+          "evaluatedRevision": 20
         },
         {
           "subject": "guest-execution-bounding",
@@ -3895,7 +3903,11 @@
           "revision": 19,
           "changedAt": "2026-09-30",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The conformance battery asserts what every HttpClient owes when it fetches, and a search of crates/server/src/e2e for microphone, whisper, dictation, utterance, and recognizer found none, so these tests never exercise speech.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
+          "evaluatedRevision": 20
         },
         {
           "subject": "web-scraping",
@@ -5444,7 +5456,11 @@
           "revision": 19,
           "changedAt": "2026-09-30",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/engine-http/src/lib.rs:1069 HttpEngine::fetch returns an HTTP response for a page or API, and a search of engine-http, engine-browser, engine-archive, and engine-remote for microphone, whisper, dictation, utterance, and recognizer found none, so this context never captures or speaks.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
+          "evaluatedRevision": 20
         },
         {
           "subject": "agent-browser-control",
@@ -5702,7 +5718,11 @@
           "revision": 19,
           "changedAt": "2026-09-30",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:25 A watch delivers an HMAC-signed HTTP payload, and a search of crates/server for microphone, whisper, dictation, utterance, and recognizer found none, so webhooks, SSE job events, and DataHub metadata do not speak or listen.",
+          "evaluatedAt": "2026-10-13",
+          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
+          "evaluatedRevision": 20
         }
       ],
       "governance": "governed"
