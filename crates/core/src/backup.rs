@@ -30,6 +30,8 @@ use chrono::{DateTime, Utc};
 use sqlx::migrate::Migrator;
 use sqlx::SqlitePool;
 
+use crate::schema::{classify, LedgerVerdict};
+
 /// Filename infix marking a file as an automatic pre-migration backup:
 /// `pumper.db.bak-premigrate-20260726-081548`.
 pub const BACKUP_MARKER: &str = ".bak-premigrate-";
@@ -52,6 +54,14 @@ pub enum BackupDecision {
     SkipFreshDatabase,
     /// Every known migration is already applied; the migrator will be a no-op.
     SkipUpToDate,
+    /// The store has applied `ahead` versions this binary does not carry — a
+    /// store a NEWER pumper already migrated.
+    ///
+    /// No snapshot, exactly as for [`BackupDecision::SkipUpToDate`] (there is
+    /// nothing this binary is about to change), but **not the same fact**: one
+    /// says "in sync", the other says "this binary is behind the store". They
+    /// used to be the same arm, which is how a downgrade rode in as a no-op.
+    SkipSchemaAhead { ahead: usize },
 }
 
 impl BackupDecision {
@@ -86,11 +96,25 @@ pub fn backup_decision(db_path: &Path, applied: &[i64], available: &[i64]) -> Ba
     if applied.is_empty() {
         return BackupDecision::SkipFreshDatabase;
     }
-    let pending = available.iter().filter(|v| !applied.contains(v)).count();
-    if pending == 0 {
-        BackupDecision::SkipUpToDate
-    } else {
-        BackupDecision::Take { pending }
+    // Two directions, one subtraction, one place: `schema::classify` is the
+    // only thing in the tree that compares a ledger to the embedded chain, so
+    // the backup decision and the boot post-condition cannot disagree about
+    // what "up to date" means.
+    match classify(applied, available) {
+        LedgerVerdict::Fresh => BackupDecision::SkipFreshDatabase,
+        LedgerVerdict::Current => BackupDecision::SkipUpToDate,
+        LedgerVerdict::Pending { versions } => BackupDecision::Take {
+            pending: versions.len(),
+        },
+        LedgerVerdict::Ahead { versions } => BackupDecision::SkipSchemaAhead {
+            ahead: versions.len(),
+        },
+        // Pending work exists, so the snapshot is still worth taking even
+        // though the boot is about to refuse: the refusal is what the operator
+        // reads, the snapshot is what they restore.
+        LedgerVerdict::Diverged { pending, .. } => BackupDecision::Take {
+            pending: pending.len(),
+        },
     }
 }
 
@@ -138,7 +162,7 @@ pub fn prunable_backups(existing: &[PathBuf], keep: usize) -> Vec<PathBuf> {
 
 /// Versions recorded in `_sqlx_migrations`, or an empty vec when the table does
 /// not exist yet (a database no migrator has ever touched).
-async fn applied_versions(pool: &SqlitePool) -> Vec<i64> {
+pub async fn applied_versions(pool: &SqlitePool) -> Vec<i64> {
     sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations ORDER BY version")
         .fetch_all(pool)
         .await
@@ -147,7 +171,7 @@ async fn applied_versions(pool: &SqlitePool) -> Vec<i64> {
 
 /// Up-migration versions carried by `migrator` (down-migrations are not
 /// schema-advancing and would double-count).
-fn available_versions(migrator: &Migrator) -> Vec<i64> {
+pub fn available_versions(migrator: &Migrator) -> Vec<i64> {
     migrator
         .iter()
         .filter(|m| !m.migration_type.is_down_migration())
@@ -174,7 +198,18 @@ pub async fn backup_before_migrations(
     let available = available_versions(migrator);
     let decision = backup_decision(db_path, &applied, &available);
     let BackupDecision::Take { pending } = decision else {
-        tracing::debug!(?decision, db = %db_path.display(), "pre-migration backup skipped");
+        if let BackupDecision::SkipSchemaAhead { ahead } = decision {
+            // Not a debug line: this is the downgrade path, and the boot
+            // post-condition is about to refuse (or, with
+            // `[storage] allow_schema_ahead`, let it through loudly).
+            tracing::warn!(
+                ahead,
+                db = %db_path.display(),
+                "store is AHEAD of this binary; no pre-migration snapshot taken"
+            );
+        } else {
+            tracing::debug!(?decision, db = %db_path.display(), "pre-migration backup skipped");
+        }
         return None;
     };
 
@@ -280,12 +315,35 @@ mod tests {
             backup_decision(Path::new("/data/pumper.db"), &[1, 2, 3], &[1, 2, 3]),
             BackupDecision::SkipUpToDate
         );
-        // Extra applied rows (a rolled-back migration file) still count as
-        // nothing pending.
-        assert_eq!(
-            backup_decision(Path::new("/data/pumper.db"), &[1, 2, 3, 4], &[1, 2, 3]),
-            BackupDecision::SkipUpToDate
+    }
+
+    /// STRENGTHENED CONTRACT. This assertion used to read `SkipUpToDate` for
+    /// applied `[1,2,3,4]` against available `[1,2,3]`, with the comment
+    /// "extra applied rows still count as nothing pending" — which collapsed a
+    /// DOWNGRADE into "in sync" and let an older binary boot in front of a
+    /// schema a newer one had already moved. The old expression is forbidden
+    /// here, not merely replaced: `SkipUpToDate` and `SkipSchemaAhead` must
+    /// stay distinguishable, because they have opposite remedies.
+    #[test]
+    fn a_store_ahead_of_this_binary_is_not_up_to_date() {
+        let decision = backup_decision(Path::new("/data/pumper.db"), &[1, 2, 3, 4], &[1, 2, 3]);
+        assert_eq!(decision, BackupDecision::SkipSchemaAhead { ahead: 1 });
+        assert_ne!(
+            decision,
+            BackupDecision::SkipUpToDate,
+            "a downgrade is not an up-to-date store"
         );
+        // Still no snapshot — there is nothing this binary is about to change.
+        assert!(!decision.is_take());
+    }
+
+    /// Both directions at once: the store is missing a version this binary
+    /// carries AND carries one this binary does not. The snapshot is still
+    /// taken, because there IS pending work about to run.
+    #[test]
+    fn a_diverged_store_still_earns_its_snapshot() {
+        let decision = backup_decision(Path::new("/data/pumper.db"), &[1, 2, 4], &[1, 2, 3]);
+        assert_eq!(decision, BackupDecision::Take { pending: 1 });
     }
 
     #[test]

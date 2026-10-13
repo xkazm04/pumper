@@ -14,7 +14,7 @@
 //! (capped at `MAX_FRONTIER`) and the kept-page SimHash fingerprints (8 bytes
 //! each) — both bounded, neither the page bodies.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{HttpClient, HttpRequest};
-use crate::simhash::{hamming, simhash};
+use crate::materiality;
+use crate::simhash::simhash;
 use crate::Result;
 
 const MAX_FRONTIER: usize = 100_000;
@@ -166,25 +167,27 @@ const CADENCE_EWMA_ALPHA: f64 = 0.3;
 /// due score of 1.0 (a baseline must be established).
 const DEFAULT_CADENCE_PRIOR_SECS: f64 = 7.0 * 86_400.0;
 
-/// SimHash Hamming distances at or below this are boilerplate churn (rotating
-/// ads, counters, timestamps) — same scale as the crawler's default
-/// `dedup_distance = 3` for "near-identical page".
-const BOILERPLATE_DISTANCE: u32 = 3;
-
 /// Grades how much a page really changed from the SimHash Hamming distance
 /// between the old and new body fingerprints: `0.0` at or below
-/// [`BOILERPLATE_DISTANCE`] (cosmetic churn must not look hot), ramping
-/// linearly to `1.0` at distance 16 (a solidly different document). An unknown
-/// old fingerprint (0) grades as a full change — no evidence to discount it.
+/// [`materiality::COSMETIC_AT_OR_BELOW`] (cosmetic churn must not look hot),
+/// ramping linearly to `1.0` at [`materiality::STRUCTURAL_AT_OR_ABOVE`] (a
+/// solidly different document). An unknown old fingerprint (`0`) grades as a
+/// full change — no evidence to discount it.
+///
+/// **This function is the crawler's view of one shared judgment, not a second
+/// copy of it.** It was the only correct answer to "is this change news?" in
+/// the whole tree, sitting in `core` with no monitor reaching for it while four
+/// apps invented their own; [`crate::materiality`] is now its home and this is
+/// the thin delegation that keeps the crawler's call site reading in the
+/// crawler's own units. The ceiling, the bound and the ramp live there once.
 pub fn change_weight(old_simhash: u64, new_simhash: u64) -> f64 {
-    if old_simhash == 0 {
-        return 1.0;
-    }
-    let d = hamming(old_simhash, new_simhash);
-    if d <= BOILERPLATE_DISTANCE {
-        return 0.0;
-    }
-    (f64::from(d - BOILERPLATE_DISTANCE) / f64::from(16 - BOILERPLATE_DISTANCE)).min(1.0)
+    materiality::judge(
+        // `0` is the crawler's stored sentinel for "never fingerprinted", which
+        // `Signal::fingerprints` reads as the first sighting it is.
+        &materiality::Signal::fingerprints(Some(old_simhash), new_simhash),
+        &materiality::Sensitivity::default(),
+    )
+    .weight()
 }
 
 /// Probability this URL has changed since its last check, under a Poisson
@@ -231,6 +234,126 @@ fn host_cadence_priors(seeds: &[RevisitSeed]) -> HashMap<String, f64> {
     sums.into_iter()
         .map(|(host, (sum, n))| (host, sum / n as f64))
         .collect()
+}
+
+/// One known page with the due score [`plan_revisit`] computed for it.
+#[derive(Debug, Clone)]
+pub struct ScoredSeed {
+    /// `due_score(cadence, now, host-or-global prior)` for this seed.
+    pub due_score: f64,
+    pub seed: RevisitSeed,
+}
+
+/// The seed selection a revisit run would make — the ONE answer both the crawl
+/// loop and the `plan` preview read.
+///
+/// Why one function rather than a preview that re-derives it: a preview running
+/// its own evaluator is a gate watching a proxy. It agrees on the day it is
+/// written and drifts silently afterwards, which is the exact failure the
+/// preview exists to prevent. [`crawl`] consumes this plan, so a divergence
+/// between "what the plan said" and "what the run fetched" is not expressible.
+#[derive(Debug, Clone)]
+pub struct RevisitPlan {
+    /// **Every** known seed with its due score, most-due first (ties broken by
+    /// URL for determinism). The first [`would_fetch`](Self::would_fetch)
+    /// entries are the selection; the rest were skipped.
+    ///
+    /// The ordering makes that prefix exact rather than approximate: a seed at
+    /// or above the threshold always scores strictly higher than one below it,
+    /// so sorting by score cannot interleave the two groups.
+    pub scored: Vec<ScoredSeed>,
+    /// How many of `scored` (its leading prefix) this run would actually fetch.
+    pub would_fetch: usize,
+    /// Seeds below `min_due_score` — lower the threshold to reach them.
+    pub skipped_not_due: usize,
+    /// Due seeds past `revisit_budget` — raise the budget to reach them.
+    pub skipped_over_budget: usize,
+    /// The due score of the LAST seed the selection still affords, i.e. the
+    /// waterline a seed must clear to be fetched this run. `None` when nothing
+    /// was selected. This is the number an operator needs to pick the next
+    /// `min_due_score` or to price the next band of budget.
+    pub cutoff_due_score: Option<f64>,
+    /// Would-fetch count per host, so a selection dominated by one site is
+    /// visible before the fetches happen.
+    pub by_host: BTreeMap<String, usize>,
+}
+
+impl RevisitPlan {
+    /// The seeds this run would fetch, most-due first.
+    pub fn selected(&self) -> &[ScoredSeed] {
+        &self.scored[..self.would_fetch]
+    }
+
+    /// Consumes the plan, yielding only the selected seeds in fetch order.
+    pub fn into_selected(mut self) -> Vec<ScoredSeed> {
+        self.scored.truncate(self.would_fetch);
+        self.scored
+    }
+}
+
+/// Scores every known seed against its learned (or host-inherited) cadence and
+/// decides which of them a revisit run would fetch: drop everything below
+/// `min_due_score`, rank the rest most-due first, keep at most `budget`.
+///
+/// Pure and side-effect free — it fetches nothing and writes nothing, which is
+/// what lets the `plan` preview answer "what would this run do?" from stored
+/// data alone. [`crawl`] calls it too, so the preview and the execution cannot
+/// disagree.
+pub fn plan_revisit(
+    seeds: Vec<RevisitSeed>,
+    min_due_score: f64,
+    budget: Option<usize>,
+    now_epoch: i64,
+) -> RevisitPlan {
+    let priors = host_cadence_priors(&seeds);
+    let mut scored: Vec<ScoredSeed> = seeds
+        .into_iter()
+        .map(|seed| {
+            let prior = seed
+                .cadence
+                .interval_secs
+                .or_else(|| host_of(&seed.url).and_then(|h| priors.get(&h).copied()))
+                .unwrap_or(DEFAULT_CADENCE_PRIOR_SECS);
+            ScoredSeed {
+                due_score: due_score(&seed.cadence, now_epoch, prior),
+                seed,
+            }
+        })
+        .collect();
+    // Most-due first; ties broken by URL for determinism.
+    scored.sort_by(|a, b| {
+        b.due_score
+            .partial_cmp(&a.due_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.seed.url.cmp(&b.seed.url))
+    });
+
+    let due = scored
+        .iter()
+        .filter(|s| s.due_score >= min_due_score)
+        .count();
+    let skipped_not_due = scored.len() - due;
+    let would_fetch = budget.map_or(due, |b| due.min(b));
+    let skipped_over_budget = due - would_fetch;
+    let cutoff_due_score = would_fetch
+        .checked_sub(1)
+        .map(|last| scored[last].due_score);
+
+    let mut by_host: BTreeMap<String, usize> = BTreeMap::new();
+    for s in &scored[..would_fetch] {
+        if let Some(host) = host_of(&s.seed.url) {
+            *by_host.entry(host).or_insert(0) += 1;
+        }
+    }
+
+    RevisitPlan {
+        scored,
+        would_fetch,
+        skipped_not_due,
+        skipped_over_budget,
+        cutoff_due_score,
+        by_host,
+    }
 }
 
 /// One existing page handed back by a [`PageSource`] to seed a revisit: the
@@ -328,7 +451,7 @@ pub struct CrawlConfig {
     pub discover: bool,
     /// Revisit mode: max known pages fetched this run, spent on the URLs with
     /// the highest [`due_score`] — the learned-cadence frontier. Seeds beyond
-    /// the budget are counted `skipped_not_due`. `None` = revisit every seed
+    /// the budget are counted `skipped_over_budget`. `None` = revisit every seed
     /// (the flat pre-M07 schedule).
     pub revisit_budget: Option<usize>,
     /// Revisit mode: seeds scoring below this due probability (0..=1) are
@@ -517,9 +640,21 @@ pub struct CrawlStats {
     /// Revisit mode: known pages that returned `404`/`410` and were flagged gone.
     pub gone: usize,
     /// Revisit mode: known pages NOT fetched this run because their due score
-    /// fell below `min_due_score` or they ranked past `revisit_budget` — honest
-    /// coverage accounting for the learned-cadence frontier.
+    /// fell **below `min_due_score`** — the threshold was the binding
+    /// constraint, and the tuning action is to lower it.
+    ///
+    /// Deliberately NOT the budget's skips: this counter used to be incremented
+    /// for both causes, so "nothing was due" and "the budget ran out" — which
+    /// call for opposite actions — were one indistinguishable number. See
+    /// [`CrawlStats::skipped_over_budget`].
     pub skipped_not_due: usize,
+    /// Revisit mode: due seeds NOT fetched this run because they ranked past
+    /// **`revisit_budget`** — the budget was the binding constraint, and the
+    /// tuning action is to raise it (or accept thinner coverage).
+    ///
+    /// Non-zero here with a scheduled revisit means the corpus is being covered
+    /// only partially, every run, by the most-due slice.
+    pub skipped_over_budget: usize,
 }
 
 /// Bounded, deduplicated, **host-fair** URL frontier.
@@ -827,43 +962,27 @@ pub async fn crawl(
         frontier.push(canonicalize_str(seed), 0);
     }
     // Revisit: seed the frontier from existing page records — but spend the
-    // budget where change is likely. Each seed's learned cadence yields a
-    // due_score(now) (cold-start URLs inherit their host's mean interval as the
-    // prior); seeds below `min_due_score` or ranked past `revisit_budget` are
-    // skipped this run and counted honestly in `skipped_not_due`.
+    // budget where change is likely. The selection itself lives in
+    // [`plan_revisit`], which the `plan` preview calls with the same seeds: the
+    // preview describes THIS code path rather than a re-derivation of it.
+    //
+    // The two skip reasons are counted apart. They used to share one counter,
+    // which made "nothing was due" (lower `min_due_score`) indistinguishable
+    // from "the budget ran out" (raise `revisit_budget`).
     let mut skipped_not_due = 0usize;
+    let mut skipped_over_budget = 0usize;
     if cfg.revisit {
         if let Some(source) = source {
-            let seeds = source.seeds().await;
-            let priors = host_cadence_priors(&seeds);
-            let now = epoch_now();
-            let mut scored: Vec<(f64, RevisitSeed)> = Vec::with_capacity(seeds.len());
-            for seed in seeds {
-                let prior = seed
-                    .cadence
-                    .interval_secs
-                    .or_else(|| host_of(&seed.url).and_then(|h| priors.get(&h).copied()))
-                    .unwrap_or(DEFAULT_CADENCE_PRIOR_SECS);
-                let score = due_score(&seed.cadence, now, prior);
-                if score < cfg.min_due_score {
-                    skipped_not_due += 1;
-                    continue;
-                }
-                scored.push((score, seed));
-            }
-            // Most-due first; ties broken by URL for determinism.
-            scored.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.url.cmp(&b.1.url))
-            });
-            if let Some(budget) = cfg.revisit_budget {
-                if scored.len() > budget {
-                    skipped_not_due += scored.len() - budget;
-                    scored.truncate(budget);
-                }
-            }
-            for (_, seed) in scored {
+            let plan = plan_revisit(
+                source.seeds().await,
+                cfg.min_due_score,
+                cfg.revisit_budget,
+                epoch_now(),
+            );
+            skipped_not_due = plan.skipped_not_due;
+            skipped_over_budget = plan.skipped_over_budget;
+            for scored in plan.into_selected() {
+                let seed = scored.seed;
                 let url = canonicalize_str(&seed.url);
                 if let Some(origin) = origin_of(&url) {
                     seed_origins.insert(origin);
@@ -894,6 +1013,7 @@ pub async fn crawl(
         resumed,
         checkpoint_reset,
         skipped_not_due,
+        skipped_over_budget,
         ..Default::default()
     };
     let mut in_flight = FuturesUnordered::new();
@@ -1985,6 +2105,9 @@ async fn seed_from_sitemaps(
 mod tests {
     use super::*;
     use crate::engine::HttpResponse;
+    // The banded-index tests verify the true Hamming distance themselves; the
+    // crawler's own code reaches it only through `materiality::judge` now.
+    use crate::simhash::hamming;
     use std::sync::Mutex as SyncMutex;
 
     #[test]
@@ -3516,12 +3639,83 @@ mod tests {
         assert!(!priors.contains_key("b.com"));
     }
 
+    #[test]
+    fn plan_revisit_separates_a_threshold_skip_from_a_budget_skip() {
+        // THE REFUTED BEHAVIOR: one counter for two causes. A seed below
+        // `min_due_score` and a seed past `revisit_budget` were both
+        // `skipped_not_due`, so the number could not say whether to lower the
+        // threshold or raise the budget.
+        let now = 1_000_000i64;
+        let seed = |url: &str, checked: Option<i64>, interval: f64| RevisitSeed {
+            url: url.into(),
+            etag: None,
+            last_modified: None,
+            simhash: 0,
+            cadence: RevisitCadence {
+                checks: 3,
+                changes: 2.0,
+                last_checked_at: checked,
+                last_change_at: checked,
+                interval_secs: Some(interval),
+            },
+        };
+        let seeds = vec![
+            seed("https://a.com/hot", None, 3600.0),              // 1.0
+            seed("https://a.com/warm", Some(now - 3600), 3600.0), // ~0.632
+            seed("https://b.com/mild", Some(now - 900), 3600.0),  // ~0.221
+            seed("https://b.com/cold", Some(now - 5), 604_800.0), // ~0.0
+        ];
+
+        let plan = plan_revisit(seeds.clone(), 0.2, Some(2), now);
+        assert_eq!(plan.would_fetch, 2);
+        assert_eq!(plan.skipped_not_due, 1, "only /cold is below 0.2");
+        assert_eq!(plan.skipped_over_budget, 1, "only /mild lost to the budget");
+        // The cutoff is the waterline: the score of the last seed afforded.
+        let cutoff = plan.cutoff_due_score.expect("a selection has a cutoff");
+        assert!((cutoff - (1.0 - (-1.0f64).exp())).abs() < 1e-9, "{cutoff}");
+        assert_eq!(plan.by_host.get("a.com").copied(), Some(2));
+        assert_eq!(plan.by_host.get("b.com"), None);
+        // `scored` keeps EVERY seed so a preview can show the distribution the
+        // thresholds are being compared against - and the selected prefix is
+        // exactly `selected()`, never interleaved with the skipped tail.
+        assert_eq!(plan.scored.len(), 4);
+        let selected: Vec<&str> = plan
+            .selected()
+            .iter()
+            .map(|s| s.seed.url.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["https://a.com/hot", "https://a.com/warm"],
+            "most-due first"
+        );
+
+        // No budget: the threshold alone decides, and nothing is over budget.
+        let open = plan_revisit(seeds, 0.2, None, now);
+        assert_eq!(open.would_fetch, 3);
+        assert_eq!(open.skipped_not_due, 1);
+        assert_eq!(open.skipped_over_budget, 0);
+    }
+
+    #[test]
+    fn plan_revisit_over_no_seeds_has_no_cutoff_rather_than_a_fake_one() {
+        let plan = plan_revisit(Vec::new(), 0.0, Some(10), 1_000_000);
+        assert_eq!(plan.would_fetch, 0);
+        assert_eq!(plan.skipped_not_due, 0);
+        assert_eq!(plan.skipped_over_budget, 0);
+        assert!(
+            plan.cutoff_due_score.is_none(),
+            "an empty plan has no waterline"
+        );
+        assert!(plan.by_host.is_empty());
+    }
+
     #[tokio::test]
     async fn revisit_budget_and_min_due_score_skip_seeds_honestly() {
         // Three known pages, all served 200. One is freshly-checked (cold, low
         // due score) and must be filtered by min_due_score; of the two due
         // ones, revisit_budget = 1 keeps only the MORE due (never-checked)
-        // seed. skipped_not_due reports both skips.
+        // seed. The two skips are reported APART: threshold vs budget.
         let now = epoch_now();
         let mut pages = HashMap::new();
         for path in ["hot", "warm", "cold"] {
@@ -3569,9 +3763,10 @@ mod tests {
             .unwrap();
         assert_eq!(stats.revisited, 1, "only the budgeted most-due seed ran");
         assert_eq!(
-            stats.skipped_not_due, 2,
-            "one below min_due_score + one past the budget"
+            stats.skipped_not_due, 1,
+            "exactly the one below min_due_score, not also the budgeted-out one"
         );
+        assert_eq!(stats.skipped_over_budget, 1, "the one past the budget");
     }
 
     #[test]

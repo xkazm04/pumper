@@ -7,7 +7,9 @@
 // source first, because a parser that has stopped matching reports clean.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -17,6 +19,7 @@ import {
   defaultRepoRoot,
   extractSites,
   findings,
+  rootFromArgv,
 } from './mcp-gate-parity.mjs';
 
 const SRC = fs.readFileSync(
@@ -123,4 +126,70 @@ test('zero parsed gated tools is cannot-check, not a pass', () => {
     s.problems.length > 0 || s.listedGated.length === 0,
     'an unlocatable gate block must not parse as an empty-but-fine set'
   );
+});
+
+// --- the process contract: 0 / 2 / 3, observed as exit codes ----------------
+//
+// Everything above calls check() in-process, which never executes the mapping
+// from a status string to an exit code at the bottom of mcp-gate-parity.mjs.
+// A checker whose cannot-check branch has never been observed is a checker that
+// may be exiting 0 on a tree it could not read. These spawn it for real.
+
+const CHECKER = path.join(defaultRepoRoot(), 'scripts', 'ci', 'mcp-gate-parity.mjs');
+
+function runChecker(root) {
+  return spawnSync(process.execPath, [CHECKER, '--root', root], {
+    encoding: 'utf8',
+  });
+}
+
+/** A scratch tree holding one mcp/mod.rs, or none when `src` is null. */
+function fakeTree(src) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-parity-'));
+  if (src !== null) {
+    const file = path.join(root, MCP_SOURCE);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, src);
+  }
+  return root;
+}
+
+test('exit_0_the_live_tree_parses_and_all_three_sites_agree', () => {
+  const r = runChecker(defaultRepoRoot());
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
+test('exit_2_a_gated_tool_with_an_unguarded_dispatch_arm_reddens_the_process', () => {
+  const root = fakeTree(
+    SRC.replace(
+      '"deep_research" if state.config.mcp.allow_enqueue => tool_deep_research(state, &args).await,',
+      '"deep_research" => tool_deep_research(state, &args).await,'
+    )
+  );
+  const r = runChecker(root);
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /deep_research/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_3_an_absent_source_is_cannot_check_never_a_clean_pass', () => {
+  const root = fakeTree(null);
+  const r = runChecker(root);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stderr, /cannot-check/);
+  assert.notEqual(r.status, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_3_a_source_whose_shape_moved_is_cannot_check', () => {
+  const root = fakeTree('fn unrelated() { let x = 1; }\n');
+  const r = runChecker(root);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('rootFromArgv_defaults_to_the_checkout_and_honours_an_override', () => {
+  assert.equal(rootFromArgv([], '/r'), '/r');
+  assert.equal(rootFromArgv(['--root'], '/r'), '/r');
+  assert.equal(rootFromArgv(['--root', '.'], '/r'), path.resolve('.'));
 });

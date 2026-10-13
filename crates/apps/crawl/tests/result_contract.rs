@@ -173,6 +173,21 @@ async fn output_shape_names_exactly_the_keys_a_real_run_returns() {
         .collect();
     let returned: BTreeSet<String> = result_keys(&out).into_iter().collect();
 
+    // The two revisit skip reasons are SEPARATE keys. `skipped_not_due` used to
+    // be incremented both for a seed below `min_due_score` and for a seed ranked
+    // past `revisit_budget` — opposite tuning actions behind one number — so a
+    // shape that promises only the merged counter is the defect, not a subset.
+    for counter in ["skipped_not_due", "skipped_over_budget"] {
+        assert!(
+            promised.contains(counter),
+            "output_shape must promise `{counter}`: {shape}"
+        );
+        assert!(
+            returned.contains(counter),
+            "a real run must return `{counter}`: {out}"
+        );
+    }
+
     let missing: Vec<&String> = promised.difference(&returned).collect();
     assert!(
         missing.is_empty(),
@@ -237,4 +252,43 @@ async fn a_revisit_with_no_known_pages_still_returns_the_whole_shape() {
         .collect();
     let returned: BTreeSet<String> = result_keys(&out).into_iter().collect();
     assert_eq!(promised, returned, "{out}");
+}
+
+/// The plan shape is a SECOND contract on the same app: `plan: true` returns a
+/// different key set, and it gets the same both-direction diff — no promised key
+/// absent, no returned key unpromised.
+#[tokio::test]
+async fn plan_output_shape_names_exactly_the_keys_a_plan_returns() {
+    let store = TempStore::new("crawl-plan-output-shape").await;
+    let site = Arc::new(StubSite::new());
+    // An empty `pages` dataset is the degenerate plan: zero seeds, but the shape
+    // must still be complete, because a consumer should not have to null-check a
+    // plan that found nothing.
+    let out = Crawl
+        .run(crawl_ctx(
+            &store,
+            site.clone(),
+            json!({ "mode": "revisit", "plan": true }),
+        ))
+        .await
+        .unwrap();
+
+    assert!(site.fetched().is_empty(), "a plan fetches nothing");
+    assert_eq!(out["plan"], true, "{out}");
+    assert_eq!(out["seeds_known"], 0, "{out}");
+    assert_eq!(out["would_fetch"], 0, "{out}");
+
+    let promised: BTreeSet<String> = app_crawl::plan_output_shape_keys()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert!(
+        !promised.is_empty(),
+        "output_shape must declare the plan-mode key block"
+    );
+    let returned: BTreeSet<String> = result_keys(&out).into_iter().collect();
+    assert_eq!(
+        promised, returned,
+        "the plan shape and the plan result must name exactly the same keys"
+    );
 }

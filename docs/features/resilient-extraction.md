@@ -1,11 +1,16 @@
 # Resilient extraction — degradation detection, quarantine & self-repair
 
-> **Status: detection and enforcement are implemented; repair is not.** Sections
-> 0–5 and 7–9 describe shipped surface. §4 (profile registry), §6 (repair), §8.1–8.3
-> (promotion/rollback) and §12's evaluation harness are **not built** — see the
-> per-section markers below and [`IMPLEMENTATION-NOTES.md`](../../IMPLEMENTATION-NOTES.md)
-> at the repo root for what was built, what was deliberately left out and why,
-> and every place the implementation deviates from this design.
+> **Status: detection, enforcement, health webhooks, the ruleset pointer,
+> golden documents and retirement are implemented; repair is not.** Sections
+> 0–5 and 7–9 describe shipped surface. §4 is built as a per-source ruleset
+> *pointer* (not the named-profile registry first designed), §3.2 golden
+> documents are built as an operator-chosen anchor with a refresh and a check,
+> and §2.9 retirement is built opt-in per source. §6 (repair), §8.1–8.3
+> (promotion/rollback beyond the pointer's manual rollback) and §12's evaluation
+> harness are **not built** — see the per-section markers below and
+> [`IMPLEMENTATION-NOTES.md`](../../IMPLEMENTATION-NOTES.md) at the repo root for
+> what was built, what was deliberately left out and why, and every place the
+> implementation deviates from this design.
 >
 > (Convention note: `docs/features/README.md` says deep design rationale belongs
 > in `docs/harness/`. The brief specified this path, so the rationale still lives
@@ -20,7 +25,8 @@
 | The seven detection signals, scoring, diagnosis (§2) | **shipped** | `core::resilience::detect` |
 | Per-field sketches + the statistics on them (§2.4) | **shipped** | `core::resilience::sketch` |
 | Mined invariants (§2.5) | **shipped** | `core::resilience::invariants` |
-| Health ladder with hysteresis (§2.7) | **shipped**, minus `retired` (manual only) | `core::resilience::detect::next_state` |
+| Health ladder with hysteresis (§2.7) | **shipped**; `retired` is manual, or automatic for sources listed in `[resilience] auto_retire` (§2.9) | `core::resilience::detect::next_state` |
+| Retirement on its own denominator (§2.9) | **shipped** — opt-in per source; stops the extractor schedule | `core::resilience::detect::retirement_due`, `server::scheduler` |
 | Automatic recovery `quarantined → probation → healthy` (§2.7) | **shipped** — `recovery_runs` consecutive clean *judged* runs per rung | `core::resilience::detect::{Recovery, next_state}` |
 | Per-source cohort adequacy + honest `unmonitored` (§2.4) | **shipped** — verdict `below_cohort`, `cohort: full\|shrunken\|chronic`, `monitored` on `GET /sources` | `core::resilience::detect::cohort_adequacy` |
 | Schema + persistence (§5) | **shipped** for the tables detection needs | migration `0020` |
@@ -28,17 +34,27 @@
 | `GET /sources`, `/sources/{id}`, `/sources/{id}/runs`, `POST /sources/{id}/state` (§8.4) | **shipped** | `server::routes` |
 | Enforcement preview (§8.5) | **shipped** — `GET /enforcement/preview`, read-only replay of the STORED verdicts | `core::resilience::preview` |
 | Config surface + validation (§9) | **shipped** | `[resilience]` |
-| Golden documents (§3.2, §6.3 retention store) | **not built** |  |
-| Profile registry (§4) | **not built** |  |
-| Repair: inversion, Claude proposals, validation gates, promotion, rollback (§6, §8.1–8.3) | **not built** |  |
-| Health webhooks (§7.3), `/metrics` gauges (§8.4) | **not built** |  |
+| Golden documents (§3.2): enrol / frozen pin, two-generation refresh, frozen + live check, cohort-less detection | **partial / shipped** — the operator names the keys (`POST /sources/{id}/golden`); nothing samples keys automatically | `core::golden`, `server::routes::health` |
+| HN test source (§3.4) | **shipped** — 40 fixtures + ruleset, one `#[ignore]`d live check | `crates/apps/extractor/tests/hn_source.rs` |
+| Profile registry (§4) | **pointer shipped** — per-source ruleset pointer, import, dry-run replay, manual rollback; no named profiles | `core::datasets` (`source_rulesets`), `server::routes::health` |
+| Health webhooks (§7.3) | **shipped** — run path and manual `POST /sources/{id}/state` | `server::webhook::dispatch_health` |
+| `/metrics` gauges (§8.4) | **not built** |  |
+| Repair engine: inversion, Claude proposals, validation gates, promotion (§6, §8.1–8.3) | **not built** |  |
 | `resilience-eval` mutation harness, canary source (§10.9, §12) | **not built** |  |
 
-`[resilience] enforce = false` ships as the default: every verdict is computed and
-stored, nothing is gated. That is §12.6's soak mode, and it is the state the
+`[resilience] enforce = false` with an empty `enforce_sources` ships as the
+default: every verdict is computed and stored, nothing is gated, and nothing is
+read on the write path. That is §12.6's soak mode, and it is the state the
 system is in until an operator reads `GET /sources` and decides otherwise —
 or, before deciding, asks `GET /enforcement/preview` (§8.5) what turning it on
 *would* have done.
+
+**Arming is per source** (§9). `enforce = true` arms the whole fleet at once,
+which is a fleet-wide precondition for a risk that is per source; the preview
+answers per source, so the control is per source too. Add one source id to
+`enforce_sources`, leave the rest soaking, and the next preview reads back
+`armed: true` for it with its counts under `consequences.armed`. Disarming is
+deleting a line.
 
 ---
 
@@ -310,10 +326,16 @@ made honestly labelled. `GET /sources` carries `monitored` per row plus an
 the floor — so `state: "healthy"` on that row means *unwatched*, not *verified*.
 `GET /sources/{id}` keeps `statistical_coverage` for the latest run.
 
-Sources that never reach the floor (e.g. `watch` on a single URL) were designed to
-get **golden-doc detection only** (§6.3) — exact, deterministic, no statistics —
-but golden docs are not built (§3.2), so today they are watched by the
-assumption-free rules alone and say so.
+Sources that never reach the floor (e.g. `watch` on a single URL) get
+**golden-doc detection** when an operator has pinned golden documents for them
+(§3.2) — exact, deterministic, no statistics. A `below_cohort` run whose keys
+include golden keys is judged by them instead: `golden_ok` when every stable
+field of every golden key present agrees, `broken` when at least half disagree
+on some stable field, and `broken` at exactly `degrade_score` (a trip, not a
+severe one) otherwise. `golden_ok` is judged — it moves the state and counts
+toward recovery — but it never enters the rolling baseline, because the
+distributional tests never ran on it. A source with no goldens is watched by the
+assumption-free rules alone and says so.
 
 Below the cohort floor exactly one rule still fires, because it needs no
 distributional assumption: **total collapse** — `miss_rate ≥ 0.9` with a baseline
@@ -438,9 +460,10 @@ would break the audit trail. It stays an ordinary dataset, so `GET
 on it, and an operator who wants that era back re-ingests it deliberately (the
 §8.2 `reextract` path, when it exists).
 
-`retired` is reached from any state when the fetch layer reports sustained
-permanent failure (404/410/DNS on ≥ 90% of URLs across 3 runs) — a dead source,
-not a broken extractor. Only runs with verdict `ok` update the rolling baseline;
+`retired` is a dead source, not a broken extractor. An operator sets it with
+`POST /sources/{id}/state`, and a source listed in `[resilience] auto_retire`
+reaches it on its own after sustained permanent fetch failure (§2.9). Only runs
+with verdict `ok` update the rolling baseline;
 `inconclusive` updates nothing; a `broken` run must never be absorbed into the
 baseline it is being judged against.
 
@@ -496,6 +519,76 @@ safety argument — `doc_fingerprints` rows are diffed against the *next* run, s
 drift would not fail loudly, it would register as a divergence on every key of
 every source.
 
+### 2.9 Retirement: a dead source, on its own denominator
+
+A dead site's runs never reach a verdict: its fetches fail, the fetch gate
+(§2.2) makes every run `inconclusive`, and an inconclusive run moves nothing on
+the ladder. Retirement therefore cannot sit behind the fetch gate. It is decided
+in `observe` from the run's own fetch facts, whatever the verdict was, and it is
+**opt-in per source**: only a source id listed verbatim in `[resilience]
+auto_retire` is ever considered.
+
+**The denominator.** `FetchHealth` carries two facts beside `attempted` / `ok`:
+
+- `permanent` — fetches the live site answered with a **permanent** "gone": HTTP
+  404 or 410 on a live http tier that was not served from the cache
+  (`cache_hit: false`), with no later tier delivering the page. The extractor
+  reads this from the structured tier trace (`permanently_gone` in
+  `crates/apps/extractor/src/lib.rs`), never from the prose. What never counts: a
+  403 (a bot wall) or a 429, a timeout, a DNS failure of any kind (the HTTP
+  engine does not tell NXDOMAIN from SERVFAIL, so neither counts), a cache hit,
+  an archive or recipe tier, a VCR replay, and a fetch that errored.
+- `roster` — the URL list the run was asked to cover. Only the extractor's
+  `urls` mode reports one (the job's URL count, every URL of which it attempts).
+  Source, backfill and archive modes report none.
+
+Both are persisted per run in `source_runs.fetch_permanent` and
+`source_runs.fetch_roster` (migration 0044). A run with no roster stores `NULL`
+in both — unknown, not zero — and never counts.
+
+**The rule** (`detect::retirement_due`, pure). A run is *dead* when
+`permanent ≥ 0.9 × attempted` and `attempted ≥ 0.9 × roster`, with at least one
+attempt. The source retires when its last three recorded runs — this one and the
+two before it, counted only since the source's current `state_since` — are all
+dead **and** span at least two cadence intervals. The cadence is the median gap
+between the creation times of the jobs the same schedule enqueued (the job's
+`schedule_id`); a job no schedule enqueued, or a schedule that has fired fewer
+than twice, has no cadence, and the span must then be at least 14 days. The span
+is what keeps three retries of a host having a bad afternoon from retiring it.
+
+On retirement the run's `state_after` is `retired` and `sources.state_reason` is
+`"permanent fetch failure"`. The run is still recorded with its real verdict
+(usually `inconclusive`), and the ordinary `source.retired` health webhook fires
+for it (§7.3; its `reason` is the run's diagnosis, usually `null`).
+
+**What `retired` does.**
+
+- **Scheduling stops.** The scheduler skips an `extractor` schedule whose
+  `params.dataset` (default `extracted`) names a source whose **stored** state is
+  `retired`. This is a scheduling decision, not a data gate, so it holds whether
+  or not `[resilience] enforce` is on. The skipped firing is recorded the way a
+  misfire skip is (`last_skipped_at`, `skipped_count`); `last_run` does not move.
+  Migration 0039 has no reason column, so "source retired" is in the log line
+  only. Only extractor schedules are stopped: no other app's params name its
+  source.
+- **Under `enforce = true`**, a retired source also infers no removals (its
+  `sync_many` is downgraded, so a dead site's short batch cannot tombstone the
+  dataset), pushes nothing, and indexes nothing. Its writes still land in the
+  live dataset, unstamped — it is not a broken extractor. A manual run of a
+  retired source in soak mode behaves exactly as before.
+- **Nothing is deleted** and nothing is rewritten.
+
+**Leaving it.** Only an operator: `POST /sources/{id}/state` to any other state.
+The scheduler reads the state on every tick, so the next firing runs. The dead
+runs that retired it are behind the new `state_since`, so it takes three new
+dead runs to retire it again.
+
+**Known gaps.** `source_runs` stores no attempted count, so a stored run's
+attempted count is read as its roster (`RetireRun::stored`). That is exact for
+the only reporter, which attempts its whole roster, but the coverage half of the
+rule is only checked for real on the current run. "Recorded run" means a run that
+reached `observe`; a job that fails after `observe` still counts.
+
 ---
 
 ## 3. The silent-corruption case — the real position
@@ -549,30 +642,94 @@ regularity the source has held for its entire history.
 
 ### 3.2 Golden documents: the only exact check, and it is cheap
 
-> **Not built.** The `data/golden/` retention store and the pinned-document
-> check do not exist. The consequence is stated honestly in §10.5: sources that
-> never form a cohort (a single-URL `watch`, a handful of rows) have **no**
-> detection at all today rather than golden-doc-only detection, and
-> `GET /sources/{id}` reports `statistical_coverage: false` for them.
+> **Built; the operator names the keys** (`core::golden`, migration 0044 `golden_docs`).
+> Nothing samples keys automatically: an operator names them. Golden documents
+> exist only for enrolled extractor sources, because only an enrolled urls-mode
+> run pins the bodies they are copied from (§4).
 
-Statistics can be argued with. A pinned document cannot. For each source, keep
-`golden_docs_per_source` (default 8) sampled documents: the **body**, copied out
-of the per-job artifact dir into `data/golden/<source>/<key>.html` so a future
-artifact GC cannot take it, plus the extracted values at pin time and the
-`profile_version` that produced them.
+Statistics can be argued with. A pinned document cannot. A golden document is
+one record key of a source, pinned with its **body** and the values it must
+produce. Two references answer two questions:
 
-Every N runs (or on any tripped run), re-fetch those exact URLs and extract. For
-fields whose historical **churn rate** — the fraction of that field's revisions
-in which it actually changed, derivable directly from `record_revisions.diff` —
-is below 5%, the expected value is an **exact match**. For churnier fields, check
-shape (type, length band, char class) instead. A mismatch on a stable field, with
-a healthy fetch, is a deterministic break signal that needs no cohort, no
-baseline, and no threshold. It is also the only detection available to
-single-record sources (§2.4).
+| Reference | Question | Checked by |
+|---|---|---|
+| **Frozen**: the pinned body, re-extracted with the source's **active** ruleset | did our code or rules change a known result? | `GET /sources/{id}/golden/check` → `frozen` |
+| **Live**: the source's current record against the pinned values, on its **stable** fields | did the site move a value that does not normally move? | the check → `live`; and cohort-less detection in `observe` (§2.4) |
 
-Golden docs are re-pinned only when a source is `healthy` and has been for
-`golden_refresh_days` (default 30). That makes them an **anchor**: the rolling
-baseline can be boiled-frogged by slow degradation, the anchor cannot (§10.4).
+**Stable fields.** A field's churn is the share of the keys' revisions whose diff
+(`record_revisions.diff`, dot paths; a `$` root diff touches every field)
+touches it. `new` revisions count in the denominator (a revision in which no field
+changed); removals do not count. A field with churn **under 5%** is stable
+(1 change in 20 revisions is not). With no revisions at all the churn is unknown
+and no field is stable. One stable-field set is computed per pin request, over
+all its keys, and stored on each row.
+
+**Pinning.** `POST /sources/{id}/golden {"keys": [...], "frozen": false}` pins
+**generation 0** of each key. `pinned_by` is one of exactly three values:
+
+| `pinned_by` | Written by | Refreshed? |
+|---|---|---|
+| `enrol` | a pin with `frozen: false` (the default) | yes — the start of a refresh lineage |
+| `refresh` | the refresh, for generation n+1 | yes |
+| `operator` | a pin with `frozen: true` | **never** (`golden::pin_is_refreshable`) |
+
+Each pinned generation 0 takes:
+
+- `expected` = the key's current record, minus the underscore meta fields
+  (`_url`, `_observed_at`, `_fetched_via`, …);
+- the body = the key's newest pinned body (`body_pins`), verified against its sha
+  and copied to `data/golden/<source id with / → _>/<sha>.html` — beside
+  `data/artifacts`, so artifact retention never walks it;
+- `url` = the pin's original URL; `rules_hash` = the source's active ruleset.
+
+Every key is validated before anything is written: a key with no record, no
+pinned body, or a body that no longer matches its sha is a 400 for the whole
+request, as is a source with no active ruleset or a non-extractor source. An
+pin replaces any earlier generations of its key, whatever their `pinned_by`.
+
+**Refresh.** After every enrolled urls-mode run that leaves its source stored
+`healthy`, the extractor calls `golden::refresh` (best-effort; a failure is
+logged and the existing generations stay). It first reads the source's golden
+rows and returns at once unless some key's newest generation is refreshable.
+Generation n+1 is pinned for a key (`pinned_by: "refresh"`) only when all of:
+
+- the newest generation is refreshable (`enrol` or `refresh`; a frozen `operator`
+  pin, or a value this build does not know, never is);
+- the source has been `healthy` without a break since generation n was pinned
+  (`sources.state_since`, which moves on every transition, manual ones included,
+  is no later than n's `pinned_at`) for at least `[resilience]
+  golden_refresh_days` (default 30);
+- the current record equals **both** generation n and generation n−1 on every
+  stable field of n (n−1 absent → it must equal n). A value that boiled slowly
+  enough to fool n still has to fool n−1.
+
+Two generations are kept: pinning n+1 deletes the rows below n. A dropped
+refreshable generation's body file is deleted once no row references it; a
+frozen `operator` pin's body file is never deleted.
+
+**The check.** `GET /sources/{id}/golden/check` is read-only. For each key's
+newest generation, `frozen` re-extracts the frozen body with the active ruleset
+(against the golden's own URL) and compares every expected field: `exact` counts
+the keys that reproduced exactly. `live` compares the current record on the
+stable fields: `agree` counts the keys that match. Every mismatching field is a
+`mismatches` row `{key, field, expected, got, kind: "frozen"|"live"}`;
+`field: null` means the whole document could not be compared (the frozen body is
+gone or no longer matches its sha, or the live record is gone).
+
+```json
+{"id": "extractor/hn-items", "rules_hash": "…",
+ "frozen": {"keys": 5, "exact": 5},
+ "live":   {"keys": 5, "agree": 4},
+ "mismatches": [{"key": "https://news.ycombinator.com/item?id=1", "field": "title",
+                 "expected": "Y Combinator", "got": "Hacker News", "kind": "live"}]}
+```
+
+`exact < keys` means code or rules drift; `agree < keys` means site drift. A
+source with no active ruleset is a 409 (`conflict`): there is nothing to
+re-extract with.
+
+**Known gaps.** There is no endpoint to list or delete goldens, and the check re-extracts only
+the newest generation of each key.
 
 ### 3.3 The residual, named honestly
 
@@ -595,42 +752,246 @@ When someone eventually notices in three months, the fix is one API call and the
 audit trail survives. That is the deliverable for this class, and pretending
 otherwise would be the dishonest part of the design.
 
----
+### 3.4 The HN test source
 
-## 4. Where rules live: the profile registry (prerequisite for everything in §6)
+A small, real, rule-backed source to exercise the pointer, the goldens and
+retirement end to end: 40 old Hacker News item pages, extracted with a five-field
+RuleSet.
 
-> **Not built.** Rules remain a job parameter. This section is a prerequisite
-> only for repair, which is also not built; detection keys on `(app, dataset)`
-> and needs none of it. The cost is that `source_runs` cannot stamp a
-> `profile_version`, so the `self_inflicted` diagnosis (§2.3) narrows the era by
-> `build_id` alone.
+**In the tree.** `crates/apps/extractor/tests/fixtures/hn/` holds 40 item pages
+(ids 1–55, the first 40 linked stories), a `manifest.json` of what each must
+extract to, and `ruleset.json`:
 
-Today a `RuleSet` is a **job parameter**. It has no identity, no version, and no
-home — it arrives in `POST /apps/extractor/jobs` or sits inside a `schedules`
-row's `params` blob. Repair is impossible against that: there is nothing to
-promote, nothing to roll back to, and nothing to stamp a record with.
-
-So: **rules become a first-class versioned entity, and job params reference them
-by name.**
-
-```jsonc
-// before (still supported, see below)
-{"urls": [...], "rules": {"title": {"type":"css","selector":"h1"}}}
-// after
-{"urls": [...], "profile": "acme-products"}
+```json
+{
+  "title":  {"type": "css", "selector": ".fatitem .titleline > a"},
+  "url":    {"type": "css", "selector": ".fatitem .titleline > a", "attr": "href"},
+  "by":     {"type": "css", "selector": ".fatitem .subline .hnuser"},
+  "time":   {"type": "css", "selector": ".fatitem .subline .age", "attr": "title"},
+  "points": {"type": "css", "selector": ".fatitem .subline .score",
+             "transforms": [{"op": "regex_replace", "pattern": "[^0-9]", "replacement": ""},
+                            {"op": "to_int"}]}
+}
 ```
 
-- `extraction_profiles` — one row per named profile, pointing at an
-  `active_version`.
-- `profile_versions` — immutable rows. A repair never edits a rule; it appends a
-  version and (maybe) moves the pointer.
+The fixtures are hand-trimmed: the `fatitem` story table in the markup
+`news.ycombinator.com/item?id=8863` served on 2026-09-22, rebuilt per id with
+that story's values from the HN API, comments and navigation removed.
+`tests/hn_source.rs` asserts every fixture extracts all five fields to its
+manifest values. `e2e::hn_source::live_hn_item_still_matches_the_ruleset` fetches
+one live item page and checks the same ruleset still matches. It is
+`#[ignore]`d (a `live-network` exemption in `.flake/register.json`) and runs with
+`--ignored`.
 
-**Inline `rules` keep working and are explicitly unwarranted**: a job that passes
-rules inline gets no health tracking beyond the coarse runtime signals and can
-never be repaired, because there is nothing to write back to. `GET /sources`
-reports `repairable: false, reason: "inline rules"`. This is the migration
-incentive and it should be documented as such rather than deprecating the inline
-form (it is the right shape for `POST /extract/preview` iteration).
+**Running it.** HN's `robots.txt` asks for a 30 s crawl delay. The extractor has
+no per-job delay parameter; host spacing is the governor's, so set it in
+`config.toml` and fetch one URL at a time:
+
+```toml
+[governor.per_domain]
+"news.ycombinator.com" = 0.0333   # requests per second: one every 30 s
+```
+
+1. One inline-rules run, so the source exists and has a job to import from:
+
+   ```
+   POST /apps/extractor/jobs
+   {"dataset": "hn-items", "concurrency": 1, "urls": [<the 40 URLs below>],
+    "rules": <ruleset.json>}
+   ```
+
+2. Import that job's rules as the source's first ruleset head:
+
+   ```
+   POST /sources/extractor%2Fhn-items/rules/import
+   {"job_id": "<the job id from step 1>"}
+   ```
+
+3. The weekly schedule, now by reference (Mondays 06:00 UTC; 6-field cron):
+
+   ```
+   POST /schedules
+   {
+     "app": "extractor",
+     "cron": "0 0 6 * * Mon",
+     "misfire_policy": "fire_once",
+     "params": {
+       "dataset": "hn-items",
+       "rules_ref": "active",
+       "concurrency": 1,
+       "urls": [
+         "https://news.ycombinator.com/item?id=1", "https://news.ycombinator.com/item?id=2",
+         "https://news.ycombinator.com/item?id=3", "https://news.ycombinator.com/item?id=4",
+         "https://news.ycombinator.com/item?id=5", "https://news.ycombinator.com/item?id=6",
+         "https://news.ycombinator.com/item?id=7", "https://news.ycombinator.com/item?id=8",
+         "https://news.ycombinator.com/item?id=9", "https://news.ycombinator.com/item?id=10",
+         "https://news.ycombinator.com/item?id=11", "https://news.ycombinator.com/item?id=12",
+         "https://news.ycombinator.com/item?id=13", "https://news.ycombinator.com/item?id=14",
+         "https://news.ycombinator.com/item?id=16", "https://news.ycombinator.com/item?id=18",
+         "https://news.ycombinator.com/item?id=19", "https://news.ycombinator.com/item?id=20",
+         "https://news.ycombinator.com/item?id=21", "https://news.ycombinator.com/item?id=24",
+         "https://news.ycombinator.com/item?id=25", "https://news.ycombinator.com/item?id=26",
+         "https://news.ycombinator.com/item?id=27", "https://news.ycombinator.com/item?id=32",
+         "https://news.ycombinator.com/item?id=37", "https://news.ycombinator.com/item?id=38",
+         "https://news.ycombinator.com/item?id=39", "https://news.ycombinator.com/item?id=40",
+         "https://news.ycombinator.com/item?id=42", "https://news.ycombinator.com/item?id=43",
+         "https://news.ycombinator.com/item?id=45", "https://news.ycombinator.com/item?id=46",
+         "https://news.ycombinator.com/item?id=47", "https://news.ycombinator.com/item?id=49",
+         "https://news.ycombinator.com/item?id=50", "https://news.ycombinator.com/item?id=51",
+         "https://news.ycombinator.com/item?id=52", "https://news.ycombinator.com/item?id=53",
+         "https://news.ycombinator.com/item?id=54", "https://news.ycombinator.com/item?id=55"
+       ]
+     }
+   }
+   ```
+
+4. After the first run by reference (an **enrolled** run, which pins each body —
+   step 1's inline run pinned none), pin the goldens:
+
+   ```
+   POST /sources/extractor%2Fhn-items/golden
+   {"keys": ["https://news.ycombinator.com/item?id=1", "https://news.ycombinator.com/item?id=8"]}
+   ```
+
+   These are enrolment pins (`pinned_by: "enrol"`), which the refresh keeps
+   current; add `"frozen": true` for a reference that never moves. Check them any
+   time with `GET /sources/extractor%2Fhn-items/golden/check`.
+   To let the source retire itself if HN ever drops these pages, add it to
+   `[resilience] auto_retire = ["extractor/hn-items"]`.
+
+Forty documents is above the default `min_cohort_docs` floor of 30, so these
+runs get the distributional tests; the goldens add the frozen and live checks on
+top.
+
+---
+
+## 4. Where rules live: the ruleset pointer (prerequisite for everything in §6)
+
+> **Built as a per-source pointer**, not the named-profile registry first
+> designed here (`extraction_profiles` / `profile_versions` do not exist). Rule
+> bodies stay content-addressed in `rules_versions` (0030); `source_rulesets`
+> (0044) says which one a source runs. Detection still keys on `(app, dataset)`
+> and needs none of it. Inline `rules` keep working: such a source reports
+> `repairable: false, repairable_reason: "inline rules"` on `GET /sources`.
+
+### Ruleset pointer (`source_rulesets`, migration 0044)
+
+A source (`<app>/<dataset>`, only `extractor/<dataset>` is rule-backed) can be **enrolled** on a
+ruleset pointer. Ruleset bodies stay content-addressed in `rules_versions`; `source_rulesets` holds
+only the pointer: one row per move, `epoch` strictly increasing per source (first = 1), the previous
+head retired (`retired_at`) in the same `BEGIN IMMEDIATE`, `parent_hash` = the head it replaced,
+`licence_at_move` always `"none"`, and `sources.active_rules_hash` set to the new head. The head is
+the non-retired row with the greatest epoch. `origin` is one of `import | human | rollback`.
+
+A pointer operation never creates a `sources` row (only a reported run does): an unknown source is
+a 404. Moving the pointer to the ruleset that is already the head is a 409 (no epoch is minted).
+
+Rulesets are addressed by full hash or a unique prefix of **at least 8 hex** characters, resolved
+only within the source's own lineage. Shorter / non-hex / ambiguous → 400; no match → 404.
+`"active"` means the current head.
+
+#### Endpoints
+
+| Route | Body | Result |
+| --- | --- | --- |
+| `GET /sources/{id}/rules` | — | `{id, active: RulesetHead \| null, lineage: [RulesetHead, newest epoch first]}`; 404 unknown source |
+| `POST /sources/{id}/rules/import` | `{job_id}` | Registers that job's inline `params.rules` (canonical hash) as the FIRST head, origin `import` → `{id, active}`. 400: bad job id, job not `extractor`, job's `dataset` (default `extracted`) is not this source's, no inline `params.rules`, rules don't parse/compile, source not an extractor source. 404: unknown source or job. 409 `conflict`: the source already has a head. |
+| `POST /sources/{id}/rules` | `{rules, dry_run?: true}` | **Dry run by default**: replays `rules` against the active head over the source's pinned bodies → `{id, dry_run: true, candidate_hash, active, replay: {source, docs, docs_matching, truncated, missing, missing_keys, baseline, fields, inner_fields, regressed_urls, regressions}}`. Writes nothing (not `source_rulesets`, not `rules_versions`). `dry_run: false` compiles, registers, activates (origin `human`) → `{id, dry_run: false, active}`. 400 bad/uncompilable rules or not an extractor source; 404 unknown source; 409 already active. |
+| `POST /sources/{id}/rules/rollback` | `{to, dry_run?: true}` | Same shape; `to` is a hash/prefix in this source's lineage; activation origin `rollback`. |
+
+`RulesetHead` = `{rules_hash, parent_hash, origin, epoch, activated_at, licence_at_move}` — every
+key always present (`parent_hash: null` = first head). `{id}` contains a `/`, so clients
+percent-encode it (`extractor%2Fprices`).
+
+#### `GET /sources` / `GET /sources/{id}` additions
+
+Every row (and the detail view's `source` object) now carries:
+
+- `active_rules_hash: string | null` — the head (`null` = not enrolled);
+- `repairable: bool` and `repairable_reason: string | null` — exactly one of
+  `"not an extractor source"`, `"inline rules"` (no ruleset head), `"no pinned bodies"`, checked in
+  that order; `null` when repairable. The key is present even when null.
+
+### Canonical ruleset hash
+
+`canonical_rules_hash(&RuleSet)` = sha256 over the RuleSet round-tripped through serde (sorted keys),
+so two spellings of one ruleset (e.g. with/without `"all": false`, `"attr": null`,
+`"transforms": []`) share one identity. `Datasets::register_ruleset` stores the canonical JSON under
+it. **Every** extractor registration now uses it — import, `POST /sources/{id}/rules`, and every
+extractor run with inline rules, enrolled or not — so one ruleset has one hash across revision
+stamps, the registry and the pointer lineage. The job result's `rules_hash` therefore changes for
+inline runs (record VALUES are unchanged; only the stamp differs). Raw-params hashes stamped before
+the switch stay resolvable via `rules_by_hash`.
+
+### Extractor params
+
+- `rules_ref: "active" | "<hash-or-prefix>"` — write modes (urls, source), instead of inline
+  `rules`, resolved in source `extractor/<dataset>`'s lineage. Exactly one of `rules` / `rules_ref`
+  (both or neither is refused at the enqueue door — schema `oneOf` — and in the app:
+  `params 'rules' and 'rules_ref' are mutually exclusive`). `rules_ref` beside `replay`/`induce` is a
+  mode conflict. An unresolvable reference fails the job:
+  `rules_ref '<ref>' did not resolve for source 'extractor/<dataset>': <reason>`; nothing is written.
+- `replay.rules` / `replay.baseline_rules` may each be `{"rules_ref": "active"|"<prefix>",
+  "source"?: "<id>"}` (source defaults to `replay.against.source`; a ref with no source is refused).
+- `replay.against.source: "<id>"` — replay that source's **pinned** bodies (latest pin per document
+  key, verified against its sha, each extracted with its pinned `original_url` as base). Excludes
+  `against.app`, `against.dataset`, `against.versions` (so `bisect_field` is unavailable with it);
+  `url_pattern` / `max_pages` still apply to document keys. The report's `against` is
+  `{source, url_pattern, versions: "latest", max_pages}`.
+
+### Enrolled URL-mode runs (body retention)
+
+A source is **enrolled** when it has an active ruleset head. An enrolled URL-mode run:
+
+1. saves each fetched body at `data/artifacts/extractor/bodies/<sha256>.html` (no rewrite when the
+   file exists — identical bodies share one file);
+2. inserts one `body_pins` row per observation (`observation_id = <job_id>:<document key>`,
+   `original_url` = the document URL) before writing records;
+3. writes each record with its OWN provenance stamp `{job_id, source_url: doc URL, artifact_sha,
+   rules_hash}` through `Datasets::upsert_many_row_stamped` (the `upsert_in_tx` body, chunked; the
+   same quarantine diversion and trust stamp as the context seam). A body that could not be saved
+   leaves that row's `artifact_sha` null (counted in `enrolled.pin_failures`).
+4. The result gains `enrolled: {source, bodies_pinned, bodies_written, pin_failures}` (urls mode
+   only; absent for non-enrolled runs).
+
+Source / backfill / archive modes are unchanged even when enrolled (they stamp the batch-level
+provenance as before).
+
+**Retention:** `pinned_artifact_refs` gains a third arm — a pinned body
+(`<app>/bodies/<sha>.html`, scanner address `ArtifactRef{app, job_id: "bodies", name: "<sha>.html"}`)
+is kept while any revision with a `rules_hash` cites its sha as `artifact_sha`; once none does, it is
+reclaimable by age like any other artifact.
+
+### `rederive`
+
+`POST /provenance/{app}/{dataset}/{key}/rederive` first resolves the revision's `artifact_sha`
+through `body_pins` (preferring the pin whose `original_url` equals the revision's `source_url`),
+reads the pinned file, and replays with the pin's `original_url` as base (so `url_absolute` fields
+reproduce). Without a pin it falls back to the record's `artifact_path` + `job_id`, base-less, as
+before. The response gains `diverged: bool` (the negation of `verdict == "reproduced"`) and
+`base_url: string | null`. Enrolled extractor rows return `diverged: false`.
+When the record's head revision has no `artifact_sha` — data written before enrolment, which an
+equal-value `rules_ref` run re-confirms without appending a revision — but its key was pinned after
+that revision, rederive replays the latest pinned observation of the key (`body_pins`, source
+`<app>/<dataset>`, `document_key = key`) with its `original_url` as base and the ruleset the pinning
+job's result reports (`rules_hash`), else the active head. Every response carries
+`replayed_from: "revision" | "latest_observation"`, `observation_id` (null unless an observation
+was replayed) and `rules_from: "revision" | "observation_job" | "active"`; with no pin either, the
+honest 409 stands. Older (non-head) revisions never take the fallback.
+
+### Saved-search views
+
+`materialize_search_hits` now writes each view row with the trust of the source record its hit
+points at (looked up in `records`; the index stores no trust), instead of `NULL` for every row. A
+provisional source record stays provisional in the view; a hit with no source record writes `NULL`.
+
+### Known gaps of the pointer
+
+- Doctor coverage of pinned bodies: `just doctor`'s `replayable_revisions` /
+  missing-body check still looks only at `data.job_id` + `data.artifact_path`, so an enrolled
+  source's pinned bodies (`<app>/bodies/<sha>.html` via `body_pins`) are not verified by it.
+- Dry runs are capped at 500 pinned documents (`truncated` says so).
+- A `rules_ref` for source mode resolves and runs, but source mode does not pin bodies.
 
 ---
 
@@ -741,18 +1102,7 @@ CREATE TABLE IF NOT EXISTS doc_fingerprints (
     PRIMARY KEY (source_id, key)
 );
 
--- ---------- golden documents ------------------------------------------------
-CREATE TABLE IF NOT EXISTS golden_docs (
-    source_id       TEXT NOT NULL,
-    key             TEXT NOT NULL,
-    url             TEXT NOT NULL,
-    body_path       TEXT NOT NULL,      -- data/golden/<source>/<sha>.html
-    expected        TEXT NOT NULL,      -- JSON values at pin time
-    stable_fields   TEXT NOT NULL,      -- JSON array: churn < 5%, exact-matched
-    profile_version INTEGER,
-    pinned_at       TEXT NOT NULL,
-    PRIMARY KEY (source_id, key)
-);
+-- ---------- golden documents: built in migration 0044, see below -----------
 
 -- ---------- repair audit trail ---------------------------------------------
 CREATE TABLE IF NOT EXISTS repair_attempts (
@@ -789,6 +1139,32 @@ ALTER TABLE records           ADD COLUMN trust TEXT;            -- NULL = stable
 ALTER TABLE record_revisions  ADD COLUMN trust TEXT;
 ALTER TABLE record_revisions  ADD COLUMN profile_version INTEGER;
 ```
+
+**Migration `0044_repair_foundations.sql`, as built.** Additive only; every new
+column is nullable and `NULL` means unknown or none. Besides `source_rulesets`,
+`body_pins` and `sources.active_rules_hash` (§4):
+
+```sql
+CREATE TABLE IF NOT EXISTS golden_docs (      -- §3.2
+    source_id     TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation    INTEGER NOT NULL,           -- 0 = the pin; +1 per refresh; two kept
+    url           TEXT NOT NULL,
+    body_sha      TEXT NOT NULL,              -- data/golden/<source id, / → _>/<sha>.html
+    expected      TEXT NOT NULL,              -- JSON: the record's values, no `_` meta fields
+    stable_fields TEXT NOT NULL,              -- JSON array: churn < 5%
+    rules_hash    TEXT NOT NULL,              -- the active ruleset at pin time
+    pinned_by     TEXT NOT NULL,              -- enrol | refresh | operator (frozen)
+    pinned_at     TEXT NOT NULL,
+    PRIMARY KEY (source_id, key, generation)
+);
+-- Retirement's own denominator (§2.9). NULL = pre-0044 row, or no roster reported.
+ALTER TABLE source_runs ADD COLUMN fetch_permanent INTEGER;
+ALTER TABLE source_runs ADD COLUMN fetch_roster    INTEGER;
+```
+
+`source_runs.verdict` gained one value, `golden_ok` (§2.4): judged, never
+baseline material.
 
 **On `records.trust` and the derived-column lesson.** `harness-learnings.md`
 (2026-07-15) records that `0004_simhash.sql` added a derived column with a
@@ -929,7 +1305,7 @@ promoted one.
 | `degraded` | live dataset, **`upsert_many` only** | `provisional` | **suppressed** | **skipped** | filtered out by default | scheduled |
 | `quarantined` | **shadow dataset `<ds>@q`** | `quarantined` | **suppressed** | **skipped** | not in live feed | active |
 | `probation` | live dataset | `provisional` | fire (payload carries `trust`) | index | filtered out by default (`provisional`) | shadow compare |
-| `retired` | none | — | — | — | — | no |
+| `retired` | extractor schedule **skipped** (any `enforce`); a manual run writes the live dataset, **`upsert_many` only** | `NULL` | **suppressed** | **skipped** | included | no |
 | `unknown` | live dataset | `NULL` | fire | index | included | n/a |
 
 `unknown` is **rendered, never stored** — the `CHECK` on `sources.state` (§5) does
@@ -962,7 +1338,7 @@ into the live dataset, which is the same code path and produces proper revisions
 ### 7.2 The three things that must never happen
 
 1. **A degrading source must never tombstone its own dataset.** `sync_many` is
-   downgraded to `upsert_many` in `degraded`/`quarantined`. `detect_removed`
+   downgraded to `upsert_many` in `degraded`/`quarantined`/`retired`. `detect_removed`
    already no-ops on an empty batch; a *partial* batch is the dangerous case and
    this is the guard for it.
 
@@ -978,14 +1354,40 @@ into the live dataset, which is the same code path and produces proper revisions
    sites. A caller that already knows which records disappeared uses
    `Datasets::tombstone_keys` — removal by name, no inference, no guard needed.
 2. **A degrading source must never push.** Watches (`dataset.changed`), triggers
-   (`fresh`/`changed`/`removed`), and saved-search alerts all fire from the
-   worker's post-run hooks. Health evaluation runs **before** those hooks and they
-   consult `sources.state`. This ordering is the entire enforcement mechanism; if
-   it is wrong, the design does nothing.
+   (`fresh`/`changed`/`removed`) and saved-search alerts (`search.matched`) all fire from the
+   worker's post-run hooks, and under `enforce = true` each is gated on source health before it
+   fires:
+   - **Watches and triggers from the run:** `suppress_unhealthy` drops the whole
+     `(app, dataset)` entry from the batch before `notify_watches` and `fire_dataset_triggers`
+     see it. This ordering is the enforcement mechanism. It is pinned by
+     `gate_calls_precede_hook_calls_in_the_success_fanout`.
+   - **Saved-search alerts:** each hit is judged by its **own** source pair (the hit's
+     `app`/`dataset`, the dataset the document was indexed from). A hit from a pair that
+     `suppresses_pushes()` is dropped **before** the `saved_search_seen` claim, so it is not
+     marked seen and can still alert after the source recovers, if it still matches. Hits from
+     healthy sources in the same search still alert.
+   - **Materialized views:** the view's records are written unchanged. Suppression gates
+     pushes, never data. The view's **deltas** are judged by their underlying source, read from
+     the view record's `source.{app,dataset}` provenance block. A `removed` delta has no
+     snapshot, so its source is read from the tombstoned view row. A delta whose source cannot
+     be read gates nothing. Judging by the view's own pair would not work: nothing observes a
+     view, so that pair always reads `healthy`. That pair also goes through `suppress_unhealthy`
+     as a backstop.
+
+   For a source nothing has armed (`enforce = false` and its id absent from
+   `enforce_sources`), all of the above behaves exactly as before.
 3. **A degrading source must never poison the search index.** `index_datasets`
    handling skips a suppressed source. Because indexing is now delta-driven from
    the change feed, the skipped revisions are simply picked up by the next healthy
    run's window — or by `search-backfill` after a reextract.
+
+   The run's **job-result echo** (`records`/`stories`/`items` arrays and the `_job` snapshot) is
+   withheld whole when any pair this run was judged on (its `source_runs` rows) `skips_search_index()`.
+   It cannot be attributed per record. Withholding it also skips the `_job` sweep, so the last
+   trusted snapshot stays searchable. `search-backfill` applies the same gate offline: under
+   `enforce = true` it skips every pair whose state `skips_search_index()` (`degraded`,
+   `quarantined` and `retired`), purges included, and names the skipped pairs in its final
+   summary line.
 
 ### 7.3 Pull vs push, stated as a rule
 
@@ -996,11 +1398,51 @@ returns records with their `trust` field populated and accepts the same filter.
 data delivery. A consumer that wants everything can always ask; a consumer that
 asks for nothing gets only what we stand behind.
 
-New webhook kinds, all through `webhook::dispatch_event` per the enforced
-convention (never hand-roll a send): `source.degraded`, `source.quarantined`,
-`source.repair_promoted`, `source.rolled_back`, `source.retired`, delivered to
-`[webhooks] health_url` with `health_secret`. These are the alerts that replace
-the human reviewer: nobody approves anything, but somebody is told.
+**Health webhooks, built.** When `[webhooks] health_url` is set, a run whose verdict moves a
+source **into** `degraded`, `quarantined` or `retired` queues one delivery there through
+`webhook::dispatch_event` (kind `health`, `ref_id` = the source id), HMAC-signed with
+`[webhooks] health_secret` when set. Retries and DLQ replays re-read the secret from config.
+The event names are `source.degraded`, `source.quarantined` and `source.retired`, sent in the
+`x-pumper-event` header. Only an entry fires (`webhook::health_transition`): a source that stays
+degraded does not re-alert, recovery (`probation`, `healthy`) and `suspect` send nothing, and
+escalation (`degraded` → `quarantined`) is an entry. The body is a `SourceHealthEvent`, and every
+key is always present (`null` when it has no value):
+
+```json
+{"source_id": "app/dataset", "app": "app", "dataset": "dataset",
+ "from": "healthy", "to": "degraded", "reason": "markup_drift",
+ "job_id": "<uuid>", "at": "<the run's created_at>"}
+```
+
+`from` is the `state_after` of the source's previous recorded run, and `null` on its first run.
+`reason` is the run's `diagnosis`. `job_id` is `null` only for a manual override. The check runs
+once per terminal job (success, failure or cancel) in `finalize`. It reads this job's
+`source_runs` rows (`idx_source_runs_job`) and reads a source's history only for a row that
+landed in an alerting state. It is independent of `enforce`: telling somebody gates nothing, so
+soak mode sends these too. With `health_url` unset, or with `[resilience] enabled = false`, it
+returns before any query. An automatic retirement (§2.9) is a run that moved the state, so it
+sends `source.retired` through this same path.
+
+**Manual transitions alert too.** `POST /sources/{id}/state` into `degraded`, `quarantined`
+or `retired` sends one event through `webhook::dispatch_health(state, &SourceHealthEvent)`,
+the callable both paths share: `from` is the state the row held **before** the write, `to` the
+state after, `reason` the operator's (`"manual override"` when none was given), `job_id` `null`,
+and `at` the new `state_since`. `dispatch_health` applies the same entry predicate, so no caller
+can alert on a non-entry: `degraded` → `degraded` and any move out of an alerting state send
+nothing.
+
+A run alerts only if it is the run that moved the stored state: the source row's
+`state_since` must equal this run's `created_at`. `commit_run` stamps it only on an actual
+transition, so this holds only then (`webhook::run_moved_state`). An operator override between
+runs therefore does not make the next same-state run re-alert. The manual path announces that
+entry itself.
+
+**Known gaps.** (1) A run is silent when a later run of the same source has already moved the
+state again before this job's finalize reads it, and also when this job's run falls outside the
+8-run history window. In both cases the later run reports its own transition. (2) Delivery is
+at-least-once: a retried job (same id, new attempt) that lands in the same alerting state can
+alert again, and the payload's `job_id` is the receiver's dedupe key. `source.repair_promoted`
+and `source.rolled_back` are not built.
 
 ---
 
@@ -1008,9 +1450,10 @@ the human reviewer: nobody approves anything, but somebody is told.
 
 ### 8.1 Promotion
 
-> **Not built** (§8.1-8.3). There is nothing to promote or roll back without the
-> profile registry and repair. `POST /sources/{id}/state` is the whole operator
-> surface. It is no longer the *only* way out of `quarantined` — §2.7's
+> **Not built** (§8.1-8.3), beyond the ruleset pointer's operator moves (§4:
+> `POST /sources/{id}/rules` and `/rules/rollback`, dry run by default). There is
+> no repair to promote. `POST /sources/{id}/state` and the pointer are the whole
+> operator surface. It is no longer the *only* way out of `quarantined` — §2.7's
 > evidence-based recovery is — but it is the shortcut for an operator who already
 > knows the source is fixed.
 
@@ -1063,15 +1506,27 @@ Registered through `openapi_router()` with `#[utoipa::path]` annotations **and**
 an entry in the coverage test's `EXPECTED` inventory, or `cargo test -p
 pumper-server` fails. Paginated lists follow the `cursor=` keyset convention.
 
+Built today (`{id}` is `<app>/<dataset>`, percent-encoded: `extractor%2Fhn-items`):
+
 ```
-GET    /sources                       # health table; ?state=&app=&cursor=
+GET    /sources                       # health table; ?state=&app=&limit=
 GET    /sources/{id}                  # state, score, last runs, per-field sketch vs baseline,
-                                      #   invariants, active profile version, repairable+reason
-GET    /sources/{id}/runs?cursor=     # verdict history with reasons
-POST   /sources/{id}/state            # {state, reason} — manual override / unquarantine / retire
-GET    /sources/{id}/golden           # pinned docs + expected values
-POST   /sources/{id}/golden/pin       # {keys?} — pin now (else auto-sampled)
-DELETE /sources/{id}/golden/{key}
+                                      #   invariants, active_rules_hash, repairable+reason
+GET    /sources/{id}/runs             # verdict history with reasons
+POST   /sources/{id}/state            # {state, reason} — manual override / unquarantine / retire;
+                                      #   an entry into degraded|quarantined|retired sends source.*
+GET    /sources/{id}/rules            # ruleset pointer: active head + lineage (§4)
+POST   /sources/{id}/rules/import     # {job_id} — first head from a job's inline rules
+POST   /sources/{id}/rules            # {rules, dry_run?: true} — dry-run replay, or activate
+POST   /sources/{id}/rules/rollback   # {to, dry_run?: true}
+POST   /sources/{id}/golden           # {keys, frozen?: false} — pin generation 0 per key (§3.2)
+GET    /sources/{id}/golden/check     # frozen + live check, read-only (§3.2)
+GET    /enforcement/preview           # §8.5
+```
+
+Designed, **not built**:
+
+```
 POST   /sources/{id}/repair           # force an attempt; ?dry_run=true → candidates + scores only
 POST   /sources/{id}/reextract        # {from_version?|since?} replay retained bodies
 
@@ -1088,13 +1543,15 @@ GET    /repairs/{id}                               # candidates, scores, reject 
 ### 8.5 Enforcement preview — what would have happened
 
 `GET /enforcement/preview` (`just enforcement-preview [app]`) answers the only
-question that gates flipping `enforce`: *what would this have done to my fleet?*
+question that gates arming enforcement: *what would this have done to my fleet?*
+— and, since arming is per source (§9), it also answers *what is it doing
+right now*, per source, with the two never summed into one number.
 
-It works because soak mode is a no-op strictly **downstream**. `observe` judges
-every run, moves the source's state and writes the verdict, the score and the
-self-explaining `reasons` to `source_runs` **regardless** of `enforce`; the one
-thing `enforce` changes is that `Resilience::enforced_state` answers `Healthy` to
-the four consumers that gate on it. So the ladder in the database is already the
+It works because an unarmed source is a no-op strictly **downstream**. `observe`
+judges every run, moves the source's state and writes the verdict, the score and
+the self-explaining `reasons` to `source_runs` **regardless** of arming; the one
+thing arming changes is that `Resilience::enforced_state` answers `Healthy` to
+the consumers that gate on it. So the ladder in the database is already the
 ladder enforcement would have walked, and a preview is a *replay of stored rows*:
 
 - **It re-judges nothing.** Every verdict, score and state reported is the one
@@ -1154,14 +1611,22 @@ Response shape:
 ```
 GET /enforcement/preview?app=&runs=&limit=
 {
-  "enforcing": false,          # true => this describes what DID happen
+  "enforcing": false,          # the fleet-wide [resilience] enforce flip, alone
+  "armed": "none",             # "all" (the flip) | "some" (a list) | "none" (the default)
+  "enforce_sources": [],       # the configured list, echoed verbatim as the server loaded it
+  "redundant_sources": [],     # list entries that do nothing because enforce = true arms all
+  "armed_unseen": [],          # list entries matching no replayed source — i.e. a typo
   "ready": false,              # no source's current state gates anything
   "not_ready": [ { "id", "state", "gates": [...], "since": <transition> } ],
   "unmonitored": ["app/dataset"],   # never cleared the cohort floor: weak evidence,
                                     #   but gates nothing, so it does not block readiness
-  "totals": { "diverted_writes": {"runs","docs"}, ... },
+  "totals": { "diverted_writes": {"runs","docs"}, ... },   # every source, armed or not
+  "consequences": {            # the same sum, split by whether it is happening
+    "armed":   { "diverted_writes": {"runs","docs"}, ... },   # IS being gated
+    "soaking": { "diverted_writes": {"runs","docs"}, ... }    # WOULD be gated
+  },
   "sources": [ {
-    "id", "state", "gates", "live_state", "monitored",
+    "id", "armed", "state", "gates", "live_state", "monitored",
     "runs_replayed", "unjudged_runs", "window_opens_at", "window_opens_in",
     "transitions": [ { "at","from","to","cause","verdict","score","diagnosis","reasons","gates" } ],
     "consequences": { ... }
@@ -1172,6 +1637,25 @@ GET /enforcement/preview?app=&runs=&limit=
 `live_state` is the `sources` row as `GET /sources` serves it. It differs from
 the replayed `state` only when something outside the run history moved it, and is
 surfaced so the preview can never quietly disagree with the health table.
+
+**`totals` vs `consequences`.** `totals` is unchanged: every replayed source
+summed, armed or not. `consequences` splits that same sum, because once arming
+is per source a single rollup would add a number describing the past to a number
+describing a hypothesis and present the sum as a fact. Arming one source moves
+exactly that source's counts from `soaking` to `armed` and changes no other
+number — pinned by
+`arming_one_source_moves_only_that_source_from_soaking_to_armed`.
+
+**`armed_unseen` is why a typo cannot pass for a rollout.** A misspelt entry
+arms nothing, and a fleet where nothing is armed looks exactly like a fleet that
+is already fine. The entries are judged against the sources this replay actually
+saw, so a `?app=` filter or a `limit` can also put a real source in there — the
+field says *unseen*, not *unknown to the server*.
+
+**Known gap.** The preview reports the arming posture the *server process*
+loaded. `enforce_sources` is read at boot like every other config key, so a
+source added to the file is not armed until a restart; the field exists so that
+the posture in effect is readable rather than inferred from the file on the box.
 
 Metrics (cardinality-capped — per-field series limited to the worst 10 fields per
 source, because `/metrics` is scraped and label explosion is a real cost):
@@ -1196,7 +1680,10 @@ are the two halves of source liveness and neither subsumes the other.
 ```toml
 [resilience]
 enabled                 = true
-enforce                 = false    # false = compute verdicts, gate nothing (soak mode, §12.6)
+enforce                 = false    # true = arm EVERY source. false = soak mode (§12.6) unless
+                                   #   enforce_sources names one
+enforce_sources         = []       # source ids armed while enforce = false (§9), e.g.
+                                   #   ["extractor/hn-items"]. Empty = nothing armed.
 min_cohort_docs         = 30
 window_runs             = 20
 degrade_score           = 0.6
@@ -1206,9 +1693,8 @@ mad_z                   = 3.5
 invariant_refresh_days  = 14
 invariant_min_support   = 500
 invariant_min_confidence= 0.99
-golden_docs_per_source  = 8
-golden_refresh_days     = 30
-golden_check_every_runs = 5
+golden_refresh_days     = 30       # healthy days before a golden generation may refresh (§3.2)
+auto_retire             = []       # source ids allowed to retire themselves (§2.9), e.g. ["extractor/hn-items"]
 sketch_retention_runs   = 60       # window_runs × 3; pruned by the retention janitor
 recovery_runs           = 3        # consecutive clean JUDGED runs per rung back up (§2.7)
 platform_change_ratio   = 0.5      # >half of sources tripping at once ⇒ it's us, §10.8
@@ -1235,8 +1721,45 @@ required — see the `ClaudeConfig` note in `harness-learnings.md`), and
 `min_cohort_docs ≥ 5`, `holdout_min_docs ≥ 5`, `fetch_ok_floor ∈ (0,1]`,
 `recovery_runs > 0` (zero would let a quarantined source release itself on the
 first run that merely failed to trip).
-`enabled = false` is a complete no-op; `enforce = false` computes everything and
-gates nothing, which is the shipping default (§12.6).
+`enabled = false` is a complete no-op; `enforce = false` with an empty
+`enforce_sources` computes everything and gates nothing, which is the shipping
+default (§12.6).
+
+**Arming, per source.** `enforce_sources` is a list of `"<app>/<dataset>"` ids,
+matched verbatim, mirroring `auto_retire` — which has been per-source opt-in
+since it shipped, for the same reason, over a *more* destructive consequence
+(retirement stops scheduling the source entirely; enforcement at worst diverts
+writes into a shadow dataset every existing tool already reads).
+
+| `enabled` | `enforce` | `enforce_sources` | armed |
+|---|---|---|---|
+| `false` | anything | anything | **nothing**. The absolute off, and it fronts every other key. |
+| `true` | `true` | anything | **every source**, including ones added later. A list beside it is redundant, never a restriction, and is reported as `redundant_sources`. |
+| `true` | `false` | `["extractor/hn-items"]` | **exactly those ids.** Everything else keeps soaking. |
+| `true` | `false` | `[]` | **nothing** — the shipping default, byte for byte. |
+
+An unset allowlist means **none**, never all: nobody who has not named a source
+has asked for that source to be gated. `enforce = true` keeps its old meaning
+exactly, so no existing deployment's behaviour moves, and a list can only widen
+arming from nothing — it can never narrow it from all.
+
+There is exactly **one** predicate between the config and any consequence:
+`resilience::detect::enforcement_armed(enforce, enforce_sources, source_id)`,
+fronted by `cfg.enabled` in `Resilience::armed`. `Resilience` is the only type
+that reads the list, and that is a scanned guard rather than a convention —
+`enforcement_armed_is_the_only_predicate_between_config_and_a_consequence`
+(`crates/core/tests/enforcement_preview.rs`) fails on a second reader anywhere
+in `crates/*/src/**`, because a second reader with its own matching rule (a
+prefix, a case fold, a trimmed entry) would make "armed" mean two things
+depending on which consumer you ask.
+
+Everything downstream became per-source without moving: the gate lives inside
+`enforced_state`, which always received `(app, dataset)` and used to discard it,
+so all nine inventoried consumers (§8.5) are per-source and none was edited.
+`Resilience::enforcing()` still answers about the fleet-wide flip alone;
+`enforcing_any()` is the cheap short-circuit the four worker gates take, which
+keeps "nothing armed" a zero-read no-op instead of one health read per dataset
+per job.
 
 ### 9.1 Cost governance, summarised
 
@@ -1288,24 +1811,29 @@ emptiness persists past `window_runs`, it escalates to an informational
 **10.4 Baseline poisoning (boiling frog).** Slow degradation is absorbed by a
 rolling baseline that moves with it. Two defences: (a) only `ok` runs update the
 baseline, so once a source trips, its baseline freezes; (b) the golden docs are
-an **anchor** re-pinned only from healthy states after 30 days, so anchor drift is
-checked against a fixed reference regardless of what the rolling window believes.
-This is the one failure mode I consider genuinely incompletely solved — a
-degradation slower than 30 days per step could in principle walk the anchor too.
-§12.1's mutation harness includes a gradual-drift class specifically to measure
-that.
+an **anchor** (§3.2) re-pinned only after `golden_refresh_days` of unbroken
+health and only when the new value equals **both** of the two kept generations,
+so a boil has to fool a reference about two refresh periods old. A frozen pin
+is never re-pinned at all. This is the one failure mode I consider genuinely
+incompletely solved — a degradation slower than two refresh periods per step
+could in principle walk the anchor too. §12.1's mutation harness (not built) is
+where a gradual-drift class would measure that.
 
 **10.5 Small sources never form a cohort.** `watch` on one URL, `cms-fee-schedule`
-on a handful of rows. Golden-doc detection is not built, so today they are watched
-by the assumption-free rules only (total collapse, the fetch gate). Their runs are
-recorded `below_cohort` with `cohort: chronic`, they contribute nothing to a
-baseline, and `GET /sources` reports them `monitored: false` and counts them in
-`unmonitored`. Honest cost, surfaced in the API rather than hidden.
+on a handful of rows. A rule-backed source with pinned golden documents
+is judged by them below the floor (§2.4: `golden_ok` / `broken`). Every other
+small source is watched by the assumption-free rules only (total collapse, the
+fetch gate). Their runs are recorded `below_cohort` with `cohort: chronic`, they
+contribute nothing to a baseline, and `GET /sources` reports them
+`monitored: false` and counts them in `unmonitored`. Honest cost, surfaced in the
+API rather than hidden.
 
 **10.6 Artifact retention.** Golden bodies live in `data/golden/`, outside the
 per-job artifact dirs, precisely so that artifact retention
 (`[storage] artifact_retention_days`, which walks only `data/artifacts/`) cannot
-take them. Recent bodies for the holdout corpus are best-effort: if fewer than
+take them. The golden store is resolved as a sibling of `[storage]
+artifacts_dir` (`<parent of artifacts_dir>/golden`), so moving the artifacts
+directory moves it too. Recent bodies for the holdout corpus are best-effort: if fewer than
 `holdout_min_docs` survive, repair declines with outcome `no_corpus` rather than
 validating against three pages.
 
@@ -1478,6 +2006,12 @@ then read `source_runs`:
 
 Enforcement flips on per-source, not fleet-wide, starting with the highest-volume
 rule-backed sources where cohorts are large and the statistics are strongest.
+**This is now the mechanism and not just the plan**: `[resilience]
+enforce_sources` (§9) arms one id at a time, `GET /enforcement/preview` reports
+`armed` per source with `consequences.armed` / `consequences.soaking` beside it,
+and the four-week soak above is therefore a per-source precondition instead of a
+fleet-wide one. The FPR bar is read per source and the arming decision taken per
+source, which is the only way a bar over 39 catalogued sources is ever met.
 
 ### 12.7 Standing regression
 

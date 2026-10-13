@@ -23,6 +23,8 @@ pub struct Extractor;
 mod induce;
 mod replay;
 
+pub use replay::replay_pinned_bodies;
+
 /// Default per-run snapshot cap for the Wayback backfill mode
 /// (`source.archive.max_snapshots`), and the hard ceiling it clamps to — one
 /// run never fans over more than [`ARCHIVE_SNAPSHOT_CEILING`] captures; wider
@@ -326,8 +328,9 @@ enum RunMode {
 /// `rules` is in the set even though it is not a mode by itself: it is the
 /// marker of "this job intends to WRITE records", and a `rules` sitting next to
 /// a `replay` (which carries its own `replay.rules`) is exactly the confusion
-/// this check exists to refuse.
-const MODE_ROOTS: [&str; 5] = ["replay", "induce", "rules", "source", "urls"];
+/// this check exists to refuse. `rules_ref` is the same marker spelled as a
+/// reference to the source's registered ruleset.
+const MODE_ROOTS: [&str; 6] = ["replay", "induce", "rules", "rules_ref", "source", "urls"];
 
 /// The read-only modes — each one owns the whole params object.
 const READ_ONLY_ROOTS: [&str; 2] = ["replay", "induce"];
@@ -382,6 +385,164 @@ fn resolve_run_mode(params: &Value) -> std::result::Result<RunMode, String> {
     // `rules` alone (or nothing at all) resolves to urls mode, which reports the
     // missing input list itself — the enqueue door already refuses the shape.
     Ok(RunMode::Urls)
+}
+
+/// Where a write mode's rule set comes from.
+#[derive(Debug, Clone, PartialEq)]
+enum RulesInput {
+    /// `params.rules`, inline.
+    Inline(Value),
+    /// `params.rules_ref`: `"active"` or a hash / unique prefix, resolved in the
+    /// source's ruleset lineage (`extractor/<dataset>`).
+    Ref(String),
+}
+
+/// The ONE rule-set input a write job declares.
+///
+/// THE ANTI-PATTERN THIS CLOSES: two ways to name a ruleset with a precedence
+/// between them is the first-match-wins shape [`resolve_run_mode`] exists to
+/// refuse — a job carrying both would run one while its author believed the
+/// other. Both, or neither, is refused; a JSON `null` counts as absent.
+fn parse_rules_input(params: &Value) -> std::result::Result<RulesInput, String> {
+    let present = |k: &str| params.get(k).filter(|v| !v.is_null());
+    match (present("rules"), present("rules_ref")) {
+        (Some(_), Some(_)) => Err(
+            "params 'rules' and 'rules_ref' are mutually exclusive — pass the inline ruleset \
+             OR a reference to the source's registered one, not both"
+                .into(),
+        ),
+        (Some(rules), None) => Ok(RulesInput::Inline(rules.clone())),
+        (None, Some(Value::String(r))) if !r.trim().is_empty() => Ok(RulesInput::Ref(r.clone())),
+        (None, Some(_)) => {
+            Err("param 'rules_ref' must be \"active\" or a ruleset hash / prefix (>= 8 hex)".into())
+        }
+        (None, None) => Err("param 'rules' is required (or 'rules_ref')".into()),
+    }
+}
+
+/// A run whose source has an active ruleset head: its URL-mode bodies are
+/// pinned and every row it writes carries its own replayable stamp.
+#[derive(Debug, Clone)]
+struct Enrollment {
+    source_id: String,
+}
+
+/// Saves one fetched body at its content address
+/// (`<artifacts_root>/<app>/bodies/<sha>.html`) and returns its sha. An
+/// existing file is not rewritten: the name IS the content, so two documents
+/// with one body share one file.
+async fn pin_body_file(root: &std::path::Path, app: &str, body: &str) -> Result<(String, bool)> {
+    let sha = pumper_core::datasets::body_sha256(body);
+    let path = pumper_core::datasets::pinned_body_path(root, app, &sha)
+        .ok_or_else(|| Error::App(format!("unsafe pinned-body address for app {app:?}")))?;
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok((sha, false));
+    }
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    tokio::fs::write(&path, body.as_bytes()).await?;
+    Ok((sha, true))
+}
+
+/// The golden-document refresh, after an enrolled run whose source is now
+/// stored `healthy` (the state `observe` just settled). Best-effort: a refresh
+/// that fails leaves the existing generations in place and never fails a
+/// working extraction. See `pumper_core::golden::refresh` for the rule.
+///
+/// Here, rather than inside `observe`, because only this seam has both the
+/// artifacts root the pinned bodies live under and this run's own pins.
+async fn refresh_goldens(ctx: &AppContext, dataset: &str, source_id: &str) {
+    if !ctx.health.enabled()
+        || ctx.health.state(&ctx.app, dataset).await != pumper_core::SourceState::Healthy
+    {
+        return;
+    }
+    let Ok(root) = replay::artifacts_root(ctx) else {
+        return;
+    };
+    match pumper_core::golden::refresh(
+        &ctx.datasets,
+        &root,
+        source_id,
+        ctx.health.config().golden_refresh_days,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(keys) if !keys.is_empty() => {
+            tracing::info!(
+                source = source_id,
+                repinned = keys.len(),
+                "golden documents refreshed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            source = source_id,
+            "golden refresh failed, generations kept: {e}"
+        ),
+    }
+}
+
+/// The observation id of one pinned document: `<job_id>:<document key>`.
+fn observation_id(job_id: &str, key: &str) -> String {
+    format!("{job_id}:{key}")
+}
+
+/// What pinning one enrolled batch did. `shas` is positional with the batch:
+/// `None` for a document whose body could not be kept, which then writes an
+/// honest-Null `artifact_sha` rather than claiming a body that is not there.
+struct PinnedBatch {
+    shas: Vec<Option<String>>,
+    /// Observations pinned (one `body_pins` row each).
+    pinned: usize,
+    /// Distinct body files newly written (identical bodies share one file).
+    written: usize,
+    failures: usize,
+}
+
+/// Keeps every fetched body of an enrolled run and pins each observation.
+async fn pin_fetched_bodies(
+    ctx: &AppContext,
+    enrollment: &Enrollment,
+    docs: &[SourceDoc],
+) -> Result<PinnedBatch> {
+    let root = replay::artifacts_root(ctx)?;
+    let job_id = ctx.job_id.to_string();
+    let captured_at = pumper_core::datasets::ts(chrono::Utc::now());
+    let mut batch = PinnedBatch {
+        shas: Vec::with_capacity(docs.len()),
+        pinned: 0,
+        written: 0,
+        failures: 0,
+    };
+    let mut pins = Vec::with_capacity(docs.len());
+    for d in docs {
+        match pin_body_file(&root, &ctx.app, &d.body).await {
+            Ok((sha, wrote)) => {
+                batch.written += usize::from(wrote);
+                pins.push(pumper_core::datasets::BodyPin {
+                    body_sha: sha.clone(),
+                    observation_id: observation_id(&job_id, &d.key),
+                    source_id: enrollment.source_id.clone(),
+                    job_id: Some(job_id.clone()),
+                    document_key: Some(d.key.clone()),
+                    original_url: Some(d.url.clone()),
+                    captured_at: captured_at.clone(),
+                });
+                batch.shas.push(Some(sha));
+            }
+            Err(e) => {
+                tracing::warn!(key = %d.key, "pinned body not kept, row stays unreplayable: {e}");
+                batch.failures += 1;
+                batch.shas.push(None);
+            }
+        }
+    }
+    batch.pinned = pins.len();
+    ctx.datasets.pin_bodies(&pins).await?;
+    Ok(batch)
 }
 
 /// Running totals for one INNER field of an `each` listing, pooled across every
@@ -601,6 +762,7 @@ async fn run_extraction(
 /// return the records plus the aggregate quality signal. `key` is a source URL
 /// (urls mode) or a dataset record key (source mode) — for the crawl `pages`
 /// dataset the key IS the canonical URL, so `_url` stays meaningful.
+#[allow(clippy::too_many_arguments)]
 async fn extract_and_upsert(
     ctx: &AppContext,
     compiled: Arc<CompiledRuleSet>,
@@ -609,6 +771,9 @@ async fn extract_and_upsert(
     fetch: FetchHealth,
     rules_hash: Option<&str>,
     echo: usize,
+    // Enrolled URL-mode runs only: each document's pinned body sha, positional
+    // with `keyed`. `Some` switches the write to per-row provenance.
+    artifact_shas: Option<Vec<Option<String>>>,
 ) -> Result<ExtractOutcome> {
     // Split keys/meta from bodies without copying the bodies — `keyed` is owned
     // and dropped here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning
@@ -666,6 +831,16 @@ async fn extract_and_upsert(
         source_url: single_source_url(&metas),
         ..Provenance::default()
     };
+    // Per-row stamps for an enrolled run: each document's OWN url and body,
+    // which a batch-level stamp could never state.
+    let row_stamps: Option<Vec<Provenance>> = artifact_shas.map(|shas| {
+        per_row_provenance(
+            &ctx.job_id.to_string(),
+            rules_hash,
+            metas.iter().map(|(url, _, _)| url.as_str()),
+            shas,
+        )
+    });
 
     let items: Vec<(String, Value)> = keys
         .into_iter()
@@ -690,9 +865,24 @@ async fn extract_and_upsert(
     // which of the two the caller should go looking in.
     let state = ctx.health.enforced_state(&ctx.app, dataset).await;
     let written = pumper_core::resilience::write_dataset(dataset, state);
-    let summary = ctx
-        .upsert_many_with_provenance(dataset, &items, prov)
-        .await?;
+    let summary = match row_stamps {
+        // The same diversion + trust the context seam applies (`write_target`),
+        // from the SAME `state` read above — not a second `enforced_state` call.
+        Some(stamps) => {
+            let rows: Vec<(String, Value, Provenance)> = items
+                .into_iter()
+                .zip(stamps)
+                .map(|((k, v), p)| (k, v, p))
+                .collect();
+            ctx.datasets
+                .upsert_many_row_stamped(&ctx.app, &written, &rows, state.trust())
+                .await?
+        }
+        None => {
+            ctx.upsert_many_with_provenance(dataset, &items, prov)
+                .await?
+        }
+    };
     Ok(ExtractOutcome {
         records,
         records_total,
@@ -775,6 +965,29 @@ fn single_source_url(metas: &[(String, Option<String>, Option<&'static str>)]) -
         .iter()
         .all(|(url, _, _)| url == first)
         .then(|| first.to_string())
+}
+
+/// The per-row stamps of an enrolled batch, positional with its documents:
+/// this job, the batch's ruleset, and each document's OWN url and pinned body.
+///
+/// THE ANTI-PATTERN THIS CLOSES: the batch write path shares one stamp, so a
+/// multi-URL run left `source_url` Null and `artifact_sha` was never set at
+/// all — every extractor revision was unreplayable by construction. A body
+/// that could not be kept stays `None` (honest-Null), never a borrowed sha.
+fn per_row_provenance<'a>(
+    job_id: &str,
+    rules_hash: Option<&str>,
+    urls: impl Iterator<Item = &'a str>,
+    shas: Vec<Option<String>>,
+) -> Vec<Provenance> {
+    urls.zip(shas)
+        .map(|(url, sha)| Provenance {
+            job_id: Some(job_id.to_string()),
+            source_url: (!url.trim().is_empty()).then(|| url.to_string()),
+            artifact_sha: sha,
+            rules_hash: rules_hash.map(str::to_string),
+        })
+        .collect()
 }
 
 /// Stamps the shared provenance convention onto an extracted record: `_url`
@@ -1025,6 +1238,7 @@ impl ScrapeApp for Extractor {
                         "required": ["replay"],
                         "not": { "anyOf": [
                             { "required": ["induce"] }, { "required": ["rules"] },
+                            { "required": ["rules_ref"] },
                             { "required": ["urls"] },   { "required": ["source"] }
                         ]}
                     },
@@ -1033,12 +1247,17 @@ impl ScrapeApp for Extractor {
                         "required": ["induce"],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["rules"] },
+                            { "required": ["rules_ref"] },
                             { "required": ["urls"] },   { "required": ["source"] }
                         ]}
                     },
                     {
                         "title": "urls mode (fetch live, write records)",
-                        "required": ["rules", "urls"],
+                        "required": ["urls"],
+                        // Exactly one of the inline ruleset or a reference to
+                        // the source's registered one — both is refused, like
+                        // `parse_rules_input`.
+                        "oneOf": [ { "required": ["rules"] }, { "required": ["rules_ref"] } ],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["induce"] },
                             { "required": ["source"] }
@@ -1046,7 +1265,8 @@ impl ScrapeApp for Extractor {
                     },
                     {
                         "title": "source mode (stored bodies, write records)",
-                        "required": ["rules", "source"],
+                        "required": ["source"],
+                        "oneOf": [ { "required": ["rules"] }, { "required": ["rules_ref"] } ],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["induce"] },
                             { "required": ["urls"] }
@@ -1057,7 +1277,12 @@ impl ScrapeApp for Extractor {
                     "rules": {
                         "type": "object",
                         "minProperties": 1,
-                        "description": "Write mode: field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}. Pair with exactly one of `urls`/`source`. REFUSED alongside `replay`/`induce`, which carry their own rules."
+                        "description": "Write mode: field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}. Pair with exactly one of `urls`/`source`. REFUSED alongside `replay`/`induce`, which carry their own rules, and alongside `rules_ref`."
+                    },
+                    "rules_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Write mode, instead of inline `rules`: \"active\" (the source's active ruleset head) or a hash / unique prefix (>= 8 hex) in the lineage of source `extractor/<dataset>` (see GET /sources/{id}/rules). An unresolvable reference fails the job. Mutually exclusive with `rules`."
                     },
                     "replay": {
                         "type": "object",
@@ -1066,16 +1291,17 @@ impl ScrapeApp for Extractor {
                             "rules": {
                                 "type": "object",
                                 "minProperties": 1,
-                                "description": "The CANDIDATE rule set to validate against the stored corpus."
+                                "description": "The CANDIDATE rule set to validate against the stored corpus — inline, or {\"rules_ref\": \"active\"|\"<hash-prefix>\", \"source\"?: \"<id>\"} resolved in that source's lineage (default: against.source)."
                             },
                             "baseline_rules": {
                                 "type": "object",
                                 "minProperties": 1,
-                                "description": "Optional baseline (e.g. the currently deployed rules); when given the report carries per-field deltas + added/lost/changed value diffs."
+                                "description": "Optional baseline (e.g. the currently deployed rules — {\"rules_ref\": \"active\"}); when given the report carries per-field deltas + added/lost/changed value diffs."
                             },
                             "against": {
                                 "type": "object",
                                 "properties": {
+                                    "source": { "type": "string", "description": "Replay this source's PINNED bodies (latest pin per document key, each with its original URL as base) instead of app/dataset records. Excludes app, dataset and versions." },
                                     "app": { "type": "string", "description": "Source app of the stored bodies (default \"crawl\")." },
                                     "dataset": { "type": "string", "description": "Source dataset (default \"pages\")." },
                                     "url_pattern": { "type": "string", "description": "Regex a record key (URL) must match to be replayed." },
@@ -1321,7 +1547,9 @@ impl ScrapeApp for Extractor {
                  fields_matched, fields_total, worst_fields[], base_url_missing, health|null, \
                  rules_hash|null, rules_registration_error?, records[] (a BOUNDED echo — see \
                  `records_echo`), records_total, records_truncated, index_datasets?}. Plus, per \
-                 mode: urls {requested, fetched, skipped, failed[], fetch_ok_rate}; source \
+                 mode: urls {requested, fetched, skipped, failed[], fetch_ok_rate, enrolled? \
+                 ({source, bodies_pinned, bodies_written, pin_failures} — only when the \
+                 source has an active ruleset head)}; source \
                  {source{app,dataset}, requested, limit, truncated (this run is PARTIAL: the \
                  no-keys sweep hit its cap, or the firing trigger's key list did — \
                  `_trigger.keys_truncated`), loaded, missing, missing_keys[]}; archive \
@@ -1370,41 +1598,82 @@ impl ScrapeApp for Extractor {
             RunMode::Induce => return induce::run_induce(&ctx, &mode_object("induce")?).await,
             RunMode::Urls | RunMode::Source => {}
         }
-        let rules_json = ctx
-            .params
-            .get("rules")
-            .cloned()
-            .ok_or_else(|| Error::App("param 'rules' is required".into()))?;
-        let rules: RuleSet = serde_json::from_value(rules_json.clone())
-            .map_err(|e| Error::App(format!("bad rules: {e}")))?;
-        // Compile (and validate selectors/regex) once, before the fan-out.
-        let compiled = Arc::new(rules.compile()?);
-        // M12: register THIS run's rule set in the content-addressed registry and
-        // carry its hash onto every revision the run writes — extractor is the
-        // one place in the fleet where a real `rules_hash` exists, and it is what
-        // makes a record re-derivable once the caller's live rules have moved on.
-        // Best-effort: provenance is additive metadata and a registry write
-        // failure must never fail a working extraction — but it IS reported
-        // (`rules_hash: null` + `rules_registration_error`), because unstamped
-        // revisions are permanently non-replayable.
-        let registration = RulesRegistration::from_outcome(ctx.register_rules(&rules_json).await);
-        if let Some(e) = &registration.error {
-            tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
-        }
+        let input = parse_rules_input(&ctx.params).map_err(Error::App)?;
         let dataset = ctx
             .params
             .get("dataset")
             .and_then(Value::as_str)
             .unwrap_or("extracted")
             .to_string();
-
+        // The source this job writes. Enrolled = it has an active ruleset head
+        // (`source_rulesets`); a source that was never imported runs exactly
+        // as it always did.
+        let source_id = pumper_core::resilience::source_id(&ctx.app, &dataset);
+        let enrollment = ctx
+            .datasets
+            .ruleset_head(&source_id)
+            .await?
+            .map(|_| Enrollment {
+                source_id: source_id.clone(),
+            });
+        let (compiled, registration) = match input {
+            RulesInput::Inline(rules_json) => {
+                let rules: RuleSet = serde_json::from_value(rules_json)
+                    .map_err(|e| Error::App(format!("bad rules: {e}")))?;
+                // Compile (and validate selectors/regex) once, before the
+                // fan-out — and before registering, so a ruleset that does not
+                // compile is never entered into the registry.
+                let compiled = Arc::new(rules.compile()?);
+                // M12: register THIS run's rule set in the content-addressed
+                // registry and carry its hash onto every revision the run
+                // writes — extractor is the one place in the fleet where a real
+                // `rules_hash` exists, and it is what makes a record
+                // re-derivable once the caller's live rules have moved on.
+                // Best-effort: provenance is additive metadata and a registry
+                // write failure must never fail a working extraction — but it IS
+                // reported (`rules_hash: null` + `rules_registration_error`),
+                // because unstamped revisions are permanently non-replayable.
+                //
+                // Every run registers under the CANONICAL hash — one ruleset,
+                // one identity across stamps, registry and pointer lineage, so
+                // inline and referenced runs of one ruleset stamp one hash.
+                // Raw-params hashes stamped before the switch stay resolvable.
+                let registration =
+                    RulesRegistration::from_outcome(ctx.datasets.register_ruleset(&rules).await);
+                if let Some(e) = &registration.error {
+                    tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
+                }
+                (compiled, registration)
+            }
+            RulesInput::Ref(reference) => {
+                // A reference that does not resolve FAILS the job: running some
+                // other ruleset, or none, is not what was asked for.
+                let hash = ctx
+                    .datasets
+                    .resolve_rules_ref(&source_id, &reference)
+                    .await
+                    .map_err(|e| {
+                        Error::App(format!(
+                            "rules_ref '{reference}' did not resolve for source '{source_id}': {e}"
+                        ))
+                    })?;
+                let rules = replay::load_registered_ruleset(&ctx.datasets, &hash).await?;
+                (
+                    Arc::new(rules.compile()?),
+                    RulesRegistration {
+                        hash: Some(hash),
+                        error: None,
+                    },
+                )
+            }
+        };
         // Two input modes: fetch live `urls`, or read stored bodies from a
         // crawl→dataset `source`. Exactly one, already resolved above.
         if mode == RunMode::Source {
             self.run_source_mode(&ctx, compiled, &dataset, &registration)
                 .await
         } else {
-            self.run_urls_mode(&ctx, compiled, &dataset, &registration)
+            self.run_urls_mode(&ctx, compiled, &dataset, &registration, enrollment)
                 .await
         }
     }
@@ -1419,6 +1688,7 @@ impl Extractor {
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
         registration: &RulesRegistration,
+        enrollment: Option<Enrollment>,
     ) -> Result<Value> {
         let urls: Vec<String> = ctx
             .params
@@ -1470,30 +1740,39 @@ impl Extractor {
                     // of bytes.
                     Ok(out) => {
                         let healthy = tier_won(&out);
+                        let gone = permanently_gone(&out);
                         (
                             url,
                             out.html.or(out.text).filter(|d| !d.is_empty()),
                             healthy,
+                            gone,
                         )
                     }
-                    Err(_) => (url, None, false),
+                    Err(_) => (url, None, false, false),
                 }
             }
         });
-        let fetched_pairs: Vec<(String, Option<String>, bool)> = futures::stream::iter(fetches)
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+        let fetched_pairs: Vec<(String, Option<String>, bool, bool)> =
+            futures::stream::iter(fetches)
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
 
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
+        // The roster is the job's URL list, and every URL of it is attempted.
         let mut fetch = FetchHealth {
             attempted: urls.len() as u32,
             ok: 0,
+            permanent: 0,
+            roster: Some(urls.len() as u32),
         };
-        for (url, doc, healthy) in fetched_pairs {
+        for (url, doc, healthy, gone) in fetched_pairs {
             if healthy {
                 fetch.ok += 1;
+            }
+            if gone {
+                fetch.permanent += 1;
             }
             match doc {
                 Some(d) => keyed.push(SourceDoc::live(url, d)),
@@ -1503,6 +1782,13 @@ impl Extractor {
 
         let requested = urls.len();
         let fetched = keyed.len();
+        // Enrolled: every fetched body is kept at its content address and
+        // pinned to its observation BEFORE the write, so no revision can cite a
+        // sha whose pin is missing.
+        let pinned = match &enrollment {
+            Some(e) => Some(pin_fetched_bodies(ctx, e, &keyed).await?),
+            None => None,
+        };
         let out = extract_and_upsert(
             ctx,
             compiled,
@@ -1511,6 +1797,7 @@ impl Extractor {
             fetch,
             registration.hash(),
             parse_records_echo(&ctx.params),
+            pinned.as_ref().map(|p| p.shas.clone()),
         )
         .await?;
 
@@ -1534,6 +1821,17 @@ impl Extractor {
             "health": out.health.clone(),
         });
         registration.merge_into(&mut result);
+        if let Some(e) = &enrollment {
+            refresh_goldens(ctx, dataset, &e.source_id).await;
+        }
+        if let (Some(e), Some(p)) = (&enrollment, &pinned) {
+            result["enrolled"] = json!({
+                "source": e.source_id,
+                "bodies_pinned": p.pinned,
+                "bodies_written": p.written,
+                "pin_failures": p.failures,
+            });
+        }
         out.merge_into(&ctx.app, &mut result);
         Ok(result)
     }
@@ -1743,6 +2041,7 @@ impl Extractor {
             FetchHealth::default(),
             registration.hash(),
             parse_records_echo(&ctx.params),
+            None,
         )
         .await?;
 
@@ -1889,6 +2188,7 @@ impl Extractor {
                     // is the mode that fans over a WHOLE archive. Zero here is
                     // also what makes the write path clone-free for it.
                     0,
+                    None,
                 )
                 .await?;
                 new += out.summary.new.len();
@@ -2036,9 +2336,11 @@ impl Extractor {
 
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<Value> = Vec::new();
+        // Archive mode reports no roster: a snapshot that is gone says nothing
+        // about whether the live page is, so it is never retirement evidence.
         let mut fetch = FetchHealth {
             attempted: found as u32,
-            ok: 0,
+            ..FetchHealth::default()
         };
         for (snap, outcome) in fetched_pairs {
             match outcome {
@@ -2076,6 +2378,7 @@ impl Extractor {
             fetch,
             registration.hash(),
             parse_records_echo(&ctx.params),
+            None,
         )
         .await?;
 
@@ -2209,6 +2512,26 @@ fn tier_won(out: &pumper_core::FetchOutcome) -> bool {
     })
 }
 
+/// Whether the live site said this page is **permanently gone**: a live http
+/// tier (not served from the cache, `cache_hit: Some(false)`) answered 404 or
+/// 410, and no tier delivered the page anyway. Retirement's evidence.
+///
+/// Read from the structured trace, never the prose. What does NOT count, each
+/// deliberately: a 403 or 429 (a bot wall or a rate limit says nothing about
+/// the page), a timeout or any DNS failure (the transport failed; the engine
+/// does not tell NXDOMAIN from SERVFAIL, so neither counts), a cache hit, an
+/// archive or recipe tier (a stored capture, not the live site), and a VCR
+/// replay (its trace carries `cache_hit: None`). A fetch that errored never
+/// reaches this function.
+fn permanently_gone(out: &pumper_core::FetchOutcome) -> bool {
+    !tier_won(out)
+        && out.trace.iter().any(|t| {
+            t.tier == pumper_core::FetchTier::Http
+                && t.cache_hit == Some(false)
+                && matches!(t.http_status, Some(404 | 410))
+        })
+}
+
 #[cfg(test)]
 mod observation_host_tests {
     use super::observation_host;
@@ -2243,6 +2566,122 @@ mod observation_host_tests {
     fn non_url_keys_yield_no_host() {
         assert_eq!(observation_host("CA:electrician"), None);
         assert_eq!(observation_host("opportunity-12345"), None);
+    }
+}
+
+#[cfg(test)]
+mod permanence_tests {
+    use super::permanently_gone;
+    use pumper_core::{FetchOutcome, FetchTier, TierTrace, TierVerdict};
+
+    fn tier(
+        tier: FetchTier,
+        verdict: TierVerdict,
+        status: Option<u16>,
+        cache: Option<bool>,
+    ) -> TierTrace {
+        TierTrace {
+            tier,
+            verdict,
+            http_status: status,
+            content_chars: None,
+            cache_hit: cache,
+            latency_ms: 1,
+            cost_usd: None,
+            detail: None,
+        }
+    }
+
+    fn outcome(trace: Vec<TierTrace>) -> FetchOutcome {
+        FetchOutcome {
+            url: "https://news.ycombinator.com/item?id=1".into(),
+            engine: "http",
+            status: trace.first().and_then(|t| t.http_status),
+            html: Some("<html></html>".into()),
+            markdown: None,
+            text: None,
+            escalations: vec![],
+            trace,
+            cost_usd: None,
+            snapshot: None,
+        }
+    }
+
+    fn live(status: u16) -> FetchOutcome {
+        // The `Http` strategy returns whatever the live tier answered, with
+        // verdict `ok` — the status is the only thing that says "gone".
+        outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(status),
+            Some(false),
+        )])
+    }
+
+    #[test]
+    fn a_live_404_or_410_is_permanent() {
+        assert!(permanently_gone(&live(404)));
+        assert!(permanently_gone(&live(410)));
+    }
+
+    #[test]
+    fn forbidden_403_is_not_permanent() {
+        // A bot wall is the fetch layer failing, not the page being gone.
+        assert!(!permanently_gone(&live(403)));
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Blocked,
+            Some(403),
+            Some(false)
+        )])));
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_are_not_permanent() {
+        assert!(!permanently_gone(&live(429)));
+        assert!(!permanently_gone(&live(503)));
+        assert!(!permanently_gone(&live(200)));
+        // A timeout or DNS failure is a tier `error` with no status.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Error,
+            None,
+            None
+        )])));
+    }
+
+    #[test]
+    fn a_cached_archived_or_replayed_404_is_not_permanent() {
+        // Served from the HTTP cache: a stored answer, not the live site.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(404),
+            Some(true)
+        )])));
+        // A VCR replay's trace carries no cache fact at all.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Http,
+            TierVerdict::Ok,
+            Some(404),
+            None
+        )])));
+        // An archive tier's 404 is a missing snapshot.
+        assert!(!permanently_gone(&outcome(vec![tier(
+            FetchTier::Archive,
+            TierVerdict::Thin,
+            Some(404),
+            Some(false)
+        )])));
+    }
+
+    #[test]
+    fn a_404_that_a_later_tier_recovered_is_not_permanent() {
+        // `auto` escalated past the 404 and the browser delivered the page.
+        assert!(!permanently_gone(&outcome(vec![
+            tier(FetchTier::Http, TierVerdict::Thin, Some(404), Some(false)),
+            tier(FetchTier::Browser, TierVerdict::Ok, None, None),
+        ])));
     }
 }
 
@@ -2903,5 +3342,67 @@ mod run_mode_tests {
             resolve_run_mode(&json!({ "replay": null, "induce": null })).unwrap(),
             RunMode::Urls
         );
+    }
+
+    #[test]
+    fn rules_ref_is_a_write_root_refused_beside_a_read_only_mode() {
+        assert_eq!(
+            resolve_run_mode(&json!({ "rules_ref": "active", "urls": ["https://a/"] })).unwrap(),
+            RunMode::Urls
+        );
+        let err =
+            resolve_run_mode(&json!({ "rules_ref": "active", "replay": { "rules": rules() } }))
+                .expect_err("a reference to write rules beside a read-only replay");
+        assert!(err.contains("rules_ref") && err.contains("replay"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod rules_input_tests {
+    use super::{observation_id, parse_rules_input, per_row_provenance, RulesInput};
+    use serde_json::json;
+
+    #[test]
+    fn both_rule_inputs_are_refused_not_ranked() {
+        let rules = json!({ "t": { "type": "css", "selector": "h1" } });
+        let err = parse_rules_input(&json!({ "rules": rules, "rules_ref": "active" }))
+            .expect_err("two ways to name one ruleset");
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert_eq!(
+            parse_rules_input(&json!({ "rules": rules })).unwrap(),
+            RulesInput::Inline(rules.clone())
+        );
+        assert_eq!(
+            parse_rules_input(&json!({ "rules_ref": "active", "rules": null })).unwrap(),
+            RulesInput::Ref("active".into()),
+            "an explicit null is absent, not a second input"
+        );
+        assert!(parse_rules_input(&json!({}))
+            .unwrap_err()
+            .starts_with("param 'rules' is required"));
+        assert!(parse_rules_input(&json!({ "rules_ref": 7 })).is_err());
+        assert!(parse_rules_input(&json!({ "rules_ref": "  " })).is_err());
+    }
+
+    #[test]
+    fn per_row_stamps_name_each_documents_own_url_not_a_shared_one() {
+        let stamps = per_row_provenance(
+            "job",
+            Some("rh"),
+            ["https://a/", "https://b/", ""].into_iter(),
+            vec![Some("sa".into()), None, Some("sc".into())],
+        );
+        assert_eq!(stamps.len(), 3);
+        assert_eq!(stamps[0].source_url.as_deref(), Some("https://a/"));
+        assert_eq!(stamps[0].artifact_sha.as_deref(), Some("sa"));
+        // A body that could not be kept stays unknown — never a neighbour's sha.
+        assert_eq!(stamps[1].source_url.as_deref(), Some("https://b/"));
+        assert_eq!(stamps[1].artifact_sha, None);
+        // A blank URL is unknown, not an empty claim.
+        assert_eq!(stamps[2].source_url, None);
+        assert!(stamps
+            .iter()
+            .all(|p| p.job_id.as_deref() == Some("job") && p.rules_hash.as_deref() == Some("rh")));
+        assert_eq!(observation_id("j", "https://a/"), "j:https://a/");
     }
 }

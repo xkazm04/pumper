@@ -32,6 +32,7 @@ pub struct Config {
     pub contracts: ContractsConfig,
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
+    pub costs: CostsConfig,
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
@@ -167,6 +168,69 @@ impl Default for RefresherConfig {
             retention_days: 30,
         }
     }
+}
+
+/// How the per-job budget ceiling charges the calls it could not price.
+///
+/// Migration 0045 gave every `cost_events` row a typed `spend_certainty`, so
+/// the store can say whether money actually moved. The ceiling could not read
+/// it: a Claude run killed mid-generation records `cost_usd = 0.0` with
+/// `spend_certainty = 'unmetered'`, and the ceiling summed the `0.0`. The run
+/// that spent the most contributed nothing to its own cap, and the Claude tier
+/// is both the only tier that spends real money and the only one that can
+/// produce such a row.
+///
+/// Registry: `llm-observability/usage-limit-governance/cost-evidence-and-imputation`
+/// — charge each unpriceable call the mean of the *priced* calls in the same
+/// window, keep the estimate in the EVALUATION and never in the stored row, and
+/// disclose the imputed share beside the current value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetImputation {
+    /// **Default.** An unpriceable call is charged the mean of the job's own
+    /// priced calls, and a job with unpriceable calls and *no* priced call is
+    /// REFUSED rather than admitted against its untouched budget.
+    ///
+    /// The window is the job's own ledger, not a fleet-wide average: a cap is
+    /// per job, and borrowing another job's prices to spend this job's money is
+    /// a number with no owner. The refusal is the operator's chosen policy and
+    /// the registry technique's own degenerate case — "a cap that cannot be
+    /// measured is not a cap", so blindness must never be read as headroom.
+    #[default]
+    WindowMean,
+    /// The pre-0045 ceiling: sum `cost_usd` and only `cost_usd`. An unreadable
+    /// bill contributes `$0.00` and an unpriceable job is admitted.
+    ///
+    /// Kept reachable on purpose: it is the **no-deploy rollback** for the
+    /// tightening above, and `crates/core/tests/budget_imputation.rs` proves
+    /// the two policies against one table so "byte-identical to before" stays a
+    /// test rather than a claim.
+    Off,
+}
+
+impl BudgetImputation {
+    /// Whether the ceiling charges for what it cannot price.
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::WindowMean)
+    }
+
+    /// The wire/report spelling, for the surfaces that disclose the policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowMean => "window_mean",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Cost-ledger policy: today, only how the per-job ceiling treats the calls it
+/// could not price. See [`BudgetImputation`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CostsConfig {
+    /// `window_mean` (default) | `off`. An unknown value is a startup error
+    /// naming the vocabulary — a typo must not silently un-enforce a cap.
+    pub budget_imputation: BudgetImputation,
 }
 
 /// Information economics (M04): joining the cost ledger with per-job yield
@@ -450,6 +514,19 @@ pub struct RecipesConfig {
     /// Consecutive failed/thin replays after which a validated recipe is
     /// un-validated (back to opportunistic-only). Must be >= 1.
     pub max_failures: u32,
+    /// The rung BELOW `max_failures`: consecutive failed/thin replays after
+    /// which an *unvalidated* recipe (a candidate) is **retired** — stamped
+    /// `retired_at` and dropped out of selection entirely (migration 0046).
+    ///
+    /// Without this rung the strike counter had exactly one consumer, guarded
+    /// on `validated`, so a candidate that had failed ten thousand consecutive
+    /// times was still the first thing tried for its host — a live outbound
+    /// replay ahead of the archive tier on every fetch, forever.
+    ///
+    /// Retirement is **reversible**: `POST /recipes/{id}/revive` returns the
+    /// recipe to probation. `0` disables the rung and restores pre-0046
+    /// selection exactly.
+    pub retire_after: u32,
 }
 
 impl Default for RecipesConfig {
@@ -458,6 +535,7 @@ impl Default for RecipesConfig {
             enabled: false,
             auto_validate: false,
             max_failures: 3,
+            retire_after: crate::recipes::DEFAULT_RETIRE_AFTER,
         }
     }
 }
@@ -519,6 +597,38 @@ pub struct ResilienceConfig {
     /// looked at. `0` would let a source un-quarantine itself on the first run
     /// that happened not to trip, so it is rejected.
     pub recovery_runs: u32,
+    /// Sources (`"<app>/<dataset>"`) whose stored verdicts are allowed to gate
+    /// anything, when `enforce` is off. Opt-in per source, exactly like
+    /// `auto_retire` below and for the same reason: the risk a verdict is wrong
+    /// is a property of one source, so the decision to act on it belongs at one
+    /// source too.
+    ///
+    /// Composition, which is the whole of the design:
+    ///
+    /// - `enforce = true` arms **every** source and always will. An allowlist
+    ///   may widen arming from nothing; it may never narrow it from all, so a
+    ///   list beside `enforce = true` is redundant rather than restrictive —
+    ///   reported as `redundant_sources` by `GET /enforcement/preview` rather
+    ///   than quietly un-enforcing a fleet.
+    /// - `enforce = false` + a non-empty list arms exactly the listed sources.
+    /// - `enforce = false` + an empty list (the shipping default) arms nothing,
+    ///   which is soak mode byte for byte: no source is read on the write path.
+    ///   An unset allowlist means **none**, never all.
+    /// - `enabled = false` is still the absolute off and fronts all of the
+    ///   above.
+    ///
+    /// Matched verbatim against the source id, so a typo arms nothing — which
+    /// is why the preview reports unmatched entries as `armed_unseen` rather
+    /// than letting a non-rollout look like a successful one.
+    pub enforce_sources: Vec<String>,
+    /// Sources (`"<app>/<dataset>"`) allowed to retire themselves on sustained
+    /// permanent fetch failure. Opt-in per source: retirement stops scheduling,
+    /// so no source reaches it by default. Empty = nothing ever auto-retires.
+    pub auto_retire: Vec<String>,
+    /// Days a source must stay healthy before its golden documents may pin a
+    /// new generation. Two generations are kept, so a slowly boiled value has
+    /// to fool a reference about twice this old.
+    pub golden_refresh_days: u32,
 }
 
 impl Default for ResilienceConfig {
@@ -548,6 +658,11 @@ impl Default for ResilienceConfig {
             // to degrade, three consecutive to quarantine): recovery should cost
             // at least what the fall did.
             recovery_runs: 3,
+            // Nothing armed. The default does not move: an empty allowlist
+            // under `enforce = false` is today's soak mode exactly.
+            enforce_sources: Vec::new(),
+            auto_retire: Vec::new(),
+            golden_refresh_days: 30,
         }
     }
 }
@@ -646,6 +761,11 @@ pub struct WebhooksConfig {
     /// brief receiver outage no longer means permanent silent event loss. `false`
     /// reverts to manual-only replay. Default: true.
     pub auto_retry: bool,
+    /// If set, every source health transition into `degraded`, `quarantined`
+    /// or `retired` POSTs a `source.*` event here. Unset = nobody is told.
+    pub health_url: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `health_url` deliveries.
+    pub health_secret: Option<String>,
 }
 
 impl Default for WebhooksConfig {
@@ -653,6 +773,8 @@ impl Default for WebhooksConfig {
         Self {
             failure_url: None,
             failure_secret: None,
+            health_url: None,
+            health_secret: None,
             auto_retry: true,
         }
     }
@@ -1227,6 +1349,16 @@ pub struct StorageConfig {
     pub webhook_dead_letter_retention_days: u64,
     /// Days of per-job yield telemetry kept (backs `GET /economics`). `0` = off.
     pub job_yield_retention_days: u64,
+    /// Boot against a store whose `_sqlx_migrations` records versions this
+    /// binary does not carry — a store a NEWER pumper already migrated.
+    ///
+    /// **Defaults closed**, and the refusal names this key. A safety ceiling,
+    /// not a preference: this repo ships zero down migrations, so an older
+    /// binary cannot undo what a newer one did, and booting it means reading a
+    /// schema with columns and constraints this build cannot see. Opening it is
+    /// a deliberate "I know, let me in" — the boot then logs the ahead versions
+    /// at `warn` on every start rather than going quiet.
+    pub allow_schema_ahead: bool,
     /// Days of saved-search `seen` doc-ids kept. **Turning this on can re-alert:**
     /// a pruned row makes an already-notified document look new again, so a
     /// still-matching doc fires its webhook a second time. `0` = off.
@@ -1250,6 +1382,8 @@ impl Default for StorageConfig {
             webhook_dead_letter_retention_days: 0,
             job_yield_retention_days: 0,
             saved_search_seen_retention_days: 0,
+            // A ceiling, so it defaults closed. See the field doc.
+            allow_schema_ahead: false,
         }
     }
 }
@@ -1833,6 +1967,57 @@ mod tests {
         cfg.validate().expect("disabled refresher never binds");
     }
 
+    /// The rollback knob has to actually PARSE, or `off` is a promise in a doc.
+    ///
+    /// `off` restores the pre-imputation ceiling without a deploy, so a
+    /// deployment that needs it needs the TOML to be accepted; and an unknown
+    /// value must be a startup ERROR naming the vocabulary, because the one
+    /// failure mode worse than a tightened cap is a typo that silently
+    /// un-enforces it while the operator believes it is on.
+    #[test]
+    fn the_budget_imputation_knob_parses_and_a_typo_does_not_silently_disable_it() {
+        let on: Config = toml::from_str("").expect("an empty config is valid");
+        assert_eq!(
+            on.costs.budget_imputation,
+            BudgetImputation::WindowMean,
+            "the ceiling ships CHARGING for what it cannot price"
+        );
+        assert!(on.costs.budget_imputation.is_on());
+
+        let off: Config = toml::from_str(
+            "[costs]
+budget_imputation = \"off\"
+",
+        )
+        .expect("off must parse");
+        assert_eq!(off.costs.budget_imputation, BudgetImputation::Off);
+        assert!(!off.costs.budget_imputation.is_on());
+        assert_eq!(off.costs.budget_imputation.as_str(), "off");
+
+        let explicit: Config = toml::from_str(
+            "[costs]
+budget_imputation = \"window_mean\"
+",
+        )
+        .expect("the default spelling must parse too");
+        assert_eq!(
+            explicit.costs.budget_imputation,
+            BudgetImputation::WindowMean
+        );
+
+        let typo = toml::from_str::<Config>(
+            "[costs]
+budget_imputation = \"of\"
+",
+        )
+        .expect_err("a typo must not fall back to the permissive policy");
+        let msg = typo.to_string();
+        assert!(
+            msg.contains("window_mean") && msg.contains("off"),
+            "the refusal must name the vocabulary: {msg}"
+        );
+    }
+
     /// The defaults must be a completely inert retention posture: a deployment
     /// that never mentions `[storage]` deletes nothing at all.
     #[test]
@@ -2046,11 +2231,24 @@ mod tests {
         assert!(!r.enabled, "recipe replay must be opt-in");
         assert!(!r.auto_validate, "auto-validation must be opt-in");
         assert_eq!(r.max_failures, 3);
+        // The reaper rung ships ON (unlike the tier itself), because it only
+        // ever takes things OUT of selection: with `[recipes]` off nothing is
+        // replayed and nothing strikes, so a shipping 10 costs a default
+        // install nothing and protects an opted-in one from an immortal
+        // candidate. Unlike `max_failures`, 0 is legal here — it is the
+        // documented escape hatch back to pre-0046 selection.
+        assert_eq!(r.retire_after, crate::recipes::DEFAULT_RETIRE_AFTER);
+        assert_eq!(r.retire_after, 10);
 
         let mut cfg = Config::default();
         cfg.recipes.max_failures = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("[recipes] max_failures"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.recipes.retire_after = 0;
+        cfg.validate()
+            .expect("retire_after = 0 disables the rung — it is not a misconfiguration");
     }
 
     #[test]

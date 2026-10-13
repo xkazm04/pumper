@@ -2,6 +2,15 @@
 
 Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/server/src/registry.rs`) as **jobs** on a durable SQLite queue.
 
+**The registry carries the fleet's declaration ratchets.** An app's `manifest().output_shape` is not only documentation — `registry.rs` holds two-direction EXPECTED-diff inventories over it, so a judgment the fleet has standardised cannot be re-answered privately by the next app without failing a test **by name**:
+
+| inventory | the declaration it pins | the roster that still owes it |
+| --- | --- | --- |
+| `completeness_inventory_tests` | a `completeness` block — "did this run get enough?" (`pumper_core::completeness`) | `AWAITING_THE_JUDGE` |
+| `materiality_inventory_tests` | a `materiality {` block — "is this change news?" (`pumper_core::materiality`, see [datasets.md](datasets.md)) | `MONITORS_AWAITING_THE_JUDGE` |
+
+Both fail in **both** directions — an app that newly declares and is not listed, and a listed app whose declaration vanished — and both exemption rosters only ever shrink: a listed app that adopts the judge fails the test until it is dropped from the roster, so an exemption cannot become permanent. Each is the generalised fix for the same defect found one layer apart: a judgment invented privately in four crates nobody else can reach.
+
 ## Jobs
 
 - Enqueue: `POST /apps/{name}/jobs` with optional `{params, max_attempts, delay_secs, priority, callback_url, callback_secret, budget_usd, idempotency_key}`. An `Idempotency-Key` header (or body field) makes retries safe: a duplicate key returns the original job with `200` instead of a new `202`.
@@ -13,7 +22,7 @@ Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/serv
   - **Every control event carries the job's real app.** Bulk retry and queued-cancel used to emit their `queued`/`cancelled` events with a **blank** app, and app-scoped watchers match the app exactly (`GET /mcp?app=…`) — so a bulk retry re-queued work invisibly to the one surface subscribed to it. `Storage::retry_bulk` now returns `(id, app)` pairs and `Storage::cancel` returns the cancelled job's app, both via `RETURNING` in the same statement, so the announce path stays at one query. Wire shapes are unchanged (`ids` is still a bare uuid array).
   - **Stale-write fence:** the worker's finish/fail/cancel writes are guarded on `(status='running', attempts)`. Because reset (and the reaper, below) re-queue the row and the next claim advances `attempts`, an orphaned task's late `complete`/`fail` matches no row and is discarded — the re-claimed attempt owns the outcome. The token registry entry is attempt-keyed so an overlapping re-claim is never clobbered.
 - **Panic containment:** the worker runs each app future under `catch_unwind`. An app that panics fails its job **on the same tick**, through the normal attempt-fenced `fail()` path (fencing, backoff and retry are identical to an app-returned error), and `job.error` carries the panic payload prefixed `panicked: ` with its `file:line:col` when available — e.g. `panicked: called Option::unwrap() on a None value (at crates/apps/x/src/lib.rs:81:14)`. The prefix keeps a panic distinguishable from an app error, a `timed out after Ns` timeout, and the reaper's `lease expired (heartbeat stale)`. This cannot catch a **non-yielding** wedge (no unwind ever happens, so no branch is reached) or a hard abort — the reaper below stays the backstop for those.
-- **Stuck-job reaper (heartbeat lease):** the worker stamps a `heartbeat_at` on each running job every `worker.heartbeat_secs` (default 30) — but only while the app future keeps yielding (`.await`-ing). A task wedged in a non-yielding loop stops beating; a slow-but-alive job keeps beating however long it runs. The reaper (piggybacked on the scheduler tick) re-queues any running job whose heartbeat is older than `worker.stale_after_secs` (default 120) using **failure semantics** — attempts + backoff apply, and an attempts-exhausted job fails permanently (`error: "lease expired (heartbeat stale)"`, with its callback + terminal triggers). This recovers a job hung on a live server (the 900s `job_timeout` only drops the future; it can't reach a task that never yields). Set `heartbeat_secs`/`stale_after_secs` to `0` to disable heartbeating / the reaper. The boot sweep still handles jobs orphaned across a full restart, and now applies the same verdict — see below.
+- **Stuck-job reaper (heartbeat lease):** the worker stamps a `heartbeat_at` on each running job every `worker.heartbeat_secs` (default 30) — but only while the app future keeps yielding (`.await`-ing). A task wedged in a non-yielding loop stops beating; a slow-but-alive job keeps beating however long it runs. The beat is **non-blocking**: the tick (still inside the job's own loop) spawns the `heartbeat_at` write instead of awaiting it, with at most one write in flight (a tick while one is pending is skipped) — awaited in the loop, it stopped the app's in-flight queries from being polled and deadlocked on the connections they held, freezing a fetch fan-out for the 30s pool acquire timeout. The write is fenced on `status = 'running' AND attempts = <this attempt>`, so a beat landing after the job finished changes nothing. The reaper (piggybacked on the scheduler tick) re-queues any running job whose heartbeat is older than `worker.stale_after_secs` (default 120) using **failure semantics** — attempts + backoff apply, and an attempts-exhausted job fails permanently (`error: "lease expired (heartbeat stale)"`, with its callback + terminal triggers). This recovers a job hung on a live server (the 900s `job_timeout` only drops the future; it can't reach a task that never yields). Set `heartbeat_secs`/`stale_after_secs` to `0` to disable heartbeating / the reaper. The boot sweep still handles jobs orphaned across a full restart, and now applies the same verdict — see below.
 - **Retention janitor:** one background loop (every 6h, `main.rs`) bounds every store that would otherwise grow forever — revision history, the artifact tree (provenance-pinned), the four append-only ledgers (`cost_events`, `webhook_deliveries`, `job_yield`, `saved_search_seen`) and extraction-health sketches. All of it is **off by default** under `[storage]`; the loop returns immediately when nothing is configured. Full key table, scoping rules and the `GET /retention/preview` dry run: [datasets.md § Retention](datasets.md).
 - **Store janitor:** a second loop (every 1h, `main.rs`) bounds the stores whose growth is *derived state*, so it needs no opt-in and is always on: expired `http_cache` and `research_cache` entries, `http_cache` rows past `[cache] max_rows` (oldest-confirmed first), the `revalidations` log past `[refresher] retention_days`, and stale `tier_memory` rows past `[fetcher] host_memory_ttl_secs`. Every pass is bounded work (indexed deletes + one `LIMIT`ed eviction). Rationale per store, and why each was previously unbounded: [fetching.md § Cache growth bounds](fetching.md).
 
@@ -26,6 +35,11 @@ Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/serv
 - **Graceful shutdown:** on Ctrl-C / SIGTERM (on Windows: Ctrl-Break, console-close, or system-shutdown) the process cancels a shared token — the worker stops claiming new jobs, the scheduler and cache janitor stop, and `axum::serve` stops accepting. In-flight jobs are given up to `worker.shutdown_drain_secs` (default 25) to finish; whatever is still `running` at the deadline goes through the recovery verdict below (reason `drain deadline reached (shutdown)`) so it resumes cleanly on the next boot instead of being stranded. The same window then drains in-flight **fan-out** (which no longer holds a permit, so re-acquiring the permits is no longer proof the queue is idle); anything unfinished at the deadline is logged, not silently dropped.
 - **A cancel during the drain is a cancel, not a deferral.** Drain phase 2 fires every in-flight job's cancel token to mean *suspend* (checkpoint + re-queue, resume next boot), and `DELETE /jobs/{id}` fires the **same** token to mean *stop*. The worker read both as suspend, so an operator's explicit cancel inside the drain window was silently converted into "run it again after the restart" while the door still answered `{cancelled: true, running: true}`. The door now claims the run for the operator — under the token-registry mutex the drain itself reads, immediately before firing — and `worker::cancel_kind` gives user intent priority over a concurrent drain: a suspend is a promise to run the work later, which is exactly what the operator asked us not to do. The one case a cancel cannot win is a run that already committed to a suspend microseconds earlier; that answers honestly with `{cancelled: false, running: true, suspended: true, note}` rather than a cancellation the queue contradicts. Jobs nobody cancelled suspend exactly as before.
 - Lineage columns: `schedule_id` (fired by a cron schedule), `trigger_id` (fired by a reactive trigger — see [triggers.md](triggers.md)).
+- **Querying the lineage (`Storage::JobQuery`).** The job list's predicates are one struct — `app`, `status`, `schedule_id`, `trigger_id`, `target_key`, `since`, `until` — and `Storage::list`, `list_page`, `status_counts_filtered` and `explain_job_list` all take it, so no two of them can disagree about what a filter means. Three facts worth knowing:
+  - **The `WHERE` clause is assembled from only the predicates actually supplied** (`sqlx::QueryBuilder`, every value `push_bind`-ed, never interpolated — the same idiom `Datasets::list_filtered_trust` uses). This is not a style choice: the obvious alternative, one static statement with a `(?n IS NULL OR col = ?n)` clause per column, returns identical rows and **full-scans `jobs` every time**, because SQLite cannot use an index for a term it cannot prove is an equality while planning. Written that way the filter would work and the indexes 0012/0014/0041 paid for would stay exactly as unreachable as before. `explain_job_list` returns `EXPLAIN QUERY PLAN`'s `detail` rows so this is asserted, not asserted-in-prose: see `lineage_filters_ride_the_indexes_not_a_table_scan` in `crates/core/tests/jobs.rs`.
+  - **The `created_at` window is half-open, `[since, until)`.** An inclusive upper bound returns the boundary row in two adjacent windows, which makes a day-at-a-time walk's counts wrong rather than merely off by one.
+  - **Which index each form actually rides** (measured, not assumed): `trigger_id` → `idx_jobs_trigger` with *no* sort, the `ORDER BY created_at DESC` being that index's own tail; `schedule_id[&status]` → `idx_jobs_schedule`; `app[&since]` → `idx_jobs_app`, the window becoming a range on its `created_at` tail; `status&target_key` → `idx_jobs_status_target`. **Known gap:** migration 0041's index is `(status, target_key)` and `status` *leads*, so a bare `target_key` with no `status` scans the table. The scan is pinned by that same test, so the gap cannot be quietly mis-documented; closing it is an index re-order this surface does not own.
+- `status_counts_filtered` is the scoped twin of the `/metrics` aggregate: one `GROUP BY status` over the same `WHERE`, metered as `StoreOp::JobStatusCounts`. With no predicate the two agree exactly (asserted), because two spellings of one count is how a dashboard and a triage page come to disagree about the same queue. Statuses the window does not hold are **absent**, not zero.
 - Worker (`crates/server/src/worker.rs`): global concurrency cap + per-app caps (`[worker]` config); wakes instantly on enqueue. After a successful run it indexes the result into search, computes the run's revision batch once, then fires dataset watches, dataset triggers, and saved searches; `finalize()` emits the terminal SSE event, the result webhook, and terminal-job triggers. All side effects are fail-open.
 - **Off-slot fan-out.** Everything in that list runs *after* the completion write, as one unit on a bounded pool (`crates/server/src/fanout.rs`) instead of on the job's own worker permit — a slow index or a large materialization no longer burns a scrape slot. Consequences to know:
   - The job reaches `succeeded` (and `GET /jobs/{id}` shows its `result`) **before** its documents are searchable and before its watches/triggers fire. Poll the terminal SSE event, not the row, if you need "the fan-out is done".
@@ -101,7 +115,7 @@ The block is **absent when every save landed** (no fabricated zeros — its pres
 
 ## Scheduler
 
-DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`, `POST /schedules/{id}/budget`. **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
+DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`, `POST /schedules/{id}/budget`, plus the read-only decision ledger `GET /schedules/{id}/runs` (see [The decision ledger](#the-decision-ledger-get-schedulesidruns)). **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
 
 **What the tick actually is.** This loop is the process's only periodic timer, so four other jobs ride it rather than owning one of their own — in this order, after the cron reconcile:
 
@@ -128,6 +142,8 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
   **Both policies pass the same gates.** A schedule that could not have fired anyway — unregistered app, or effective params that fail the app's schema — records *no* skip advance either (`skipped_count` and `last_skipped_at` stay put), so fixing the row makes it fire instead of leaving it having quietly advanced past its own backlog. Same for a firing the overlap guard is holding.
 - **`max_attempts`** — attempt budget for jobs this schedule enqueues; `null` = server default (**3**), so scheduled runs retry transient failures with backoff exactly like a manual job (previously cron runs were hardcoded to a single attempt).
 
+**Retired sources are skipped.** An `extractor` schedule whose `params.dataset` (default `extracted`) names a source whose **stored** health state is `retired` does not fire: the firing is recorded as a skip (`last_skipped_at`, `skipped_count` — the eaten firings), `last_run` does not move, and nothing is enqueued. This holds whether or not `[resilience] enforce` is on — it is a scheduling decision, not a data gate. The state is read every tick, so `POST /sources/{id}/state` back to any other state resumes the schedule at its next firing. The reason is named on the API: `GET /schedules` reports `health: "retired"` for such a row (it is one of the admission verdicts below), so the skip no longer has to be read out of the logs. The *verdict* is still never stored on the schedule row — migration 0039 has no skip-reason column, deliberately: it is derived on every read, so `POST /sources/{id}/state` back out of `retired` clears it in the same instant the scheduler starts firing the schedule again. What **is** stored, since migration 0047, is the *history*: each eaten firing writes one `schedule_runs` row carrying `reason: "retired"`, so a retirement skip and a misfire skip are no longer byte-identical after the fact (see [The decision ledger](#the-decision-ledger-get-schedulesidruns) below). Only extractor schedules are affected; no other app's params name its source. See [resilient-extraction.md §2.9](resilient-extraction.md).
+
 **Spend ceiling (`budget_usd`, `schedules` col, migration 0040).** The ceiling replayed into **every** job this schedule enqueues, identical in meaning and effect to the `budget_usd` of the same app enqueued at the jobs door (see [Budgets](#budgets--the-cost-ledger)). Set at `POST /schedules`, changed later with `POST /schedules/{id}/budget` (`{"budget_usd": 2.0}`, or `null` to remove it), returned by `GET /schedules`.
 
 - **`null` = no ceiling, and that is still the default.** No ceiling is invented for a schedule that doesn't set one — a standing order that ran unlimited yesterday runs unlimited today. What changed is that a ceiling is now *expressible*: before this the fire path built its enqueue options from `Default`, so `budget_usd` was `None` for every scheduled run and a nightly Claude-tier research schedule was the one work shape that could spend without limit while the same app enqueued by hand honoured its cap.
@@ -139,7 +155,56 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - **`last_job_id` / `last_status`** — the most recent job this schedule enqueued (joined on `schedule_id`), or `null` if it has never fired.
 - **`last_run`** — when this schedule last **enqueued a job**, `null` until it has. It is only written by the fire path, so it can no longer contradict `last_job_id`.
 - **`last_skipped_at` / `skipped_count`** (`schedules` cols, migration 0039) — when the `skip` misfire policy last advanced past missed firings without enqueuing, and the cumulative count of firings it has eaten over the schedule's life. This is what makes "my `skip` schedule quietly does nothing" visible; previously the advance was written to `last_run` (so the row claimed a run that never happened, beside a null `last_job_id`) and the count existed only in a log line.
-- **`health`** — `ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`, derived from the same conditions the scheduler checks each tick — and for `overlapping`, from the *same read and predicate*, not a second query. `overlapping` means the schedule's most recent run is still queued/running and the overlap guard is holding the next firing back — the one case where an ever-older `last_run` otherwise looks like a dead schedule. `invalid_params` means the row's effective params fail the app's declared schema, so the fire path skips it (see below).
+- **`health`** — `ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `retired` | `overlapping`. **This is the fire path's own admission verdict, read verbatim — not a second derivation of it.** One firing gets exactly one verdict from one closed vocabulary (`scheduler::ScheduleAdmission`), produced by one `scheduler::admit()` that both the reconcile loop and this endpoint call, and the values above are its variants' names. The precedence is the vocabulary's declaration order, highest gate first:
+
+  | `health` | what it means | the operator's move |
+  | --- | --- | --- |
+  | `disabled` | the row is switched off; its cron is never even parsed | `POST /schedules/{id}/enabled {true}` |
+  | `invalid_cron` | the cron is unparseable or has no future firing (`next_run` is `null`). Only reachable by editing the row — the create door refuses it | fix `schedules.cron` |
+  | `unregistered_app` | no app of that name is registered in this binary | deploy the app, or delete the row |
+  | `invalid_params` | the row's effective params fail the app's declared schema, so the fire path refuses it (see *Params: same door, same answer* below) | fix `schedules.params` |
+  | `retired` | an `extractor` schedule whose source (`extractor/<params.dataset>`) has stored health state `retired`, so every firing is eaten as a skip (see *Retired sources are skipped* above) | `POST /sources/{id}/state` out of `retired` |
+  | `overlapping` | this schedule's own most recent run is still queued/running and the overlap guard is holding the next firing back — the one case where an ever-older `last_run` otherwise looks like a dead schedule. Read through the *same read and predicate* the guard uses, not a second query | let the run finish, or cancel it |
+  | `ok` | nothing is stopping the next firing | — |
+
+  Every verdict is **derived on each read, never stored**: fixing the row (or restoring the source) clears the marker in the same instant the scheduler starts firing it again, where a stored flag would have to be un-set by somebody. Two inventory tests keep the vocabulary single — one fails if this endpoint re-answers any gate for itself, the other if the declared variants and the `health` values the OpenAPI description publishes drift apart, so a seventh gate cannot land without the API learning its name.
+
+  > Before this, the endpoint re-derived `health` in its own `if/else` chain. It knew five of the scheduler's six gates and never learned about retirement — so a schedule over a retired source answered `health: "ok"` beside a confident future `next_run` while eating a firing on every tick, and the only way to find out was the server log or the SQLite file.
+
+### The decision ledger (`GET /schedules/{id}/runs`)
+
+`health` and `next_run` answer *"what will this schedule do next?"*. The ledger answers the other half — *"what did it already swallow?"* — which had no answer outside the server log, and for the most common non-fire not even there.
+
+**One row per non-idle tick verdict** (`schedule_runs`, migration 0047), negatives included. This is the schedules-shaped twin of the trigger decision ledger (`trigger_runs`, migration 0036) and deliberately so: same table shape, same fail-open writer contract, same keyset paging, same age bound off the reaper tick. An **idle** tick writes nothing — one row per schedule per tick for doing nothing is the one write rate this table must not have.
+
+| field | what it carries |
+| --- | --- |
+| `outcome` | `fired` \| `skipped` \| `held` \| `refused` \| `failed` (`pumper_core::storage::SCHEDULE_OUTCOMES`) |
+| `reason` | **the `health` word above, read verbatim** off the one `scheduler::admit()` verdict. `null` only when admission never ran (a storage failure inside the step), where `detail` is the answer |
+| `due_at` | the firing this row is about, projected with the same reference rule `next_run` uses |
+| `job_id` | the job enqueued — or, for `held`, the job still **holding the slot**, which is the one the operator has to go look at |
+| `missed` | firings advanced past by `misfire_policy = "skip"`, **per occurrence**. `schedules.skipped_count` does accumulate this number (it is `skipped_count + missed`, not `+ 1`) — but as a *lifetime total with no window and no reason*, so four firings eaten in one tick and one eaten in each of four ticks are the same `4`, and so are a retirement skip and a misfire skip. The row is what separates them |
+| `detail` | free text: an error message, the retired dataset, the collapsed backlog size |
+
+The three silences it ends:
+
+- **`held`** — the overlap guard's hold recorded *nothing at all*, and correctly so: `record_schedule_skip` stamps `last_skipped_at`, which would advance the cron reference past the very firing the guard just promised to keep due. A ledger row advances nothing, which is why the hold can finally be written down. Three held ticks are three rows naming the same `due_at` and the same blocking `job_id`, and `last_run` does not move.
+- **`skipped`** — a retirement skip and a misfire skip wrote the identical two columns, so the store could not tell them apart. `reason` now does: `retired` for the gate, `ok` for the misfire policy (nothing *refused* that firing — the policy ate the backlog, and `ok` is what the one admission vocabulary calls the absence of a reason not to fire). A `skip` tick that also runs its on-time firing writes **two** rows, not one: the skip carries its `missed` and the fire carries its `job_id`, because collapsing them is exactly the flattening `skipped_count` already does wrong.
+- **`failed`** — a per-schedule storage error inside the pass was `PassTally::failed += 1` and one aggregate log line, so the schedule that silently did nothing could not be named. It is now a row with the error text. (The pass itself still continues with the remaining schedules — that is unchanged.)
+
+**`reason` is not a new vocabulary.** It is `ScheduleAdmission::health()`, the same closed list the fire path acts on and `GET /schedules` publishes. This context's whole problem was three separate authorities on "why isn't this firing?"; an inventory test fails if `scheduler.rs` spells a ledger `reason` as a string literal at all, so a fourth cannot be added by accident.
+
+**Fail-open, and bounded at birth.** A decision that could not be recorded never holds up the firing it describes — dropping the table entirely still enqueues the job and still stamps `last_run`. The ledger is *diagnostic*, not evidence: the reaper tick prunes rows past 14 days alongside `trigger_runs`, in the same function and under the same hourly due-check, so a second ledger cannot end up the one that grows forever.
+
+**The pass heartbeat (`scheduler: {last_pass_at, stale}`).** The one scheduler failure the loop cannot log. `reconcile` failing at `list_schedules` returns before it looks at a single schedule, so no firing gets its chance, every row keeps answering `health: "ok"` beside a confident future `next_run`, and `last_pass` — a loop-local — never advances. From outside the process that was indistinguishable from "nothing was due", and a liveness probe against a live HTTP server passes it.
+
+A completed pass now stamps a durable heartbeat, gated by the **same** `completed` bool that advances `last_pass`, so the durable fact and the in-memory one cannot drift (an inventory test pins the pairing). `stale` is true when no pass has completed within four configured ticks (floored at 60s so a sub-minute tick cannot make the verdict flap), and **also when no pass has ever completed** — "never" is the honest answer and the worst case, not a reason to report healthy.
+
+The heartbeat is **one upserted row**, not one row per pass. The trigger ledger shows what the append shape costs: a fact written once per process as an ordinary row paginates out of reach of the newest-first page it was meant to be read from. A fixed primary key makes the table's size independent of the tick rate and makes "when did a pass last complete?" a point read — and the row is **exempt from the prune**, because deleting a stale heartbeat would delete the evidence of the very wedge it exists to prove.
+
+It is published from one builder on both `GET /schedules/{id}/runs` and the **cursored** `GET /schedules` envelope. The legacy bare-array mode of `GET /schedules` cannot carry it — that response is a JSON array and has nowhere to put a field.
+
+> Known gap: an empty `decisions` page on a schedule that has genuinely never been due looks the same as one whose rows have aged out of the 14-day window. The `scheduler` block distinguishes "the loop is not running" from both, but not "it ran and the evidence expired".
 
 **Params: same door, same answer.** A schedule's effective params are the app's `default_params` with the schedule's own `params` **shallow-merged over them** — byte-identical to what `POST /apps/{name}/jobs` does with a request body, and what `ScrapeApp::default_params` ("params used for scheduled runs") always promised. `POST /schedules` validates that merged object against the app's declared `params_schema` and answers **422** with the same JSON-pointer message the enqueue door uses, so a standing order can no longer hold params a one-off run would have been refused. The fire path re-checks (rows can predate the door, or be edited in SQL): an invalid row is **skipped without touching `last_run`** — so fixing the params makes it fire on the next tick rather than having silently eaten firings — and shows as `health: "invalid_params"` on `GET /schedules`.
 
@@ -154,8 +219,59 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - **Exhausting the budget is terminal, not retryable.** The refusal is a typed error (`Error::BudgetExhausted`), and the worker sends it straight to the permanent-fail path: the job goes to `failed` on the attempt that hit the ceiling, with its remaining `max_attempts` visibly un-burned (`attempts: 1 / max_attempts: 5`). Retrying could never have helped — a retry re-seeds the job's spend from the cost ledger (the money really was spent) and re-refuses on its first metered call, so the backoff ladder only delayed the same answer. Terminal budget failures still fire the normal terminal fan-out (callback, `failed` event, terminal triggers). **Only** the ceiling refusal is classified this way; engine, storage and ordinary app errors keep their full retry/backoff semantics. There is no top-up-and-resume flow: raise `budget_usd` and enqueue again.
 - **Schema drift is terminal too, and no longer looks like an outage.** The grants fleet refuses to write when an upstream listing response no longer parses — a renamed field, a changed envelope — and that refusal is now `Error::SourceDrift` rather than a generic `Error::App`. It is a pure function of one already-fetched response, and the request came from params frozen at enqueue, so attempt #2 asks the identical question, gets an identically shaped answer, and re-refuses in the identical place: a permanent upstream rename used to burn three attempts plus backoff on **every scheduled run, every day, indefinitely**. A source that is *down* is a different failure (`Error::Http`) and keeps its full retry ladder; the two used to be indistinguishable `Error::App`s in the job log. At the HTTP boundary it maps to **502**, not 500 — a source changing its schema is somebody else's failure, and this server refusing to write a corrupt corpus is it working correctly. The boundary is deliberately narrow: only **pre-write listing** refusals are terminal. Warn-only drift signals stay warnings, and a per-item degradation that aborts a *stage* rather than the job (grants-gov's detail stage) stays retryable — a partial harvest is a fact about one attempt, not about the contract.
 - **A governance pause is reported as a pause.** A DataHub `cost:pause` tag forces the job's budget to `$0` (see [datahub.md](datahub.md)), so the same refusal fires — but the stored `error` says the tag on `<app>`'s datasets is holding its paid work and that nothing was spent, instead of the misleading "job budget of $0.00 exhausted". A paused job's `GET /jobs/{id}/costs` total is `$0`.
-- APIs: `GET /jobs/{id}/costs` (events, total, cost-per-fresh-record), `GET /costs?app=&since=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
+- APIs: `GET /jobs/{id}/costs` (events, totals, certainty, cost-per-fresh-record), `GET /costs?app=&since=&certainty=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
 - Research cache: identical `ResearchRequest`s within `claude.research_cache_ttl_secs` (default 24h, 0 disables) are served from disk at zero cost, logged as `cache_hit (saved ~$X)` events. `resume_session` requests bypass.
+
+### Was it billed, unmetered, or genuinely free?
+
+`cost_usd = 0.0` used to carry four different facts and the only thing separating them was a *prefix of the free-text `detail` column*, which no endpoint selected, grouped or filtered on. A job that burned to its budget ceiling and was killed answered `GET /jobs/{id}/costs` with `{"total_usd": 0.0, "calls": 1}` — byte-identical to a job that served one free cache hit — and `cost_per_fresh_record_usd` then divided that zero by the record count and published a confident `$0.00` ROI that `GET /economics` recommends budgets from.
+
+Every `cost_events` row now carries a typed **`spend_certainty`** (migration 0045), a closed four-member vocabulary owned by `pumper_core::error::SpendCertainty`:
+
+| `spend_certainty` | Means | Written for |
+| --- | --- | --- |
+| `billed` | `cost_usd` **is** the bill, as the engine reported it. A reported `$0.00` is billed — it is a *known* amount. | a priced answer; any failure whose envelope still reported `total_cost_usd` (`failed_spend (<class>)`) |
+| `unmetered` | A paid call happened and `cost_usd` is **not** its bill. The `0.0` is a floor, never a price. | `Timeout` (killed mid-generation), `Unparseable` and `PromptUndelivered` (exit 0 — the model answered), `CliError` with no amount, and a success whose envelope omitted `total_cost_usd` (`cost_unreported`) |
+| `unknown` | A child existed and may have spent, and we cannot say whether it was billed **at all**. | `WaitFailed`, `PipeFailure`, `Interrupted`, `NonZeroExit` with no envelope |
+| `free` | No money moved. | cache hits, VCR replays, the http/browser tiers |
+
+**`unmetered` and `unknown` are deliberately not the same row.** Calling a failed `wait()` syscall or a broken pipe "unmetered" asserts *a paid call vanished* about a run that may never have reached the model — the exact claim the `WaitFailed`/`PipeFailure` classes were split out of `Timeout` to stop making. `ClaudeFailure::unreported_certainty()` decides it member by member, exhaustively, so a new failure class cannot inherit a neighbour's answer.
+
+What it buys on the surfaces:
+
+- `GET /jobs/{id}/costs` adds `billed_usd`, `unmetered_calls`, `unknown_calls` and `total_certainty` (`exact` | `at_least`). `total_usd` is kept and is the same number as `billed_usd`.
+- `cost_per_fresh_record_usd` is **`null`** for any job holding an uncertain call, with `cost_per_fresh_record_unavailable` naming which (`"unmetered_calls"` | `"unknown_calls"`). A price derived from a floor is not a price.
+- `GET /costs?certainty=unmetered` keeps only the (app, engine) groups holding at least one such call, with the group's whole picture; every group also reports `unmetered_calls` / `unknown_calls`.
+- `GET /economics` reports `unmetered_calls`, `unknown_calls` and `cost_certainty` per app-window, and a recommendation built from a floor says so in its `reason`.
+- `GET /jobs/{id}/receipt` reports the same four fields in its `cost` block, from the same rollup — `billed_usd`, `unmetered_calls`, `unknown_calls`, `total_certainty` — and `total_usd` keeps its exact prior value, so no consumer breaks. When the total is a floor, `unknown[]` gains one line naming how many calls are unmetered and how many unknown, saying the run cost *at least* that much. An **exact** total gets no entry: a footnote on every receipt is a footnote on none.
+- `GET /metrics` emits `pumper_cost_uncertain_calls{app,engine}` beside `pumper_cost_usd{app,engine}` — `unmetered + unknown` for the group, with an **explicit zero** when the group is clean. Without it a month of unmetered failures reads as a flat, reassuring spend line, and an alert on `pumper_cost_usd` is unfalsifiable.
+
+**One summer, in core.** `pumper_core::costs::roll_up` (per event) and `CostSummary` (per `(app, engine)` group) are the only code allowed to turn `cost_events.cost_usd` into a published number; `routes::jobs::certainty_fields` is the only code that emits the four fields. The rule used to live in a `pub(crate)` helper inside one route module, so the second surface in the same crate — the receipt — wrote its own sum and dropped the certainty. An inventory test over the whole server crate (`cost_sum_inventory`, the EXPECTED-diff idiom) enumerates every remaining `cost_usd` fold and fails the build on a new hand-rolled one.
+
+**The budget ceiling charges the calls it could not price.** It used to be `budget - billed`, which read a Claude run killed mid-generation as free money: that run records `cost_usd = 0.0` with `spend_certainty = 'unmetered'`, so it contributed exactly `$0.00` to its own ceiling. The Claude tier is both the only tier that spends real money and the only tier that can produce such a row, so the cap was blind precisely where its target lives — an app that repeatedly timed out Claude mid-generation could run forever under a `$1` budget.
+
+The ceiling now charges an unpriceable call the **mean of the job's own priced calls** (`pumper_core::costs::impute_uncertain`), and the estimate lives in the evaluation only — no stored row is ever rewritten. A `$1.00` job with four billed calls summing `$0.40` and two `unmetered` calls has `$0.40` of headroom, not `$0.60`: `$0.40` billed plus `$0.20` imputed at its own `$0.10` mean. The window is the job's own ledger, never a fleet average — a cap is per job, and borrowing another job's prices to spend this job's money is a number with no owner. A `free` row is **not** a price sample and stays out of the denominator, or a job doing a hundred free http fetches beside two unreadable Claude bills would charge its blind spots a third of a cent and re-open the hole from inside the fix.
+
+**A job with unreadable bills and no readable one is REFUSED, not admitted.** There is nothing to take a mean of, so there is no honest number — and the old answer was to present the platform's blindness as the job's full headroom. The next metered call gets `Error::BudgetExhausted` (terminal, like any ceiling refusal) whose message says *unpriceable*, names how many calls could not be priced, and tells the operator the fix is to find out why the bill is unreadable — raising `budget_usd` cannot help and would only authorise more unmeasurable spend. An `AutoWithResearch` **fetch** degrades to the free tiers instead, with the same distinction in its escalation trail. An **unbudgeted** job in the identical state still runs: there is no ceiling to be blind about. This is the registry's own degenerate case (`llm-observability/usage-limit-governance/cost-evidence-and-imputation`) — *a cap that cannot be measured is not a cap*.
+
+**What the surfaces say.** `GET /jobs/{id}/costs` keeps `budget_remaining_usd` (now charged) and `budget_remaining_certainty` (still `at_most` whenever a floor went into it) and adds:
+
+| key | means |
+| --- | --- |
+| `budget_imputed_usd` | how much of the charge is an **estimate**. An estimate must announce itself; a headroom that silently folds in imputed dollars is a number nobody can audit |
+| `unpriceable` | the job has calls we could not price and none we could, so its spend has no actionable bound. `budget_remaining_usd` and `budget_imputed_usd` are both `null` here — not `0.0`, which is a measurement |
+| `breached` | charged spend actually *reached* the ceiling. A different fact from `unpriceable`: a blind job has not been shown to have overspent anything |
+| `budget_imputation` | the policy in force, echoed so a surprising number can be traced to a config key |
+
+The report and the enforcement point call one function (`pumper_core::costs::budget_verdict`, three cases: `Unlimited` / `Headroom` / `Unpriceable`), so `GET /jobs/{id}/costs` cannot tell an operator there is money left while the worker is refusing the next call. A unit test walks both policies over a table of spends and asserts the two agree.
+
+**The knob, which is the rollback.** `[costs] budget_imputation = "window_mean"` (default) | `"off"`. `off` is the pre-change ceiling exactly: `$0.60` remaining on the job above, and the unpriceable job admitted against its `$0` total. It restores the old behaviour **without a deploy**, and `crates/core/tests/budget_imputation.rs` proves both policies against one table so "byte-identical to before" stays a test rather than a claim. An unknown value is a startup error naming the vocabulary — a typo must not quietly un-enforce a cap.
+
+`CostLedger::job_total` is untouched and still the plain `SUM(cost_usd)` for the callers that want exactly that. The ceiling reads `job_spend()` instead — the same dollars plus the two counts it was missing, in one query — and `SpentTotal`, the in-memory mirror on the pre-flight path, carries those counts too, so a **retried** job counts its earlier attempts' unreadable bills as well as their dollars. The pre-flight path still issues no query at all.
+
+**Back-fill.** 0045 derives `spend_certainty` for existing rows from their `detail` prefixes (`failed_spend (…)` → `billed`, `unmetered_timeout`/`cost_unreported` → `unmetered`, `failed_spend_unreported (…)` → `unmetered` or `unknown` by class, everything else by engine and amount). It is deterministic and replaying it is a no-op.
+
+**Known gaps.** The retention pruner ignores the column: it prunes `cost_events` by age alone, so pruning an `unmetered` row destroys the only evidence that an unpriced paid call happened — and it now also destroys the evidence the ceiling imputes from, which turns a historical `at_least` aggregate back into a confident `exact` one. The imputation mean is taken over the job's **whole** ledger rather than a recency window, so a long job whose prices drift charges its late blind spots at its early rate; the fix is a windowed mean, and the mean is deliberately the simplest estimator that cannot read blindness as zero.
 
 ## Record & replay (VCR)
 
@@ -189,7 +305,7 @@ The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file a
 
 ## Job receipt
 
-`GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job) and `trigger_hops` (the jobs this run's outcome enqueued).
+`GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job), `trigger_hops` (the jobs this run's outcome enqueued) and `coverage` (what it wrote vs what it declared — see below).
 
 **Honest nulls, and an `unknown[]` list that names every gap in the caller's words** — nothing is inferred, averaged or back-filled. The structural gaps it reports:
 - `stages: null` for a job that predates migration 0034, failed before its fan-out, or hasn't finished — and the message says which.
@@ -200,15 +316,72 @@ The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file a
 
 Every join is an index seek on the job id — a receipt is a per-job audit view, not a metrics query, and it must not slow down as the corpus grows.
 
+### `coverage` — what the run wrote vs what it declared
+
+A run declares the namespaces it puts records under in its result's `index_datasets`; the worker turns that into `run_indexed_apps(job.app, index_specs)` and scopes the hook batch (`load_run_changes`) and the saved-search pass by it. A namespace the run writes but never declares is therefore reachable by **no** watch, dataset trigger or saved search scoped to it — silently, with the job green. That class has bitten twice (`ca-grants` writing `grants/unified`, `peer` writing `peer_<origin>/<dataset>`), and both times a human found it after shipping.
+
+The receipt now diffs the two populations, which both already existed and were never compared:
+
+```json
+"coverage": {
+  "declared": ["mpsv-vpm", "cz-labour"],
+  "declared_datasets": [{ "app": "cz-labour", "dataset": "salary_gap" }],
+  "undeclared": [{ "app": "cz-labour", "dataset": "skill_demand" }],
+  "complete": true
+}
+```
+
+- `declared` — `run_indexed_apps(job.app, index_specs)`: the job's own app first, then the virtual apps its result names.
+- `declared_datasets` — the exact `index_datasets` specs. A declared **app** does not launder an undeclared **dataset** inside it: per-record search documents are minted per spec, so an unnamed dataset is unsearchable even in a namespace that is otherwise reachable.
+- `undeclared` — every `(app, dataset)` the run's revisions carry that is **outside the job's own app** and not named by a spec. Deduplicated and sorted. The worker logs one `WARN` per entry at the end of a successful run, naming the job, the app and the namespace.
+- `complete` — whether the diff may be trusted at all.
+
+A write under the job's **own** app is never reported: an app owns its namespace and writes plenty of internal datasets there (`mpsv-vpm` alone deliberately excludes eight from indexing). Flagging those would make the signal fire on every run, and a signal that is always on is not a signal.
+
+**Known gaps.**
+- The observed set comes from the `job_id` provenance stamp (migration 0030), the same source as `changes`. A write path that does not stamp a job id is invisible here.
+- When the receipt cannot see the run's writes it says so rather than reporting a clean bill: `complete: false` plus a named reason in `unknown[]`. Two causes, never collapsed — the job is not `succeeded` (its writes are not final), or no revision carries its stamp at all (“wrote nothing” and “wrote unstamped” are one picture from here). **An empty `undeclared` with `complete: false` is not a pass.**
+- The check is a report, not a gate: it runs after the fan-out, a store error is warned and dropped, and nothing here can change a job outcome.
+
+
 ## AppContext (what a running app gets)
 
 `job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `require_str`, `remaining_budget_usd`.
 
-**Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives **in the store**: `Datasets::detect_removed` demands a `RemovalGuard`, and the only public way to mint one is `RemovalGuard::for_source_state(state)`, which yields `None` for a degrading source. So an app that hand-rolls `upsert_many` + removal detection cannot skip it either (it previously could, and one did). A caller that already knows which specific records disappeared uses `Datasets::tombstone_keys` instead — removal by name, nothing inferred. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert while `[resilience] enforce = false` (the shipping default — verdicts are computed and stored, nothing is gated). Full surface: [resilient-extraction.md](resilient-extraction.md).
+**Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives **in the store**: `Datasets::detect_removed` demands a `RemovalGuard`, and the only public way to mint one is `RemovalGuard::for_source_state(state)`, which yields `None` for a degrading source. So an app that hand-rolls `upsert_many` + removal detection cannot skip it either (it previously could, and one did). A caller that already knows which specific records disappeared uses `Datasets::tombstone_keys` instead — removal by name, nothing inferred. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert for a source nothing has armed, which is every source under the shipping default (`[resilience] enforce = false` with an empty `enforce_sources` — verdicts are computed and stored, nothing is gated, and nothing is even read on the write path).
+
+**Arming is per source.** `[resilience] enforce = true` arms the whole fleet at once; `enforce_sources = ["<app>/<dataset>", ...]` arms exactly the ids it names while `enforce = false`, mirroring `auto_retire` — which has been per-source opt-in since it shipped, over the *more* destructive consequence. An empty list arms nothing (an unset allowlist means none, never all), and `enforce = true` keeps its old meaning exactly, so no existing deployment's behaviour moves: a list can widen arming from nothing, never narrow it from all, and a list set beside `enforce = true` is reported as redundant rather than honoured as a restriction. `enabled = false` remains the absolute off and fronts both keys. The single predicate is `resilience::detect::enforcement_armed`; the gate lives inside `enforced_state`, so every consumer became per-source without a call site moving. `GET /sources` carries `armed` per row plus `enforcing_any`/`enforce_sources`, and `GET /enforcement/preview` splits its rollup into `consequences.armed` (happening) and `consequences.soaking` (hypothetical). Full surface: [resilient-extraction.md](resilient-extraction.md).
 
 ## Config
 
 `config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
+
+### `[recipes]` — learned API-recipe replay, and its two strike rungs
+
+| key | default | what it does |
+| --- | --- | --- |
+| `enabled` | `false` | consider recipes on every fetch. A single fetch opts in without it via `FetchRequest.use_recipes`. |
+| `auto_validate` | `false` | also try an *unvalidated* recipe opportunistically, and promote it when a successful replay still overlaps its expected field paths. |
+| `max_failures` | `3` | consecutive failed/thin replays after which a **validated** recipe is un-validated (back to candidate, counter reset). **Must be >= 1** — `validate()` rejects `0`, because a validated recipe needs at least one consecutive failure before it is demoted. |
+| `retire_after` | `10` | the rung **below** `max_failures`: consecutive strikes after which a **candidate** is *retired* — stamped `retired_at` and dropped out of selection entirely (migration 0046). `0` disables the rung and restores pre-0046 selection exactly. |
+
+`retire_after` is the one key in this section that ships **on**, and the
+asymmetry is deliberate. Before it existed the strike counter had exactly one
+consumer and it was guarded on `validated`, so once a recipe was unvalidated
+that branch was unreachable for that row forever: the counter was write-only and
+selection never read it, which made a candidate that had failed ten thousand
+consecutive times still the first thing tried for its host — a live outbound
+replay ahead of the archive tier on every fetch. The rung only ever takes things
+*out* of selection, and with `[recipes]` off nothing is replayed and nothing
+strikes, so a default install pays nothing for it while an opted-in one is
+protected from an immortal candidate. Unlike `max_failures`, `0` is legal here:
+it is the documented escape hatch, not a misconfiguration.
+
+The threshold rides on the `RecipeStore` handle (wired in `state.rs` and
+`worker.rs`) rather than being threaded through `RecipeSource::record_failure`,
+because the `Fetcher` holds the source behind `dyn` and compiles without the
+`storage` feature — so the trait keeps its signature and the concrete store
+carries the policy. Full lifecycle: [fetching.md § The recipe lifecycle](fetching.md#the-recipe-lifecycle-candidate--validated--retired).
 
 ## Process startup & error reporting
 
@@ -234,6 +407,56 @@ by outcome, and the activity gauge — is listed in
 It is a **partial census by design** and says so in its own `# HELP` text: seven
 instrumented statement families, with schedules, watches, triggers, deliveries,
 saved searches, the caches and the search index explicitly unmeasured.
+
+## Boot: the schema post-condition
+
+The migration chain (`crates/core/migrations/`, `0001_init.sql` …) is replayed on
+every `Storage::connect`. It used to be replayed and then *believed*: the
+migrator ran, `connect` returned `Ok`, and nothing read back the schema it had
+produced. Boot now asserts it, in two halves, and **refuses** a store this
+binary cannot read (`Error::Schema`).
+
+**Half one, before the chain runs — is the store ahead of this binary?**
+`pumper_core::schema::classify` compares `_sqlx_migrations` against the embedded
+chain **in both directions**. `pending` (versions this binary carries that the
+store lacks) is ordinary forward migration. `ahead` (versions the store has that
+this binary does not) is a **downgrade**, and this repo ships **zero down
+migrations** — so running an older binary is the only way back, and it is the
+path that previously classified identically to "in sync". The five verdicts are
+`fresh`, `current`, `pending`, `ahead`, `diverged` (both directions at once).
+
+*What the operator sees:* boot fails with a message naming the ahead versions,
+the version this build's chain ends at, and three remedies — run the newer
+binary, restore the pre-migration snapshot written beside the database
+(`<database>.bak-premigrate-*`, see "Budgets" → the backup ritual is automatic),
+or set **`[storage] allow_schema_ahead = true`**. That key defaults to `false`:
+it is a safety ceiling, not a preference. With it on, the same store boots, the
+ahead versions are logged at `warn` on **every** start, and `GET
+/datasets/doctor` keeps reporting the drift as a finding.
+
+**Half two, after the chain runs — did it produce the inventory it promises?**
+`pumper_core::schema::EXPECTED_TABLES` is the single manifest of which tables the
+chain must leave behind (33 today). It used to live in `crates/core/tests/
+migrations.rs`, where the boot path could not reach it; it now lives in the crate
+and is read by **both** the CI replay test and every real boot. A missing table
+refuses the boot naming the table — this is drift *below* the ledger (an
+interrupted migration, a hand-restored partial copy, a table dropped out of
+band), which no version comparison can see. An **unexpected** table is logged at
+`info` and never fatal: an operator's own scratch table is not a fault.
+
+*What the operator does:* restore the `*.bak-premigrate-*` snapshot beside the
+database and re-run so the chain replays, or move the database aside and let it
+rebuild from 0001. Do not create the table by hand — the chain is the only
+authority for its shape.
+
+**A migration that creates a table without adding it to `EXPECTED_TABLES` now
+fails the test AND refuses a real boot.** Add the name in the same change as the
+migration.
+
+The pre-migration snapshot decision reads the same `classify`: a store that is
+`ahead` takes no snapshot (there is nothing this binary is about to change) but
+is logged as `SkipSchemaAhead`, not `SkipUpToDate` — the two used to be the same
+arm, which is how a downgrade rode in as a no-op.
 
 ## Known gaps
 

@@ -126,14 +126,14 @@ fn sentry_plan(dsn: Option<&str>, environment: Option<&str>, release: Option<&st
         .filter(|r| !r.is_empty())
         .unwrap_or(env!("CARGO_PKG_VERSION"))
         .to_string();
-    SentryPlan::Enabled(Box::new(sentry::ClientOptions {
-        dsn: Some(dsn),
-        environment: Some(environment.into()),
-        release: Some(release.into()),
-        traces_sample_rate: 0.0,
-        send_default_pii: false,
-        ..Default::default()
-    }))
+    // `ClientOptions` is `#[non_exhaustive]` since sentry 0.49, so it is built by
+    // mutating the default rather than with a struct expression.
+    let mut options = sentry::ClientOptions::default();
+    options.dsn = Some(dsn);
+    options.environment = Some(environment.into());
+    options.release = Some(release.into());
+    options.send_default_pii = false;
+    SentryPlan::Enabled(Box::new(options.traces_sample_rate(0.0)))
 }
 
 /// Reads the environment, applies [`sentry_plan`], and initializes Sentry if it
@@ -203,11 +203,18 @@ fn log_contract_observability(status: &ContractsStatus) {
              contracts.enforce_observed = false"
         );
     } else if status.declared > 0 || status.enforce_configured {
+        // The fraction, not the bare count: `declared = 12` reads as coverage
+        // and is a numerator. `coverage_line` states both denominators — live
+        // sources, and registered apps with no source row at all.
         tracing::info!(
             declared = status.declared,
+            live_sources = status.live_sources,
+            registered = status.registered.unwrap_or(0),
+            sourced = status.sourced.unwrap_or(0),
             enforce = status.enforce_configured,
             reason = status.reason.as_deref().unwrap_or(""),
-            "declared data contracts loaded from the catalog"
+            "{}",
+            status.coverage_line()
         );
     }
 }
@@ -240,7 +247,11 @@ async fn run() -> anyhow::Result<()> {
     // Say what declared-contract enforcement can actually be observed to do,
     // once, before the first job runs. Never blocking: the publish seam is
     // deliberately fail-open on an unreadable catalog, so this is visibility.
-    log_contract_observability(&ContractsStatus::load(state.config.contracts.enforce).1);
+    let registered = registry::app_names();
+    let exempt = registry::non_source_app_names();
+    log_contract_observability(
+        &ContractsStatus::load_with_apps(state.config.contracts.enforce, &registered, &exempt).1,
+    );
 
     // Seed code-declared schedules into the DB (idempotent) so they become
     // editable rows the scheduler and API share.
@@ -823,7 +834,10 @@ mod sentry_tests {
         assert_eq!(opts.release.as_deref(), Some("abc123"));
         assert_eq!(opts.environment.as_deref(), Some("staging"));
         // Performance tracing is out of scope; errors are the accepted surface.
-        assert_eq!(opts.traces_sample_rate, 0.0);
+        assert!(matches!(
+            opts.traces_sampling_strategy,
+            sentry::TracesSamplingStrategy::FixedRate(rate) if rate == 0.0
+        ));
         assert!(!opts.send_default_pii);
 
         let SentryPlan::Enabled(opts) = sentry_plan(Some(FAKE_DSN), None, Some(" ")) else {

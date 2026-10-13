@@ -124,6 +124,9 @@ impl pumper_core::Plugins for EchoPlugins {
 /// could just mean the fixture never escalated at all.
 #[tokio::test]
 async fn exhausted_budget_downgrades_extractor_instead_of_spending() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let thin = "<html><h1>T</h1></html>";
 
     // Control: budget headroom exists → the ladder really does reach Claude.
@@ -191,6 +194,9 @@ async fn exhausted_budget_downgrades_extractor_instead_of_spending() {
 /// positional zip, so it must not reorder either).
 #[tokio::test]
 async fn exhausted_budget_downgrades_plugin_instead_of_spending() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let thin = "<html><h1>T</h1></html>";
     let store = TempStore::new("chokepoint-plugin-broke").await;
     let claude = Arc::new(ScriptedResearcher::new().always_text("x".repeat(400)));
@@ -241,6 +247,9 @@ async fn exhausted_budget_downgrades_plugin_instead_of_spending() {
 /// fetched URL, carrying the winning engine and the URL.
 #[tokio::test]
 async fn every_fanned_out_url_lands_a_cost_event() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let body = "<html><h1>Title</h1></html>";
     for (app, params) in [
         (
@@ -300,6 +309,9 @@ async fn every_fanned_out_url_lands_a_cost_event() {
 /// so a single live fetch fails the test loudly.
 #[tokio::test]
 async fn recorded_extractor_run_replays_from_the_cassette_with_dead_engines() {
+    // Arms the repro/flake footer for any panic below: this module builds no
+    // `harness::test_state*`, which is where every other module gets it.
+    super::harness::arm();
     let store = TempStore::new("chokepoint-vcr").await;
     let dir = store.path().join("extractor").join("rec");
     let http = CannedHttp::new("<html><h1>Recorded</h1></html>");

@@ -24,6 +24,7 @@
 //!                   2016→now history (~100+ dumps). Omitted → all dumps.
 
 use async_trait::async_trait;
+use pumper_core::completeness::{self, Disposition, Expectation, Verdict};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
     ScrapeApp,
@@ -144,7 +145,21 @@ impl IndexParse {
     /// whole of it — i.e. whether a full-snapshot write would tombstone dumps
     /// that are still live upstream.
     fn is_partial(&self) -> bool {
-        self.share() < PARSE_FLOOR
+        !self.verdict().may_tombstone()
+    }
+
+    /// The completeness verdict on this parse, in the workspace's one
+    /// vocabulary (`pumper_core::completeness`).
+    ///
+    /// `suppress_only`, never fatal: a garbled index still carries the dumps
+    /// that DID parse, and refusing to write them would be a worse answer than
+    /// refusing to tombstone the ones it could not read. That asymmetry is the
+    /// whole reason the judge has three states rather than two.
+    fn verdict(&self) -> Verdict {
+        completeness::judge(
+            &Expectation::parsed_ratio("<dump> blocks", self.blocks_seen, self.parsed()),
+            Disposition::suppress_only(PARSE_FLOOR),
+        )
     }
 
     /// The `parse` block of the result: what the index held, what we read out of
@@ -179,6 +194,60 @@ impl IndexParse {
                 self.skipped_unparseable_date,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod completeness_verdict_tests {
+    use super::{Dump, IndexParse};
+
+    fn parse(seen: usize, parsed: usize) -> IndexParse {
+        IndexParse {
+            dumps: (0..parsed)
+                .map(|i| Dump {
+                    year: 2026,
+                    month: 1,
+                    hash: format!("{i:040x}"),
+                    size_bytes: 1,
+                    generated_at: "2026-01-01T00:00:00".to_string(),
+                    url: format!("https://example.test/{i}.xml"),
+                })
+                .collect(),
+            blocks_seen: seen,
+            skipped_missing_url: seen - parsed,
+            skipped_unparseable_date: 0,
+        }
+    }
+
+    /// 2 of 3 blocks parsed is `suspect`: the batch is written, but it is a
+    /// SUBSET of the published index, so the full-snapshot write downgrades to
+    /// an upsert rather than tombstoning the dump it could not read.
+    #[test]
+    fn a_two_of_three_parse_is_suspect_and_may_not_tombstone() {
+        let v = parse(3, 2).verdict();
+        assert!(v.is_suspect());
+        assert!(!v.may_tombstone());
+        // Never fatal: the two dumps that DID parse are still worth writing.
+        assert!(v.guard().is_ok());
+        assert_eq!(v.to_json()["verdict"], "suspect");
+    }
+
+    /// ...and a clean parse still tombstones. The Ministry retiring 2016
+    /// publishes fewer blocks that all parse, which is a real removal.
+    #[test]
+    fn a_three_of_three_parse_is_ok_and_still_tombstones() {
+        let v = parse(3, 3).verdict();
+        assert!(v.is_ok());
+        assert!(v.may_tombstone());
+        assert_eq!(v.to_json()["verdict"], "ok");
+    }
+
+    /// An index with no blocks at all is complete, not collapsed -- nothing was
+    /// published, so nothing was lost. That case belongs to `run`'s own empty
+    /// guard, which errors with the drift message.
+    #[test]
+    fn an_empty_index_is_complete_rather_than_collapsed() {
+        assert!(parse(0, 0).verdict().is_ok());
     }
 }
 
@@ -405,7 +474,10 @@ impl ScrapeApp for SmlouvyDumpWatch {
             output_shape: Some(
                 "{index_url, dumps_in_index, dumps_parsed, dumps_tracked, year_from, \
                  parse: {blocks_seen, parsed, skipped, skipped_missing_url, \
-                 skipped_unparseable_date, share, floor, partial}, warnings: [string], new, \
+                 skipped_unparseable_date, share, floor, partial}, completeness: \
+                 {verdict: ok|suspect|collapsed, unit, covered, expected, ratio, \
+                 suspect_below, collapse_below, bounded, missing, message}, \
+                 warnings: [string], new, \
                  changed, unchanged, removed, removals_suppressed, fresh_dumps[], \
                  newest_period, newest_url} — full-snapshot sync of the `dumps` dataset keyed \
                  by dump URL; `dumps_in_index` is the number of <dump> blocks SEEN and \
@@ -523,6 +595,7 @@ impl ScrapeApp for SmlouvyDumpWatch {
             "dumps_in_index": parse.blocks_seen,
             "dumps_parsed": parse.parsed(),
             "parse": parse.to_json(),
+            "completeness": parse.verdict().to_json(),
             "warnings": warnings,
             "removals_suppressed": removals_suppressed,
             "dumps_tracked": window.dumps.len(),

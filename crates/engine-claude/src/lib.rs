@@ -18,6 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info, warn};
 
+mod outcome;
+use outcome::{classify_error, RunOutcome};
+
 pub struct ClaudeEngine {
     cfg: ClaudeConfig,
 }
@@ -260,9 +263,13 @@ impl Researcher for ClaudeEngine {
         let (mut stdin, mut stdout_pipe, mut stderr_pipe) = scope.take_pipes()?;
 
         let prompt = req.prompt.clone();
+        // The delivery result is KEPT, not `let _ =`'d. A CLI that never
+        // received the prompt reads EOF, answers an empty question and exits 0
+        // with a perfectly valid, billed envelope — so every other signal on
+        // this path says success. This is the only place that knows otherwise.
         let writer = tokio::spawn(async move {
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-            let _ = stdin.shutdown().await;
+            stdin.write_all(prompt.as_bytes()).await?;
+            stdin.shutdown().await
         });
         // Drained concurrently with the wait, because a child that fills its
         // stdout pipe blocks forever if nobody reads it. `wait_with_output` used
@@ -270,10 +277,13 @@ impl Researcher for ClaudeEngine {
         // `kill_on_drop` as the only possible cleanup. Reading the pipes by hand
         // is the price of keeping `child` borrowable, and a borrowable child is
         // what makes an explicit process-tree kill possible at all.
+        // An io error mid-drain used to be discarded, which left a TRUNCATED
+        // buffer that was then parsed as if it were the whole envelope — a
+        // half-read answer scored as a complete one. The error now travels.
         let stdout_task = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf).await;
-            buf
+            stdout_pipe.read_to_end(&mut buf).await?;
+            std::io::Result::Ok(buf)
         });
         let stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -299,35 +309,63 @@ impl Researcher for ClaudeEngine {
         let waited = tokio::time::timeout_at(deadline, scope.wait()).await;
         let status = match waited {
             Ok(Ok(status)) => status,
-            Ok(Err(e)) => return Err(scope.abandon(format!("cli failed: {e}")).await),
+            // A failed `wait()` is OUR syscall failing, not the CLI timing
+            // out. It shared `Timeout`'s class — and therefore its
+            // `unmetered_timeout` ledger row, which asserts a paid call
+            // vanished — until `abandon` started taking its class.
+            Ok(Err(e)) => {
+                return Err(scope
+                    .abandon(RunOutcome::WaitFailed, format!("cli failed: {e}"))
+                    .await)
+            }
             Err(_) => {
                 return Err(scope
-                    .abandon(format!(
-                        "timed out after {}s waiting for the cli to exit",
-                        timeout.as_secs()
-                    ))
+                    .abandon(
+                        RunOutcome::TimedOut,
+                        format!(
+                            "timed out after {}s waiting for the cli to exit",
+                            timeout.as_secs()
+                        ),
+                    )
                     .await)
             }
         };
         // The child is gone, so the writer's pipe is closed and the task is
-        // finished or about to be — this cannot hang.
-        let _ = writer.await;
+        // finished or about to be — this cannot hang. Both failures are the
+        // same fact (the prompt may not have arrived) and are held until the
+        // run's cleanup below has run, so this path pays for no `taskkill`
+        // that the success path would not.
+        let undelivered = match writer.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("the prompt never reached the cli: {e}")),
+            Err(e) => Some(format!("the task delivering the prompt failed: {e}")),
+        };
         let drained = tokio::time::timeout_at(deadline, stdout_task).await;
         let stdout_bytes = match drained {
-            Ok(Ok(buf)) => buf,
+            Ok(Ok(Ok(buf))) => buf,
+            // The host's own drain failed; stdout was never fully read, so
+            // "not a parseable envelope" would be a claim about bytes nobody
+            // has seen.
+            Ok(Ok(Err(e))) => {
+                return Err(classify_error(RunOutcome::PipeFailure(format!(
+                    "reading cli stdout failed: {e}"
+                ))))
+            }
             Ok(Err(e)) => {
-                return Err(Error::claude(
-                    ClaudeFailure::Unparseable,
-                    format!("stdout reader failed: {e}"),
-                ))
+                return Err(classify_error(RunOutcome::PipeFailure(format!(
+                    "stdout reader failed: {e}"
+                ))))
             }
             Err(_) => {
                 return Err(scope
-                    .abandon(format!(
-                        "timed out after {}s draining cli stdout — a spawned process is still \
-                         holding the pipe open",
-                        timeout.as_secs()
-                    ))
+                    .abandon(
+                        RunOutcome::TimedOut,
+                        format!(
+                            "timed out after {}s draining cli stdout — a spawned process is \
+                             still holding the pipe open",
+                            timeout.as_secs()
+                        ),
+                    )
                     .await)
             }
         };
@@ -342,6 +380,14 @@ impl Researcher for ClaudeEngine {
         // same `Drop`, and a healthy run must not pay for a `taskkill`.
         scope.release();
 
+        // Checked after cleanup and BEFORE anything stdout says, because what
+        // stdout says is an answer to a question the CLI never received. This
+        // supersedes the exit status deliberately: whatever the child then did,
+        // it did without the prompt.
+        if let Some(why) = undelivered {
+            return Err(classify_error(RunOutcome::PromptUndelivered(why)));
+        }
+
         let stdout = String::from_utf8_lossy(&stdout_bytes);
         // A non-zero exit does NOT mean stdout is worthless: the CLI routinely
         // prints a complete envelope — cost and all — and then exits non-zero.
@@ -353,28 +399,30 @@ impl Researcher for ClaudeEngine {
             .and_then(|e| e["total_cost_usd"].as_f64());
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_bytes);
-            return Err(Error::claude_spent(
-                ClaudeFailure::NonZeroExit,
+            // `status.code()` is `None` only for a process a signal ended.
+            // `!success()` cannot tell the two apart, which is how a killed
+            // CLI came to be reported as having "exited non-zero".
+            return Err(classify_error(RunOutcome::Exited {
+                code: status.code(),
+                why: format!("exited with {}: {}", status, truncate(&stderr, 2000)),
                 reported_cost,
-                format!("exited with {}: {}", status, truncate(&stderr, 2000)),
-            ));
+            }));
         }
 
         let envelope = parsed.map_err(|e| {
-            Error::claude(
-                ClaudeFailure::Unparseable,
-                format!("unparseable cli output: {e}: {}", truncate(&stdout, 500)),
-            )
+            classify_error(RunOutcome::Unparseable(format!(
+                "unparseable cli output: {e}: {}",
+                truncate(&stdout, 500)
+            )))
         })?;
         if envelope["is_error"].as_bool() == Some(true) {
             // The most expensive failure shape there is: the run *happened*, so
             // the envelope's cost is money already spent. It rides out on the
             // error and the chokepoint meters it.
-            return Err(Error::claude_spent(
-                ClaudeFailure::CliError,
+            return Err(classify_error(RunOutcome::CliError {
+                why: format!("cli reported error: {}", envelope["result"]),
                 reported_cost,
-                format!("cli reported error: {}", envelope["result"]),
-            ));
+            }));
         }
 
         let text = envelope_text(&envelope);
@@ -453,8 +501,15 @@ impl RunScope {
 
     /// Takes the three piped handles. Called once, immediately after
     /// construction, which is why the child is necessarily still held.
+    ///
+    /// A missing handle here is a **`PipeFailure`, not a `Spawn`**: the spawn
+    /// already succeeded, so a child exists and may be spending. `Spawn` is
+    /// documented as "could not be started at all… nothing was spent" and
+    /// `ledger_event()` maps it to `None` — which meant a live child left no
+    /// cost row at all.
     fn take_pipes(&mut self) -> Result<(ChildStdin, ChildStdout, ChildStderr)> {
-        let missing = |what: &str| Error::claude(ClaudeFailure::Spawn, format!("no {what} handle"));
+        let missing =
+            |what: &str| classify_error(RunOutcome::PipeFailure(format!("no {what} handle")));
         let child = self.child.as_mut().ok_or_else(|| missing("child"))?;
         let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
@@ -501,7 +556,13 @@ impl RunScope {
     /// `write_all` into a pipe nobody will ever read again, and dropping the
     /// future (the old behaviour) never even reached the `writer.await` below it
     /// — `?` returned first, so the task leaked for the life of the process.
-    async fn abandon(&mut self, why: String) -> Error {
+    ///
+    /// `ending` is a parameter because this used to hardcode
+    /// `ClaudeFailure::Timeout` for all three of its callers, one of which is
+    /// a failed `wait()` syscall. The ledger derives its row from the class,
+    /// so that hardcode wrote `unmetered_timeout` — "a paid call vanished" —
+    /// about a call that may never have been paid for.
+    async fn abandon(&mut self, ending: fn(String) -> RunOutcome, why: String) -> Error {
         self.abort_tasks();
         let pid = self.pid;
         let outcome = match self.child.as_mut() {
@@ -509,10 +570,11 @@ impl RunScope {
             None => "already ended".to_string(),
         };
         self.child = None;
-        // Unreported by construction: a killed run produces no envelope, so what
-        // it spent is unknowable here. The chokepoint still records THAT it
-        // happened (`unmetered_timeout`) rather than leaving the ledger silent.
-        Error::claude(ClaudeFailure::Timeout, format!("{why}; {outcome}"))
+        // Unreported by construction: an abandoned run produces no envelope, so
+        // what it spent is unknowable here. The chokepoint still records THAT
+        // it happened rather than leaving the ledger silent — under the row its
+        // actual class earns, which is not always the timeout's.
+        classify_error(ending(format!("{why}; {outcome}")))
     }
 }
 
@@ -873,7 +935,8 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         check_shim_argv, envelope_text, is_plain_model_id, parse_loose_json, tree_kill_argv,
-        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, MAX_SHIM_COMMAND_LINE,
+        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, CMD_HOSTILE,
+        MAX_SHIM_COMMAND_LINE,
     };
     use pumper_core::config::{ClaudeConfig, ClaudeRole};
     use pumper_core::ResearchRequest;
@@ -882,6 +945,19 @@ mod tests {
 
     fn argv(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The anti-pattern: the characters cmd.exe mangles lived in two lists,
+    /// `CMD_HOSTILE` and a copy in the refusal test. Adding a character to
+    /// only one of them shipped — the door and the measurement had drifted
+    /// apart with nothing to say so.
+    #[test]
+    fn cmd_hostile_is_exactly_the_measured_set_not_a_second_list() {
+        const MEASURED: &[char] = &['%', '&', '|', '<', '>', '^', '\n', '\r'];
+        assert_eq!(
+            CMD_HOSTILE, MEASURED,
+            "the shim refusal set and the measured cmd.exe set are one rule"
+        );
     }
 
     /// THE anti-pattern this guard exists for: cmd.exe re-parses the shim line,

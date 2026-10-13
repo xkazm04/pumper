@@ -132,7 +132,9 @@ impl ScrapeApp for StateLicensing {
                 "{source, year, trades_run: [..], trades_skipped: [..], \
                  trades_resumed: [..], records, coverage: {<trade>: {unit, covered, \
                  expected, ratio, floor, short, missing, states_covered, \
-                 states_expected, missing_states}}, warnings: [string], new, \
+                 states_expected, missing_states}}, completeness: {<trade>: {verdict: \
+                 ok|suspect|collapsed, unit, covered, expected, ratio, suspect_below, \
+                 collapse_below, bounded, missing, message}}, warnings: [string], new, \
                  changed, unchanged, rejected: [..], \
                  rejected_count, unified: {dataset, trust, new, changed, unchanged, \
                  inputs_truncated, join_complete}, index_datasets, cost_usd (null when no \
@@ -208,6 +210,10 @@ impl ScrapeApp for StateLicensing {
         let mut trades_resumed: Vec<String> = Vec::new();
         let mut trades_skipped: Vec<String> = Vec::new();
         let mut coverage = serde_json::Map::new();
+        // The VERDICT per trade, beside the number. Per trade for the same
+        // reason the coverage is: this app's roster is the 51 jurisdictions,
+        // re-asked once per trade.
+        let mut completeness = serde_json::Map::new();
         // The family's shared "a near-total rejection is not a silent success"
         // channel (see `trades_common::coverage`). Per trade, because this app's
         // roster is per trade.
@@ -230,6 +236,13 @@ impl ScrapeApp for StateLicensing {
                 trades_resumed.push(label.to_string());
                 if let Some(cov) = done.get("coverage") {
                     coverage.insert(label.to_string(), cov.clone());
+                }
+                // Replayed, not recomputed, for the same reason the warning is:
+                // the answer that produced it was consumed by an earlier
+                // attempt. A checkpoint written before this field existed
+                // simply has no verdict to replay.
+                if let Some(v) = done.get("completeness") {
+                    completeness.insert(label.to_string(), v.clone());
                 }
                 // A resumed trade replays its recorded warning verbatim: a
                 // shortfall paid for in an earlier attempt is still a shortfall
@@ -304,12 +317,21 @@ impl ScrapeApp for StateLicensing {
             if let Some(w) = &trade_warning {
                 warnings.push(format!("{label}: {w}"));
             }
+            // **The verdict this coverage was computed for.** 10 of 51
+            // jurisdictions for a trade is not a short answer, it is a
+            // different answer -- and it used to be a green job with a string.
+            let verdict = cov.judge(trades_common::coverage::upsert_disposition(
+                trades_common::allow_shrink(&ctx),
+            ));
+            let trade_completeness = verdict.to_json();
+            completeness.insert(label.to_string(), trade_completeness.clone());
             if present.is_empty() {
                 return Err(Error::App(format!(
                     "state-licensing: agent JSON for trade {label} contained no plausible \
                      state records"
                 )));
             }
+            verdict.guard()?;
 
             // Partial-scope runs are the norm (per-trade chunking + vintage
             // skips), so this is an idempotent JOIN-style upsert — never a
@@ -360,6 +382,7 @@ impl ScrapeApp for StateLicensing {
                 label.to_string(),
                 json!({
                     "coverage": trade_coverage,
+                    "completeness": trade_completeness,
                     "warning": trade_warning,
                     "records": records.len(),
                     "rejected": trade_rejected_json,
@@ -387,6 +410,7 @@ impl ScrapeApp for StateLicensing {
             "trades_resumed": trades_resumed,
             "records": records_total,
             "coverage": coverage,
+            "completeness": completeness,
             "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),

@@ -162,11 +162,11 @@ impl HealthStore {
         app: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SourceHealth>> {
-        let rows: Vec<SourceRow> = sqlx::query_as(&format!(
+        let rows: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "{SOURCE_COLUMNS_LIST_SQL} \
              WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR app = ?2) \
              ORDER BY degradation_score DESC, id ASC LIMIT ?3"
-        ))
+        )))
         .bind(state)
         .bind(app)
         .bind(limit)
@@ -217,11 +217,12 @@ impl HealthStore {
     /// rows rather than accumulated in a counter, so it cannot drift out of sync
     /// with the history it claims to summarize.
     async fn recent_trips(&self, id: &str, n: i64, degrade_score: f64) -> Result<u32> {
-        let scores: Vec<f64> = sqlx::query_scalar(
+        let scores: Vec<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT score FROM source_runs WHERE source_id = ?1 \
-             AND verdict IN ('ok', 'broken', 'self_inflicted') \
+             AND verdict IN {} \
              ORDER BY created_at DESC LIMIT ?2",
-        )
+            RunVerdict::JUDGED_SQL
+        )))
         .bind(id)
         .bind(n)
         .fetch_all(&self.pool)
@@ -247,17 +248,69 @@ impl HealthStore {
         degrade_score: f64,
         limit: i64,
     ) -> Result<u32> {
-        let scores: Vec<f64> = sqlx::query_scalar(
+        let scores: Vec<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT score FROM source_runs WHERE source_id = ?1 \
-             AND verdict IN ('ok', 'broken', 'self_inflicted') AND created_at > ?2 \
+             AND verdict IN {} AND created_at > ?2 \
              ORDER BY created_at DESC LIMIT ?3",
-        )
+            RunVerdict::JUDGED_SQL
+        )))
         .bind(id)
         .bind(since)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(detect::consecutive_clean(&scores, degrade_score))
+    }
+
+    /// The source's recorded runs since `since` (its `state_since`), newest
+    /// first, as retirement reads them.
+    ///
+    /// Scoped to the current state's lifetime for the same reason the recovery
+    /// streak is: when an operator un-retires a source, the dead runs that
+    /// retired it are behind the new `state_since`, so they cannot re-retire it
+    /// on the very next run.
+    async fn retire_history(
+        &self,
+        id: &str,
+        since: &str,
+        limit: i64,
+    ) -> Result<Vec<detect::RetireRun>> {
+        let rows: Vec<(Option<i64>, Option<i64>, String)> = sqlx::query_as(
+            "SELECT fetch_permanent, fetch_roster, created_at FROM source_runs \
+             WHERE source_id = ?1 AND created_at > ?2 ORDER BY created_at DESC LIMIT ?3",
+        )
+        .bind(id)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(permanent, roster, at)| {
+                let at = DateTime::parse_from_rfc3339(&at).ok()?.with_timezone(&Utc);
+                Some(detect::RetireRun::stored(permanent, roster, at))
+            })
+            .collect())
+    }
+
+    /// The cadence of the schedule that enqueued `job_id`, read from when that
+    /// schedule's jobs were created (the median gap). `None` for a job no
+    /// schedule enqueued, or a schedule that has fired fewer than twice.
+    async fn schedule_cadence(&self, job_id: &str) -> Result<Option<Duration>> {
+        let fired: Vec<String> = sqlx::query_scalar(
+            "SELECT created_at FROM jobs WHERE schedule_id IS NOT NULL AND schedule_id = \
+                 (SELECT schedule_id FROM jobs WHERE id = ?1) \
+             ORDER BY created_at DESC LIMIT 8",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let fired: Vec<DateTime<Utc>> = fired
+            .iter()
+            .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .collect();
+        Ok(detect::cadence_from_firings(&fired))
     }
 
     /// The rolling baseline: per-field sketches from the last `window` runs this
@@ -433,17 +486,27 @@ impl HealthStore {
         state: SourceState,
         state_changed: bool,
         trips: u32,
+        // Why the state moved, when something other than the ladder moved it
+        // (retirement). `None` clears the reason on a transition, as before.
+        state_reason: Option<&str>,
     ) -> Result<()> {
         let now = ts(Utc::now());
         let job = job_id.to_string();
+        // Retirement's denominator. Both NULL when the app reports no roster:
+        // a permanent count with nothing to divide it by is not a measurement.
+        let (fetch_permanent, fetch_roster) = match report.fetch.roster {
+            Some(roster) => (Some(report.fetch.permanent as i64), Some(roster as i64)),
+            None => (None, None),
+        };
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let outcome: Result<()> = async {
             sqlx::query(
                 "INSERT OR REPLACE INTO source_runs (source_id, job_id, docs, fetch_ok_rate, \
                      d_text, d_dom, d_val, compared, verdict, diagnosis, score, reasons, \
-                     state_after, build_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     state_after, build_id, created_at, fetch_permanent, fetch_roster) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                         ?16, ?17)",
             )
             .bind(id)
             .bind(&job)
@@ -460,6 +523,8 @@ impl HealthStore {
             .bind(state.as_str())
             .bind(report.build_id.as_deref())
             .bind(&now)
+            .bind(fetch_permanent)
+            .bind(fetch_roster)
             .execute(&mut *conn)
             .await?;
 
@@ -498,7 +563,7 @@ impl HealthStore {
             sqlx::query(
                 "UPDATE sources SET state = ?2, degradation_score = ?3, \
                     state_since = CASE WHEN ?4 THEN ?5 ELSE state_since END, \
-                    state_reason = CASE WHEN ?4 THEN NULL ELSE state_reason END, \
+                    state_reason = CASE WHEN ?4 THEN ?8 ELSE state_reason END, \
                     last_verdict = ?6, last_verdict_at = ?5, tripped_of_last3 = ?7, \
                     updated_at = ?5 WHERE id = ?1",
             )
@@ -509,6 +574,7 @@ impl HealthStore {
             .bind(&now)
             .bind(eval.verdict.as_str())
             .bind(trips as i64)
+            .bind(state_reason)
             .execute(&mut *conn)
             .await?;
             Ok(())
@@ -633,18 +699,18 @@ impl HealthStore {
              WHERE n.source_id = {t}.source_id \
                AND n.created_at >= (SELECT r.created_at FROM source_runs AS r \
                                     WHERE r.source_id = {t}.source_id AND r.job_id = {t}.job_id))";
-        let sketches = sqlx::query(&format!(
+        let sketches = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM field_sketches WHERE {} > ?1",
             newer_than_mine.replace("{t}", "field_sketches")
-        ))
+        )))
         .bind(keep)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        let runs = sqlx::query(&format!(
+        let runs = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM source_runs WHERE {} > ?1",
             newer_than_mine.replace("{t}", "source_runs")
-        ))
+        )))
         .bind(keep)
         .execute(&self.pool)
         .await?
@@ -692,10 +758,65 @@ impl Resilience {
         self.store.is_some()
     }
 
-    /// Whether verdicts are allowed to gate anything. `false` is the shipping
-    /// default: compute and store everything, change nothing.
+    /// Whether the **fleet-wide** flip is on: `[resilience] enforce`, which
+    /// arms every source at once.
+    ///
+    /// This is narrower than it used to be, and the narrowing is the point.
+    /// `enforce` is no longer the only way a source gets armed, so a caller
+    /// asking "is anything being gated" wants [`enforcing_any`](Self::enforcing_any)
+    /// and a caller asking about one source wants [`armed`](Self::armed). This
+    /// answers only the configured fleet-wide intent — which is what a startup
+    /// log line and the `enforcing` field of the health routes report.
     pub fn enforcing(&self) -> bool {
         self.cfg.enabled && self.cfg.enforce
+    }
+
+    /// Whether ANY source is armed — the cheap short-circuit.
+    ///
+    /// The four worker gates and the health routes ask this before walking a
+    /// per-pair loop, so soak mode (`enforce = false`, empty `enforce_sources`)
+    /// stays what it has always been: zero health reads on the write path, not
+    /// one read per dataset per job that always answers `Healthy`.
+    pub fn enforcing_any(&self) -> bool {
+        self.cfg.enabled
+            && super::detect::enforcement_armed_anywhere(
+                self.cfg.enforce,
+                &self.cfg.enforce_sources,
+            )
+    }
+
+    /// Whether enforcement is armed for this one source.
+    ///
+    /// `cfg.enabled` fronts the predicate deliberately and must stay in front
+    /// of it: `enforce = false` is no longer an absolute kill switch now that a
+    /// list can arm sources without it, so the absolute off has to survive
+    /// somewhere, and that somewhere is `enabled = false`.
+    pub fn armed(&self, app: &str, dataset: &str) -> bool {
+        self.armed_source(&super::source_id(app, dataset))
+    }
+
+    /// [`armed`](Self::armed) by source id, for callers that already hold one
+    /// (the health routes render rows keyed by id).
+    pub fn armed_source(&self, source_id: &str) -> bool {
+        self.cfg.enabled
+            && super::detect::enforcement_armed(
+                self.cfg.enforce,
+                &self.cfg.enforce_sources,
+                source_id,
+            )
+    }
+
+    /// The arming posture as the preview reports it: what is armed, and which
+    /// configured entries are redundant. Built here so `cfg.enabled` fronts the
+    /// preview's view of arming exactly as it fronts the gate's.
+    pub fn arming(&self) -> super::preview::Arming {
+        if !self.cfg.enabled {
+            return super::preview::Arming::default();
+        }
+        super::preview::Arming {
+            enforce: self.cfg.enforce,
+            sources: self.cfg.enforce_sources.clone(),
+        }
     }
 
     pub fn store(&self) -> Option<&HealthStore> {
@@ -733,10 +854,16 @@ impl Resilience {
         }
     }
 
-    /// The state that governs enforcement: always `Healthy` while `enforce` is
-    /// off, so soak mode cannot gate anything even by accident.
+    /// The state that governs enforcement: always `Healthy` for a source that
+    /// is not armed, so an unarmed source cannot be gated even by accident.
+    ///
+    /// This is the one place arming is decided. The signature always carried
+    /// the source identity and used to throw it away; now [`armed`](Self::armed)
+    /// consults it, and every one of the enforcement consumers inventoried by
+    /// `every_enforced_state_consumer_is_named_in_the_preview_inventory`
+    /// becomes per-source without moving a single call site.
     pub async fn enforced_state(&self, app: &str, dataset: &str) -> SourceState {
-        if !self.enforcing() {
+        if !self.armed(app, dataset) {
             return SourceState::Healthy;
         }
         self.state(app, dataset).await
@@ -763,7 +890,7 @@ impl Resilience {
         let checks: Vec<InvariantCheck> =
             invariants::check(&invariants, run.docs.iter().map(|d| &d.values), &sketches);
 
-        let eval = detect::evaluate(
+        let mut eval = detect::evaluate(
             &self.cfg,
             &detect::RunInput {
                 docs: run.docs.len() as u32,
@@ -774,6 +901,41 @@ impl Resilience {
                 drift,
             },
         );
+
+        // Cohort-less detection: where the cohort was too small for the
+        // distributional tests, the source's golden documents may still judge
+        // the run. Only a `below_cohort` run is eligible — every other verdict
+        // was reached by a rule the goldens have no business overriding.
+        if eval.verdict == RunVerdict::BelowCohort {
+            let goldens = crate::golden::goldens(&store.pool, &id).await?;
+            if !goldens.is_empty() {
+                let by_key = crate::golden::generations_by_key(goldens);
+                let observations: Vec<crate::golden::GoldenObservation> = run
+                    .docs
+                    .iter()
+                    .filter_map(|d| {
+                        by_key
+                            .get(&d.key)
+                            .map(|(g, _)| crate::golden::GoldenObservation {
+                                expected: &g.expected,
+                                observed: &d.values,
+                                stable_fields: &g.stable_fields,
+                            })
+                    })
+                    .collect();
+                crate::golden::apply_golden_verdict(
+                    &mut eval,
+                    &observations,
+                    self.cfg.degrade_score,
+                );
+            }
+        }
+
+        // Retirement, BEFORE the fetch gate's consequences: a dead source's
+        // runs are all `inconclusive` (its fetches fail), and an inconclusive
+        // run moves nothing on the ladder, so behind the gate a dead source
+        // could never retire. It is judged on its own denominator instead.
+        let retire = self.retirement_due(store, &id, &source, run).await?;
 
         // An unjudged run moves nothing: not the state, not the trip count, and
         // not the recovery streak — a source cannot heal on a run nobody judged.
@@ -816,6 +978,11 @@ impl Resilience {
         } else {
             (previous_state, source.tripped_of_last3 as u32)
         };
+        let (state, state_reason) = if retire {
+            (SourceState::Retired, Some(detect::RETIRED_REASON))
+        } else {
+            (state, None)
+        };
 
         store
             .commit_run(
@@ -827,6 +994,7 @@ impl Resilience {
                 state,
                 state != previous_state,
                 trips,
+                state_reason,
             )
             .await?;
 
@@ -854,6 +1022,37 @@ impl Resilience {
             reasons: eval.reasons,
             drift: eval.drift,
         }))
+    }
+
+    /// Whether this run retires the source: it is listed in `[resilience]
+    /// auto_retire`, not already retired, and it and the runs before it since
+    /// the last transition satisfy [`detect::retirement_due`] at the cadence of
+    /// the schedule that enqueued it.
+    ///
+    /// Cheap first: an unlisted source, or a current run that is not itself
+    /// dead, costs no query at all.
+    async fn retirement_due(
+        &self,
+        store: &HealthStore,
+        id: &str,
+        source: &SourceHealth,
+        run: &RunReport<'_>,
+    ) -> Result<bool> {
+        if !detect::retirement_enrolled(&self.cfg.auto_retire, id, source.state) {
+            return Ok(false);
+        }
+        let current = detect::RetireRun::current(run.fetch, Utc::now());
+        if !current.dead() {
+            return Ok(false);
+        }
+        let mut runs = vec![current];
+        runs.extend(
+            store
+                .retire_history(id, &source.state_since, detect::RETIRE_RUNS as i64 - 1)
+                .await?,
+        );
+        let cadence = store.schedule_cadence(&run.job_id.to_string()).await?;
+        Ok(detect::retirement_due(&runs, cadence))
     }
 
     /// Cohort drift: the median per-key drift over keys present in both this run

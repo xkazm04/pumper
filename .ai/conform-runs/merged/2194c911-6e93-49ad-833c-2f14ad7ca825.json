@@ -1,0 +1,196 @@
+{
+  "schema": "conform-run/1",
+  "worker": "2194c911-6e93-49ad-833c-2f14ad7ca825",
+  "subject": "structured-output",
+  "evaluatedAt": "2026-10-13T13:02:04.905824+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [
+    {
+      "context": "web-crawl-extraction",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/apps/extractor/src/induce.rs:3 Grep for prompt, salvage, and json_schema in web-crawl-extraction returned zero hits, as extraction is performed via compiled deterministic selector rules and statistical DOM induction without generative model pipelines.",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:3 Precondition does not hold as extraction uses DOM heuristics without generative models."
+        }
+      ],
+      "absenceTerms": [
+        "prompt",
+        "salvage",
+        "json_schema"
+      ]
+    },
+    {
+      "context": "wasm-plugins",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "plugins-src/title-extractor/src/lib.rs:39 Grep for prompt, salvage, claude, and llm across plugins-src returned zero hits, as plugins execute compiled WebAssembly modules for deterministic string slicing and JSON manipulation without generative model output.",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:39 Precondition does not hold as WASM extraction uses deterministic substring matching without generative models."
+        }
+      ],
+      "absenceTerms": [
+        "prompt",
+        "salvage",
+        "claude",
+        "llm"
+      ]
+    },
+    {
+      "context": "core-extraction",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/json_salvage.rs:10 salvage_json recovers JSON from raw agent text but returns an anonymous Option<Value> that discards the fired strategy, omits bounds on input text and openers, and fails to continue past a malformed first brace.",
+      "techniques": [
+        {
+          "technique": "extraction-strategies",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:10 Returns an Option<Value> discarding the fired strategy, omits size and opener bounds on balanced-span detection, and stops on the first brace rather than trying subsequent openers."
+        },
+        {
+          "technique": "extraction-observability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:20 Emits no strategy-fired counter, repair-loop depth, or failure diagnostic samples from the salvage ladder."
+        },
+        {
+          "technique": "schema-validation-and-repair",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/json_salvage.rs:12 Accepts any arbitrary unvalidated Value without enforcing a schema or generating path-addressed errors for a bounded repair loop."
+        }
+      ]
+    },
+    {
+      "context": "ai-extraction-engines",
+      "subject": "structured-output",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/engine-claude/src/lib.rs:135 engine-claude passes --json-schema on argv alongside --allowedTools without asserting mutual exclusion at the assembly boundary, allowing schema constraints to suppress tool emissions on acting turns.",
+      "techniques": [
+        {
+          "technique": "constraint-and-tool-channel-exclusion",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:135 Appends --json-schema without asserting that allowed_tools is empty, allowing schema constraints to suppress tool emissions on acting turns."
+        },
+        {
+          "technique": "extraction-strategies",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:433 Collapses loose JSON parsing into an anonymous Option<Value> without recording which strategy fired and runs an unbounded substring loop."
+        },
+        {
+          "technique": "output-budget-signal",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:445 Records dollar cost and CLI turns but collects no output size metric against the model ceiling to detect approaching truncation."
+        },
+        {
+          "technique": "extraction-observability",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:438 Logs a single boolean structured flag instead of emitting chokepoint metrics for strategy rungs or failure categories."
+        },
+        {
+          "technique": "constrained-decoding-is-a-shared-budget",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-claude/src/lib.rs:134 Precondition does not hold as the engine is the sole schema claimant on each request rather than contended independently authored constraints requiring priority shedding."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "structured-output",
+      "context": "content-monitoring",
+      "reason": "withdrawn after review: reviewer (sonnet): The technique anchor research/src/lib.rs:641 is `is_report_shaped` and says nothing about citations or grounding (the word 'citation' never appears in that file), so that claim is unsupported. The 515, 550 and 592 anchors did check out."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-13T13:02:04.905824+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "structured-output"
+      ],
+      "techniques": [
+        "extraction-strategies"
+      ],
+      "deviations": 0,
+      "context": "web-crawl-extraction",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T13:02:04.905824+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "structured-output"
+      ],
+      "techniques": [
+        "extraction-strategies"
+      ],
+      "deviations": 0,
+      "context": "wasm-plugins",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T13:02:04.905824+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "structured-output"
+      ],
+      "techniques": [
+        "extraction-observability",
+        "extraction-strategies",
+        "schema-validation-and-repair"
+      ],
+      "deviations": 1,
+      "context": "core-extraction",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T13:02:04.905824+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "structured-output"
+      ],
+      "techniques": [
+        "constrained-decoding-is-a-shared-budget",
+        "constraint-and-tool-channel-exclusion",
+        "extraction-observability",
+        "extraction-strategies",
+        "output-budget-signal"
+      ],
+      "deviations": 1,
+      "context": "ai-extraction-engines",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-13T13:02:04.905824+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "structured-output"
+      ],
+      "techniques": [
+        "answer-coverage-gating",
+        "display-vs-machine-channels",
+        "extraction-strategies",
+        "graded-span-grounding",
+        "schema-validation-and-repair"
+      ],
+      "deviations": 1,
+      "context": "content-monitoring",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}

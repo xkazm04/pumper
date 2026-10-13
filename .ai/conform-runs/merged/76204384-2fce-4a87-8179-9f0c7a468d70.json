@@ -1,0 +1,170 @@
+{
+  "schema": "conform-run/1",
+  "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
+  "subject": "eval-harness",
+  "evaluatedAt": "2026-10-13T09:47:49.107352+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [
+    {
+      "context": "ci-quality-gates",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/ci/lane-certify.mjs:169 These scripts check deterministic contracts and numeric lane bounds; searches found no rubric, holdout, or pairwise occurrences in scripts/ci, placing this machinery outside model-evaluation scope.",
+      "techniques": [
+        {
+          "technique": "certification-levels",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:7 These are test-harness long-lane certifications, rather than theoretical and empirical certification of agent journeys."
+        },
+        {
+          "technique": "judge-stability",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:127 The function called judge applies numeric bounds; it does not invoke a model judge."
+        },
+        {
+          "technique": "reliability-aggregation",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:84 This aggregation selects a percentile of measured samples, rather than any-of-N or all-of-N model-trial success."
+        },
+        {
+          "technique": "selection-over-noise",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-record.mjs:18 The recorder retains test outcomes rather than selecting a maximum over scored model attempts."
+        }
+      ],
+      "absenceTerms": [
+        "rubric",
+        "holdout",
+        "pairwise"
+      ]
+    },
+    {
+      "context": "docs-and-ops-scripts",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/docs/check-doc-sync.mjs:222 The hook deterministically identifies unmatched documentation edits rather than running scored model scenarios, and searches found no rubric, holdout, or pairwise occurrences in scripts/docs.",
+      "techniques": [
+        {
+          "technique": "monitor-inside-the-loop",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:311 The reviewer is a deterministic path-map check, not a model monitor gating a scored optimization loop."
+        }
+      ],
+      "absenceTerms": [
+        "rubric",
+        "holdout",
+        "pairwise"
+      ]
+    },
+    {
+      "context": "core-platform-services",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/tests/eval_tier3_extraction.rs:488 The extraction eval gates each case against its recording-time score, violating metric-role-contract's explicit prohibition on deriving a threshold from the baseline being preserved.",
+      "techniques": [
+        {
+          "technique": "assertion-vs-judgment",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:435 Mechanical pipeline invariants gate the deterministic extraction scorer; the suite also checks trace fields, Markdown, call count, cost propagation, and fixture-grounded terms without a model judge."
+        },
+        {
+          "technique": "judge-stability",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:314 The inspected extraction eval uses a deterministic scorer over recorded text, not a model judge."
+        },
+        {
+          "technique": "metric-role-contract",
+          "verdict": "deviation",
+          "evidence": "evals/tier3-extraction/manifest.json:26 The manifest explicitly derives the gate threshold from the first measurement, a failure named by this technique."
+        },
+        {
+          "technique": "resolution-precondition",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:516 This replay reports a corpus mean and per-case regression results, rather than a ranking of model or prompt conditions."
+        }
+      ],
+      "registryProposal": "Clarify whether metric-role-contract's prohibition on baseline-derived thresholds covers frozen regression ratchets, which comparison-modes otherwise recognizes as absolute gates."
+    }
+  ],
+  "declined": [
+    {
+      "subject": "eval-harness",
+      "context": "content-monitoring",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "eval-harness",
+      "context": "e2e-data-integrity",
+      "reason": "withdrawn after review: reviewer (sonnet): The primary anchor engine_conformance.rs:289 is a doc comment opening a Browser-stub description, so it does not itself show that model-quality measurement is absent; only the technique anchors (lines 31 and dataset_reads.rs:9) carry the claim, and the other listed e2e files (vcr_attempts, search_de"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-13T09:47:49.107352+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "eval-harness"
+      ],
+      "techniques": [
+        "certification-levels",
+        "judge-stability",
+        "reliability-aggregation",
+        "selection-over-noise"
+      ],
+      "deviations": 0,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "ts": "2026-10-13T09:47:49.107352+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "eval-harness"
+      ],
+      "techniques": [
+        "monitor-inside-the-loop"
+      ],
+      "deviations": 0,
+      "context": "docs-and-ops-scripts",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "ts": "2026-10-13T09:47:49.107352+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "eval-harness"
+      ],
+      "techniques": [
+        "assertion-vs-judgment",
+        "judge-stability",
+        "metric-role-contract",
+        "resolution-precondition"
+      ],
+      "deviations": 1,
+      "context": "core-platform-services",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "ts": "2026-10-13T09:47:49.107352+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "eval-harness"
+      ],
+      "techniques": [
+        "comparison-modes",
+        "judge-stability"
+      ],
+      "deviations": 0,
+      "context": "e2e-data-integrity",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}

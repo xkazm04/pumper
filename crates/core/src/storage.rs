@@ -21,6 +21,138 @@ const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, prio
                            target_key, result, error, requeue_reason, cause_kind, created_at, \
                            available_at, started_at, finished_at";
 
+/// The queue list's predicate set, as a struct rather than a growing row of
+/// positional `Option`s.
+///
+/// Every field is a column the `jobs` table already carries and an index
+/// already covers: `app` (`idx_jobs_app`), `status` (`idx_jobs_claim`),
+/// `schedule_id` (0012 `idx_jobs_schedule`), `trigger_id` (0014
+/// `idx_jobs_trigger`), `target_key` (0041 `idx_jobs_status_target`). The
+/// `created_at` window rides the same `(…, created_at DESC)` index tails the
+/// `ORDER BY` does.
+///
+/// A struct, not six more arguments, for two reasons: `list_page` would be
+/// nine positional parameters and fail `clippy::too_many_arguments`, and a
+/// new predicate is then additive at every call site instead of a signature
+/// churn across the tree.
+///
+/// **The window is half-open — `[since, until)`.** An inclusive upper bound
+/// makes a day-at-a-time walk return the boundary row in both pages, which
+/// is the error that makes a per-window count untrustworthy rather than
+/// merely off by one.
+#[derive(Debug, Clone, Default)]
+pub struct JobQuery {
+    pub app: Option<String>,
+    pub status: Option<JobStatus>,
+    pub schedule_id: Option<String>,
+    pub trigger_id: Option<String>,
+    pub target_key: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub since: Option<DateTime<Utc>>,
+    /// **Exclusive** upper bound on `created_at`.
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl JobQuery {
+    /// The unfiltered list — every job, newest first.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// One app's jobs and nothing else, the commonest single-predicate form.
+    pub fn for_app(app: &str) -> Self {
+        Self {
+            app: Some(app.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Appends `AND <col> = ?` for **only the predicates actually supplied**,
+/// binding every value.
+///
+/// This is the whole reason the queue list is built with a
+/// [`sqlx::QueryBuilder`] rather than one static statement with a
+/// `(?n IS NULL OR col = ?n)` clause per column. That nullable-parameter
+/// idiom reads as equivalent and is not: SQLite cannot use an index for a
+/// term it cannot prove is an equality at *planning* time, so a statement
+/// written that way **full-scans `jobs`** no matter which of the five
+/// columns the caller filtered on. The indexes 0012/0014/0041 paid for
+/// would stay exactly as unreachable as they were before this surface
+/// existed — the filter would work and the index would not. The plan is
+/// asserted, not assumed: see `Storage::explain_job_list` and the
+/// `trigger_filter_rides_idx_jobs_trigger` test in
+/// `crates/core/tests/jobs.rs`.
+///
+/// Values are **bound**, never interpolated. The only text this function
+/// pushes is its own column names.
+fn push_job_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, q: &JobQuery) {
+    if let Some(app) = &q.app {
+        qb.push(" AND app = ");
+        qb.push_bind(app.clone());
+    }
+    if let Some(status) = q.status {
+        qb.push(" AND status = ");
+        qb.push_bind(status.as_str());
+    }
+    if let Some(schedule_id) = &q.schedule_id {
+        qb.push(" AND schedule_id = ");
+        qb.push_bind(schedule_id.clone());
+    }
+    if let Some(trigger_id) = &q.trigger_id {
+        qb.push(" AND trigger_id = ");
+        qb.push_bind(trigger_id.clone());
+    }
+    if let Some(target_key) = &q.target_key {
+        qb.push(" AND target_key = ");
+        qb.push_bind(target_key.clone());
+    }
+    if let Some(since) = q.since {
+        qb.push(" AND created_at >= ");
+        qb.push_bind(crate::datasets::ts(since));
+    }
+    if let Some(until) = q.until {
+        qb.push(" AND created_at < ");
+        qb.push_bind(crate::datasets::ts(until));
+    }
+}
+
+/// The ONE assembler behind every job-list read: `list`, `list_page`, the
+/// `GROUP BY status` rollup, and the `EXPLAIN QUERY PLAN` probe all take
+/// their `WHERE` from here, so no two of them can disagree about what a
+/// filter means. `select` is the projection (and, for the probe, carries
+/// the `EXPLAIN QUERY PLAN` prefix).
+fn job_query_builder(
+    select: &str,
+    q: &JobQuery,
+    after: Option<&(String, String)>,
+    order_and_limit: Option<i64>,
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    // `WHERE 1 = 1` so every predicate below is uniformly ` AND …`; SQLite
+    // folds the constant away before planning, which the plan assertion in
+    // `crates/core/tests/jobs.rs` is what actually proves.
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("{select} FROM jobs WHERE 1 = 1"));
+    push_job_filters(&mut qb, q);
+    if let Some((after_ts, after_id)) = after {
+        qb.push(" AND (created_at < ");
+        qb.push_bind(after_ts.as_str());
+        qb.push(" OR (created_at = ");
+        qb.push_bind(after_ts.as_str());
+        qb.push(" AND id < ");
+        qb.push_bind(after_id.as_str());
+        qb.push("))");
+    }
+    if let Some(limit) = order_and_limit {
+        qb.push(if after.is_some() {
+            " ORDER BY created_at DESC, id DESC LIMIT "
+        } else {
+            " ORDER BY created_at DESC LIMIT "
+        });
+        qb.push_bind(limit);
+    }
+    qb
+}
+
 /// The claim's in-flight exclusion by target: a job whose `target_key` is
 /// already held by a `running` row is not the row this claim picks.
 ///
@@ -379,6 +511,20 @@ pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
 }
 
+/// Every non-internal table name in `sqlite_master`.
+///
+/// The `sqlite_%` filter lives here rather than in `crate::schema` so that
+/// module stays free of SQLite trivia and testable without a database.
+async fn observed_tables(pool: &SqlitePool) -> Result<std::collections::BTreeSet<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT name FROM sqlite_master WHERE type = 'table'          AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
+}
+
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
 /// re-queues anything that was mid-flight when the process died.
 #[derive(Clone)]
@@ -431,12 +577,63 @@ impl Storage {
         // schema. No-ops for fresh/up-to-date/in-memory databases, so the test
         // harness (`testing::TempStore`) never writes a backup — see
         // `backup::backup_decision`.
-        let migrator = migrator();
+        let mut migrator = migrator();
+        let db = cfg.database_path.display().to_string();
+
+        // POST-CONDITION, HALF ONE — before the chain runs, because a store
+        // ahead of this binary must not be touched at all. `classify` is the
+        // two-directional ledger compare; the old code could only see versions
+        // this binary had that the store lacked, so a store a NEWER pumper had
+        // already migrated was indistinguishable from one in sync.
+        let applied = crate::backup::applied_versions(&pool).await;
+        let available = crate::backup::available_versions(&migrator);
+        let verdict = crate::schema::classify(&applied, &available);
+        if !verdict.ahead().is_empty() {
+            if !cfg.allow_schema_ahead {
+                return Err(Error::Schema(crate::schema::ahead_refusal(
+                    &db,
+                    verdict.ahead(),
+                    available.iter().copied().max(),
+                )));
+            }
+            tracing::warn!(
+                ahead = ?verdict.ahead(),
+                db = %db,
+                "booting against a store AHEAD of this binary because                  [storage] allow_schema_ahead = true; its newer columns and                  constraints are invisible to this build"
+            );
+            // sqlx refuses to run a chain whose ledger holds versions it does
+            // not carry. The operator opened the door explicitly, so the
+            // migrator is told to tolerate what the refusal above described.
+            migrator.set_ignore_missing(true);
+        }
+
         crate::backup::backup_before_migrations(&pool, &cfg.database_path, &migrator).await;
         migrator
             .run(&pool)
             .await
             .map_err(|e| Error::Storage(sqlx::Error::Migrate(Box::new(e))))?;
+
+        // POST-CONDITION, HALF TWO — the chain claims to have run; check that
+        // it actually produced the inventory it promises. This is drift BELOW
+        // the ledger (an interrupted migration, a hand-restored partial copy, a
+        // table dropped out of band), which no version comparison can see.
+        // Extra tables are reported, never fatal: an operator's scratch table
+        // is not a fault.
+        let observed = observed_tables(&pool).await?;
+        let drift = crate::schema::table_drift(&observed, crate::schema::EXPECTED_TABLES);
+        if !drift.missing.is_empty() {
+            return Err(Error::Schema(crate::schema::missing_tables_refusal(
+                &db,
+                &drift.missing,
+            )));
+        }
+        if !drift.unexpected.is_empty() {
+            tracing::info!(
+                tables = ?drift.unexpected,
+                db = %db,
+                "store carries tables the migration chain does not create"
+            );
+        }
 
         Ok(Self {
             pool,
@@ -558,7 +755,7 @@ impl Storage {
 
     async fn get_by_idempotency_key(&self, key: &str) -> Result<Option<Job>> {
         let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE idempotency_key = ?1");
-        let row: Option<JobRow> = sqlx::query_as(&sql)
+        let row: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -614,7 +811,7 @@ impl Storage {
         );
         let row = self
             .metered(StoreOp::JobClaim, |mut conn| async move {
-                let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(now());
+                let mut query = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql)).bind(now());
                 for app in blocked {
                     query = query.bind(app);
                 }
@@ -897,30 +1094,17 @@ impl Storage {
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Job>> {
         let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
-        let row: Option<JobRow> = sqlx::query_as(&sql)
+        let row: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await?;
         row.map(Job::try_from).transpose()
     }
 
-    pub async fn list(
-        &self,
-        app: Option<&str>,
-        status: Option<JobStatus>,
-        limit: i64,
-    ) -> Result<Vec<Job>> {
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM jobs \
-             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
-             ORDER BY created_at DESC LIMIT ?3"
-        );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(app)
-            .bind(status.map(JobStatus::as_str))
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn list(&self, q: &JobQuery, limit: i64) -> Result<Vec<Job>> {
+        let select = format!("SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, None, Some(limit));
+        let rows: Vec<JobRow> = qb.build_query_as().fetch_all(&self.pool).await?;
         rows.into_iter().map(Job::try_from).collect()
     }
 
@@ -928,29 +1112,57 @@ impl Storage {
     /// previous page's last (created_at-as-stored, id); None starts at the top.
     pub async fn list_page(
         &self,
-        app: Option<&str>,
-        status: Option<JobStatus>,
+        q: &JobQuery,
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<Job>> {
-        let (after_ts, after_id) = after
-            .map(|(t, i)| (Some(t), Some(i)))
-            .unwrap_or((None, None));
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM jobs \
-             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
-             AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id < ?4)) \
-             ORDER BY created_at DESC, id DESC LIMIT ?5"
-        );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(app)
-            .bind(status.map(JobStatus::as_str))
-            .bind(after_ts)
-            .bind(after_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+        let select = format!("SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, after.as_ref(), Some(limit));
+        let rows: Vec<JobRow> = qb.build_query_as().fetch_all(&self.pool).await?;
         rows.into_iter().map(Job::try_from).collect()
+    }
+
+    /// `GROUP BY status` over the SAME `WHERE` the list uses — "how did this
+    /// schedule's night go?" as one statement instead of a paged table the
+    /// caller counts by hand.
+    ///
+    /// Metered as [`StoreOp::JobStatusCounts`], the family the unscoped
+    /// `/metrics` aggregate already belongs to. That meter is also the test's
+    /// instrument: the list paths are unmetered, so a handler that paged rows
+    /// to count them would leave this counter untouched.
+    ///
+    /// Returns only the statuses the window actually holds. An absent status is
+    /// absent, not `0`: a zero is a claim about a value, and inventing five of
+    /// them per response would make "no failures in the window" and "no window"
+    /// read identically.
+    pub async fn status_counts_filtered(&self, q: &JobQuery) -> Result<Vec<(String, i64)>> {
+        let q = q.clone();
+        self.metered(StoreOp::JobStatusCounts, move |mut conn| async move {
+            let mut qb = job_query_builder("SELECT status, COUNT(*)", &q, None, None);
+            qb.push(" GROUP BY status ORDER BY status");
+            let rows: Vec<(String, i64)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            // Rows *touched*, as `status_counts` reports: the figure's job is to
+            // separate "the query got slower" from "the window got bigger".
+            let scanned = rows.iter().map(|(_, n)| *n as u64).sum();
+            Ok((rows, scanned))
+        })
+        .await
+    }
+
+    /// `EXPLAIN QUERY PLAN` over the statement [`Storage::list`] would run for
+    /// `q` — the `detail` column, one string per plan row.
+    ///
+    /// Exists so the claim "this filter rides the index migration 0014 built"
+    /// is a **test assertion over the real plan** rather than a sentence in a
+    /// doc. A `(?n IS NULL OR col = ?n)` statement passes every behavioural
+    /// test here and fails this one, which is precisely the failure mode worth
+    /// a dedicated probe.
+    pub async fn explain_job_list(&self, q: &JobQuery, limit: i64) -> Result<Vec<String>> {
+        let select = format!("EXPLAIN QUERY PLAN SELECT {JOB_COLUMNS}");
+        let mut qb = job_query_builder(&select, q, None, Some(limit));
+        // EXPLAIN QUERY PLAN's shape is (id, parent, notused, detail).
+        let rows: Vec<(i64, i64, i64, String)> = qb.build_query_as().fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(_, _, _, detail)| detail).collect())
     }
 
     /// Counts jobs grouped by status — for the metrics endpoint.
@@ -1067,11 +1279,11 @@ impl Storage {
     /// the gauge cannot drift from the guard it reports on.
     pub async fn held_by_target(&self) -> Result<i64> {
         self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
-            let (n,): (i64,) = sqlx::query_as(&format!(
+            let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM jobs \
                  WHERE status = 'queued' AND available_at <= ?1 \
                    AND NOT (1 = 1{TARGET_EXCLUSION})"
-            ))
+            )))
             .bind(now())
             .fetch_one(&mut *conn)
             .await?;
@@ -1235,7 +1447,7 @@ impl Storage {
         );
         let rows: Vec<JobRow> = self
             .metered(StoreOp::JobRecovery, |mut conn| async move {
-                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(RECOVERY_SWEEP_LIMIT)
                     .fetch_all(&mut *conn)
                     .await?;
@@ -1335,7 +1547,7 @@ impl Storage {
         );
         let rows: Vec<JobRow> = self
             .metered(StoreOp::JobRecovery, |mut conn| async move {
-                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(&cutoff)
                     .bind(RECOVERY_SWEEP_LIMIT)
                     .fetch_all(&mut *conn)
@@ -1402,9 +1614,9 @@ impl Storage {
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+        let rows: Vec<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY app"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Schedule::try_from).collect()
@@ -1418,11 +1630,11 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<Schedule>> {
         let (after_ts, after_id) = split_after(after);
-        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+        let rows: Vec<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules \
              WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2)) \
              ORDER BY created_at DESC, id DESC LIMIT ?3"
-        ))
+        )))
         .bind(after_ts)
         .bind(after_id)
         .bind(limit)
@@ -1432,9 +1644,9 @@ impl Storage {
     }
 
     pub async fn get_schedule(&self, id: &str) -> Result<Option<Schedule>> {
-        let row: Option<ScheduleRow> = sqlx::query_as(&format!(
+        let row: Option<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1507,6 +1719,129 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ---- Schedule decision ledger (migration 0047) --------------------------
+
+    /// Records ONE schedule decision. Callers are fail-open, exactly like
+    /// [`Storage::record_trigger_run`]: a decision that could not be recorded
+    /// must never hold up the firing it describes, so this returns the error
+    /// rather than acting on it.
+    ///
+    /// This is the ledger `record_schedule_skip` above could never be: that one
+    /// writes two reason-free columns on the schedule row, so a retirement skip
+    /// and a misfire skip are byte-identical in the store, the overlap hold
+    /// cannot be written at all (it would move the cron reference past the very
+    /// firing the guard promised to keep due), and a per-schedule failure inside
+    /// the pass has nowhere to land. A row here moves nothing.
+    pub async fn record_schedule_run(&self, run: &NewScheduleRun<'_>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, outcome, reason, due_at, job_id, \
+             missed, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(&id)
+        .bind(run.schedule_id)
+        .bind(run.outcome)
+        .bind(run.reason)
+        .bind(run.due_at.map(ts))
+        .bind(run.job_id)
+        .bind(run.missed as i64)
+        .bind(run.detail)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Keyset page of one schedule's decisions, newest first. `after` is the
+    /// previous page's last (created_at, id).
+    ///
+    /// The pass heartbeat ([`SCHEDULE_PASS_ID`]) is never one of these: it is a
+    /// fact about the reconcile loop, not about a schedule, and no real
+    /// schedule id can collide with `*`.
+    pub async fn list_schedule_runs_page(
+        &self,
+        schedule_id: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<ScheduleRun>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<ScheduleRunRow> = sqlx::query_as(
+            "SELECT id, schedule_id, outcome, reason, due_at, job_id, missed, detail, \
+             created_at FROM schedule_runs \
+             WHERE schedule_id = ?1 \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(schedule_id)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ScheduleRun::try_from).collect()
+    }
+
+    /// Drops decisions older than `days`; `0` = never prune. Called from the
+    /// worker's reaper tick, like [`Storage::prune_trigger_runs`] — the ledger
+    /// is diagnostic (one row per non-idle decision per tick, negatives
+    /// included), so it is bounded by default rather than by an operator knob.
+    ///
+    /// **The heartbeat is exempt.** It is one upserted row whose whole value is
+    /// its age: a loop wedged for longer than the retention window is exactly
+    /// the case the operator is asking about, and pruning the stale heartbeat
+    /// would delete the evidence of the wedge it exists to prove — turning the
+    /// answer back into "nothing was due".
+    pub async fn prune_schedule_runs(&self, days: u64) -> Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query("DELETE FROM schedule_runs WHERE created_at < ?1 AND schedule_id <> ?2")
+                .bind(ts(cutoff(days)))
+                .bind(SCHEDULE_PASS_ID)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// Stamps the scheduler's pass heartbeat: the reconcile loop completed a
+    /// pass at `at`.
+    ///
+    /// **One row, upserted in place** — deliberately not one row per pass. An
+    /// append-only heartbeat on a 15-second tick writes ~5,700 rows a day, and
+    /// the trigger ledger already shows what that costs: a once-per-process fact
+    /// written as an ordinary row paginates out of reach of the newest-first
+    /// page it was meant to be read from. A fixed primary key makes the ledger's
+    /// size independent of the tick rate, and makes "when did a pass last
+    /// complete?" a point read.
+    pub async fn mark_schedule_pass(&self, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, outcome, missed, created_at) \
+             VALUES (?1, ?2, ?3, 0, ?4) \
+             ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at",
+        )
+        .bind(SCHEDULE_PASS_HEARTBEAT_ID)
+        .bind(SCHEDULE_PASS_ID)
+        .bind(SCHEDULE_OUTCOME_PASS)
+        .bind(ts(at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// When the reconcile loop last completed a pass, or `None` if it never has
+    /// since this store was created. `None` and "long ago" are both answers the
+    /// in-memory `last_pass` could never give the API.
+    pub async fn schedule_pass_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT created_at FROM schedule_runs WHERE id = ?1")
+                .bind(SCHEDULE_PASS_HEARTBEAT_ID)
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.as_deref().map(parse_ts).transpose()
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<bool> {
@@ -1717,9 +2052,9 @@ impl Storage {
     }
 
     pub async fn get_trigger(&self, id: &str) -> Result<Option<Trigger>> {
-        let row: Option<TriggerRow> = sqlx::query_as(&format!(
+        let row: Option<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE id = ?1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1728,10 +2063,10 @@ impl Storage {
 
     /// All triggers, optionally filtered by source app.
     pub async fn list_triggers(&self, source_app: Option<&str>) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE (?1 IS NULL OR source_app = ?1) ORDER BY created_at"
-        ))
+        )))
         .bind(source_app)
         .fetch_all(&self.pool)
         .await?;
@@ -1747,12 +2082,12 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<Trigger>> {
         let (after_ts, after_id) = split_after(after);
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE (?1 IS NULL OR source_app = ?1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4"
-        ))
+        )))
         .bind(source_app)
         .bind(after_ts)
         .bind(after_id)
@@ -1768,10 +2103,10 @@ impl Storage {
         source_kind: &str,
         source_app: &str,
     ) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE source_kind = ?1 AND source_app = ?2 AND enabled = 1"
-        ))
+        )))
         .bind(source_kind)
         .bind(source_app)
         .fetch_all(&self.pool)
@@ -1804,8 +2139,29 @@ impl Storage {
             "SELECT {JOB_COLUMNS} FROM jobs WHERE trigger_id = ?1 \
              ORDER BY created_at DESC LIMIT ?2"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(trigger_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
+    /// The jobs one schedule actually enqueued, newest first — its lineage, the
+    /// twin of [`Storage::jobs_by_trigger`].
+    ///
+    /// Deliberately a narrow, indexed reader rather than a predicate bolted onto
+    /// the `GET /jobs` list query: the decision ledger answers "what did this
+    /// schedule DECIDE", and this answers "what did it RUN", and the two are
+    /// read side by side on one endpoint. The general queue filter is a separate
+    /// surface and stays free for one.
+    pub async fn jobs_by_schedule(&self, schedule_id: &str, limit: i64) -> Result<Vec<Job>> {
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE schedule_id = ?1 \
+             ORDER BY created_at DESC LIMIT ?2"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(schedule_id)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
@@ -2601,10 +2957,11 @@ impl Storage {
         let mut out = Vec::new();
         for table in LEDGER_TABLES {
             // `table` comes from a crate constant, never from a caller.
-            let row: (i64, Option<String>) =
-                sqlx::query_as(&format!("SELECT COUNT(*), MIN(created_at) FROM {table}"))
-                    .fetch_one(&self.pool)
-                    .await?;
+            let row: (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*), MIN(created_at) FROM {table}"
+            )))
+            .fetch_one(&self.pool)
+            .await?;
             out.push(LedgerStat {
                 table: table.to_string(),
                 rows: row.0,
@@ -2612,6 +2969,22 @@ impl Storage {
             });
         }
         Ok(out)
+    }
+
+    /// What this store's schema looks like against the chain this binary
+    /// carries — the same three facts `connect` asserts on, in the shape
+    /// `GET /datasets/doctor` reports.
+    ///
+    /// Read-only and cheap: one `sqlite_master` scan and one ledger read. The
+    /// boot refusal and the operator report are therefore derived from the
+    /// same numbers rather than from two independent walks that can disagree.
+    pub async fn schema_report(&self) -> Result<crate::schema::SchemaReport> {
+        let applied = crate::backup::applied_versions(&self.pool).await;
+        let available = crate::backup::available_versions(&migrator());
+        let observed = observed_tables(&self.pool).await?;
+        Ok(crate::schema::SchemaReport::new(
+            &applied, &available, &observed,
+        ))
     }
 
     /// Tables named `*_new` still present in `sqlite_master`.
@@ -2691,11 +3064,11 @@ impl Storage {
     /// Enabled external-kind triggers for one ingress source — the evaluation
     /// set for an inbound event. `source_app = '*'` triggers match every source.
     pub async fn enabled_external_triggers(&self, source_id: &str) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE source_kind = 'external' AND (source_app = ?1 OR source_app = '*') \
              AND enabled = 1"
-        ))
+        )))
         .bind(source_id)
         .fetch_all(&self.pool)
         .await?;
@@ -3042,7 +3415,7 @@ impl Storage {
     pub async fn triggered_hops(&self, job_id: Uuid) -> Result<Vec<Job>> {
         let sql =
             format!("SELECT {JOB_COLUMNS} FROM jobs WHERE source_job_id = ?1 ORDER BY created_at");
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(job_id.to_string())
             .fetch_all(&self.pool)
             .await?;
@@ -3113,23 +3486,24 @@ impl Storage {
     }
 
     pub async fn get_derived_spec(&self, id: &str) -> Result<Option<DerivedSpec>> {
-        let row: Option<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
-            "SELECT {} FROM derived WHERE id = ?1",
-            crate::datasets::DERIVED_COLUMNS
-        ))
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<crate::datasets::DerivedRow> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM derived WHERE id = ?1",
+                crate::datasets::DERIVED_COLUMNS
+            )))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(DerivedSpec::try_from).transpose()
     }
 
     /// All derived specs, optionally filtered by source app.
     pub async fn list_derived_specs(&self, app: Option<&str>) -> Result<Vec<DerivedSpec>> {
-        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM derived WHERE (?1 IS NULL OR source_app = ?1) \
              ORDER BY created_at, id",
             crate::datasets::DERIVED_COLUMNS
-        ))
+        )))
         .bind(app)
         .fetch_all(&self.pool)
         .await?;
@@ -3687,6 +4061,129 @@ impl TryFrom<TriggerRunRow> for TriggerRun {
             dataset: r.dataset,
             event_id: r.event_id,
             job_id: r.job_id,
+            detail: r.detail,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+// ---- Schedule decision ledger (migration 0047) ------------------------------
+
+/// One recorded schedule decision: what a reconcile tick concluded about one
+/// schedule, fires and non-fires alike.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleRun {
+    pub id: String,
+    /// The schedule the decision is about, or [`SCHEDULE_PASS_ID`] for the pass
+    /// heartbeat.
+    pub schedule_id: String,
+    /// One of [`SCHEDULE_OUTCOMES`] — the scheduler's own `StepOutcome`.
+    pub outcome: String,
+    /// WHY, in the admission vocabulary the fire path and `GET /schedules`
+    /// already share (`health`: `ok` | `disabled` | `invalid_cron` |
+    /// `unregistered_app` | `invalid_params` | `retired` | `overlapping`).
+    /// `None` when admission never ran — a storage failure inside the step,
+    /// where `detail` carries the error instead.
+    pub reason: Option<String>,
+    /// The firing this row is about.
+    pub due_at: Option<DateTime<Utc>>,
+    /// The job enqueued, or (for `held`) the job still holding the slot.
+    pub job_id: Option<String>,
+    /// Firings advanced past by `misfire_policy = "skip"`.
+    pub missed: i64,
+    /// Free-text context: an error message, the retired dataset, the collapsed
+    /// backlog size.
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The `schedule_id` a row carries when it is about the reconcile LOOP rather
+/// than about one schedule — the pass heartbeat. `*` cannot collide with a real
+/// schedule id (a UUID), and `list_schedule_runs_page` is keyed on the column,
+/// so the heartbeat never appears in a schedule's own page.
+pub const SCHEDULE_PASS_ID: &str = "*";
+
+/// Primary key of the single upserted heartbeat row. Fixed, so a pass costs an
+/// UPDATE rather than an INSERT — see [`Storage::mark_schedule_pass`].
+pub const SCHEDULE_PASS_HEARTBEAT_ID: &str = "scheduler-pass";
+
+/// The heartbeat row's `outcome`.
+pub const SCHEDULE_OUTCOME_PASS: &str = "pass";
+
+/// Every value `schedule_runs.outcome` may take. The API documents these as the
+/// decision vocabulary, so the list is a contract, not a hint.
+///
+/// These are the scheduler's own `StepOutcome` words, with two deliberate
+/// differences:
+///
+/// - `Idle` has no word. An idle tick writes NO row — one row per schedule per
+///   tick for doing nothing is the one write rate this table must not have.
+/// - `SkippedAndFired` has no word either, because it is two facts with
+///   different `missed` and different `job_id`, and collapsing them is exactly
+///   what `skipped_count` already did wrong. That tick writes a `skipped` row
+///   carrying its missed count AND a `fired` row carrying its job.
+///
+/// `failed` is the step error `PassTally::absorb` used to turn into a bare
+/// counter; `pass` belongs to the heartbeat alone.
+pub const SCHEDULE_OUTCOMES: &[&str] = &[
+    // A job was enqueued.
+    "fired",
+    // `misfire_policy = "skip"` advanced past missed firings, or an admission
+    // gate (retirement) declined the firing. `reason` tells the two apart —
+    // before this table they were byte-identical in the schedule row.
+    "skipped",
+    // The overlap guard held the firing; the same firing stays due. `job_id` is
+    // the run that owns the slot.
+    "held",
+    // A door gate refused the row and NOTHING was recorded on the schedule, so
+    // fixing the row makes the firing happen.
+    "refused",
+    // The step itself failed (a per-schedule storage error). The pass continued;
+    // this schedule silently did nothing, and `detail` says why.
+    "failed",
+    // The reconcile loop completed a pass. Written against `SCHEDULE_PASS_ID`
+    // only, as ONE upserted row.
+    "pass",
+];
+
+/// Insert shape for [`Storage::record_schedule_run`]. Borrowed and `Default`ing
+/// so each decision point names only the fields it actually knows.
+#[derive(Debug, Default)]
+pub struct NewScheduleRun<'a> {
+    pub schedule_id: &'a str,
+    pub outcome: &'a str,
+    pub reason: Option<&'a str>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub job_id: Option<&'a str>,
+    pub missed: usize,
+    pub detail: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ScheduleRunRow {
+    id: String,
+    schedule_id: String,
+    outcome: String,
+    reason: Option<String>,
+    due_at: Option<String>,
+    job_id: Option<String>,
+    missed: i64,
+    detail: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ScheduleRunRow> for ScheduleRun {
+    type Error = Error;
+
+    fn try_from(r: ScheduleRunRow) -> Result<ScheduleRun> {
+        Ok(ScheduleRun {
+            id: r.id,
+            schedule_id: r.schedule_id,
+            outcome: r.outcome,
+            reason: r.reason,
+            due_at: r.due_at.as_deref().map(parse_ts).transpose()?,
+            job_id: r.job_id,
+            missed: r.missed,
             detail: r.detail,
             created_at: parse_ts(&r.created_at)?,
         })

@@ -31,7 +31,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `retired` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -51,9 +51,101 @@ pub(crate) async fn list_schedules(
         format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
     });
     let enriched = enrich_schedules(&state, items).await?;
-    Ok(Json(
-        json!({ "items": enriched, "next_cursor": next_cursor }),
-    ))
+    Ok(Json(json!({
+        "items": enriched,
+        "next_cursor": next_cursor,
+        // The liveness answer. Per-schedule `health` says whether each ROW may
+        // fire; this says whether the LOOP is still asking. A reconcile that
+        // fails at `list_schedules` returns before it looks at a single
+        // schedule, so every row keeps answering `health: "ok"` beside a
+        // confident future `next_run` while nothing fires at all — and from
+        // outside the process that was indistinguishable from "nothing was
+        // due", because `last_pass` was a loop-local.
+        //
+        // Only the cursored envelope can carry it: the legacy bare-array mode
+        // is a JSON array and has nowhere to put a field. `GET /schedules/{id}/
+        // runs` publishes the same block, from the same builder.
+        "scheduler": crate::scheduler::scheduler_liveness(&state).await,
+    })))
+}
+
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ScheduleRunsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor over `decisions` (the `runs` array is always the
+    /// newest `limit` jobs).
+    cursor: Option<String>,
+}
+
+/// What this schedule did, fires and non-fires alike.
+///
+/// `runs` is the job lineage (`jobs.schedule_id`) — the jobs this schedule
+/// actually enqueued. `decisions` is the ledger (`schedule_runs`, migration
+/// 0047): one row per non-idle tick verdict, INCLUDING the negatives, which are
+/// otherwise invisible. The three silences it ends:
+///
+/// - **held** — the overlap guard's hold recorded nothing at all, by design
+///   (recording a skip there would have advanced the cron reference past the
+///   very firing the guard promised to keep due). A ledger row advances nothing,
+///   so it is the only place that fact can live.
+/// - **skipped** — a retirement skip and a misfire skip wrote the identical two
+///   columns on the schedule row, so they could not be told apart in the store.
+///   `reason` now does it. `missed` carries the per-occurrence count:
+///   `skipped_count` does accumulate it, but as a lifetime total with no window
+///   and no reason, so four firings eaten in one tick and one eaten in each of
+///   four ticks are indistinguishable -- and so are a retirement skip and a
+///   misfire skip.
+/// - **failed** — a per-schedule storage error inside the pass was an aggregate
+///   counter and one log line; the schedule that silently did nothing could not
+///   be named.
+///
+/// The `outcome` vocabulary is `pumper_core::storage::SCHEDULE_OUTCOMES`; the
+/// `reason` vocabulary is the SAME closed `health` list `GET /schedules`
+/// publishes, read off the one admission verdict the fire path acts on.
+#[utoipa::path(
+    get,
+    path = "/schedules/{id}/runs",
+    tag = "schedules",
+    params(("id" = String, Path, description = "Schedule id"), ScheduleRunsQuery),
+    responses(
+        (status = 200, description = "`{schedule_id, count, runs: [Job], decisions: [ScheduleRun], next_cursor, scheduler: {last_pass_at, stale}}`. Each decision carries `outcome` (`fired` | `skipped` | `held` | `refused` | `failed`), `reason` (the admission `health` word, null when admission never ran), `due_at` (the firing the row is about), `job_id` (the job fired, or for `held` the one holding the slot), `missed` and `detail`."),
+        (status = 404, description = "Schedule not found", body = Object),
+    )
+)]
+pub(crate) async fn schedule_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ScheduleRunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    // A deleted (or mistyped) id must not answer 200 `{count: 0}` — that reads
+    // as "this schedule has never done anything", which is the exact wrong
+    // answer for the question this endpoint exists to answer. Same 404 parity
+    // `GET /triggers/{id}/runs` already has.
+    if state.storage.get_schedule(&id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "schedule not found".into()));
+    }
+    let limit = query.limit.clamp(1, 500);
+    let jobs = state.storage.jobs_by_schedule(&id, limit).await?;
+    let after = query.cursor.as_deref().and_then(parse_cursor);
+    let decisions = state
+        .storage
+        .list_schedule_runs_page(&id, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&decisions, limit, |d| {
+        format!("{}|{}", pumper_core::datasets::ts(d.created_at), d.id)
+    });
+    Ok(Json(json!({
+        "schedule_id": id,
+        "count": jobs.len(),
+        "runs": jobs,
+        "decisions": decisions,
+        "next_cursor": next_cursor,
+        // An empty ledger means one of two very different things: nothing was
+        // ever due, or no pass has run in six hours. The block that tells them
+        // apart travels with the page that would otherwise be read as the first.
+        "scheduler": crate::scheduler::scheduler_liveness(&state).await,
+    })))
 }
 
 /// Enriches each schedule with the observability fields the raw row can't carry:
@@ -61,12 +153,13 @@ pub(crate) async fn list_schedules(
 /// and a `health` reason so "why isn't this firing?" is answerable over the API
 /// instead of only in server logs.
 ///
-/// `health` is derived from the same conditions the scheduler checks — and for
-/// the overlap condition from the same read and the same predicate
-/// (`scheduler::latest_run` → `run_holds_slot`), not a second interpretation of
-/// a second query. The previous arrangement had exactly that second
-/// interpretation, and it reported `ok` for schedules the scheduler had already
-/// stopped firing (see `run_holds_slot`).
+/// `health` is not derived here at all: it is the fire path's own admission
+/// verdict (`scheduler::admit` → `ScheduleAdmission::health`), read verbatim.
+/// This file used to re-derive it in a second if/else chain, and that copy
+/// drifted — it knew five of the scheduler's six gates and never learned about
+/// retirement, so a schedule the scheduler had stopped firing answered `ok`.
+/// `scheduler::health_and_guard_share_one_predicate` fails if any gate is
+/// re-answered below.
 async fn enrich_schedules(
     state: &AppState,
     schedules: Vec<Schedule>,
@@ -83,34 +176,20 @@ async fn enrich_schedules(
                 )
             })?;
         let (last_job_id, last_status) = (last.job_id, last.status);
-        // Precedence mirrors the scheduler's own short-circuits: a disabled or
-        // mis-configured schedule never reaches the overlap check.
-        let health = if !schedule.enabled {
-            "disabled"
-        } else if next_run.is_none() {
-            // project_next_run only returns None on an unparseable/exhausted cron.
-            "invalid_cron"
-        } else if !state.registry.contains_key(&schedule.app) {
-            "unregistered_app"
-        } else if crate::scheduler::validate_schedule_params(
-            &state.registry,
-            &schedule.app,
-            &schedule.params,
-        )
-        .is_err()
-        {
-            // The scheduler skips this row at the fire step; say so here rather
-            // than reporting "ok" for a schedule that will never enqueue again.
-            // Derived (not stored) on purpose: it is computed by the SAME
-            // function the fire path calls, so fixing the row clears the marker
-            // in the same instant the scheduler starts firing it again — a
-            // stored flag would have to be un-set by somebody.
-            "invalid_params"
-        } else if last.holds_slot {
-            "overlapping"
-        } else {
-            "ok"
-        };
+        // ONE verdict, the fire path's own, with its own declared precedence.
+        // Derived (not stored) on purpose: fixing the row — valid params again,
+        // the source restored out of `retired` — clears the marker in the same
+        // instant the scheduler starts firing it again, where a stored flag
+        // would have to be un-set by somebody.
+        let health = crate::scheduler::admit(state, &schedule)
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to decide the schedule's admission: {e}"),
+                )
+            })?
+            .health();
         let mut value = serde_json::to_value(&schedule).unwrap_or_else(|_| json!({}));
         if let Value::Object(map) = &mut value {
             map.insert("next_run".into(), json!(next_run));

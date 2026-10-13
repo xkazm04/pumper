@@ -18,6 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule as CronSchedule;
+use pumper_core::storage::NewScheduleRun;
 use pumper_core::{Catalog, EnqueueOptions, ReconcilePlan, Schedule, CATALOG_MANAGED_BY};
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -136,6 +137,19 @@ async fn tick_once(
             false
         }
     };
+    // The pass heartbeat (migration 0047), stamped from the SAME `completed`
+    // that gates `last_pass` in [`run`] — so the durable fact and the in-memory
+    // one can never disagree about whether a pass happened. Only a pass that
+    // actually walked the table counts: a `reconcile` that failed at
+    // `list_schedules` gave no firing its chance, and that is precisely the
+    // wedge `GET /schedules`'s `scheduler.stale` exists to expose. Fail-open —
+    // an unwritable heartbeat is an observability loss, never a reason to
+    // disturb the queue.
+    if completed {
+        if let Err(e) = state.storage.mark_schedule_pass(now).await {
+            warn!("scheduler pass heartbeat could not be stamped: {e}");
+        }
+    }
     // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
     // running jobs whose heartbeat lease has gone stale (a hung task on a
     // live server). Cheap — one indexed scan of `running` jobs. The hourly
@@ -272,6 +286,18 @@ pub(crate) async fn reconcile(
                 Ok(cron) => cron_cache.entry(schedule.cron.clone()).or_insert(cron),
                 Err(e) => {
                     warn!(id = %schedule.id, cron = %schedule.cron, "invalid cron: {e}");
+                    // This refusal is reached before `admit` ever runs, so the
+                    // reason is named from the variant that *would* have been
+                    // produced rather than from a literal of this file's own.
+                    let detail = e.to_string();
+                    record_decision(
+                        state,
+                        &NewScheduleRun {
+                            detail: Some(&detail),
+                            ..refusal(&schedule.id, ScheduleAdmission::InvalidCron.health(), None)
+                        },
+                    )
+                    .await;
                     tally.absorb(&schedule.id, &schedule.app, Ok(StepOutcome::Refused));
                     continue;
                 }
@@ -293,6 +319,26 @@ pub(crate) async fn reconcile(
                     )
                 )),
             };
+        // The absorbed failure is the one outcome with no row of its own to
+        // write inside the step: the error ENDED the step, so it can only be
+        // recorded from out here, where the `Err` is in hand. Before the ledger
+        // it became `PassTally::failed += 1` and one aggregate log line, so the
+        // schedule that silently did nothing could not be named over the API.
+        if let Err(e) = &outcome {
+            let detail = e.to_string();
+            record_decision(
+                state,
+                &NewScheduleRun {
+                    schedule_id: &schedule.id,
+                    outcome: "failed",
+                    // Admission did not complete, so there is no verdict to
+                    // quote. NULL rather than a guess: `detail` is the answer.
+                    detail: Some(&detail),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
         tally.absorb(&schedule.id, &schedule.app, outcome);
     }
     Ok(tally)
@@ -322,38 +368,102 @@ pub(crate) async fn reconcile_one(
         Action::Skip { missed } => (missed, 0, false),
         Action::SkipThenFire { missed } => (missed, 0, true),
     };
+    // The firing every ledger row below is about, computed once off the cron
+    // handle this tick already holds (see `pending_firing`).
+    let due_at = pending_firing(cron, tz, reference);
 
-    // ---- Door gates ---------------------------------------------------------
-    // These apply to EVERY acting branch, `skip` included. A `skip` schedule on
+    // ---- Admission: ONE verdict, from the one vocabulary --------------------
+    // Every gate below is composed by [`admit`], and `GET /schedules` reads the
+    // SAME call — so "why isn't this firing?" has exactly one authority. The
+    // gates apply to EVERY acting branch, `skip` included: a `skip` schedule on
     // an unregistered app used to accrue `skipped_count` forever while
     // `GET /schedules` reported `health: "unregistered_app"` — the row "ate"
-    // firings that could never have run in the first place, and the count of
-    // eaten firings said work had been dropped when none was ever runnable.
-    // Refusing without recording keeps ONE contract for both policies: fixing
-    // the row makes it fire, because nothing advanced while it was broken.
-    if !state.registry.contains_key(&schedule.app) {
-        warn!(
-            id = %schedule.id, app = %schedule.app,
-            "schedule references unregistered app; neither firing nor recording a skip advance"
-        );
-        return Ok(StepOutcome::Refused);
-    }
-    // Door parity: a schedule whose effective params fail the app's declared
-    // schema is REFUSED, not enqueued — the same 422 the HTTP door answers,
-    // moved to the only place a legacy row can still be caught. Neither
-    // `last_run` nor `last_skipped_at` is touched, so fixing the row makes the
-    // schedule fire again instead of having silently eaten firings.
-    // Visible on `GET /schedules` as `health: "invalid_params"`.
-    let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
-        Ok(params) => params,
-        Err(msg) => {
+    // firings that could never have run in the first place. Refusing without
+    // recording keeps ONE contract for both policies: fixing the row makes it
+    // fire, because nothing advanced while it was broken.
+    let verdict = admit(state, schedule).await?;
+    // The ledger's `reason` for every branch below, taken ONCE off that one
+    // verdict. Not a word of this file's own invention — see the ledger section
+    // above and `admission_reasons_come_only_from_the_shared_vocabulary`.
+    let reason = verdict.health();
+    // `Some(params)` once the row is admitted; `None` only on the overlap
+    // verdict, which is decided AFTER the misfire policy (below) exactly as it
+    // always was.
+    let params = match verdict {
+        ScheduleAdmission::Disabled => {
+            // Unreachable from the pass (it filters disabled rows) and caught
+            // again at fire time against the LIVE row — see `still_firable`.
+            info!(id = %schedule.id, app = %schedule.app, "schedule is disabled; not enqueuing");
+            record_decision(state, &refusal(&schedule.id, reason, due_at)).await;
+            return Ok(StepOutcome::Refused);
+        }
+        ScheduleAdmission::InvalidCron => {
+            warn!(id = %schedule.id, cron = %schedule.cron, "schedule cron has no next firing");
+            record_decision(state, &refusal(&schedule.id, reason, due_at)).await;
+            return Ok(StepOutcome::Refused);
+        }
+        ScheduleAdmission::UnregisteredApp => {
+            warn!(
+                id = %schedule.id, app = %schedule.app,
+                "schedule references unregistered app; neither firing nor recording a skip advance"
+            );
+            record_decision(state, &refusal(&schedule.id, reason, due_at)).await;
+            return Ok(StepOutcome::Refused);
+        }
+        // Door parity: a schedule whose effective params fail the app's
+        // declared schema is REFUSED, not enqueued — the same 422 the HTTP door
+        // answers, moved to the only place a legacy row can still be caught.
+        // Neither `last_run` nor `last_skipped_at` is touched, so fixing the row
+        // makes the schedule fire again instead of having silently eaten
+        // firings.
+        ScheduleAdmission::InvalidParams { reason: detail } => {
             warn!(
                 id = %schedule.id, app = %schedule.app,
                 "schedule params fail the app's declared schema; neither firing nor recording a \
-                 skip advance (GET /schedules shows health=invalid_params): {msg}"
+                 skip advance (GET /schedules shows health=invalid_params): {detail}"
             );
+            record_decision(
+                state,
+                &NewScheduleRun {
+                    detail: Some(&detail),
+                    ..refusal(&schedule.id, reason, due_at)
+                },
+            )
+            .await;
             return Ok(StepOutcome::Refused);
         }
+        // Retirement: an extractor schedule over a retired source is skipped,
+        // not fired. The state is read on every tick, so
+        // `POST /sources/{id}/state` back to any other state resumes the
+        // schedule at its next firing.
+        ScheduleAdmission::Retired { dataset } => {
+            let eaten = missed + collapsed + usize::from(fires);
+            info!(
+                id = %schedule.id, app = %schedule.app, dataset = %dataset, eaten,
+                "source retired: skipping the scheduled firing (recorded as a skip; \
+                 POST /sources/{{id}}/state resumes it)"
+            );
+            state
+                .storage
+                .record_schedule_skip(&schedule.id, now, eaten)
+                .await?;
+            record_decision(
+                state,
+                &NewScheduleRun {
+                    schedule_id: &schedule.id,
+                    outcome: "skipped",
+                    reason: Some(reason),
+                    due_at,
+                    missed: eaten,
+                    detail: Some(&dataset),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return Ok(StepOutcome::Skipped);
+        }
+        ScheduleAdmission::Overlapping => None,
+        ScheduleAdmission::Fire { params } => Some(params),
     };
 
     if !fires {
@@ -368,20 +478,55 @@ pub(crate) async fn reconcile_one(
             .storage
             .record_schedule_skip(&schedule.id, now, missed)
             .await?;
+        // `reason` here is the ADMITTED verdict (`ok`): no gate refused this
+        // firing -- the misfire policy ate the backlog. That is what makes a
+        // misfire skip and a retirement skip two distinguishable rows instead of
+        // the one byte-identical pair of columns they used to be.
+        record_decision(
+            state,
+            &NewScheduleRun {
+                schedule_id: &schedule.id,
+                outcome: "skipped",
+                reason: Some(reason),
+                due_at,
+                missed,
+                ..Default::default()
+            },
+        )
+        .await;
         return Ok(StepOutcome::Skipped);
     }
 
     // Overlap guard: don't stack a second run while the previous one
     // is still queued/running. last_run is NOT touched, so the missed
     // firing stays due and fires on the first tick after it finishes.
-    // The SAME read + predicate `GET /schedules` reports as
-    // `health: "overlapping"` — see `latest_run`. Nothing is recorded here, the
-    // skip advance included: recording it would move the reference past the very
-    // firing the guard just promised to keep due.
-    if latest_run(state, &schedule.id).await?.holds_slot {
+    // Nothing is recorded here, the skip advance included: recording it would
+    // move the reference past the very firing the guard just promised to keep
+    // due.
+    let Some(params) = params else {
         info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
+        // The job that owns the slot -- the one the operator actually has to go
+        // look at. Re-read here rather than carried on the verdict: this is the
+        // uncommon path, and widening the shared admission vocabulary to carry a
+        // diagnostic field would be the wrong trade.
+        let holder = latest_run(state, &schedule.id)
+            .await
+            .ok()
+            .and_then(|r| r.job_id);
+        record_decision(
+            state,
+            &NewScheduleRun {
+                schedule_id: &schedule.id,
+                outcome: "held",
+                reason: Some(reason),
+                due_at,
+                job_id: holder.as_deref(),
+                ..Default::default()
+            },
+        )
+        .await;
         return Ok(StepOutcome::Held);
-    }
+    };
 
     // Fire-time re-check against the LIVE row rather than the pass's snapshot —
     // see `still_firable`.
@@ -391,6 +536,13 @@ pub(crate) async fn reconcile_one(
             id = %schedule.id, app = %schedule.app,
             "schedule was disabled or removed after this pass read it; not enqueuing"
         );
+        // The live row is what refused it, so the ledger says so in the shared
+        // vocabulary's own word rather than inventing a "raced" one.
+        record_decision(
+            state,
+            &refusal(&schedule.id, ScheduleAdmission::Disabled.health(), due_at),
+        )
+        .await;
         return Ok(StepOutcome::Refused);
     }
 
@@ -419,6 +571,21 @@ pub(crate) async fn reconcile_one(
     }
     state.storage.touch_schedule(&schedule.id, now).await?;
     state.notify.notify_one();
+    let collapsed_detail = (collapsed > 0).then(|| format!("collapsed {collapsed} missed firings"));
+    let fired_job = job.id.to_string();
+    record_decision(
+        state,
+        &NewScheduleRun {
+            schedule_id: &schedule.id,
+            outcome: "fired",
+            reason: Some(reason),
+            due_at,
+            job_id: Some(&fired_job),
+            detail: collapsed_detail.as_deref(),
+            ..Default::default()
+        },
+    )
+    .await;
     if missed == 0 {
         return Ok(StepOutcome::Fired);
     }
@@ -435,7 +602,287 @@ pub(crate) async fn reconcile_one(
         .storage
         .record_schedule_skip(&schedule.id, now, missed)
         .await?;
+    // TWO rows, not one: the skip carries its missed count and the fire carries
+    // its job -- two facts with different `missed` and different `job_id`.
+    //
+    // `skipped_count` DOES accumulate `missed` (verified: it is
+    // `skipped_count + ?3`, not `+ 1`), so the number itself was never lost.
+    // What a lifetime total cannot say is WHEN or WHY: four firings eaten in one
+    // tick and one eaten in each of four ticks are the same `4`, and a
+    // retirement skip and a misfire skip are the same `4` again. That is the gap
+    // a row per occurrence closes, and it is why the two facts of this tick do
+    // not get collapsed into one row either.
+    record_decision(
+        state,
+        &NewScheduleRun {
+            schedule_id: &schedule.id,
+            outcome: "skipped",
+            reason: Some(reason),
+            due_at,
+            missed,
+            ..Default::default()
+        },
+    )
+    .await;
     Ok(StepOutcome::SkippedAndFired)
+}
+
+/// The admission verdict for ONE firing of ONE schedule: exactly one value,
+/// from one closed vocabulary, produced by [`admit`] and read by **both** the
+/// fire path ([`reconcile_one`]) and `GET /schedules`
+/// (`routes::schedules::enrich_schedules`).
+///
+/// The anti-pattern this replaces: the scheduler decided six separate times
+/// whether a firing may happen, each decision an early return, and the read
+/// side answered the operator's "why isn't this firing?" with a *second*
+/// if/else chain that reproduced five of them. The copy drifted — retirement
+/// landed on the fire path with no health branch at all, so a schedule that ate
+/// a firing every tick reported `health: "ok"` beside a confident future
+/// `next_run`. Per-gate guards cannot fix that (there was one, for overlap);
+/// the vocabulary itself has to be the shared thing.
+///
+/// Registry: `admission-queue/admission-vocabulary` — "one gate, one
+/// vocabulary", law `one-authority-per-vocabulary`.
+///
+/// **Declaration order is the precedence**, highest gate first. The serialized
+/// `health` string of each variant is its name in snake_case
+/// ([`ScheduleAdmission::health`]), and the set of them is pinned against the
+/// `GET /schedules` OpenAPI description by
+/// `admission_variants_and_the_published_health_values_are_one_list` — a
+/// seventh gate cannot land without the API learning its name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScheduleAdmission {
+    /// The row is switched off. Outranks everything: a disabled schedule's cron
+    /// is never even parsed.
+    Disabled,
+    /// The cron is unparseable or has no future firing, so there is nothing to
+    /// admit. Only reachable by editing the row — the create door refuses it.
+    InvalidCron,
+    /// No app of this name is registered in this binary.
+    UnregisteredApp,
+    /// The effective params fail the app's declared schema. Carries the door's
+    /// own pointer-path message for the log line.
+    InvalidParams { reason: String },
+    /// An `extractor` schedule whose source is retired. Carries the dataset so
+    /// the operator is told which source to restore.
+    Retired { dataset: String },
+    /// This schedule's own most recent run is still queued/running, so the next
+    /// firing is held back rather than stacked.
+    Overlapping,
+    /// Admitted. Carries the validated effective params, so the fire path does
+    /// not re-run the gate it just passed.
+    Fire { params: Value },
+}
+
+impl ScheduleAdmission {
+    /// The `health` string `GET /schedules` publishes for this verdict. The one
+    /// producer — nothing else may spell these.
+    pub(crate) fn health(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::InvalidCron => "invalid_cron",
+            Self::UnregisteredApp => "unregistered_app",
+            Self::InvalidParams { .. } => "invalid_params",
+            Self::Retired { .. } => "retired",
+            Self::Overlapping => "overlapping",
+            // `Fire` is the absence of a reason not to fire, and the API has
+            // always called that `ok`.
+            Self::Fire { .. } => "ok",
+        }
+    }
+}
+
+/// The ONE admission decision for a schedule, composed from every gate in
+/// declared precedence order and answering with exactly one
+/// [`ScheduleAdmission`].
+///
+/// Read-only: it writes nothing and records nothing, so the read side can call
+/// it per request and the fire path can act on it. That is also why the verdict
+/// is *derived* rather than stored — restoring a retired source clears
+/// `health: "retired"` on the very next read, with nobody having to un-set a
+/// flag.
+pub(crate) async fn admit(
+    state: &AppState,
+    schedule: &Schedule,
+) -> anyhow::Result<ScheduleAdmission> {
+    if !schedule.enabled {
+        return Ok(ScheduleAdmission::Disabled);
+    }
+    // The same projection `GET /schedules` reports as `next_run`, so "no next
+    // firing" and "null next_run" can never disagree.
+    if project_next_run(schedule).is_none() {
+        return Ok(ScheduleAdmission::InvalidCron);
+    }
+    if !state.registry.contains_key(&schedule.app) {
+        return Ok(ScheduleAdmission::UnregisteredApp);
+    }
+    let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
+        Ok(params) => params,
+        Err(reason) => return Ok(ScheduleAdmission::InvalidParams { reason }),
+    };
+    // Read from the STORED state, not the enforced one — retirement is a
+    // scheduling decision, not a data gate, so it holds in soak mode too.
+    if let Some(dataset) = retirement_dataset(&schedule.app, &params) {
+        let stored = state.health.state(&schedule.app, &dataset).await;
+        if schedule_blocked_by_retirement(&schedule.app, &params, stored) {
+            return Ok(ScheduleAdmission::Retired { dataset });
+        }
+    }
+    // The same read and the same predicate on both sides — see `latest_run`.
+    if latest_run(state, &schedule.id).await?.holds_slot {
+        return Ok(ScheduleAdmission::Overlapping);
+    }
+    Ok(ScheduleAdmission::Fire { params })
+}
+
+// ---- The decision ledger (migration 0047) -----------------------------------
+// Every non-idle verdict this file reaches is written as one `schedule_runs`
+// row before the branch returns. The two rules that make that safe:
+//
+// 1. **Fail-open.** `record_decision` logs and swallows. A decision that could
+//    not be recorded must never hold up the firing it describes — the same
+//    contract `Storage::record_trigger_run` states for the sibling ledger.
+// 2. **A row moves nothing.** This is why the overlap hold can finally be
+//    recorded at all: `record_schedule_skip` would have advanced the cron
+//    reference past the very firing the guard just promised to keep due, and a
+//    ledger row advances no reference.
+//
+// `reason` is NEVER a word of this file's own invention: it is
+// `ScheduleAdmission::health()`, read verbatim off the one admission verdict
+// that the fire path and `GET /schedules` already share. `admission_reasons_
+// come_only_from_the_shared_vocabulary` fails if a literal appears here that
+// the enum cannot produce — the ledger must not become a fourth authority on
+// "why isn't this firing?".
+
+/// The row shape every refusal shares: nothing was recorded on the schedule
+/// itself, so fixing the row makes the firing happen. Spelled once so the five
+/// refusal branches cannot drift on which columns a refusal carries.
+fn refusal<'a>(
+    schedule_id: &'a str,
+    reason: &'a str,
+    due_at: Option<DateTime<Utc>>,
+) -> NewScheduleRun<'a> {
+    NewScheduleRun {
+        schedule_id,
+        outcome: "refused",
+        reason: Some(reason),
+        due_at,
+        ..Default::default()
+    }
+}
+
+/// Writes one decision row, fail-open.
+async fn record_decision(state: &AppState, run: &NewScheduleRun<'_>) {
+    if let Err(e) = state.storage.record_schedule_run(run).await {
+        warn!(
+            schedule = %run.schedule_id, outcome = %run.outcome,
+            "schedule decision could not be recorded; the decision itself STANDS: {e}"
+        );
+    }
+}
+
+/// The firing a decision is about: the first cron time strictly after the
+/// schedule's reference, in the schedule's timezone.
+///
+/// The same projection `project_next_run` publishes as `next_run`, computed off
+/// the cron handle the tick already parsed rather than re-parsing the string —
+/// so a ledger row's `due_at` and the API's `next_run` can never name different
+/// instants for one firing.
+pub(crate) fn pending_firing(
+    cron: &CronSchedule,
+    tz: Tz,
+    reference: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    cron.after(&reference.with_timezone(&tz))
+        .next()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// How many configured ticks a completed pass may be behind before the loop is
+/// reported stale. Four: one slow pass is not an alarm, and a loop that has
+/// missed four in a row is not merely slow.
+const STALE_PASS_TICKS: i64 = 4;
+
+/// Floor on the staleness window, so a sub-minute tick does not make the
+/// verdict flap on ordinary scheduling jitter.
+const STALE_PASS_FLOOR_SECS: i64 = 60;
+
+/// Whether the reconcile loop looks wedged: no pass has completed within
+/// [`STALE_PASS_TICKS`] ticks.
+///
+/// The failure this exists for is the one the loop cannot log. `reconcile`
+/// returning `Err` at `list_schedules` means the pass never looked at a single
+/// schedule, so `last_pass` never advances — and `last_pass` was a loop-local,
+/// which made "the loop has not completed a pass in six hours" and "nothing was
+/// due" the same observation from outside the process. A live HTTP server with a
+/// wedged scheduler is precisely the case a liveness proxy passes.
+///
+/// `None` (no pass has EVER completed against this store) is stale, not fresh:
+/// the honest answer to "when did a pass last complete?" is "never", and a
+/// never-completing loop is the worst case of all.
+pub(crate) fn pass_is_stale(
+    last_pass_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    tick_secs: u64,
+) -> bool {
+    let Some(last) = last_pass_at else {
+        return true;
+    };
+    let window = chrono::Duration::seconds(
+        (tick_secs.max(1) as i64 * STALE_PASS_TICKS).max(STALE_PASS_FLOOR_SECS),
+    );
+    now.signed_duration_since(last) > window
+}
+
+/// The `{last_pass_at, stale}` block `GET /schedules` and
+/// `GET /schedules/{id}/runs` both publish — surface 4 of the observability
+/// technique, built in ONE place so the two cannot disagree.
+pub(crate) async fn scheduler_liveness(state: &AppState) -> Value {
+    let last_pass_at = state
+        .storage
+        .schedule_pass_heartbeat()
+        .await
+        .unwrap_or_else(|e| {
+            warn!("scheduler pass heartbeat could not be read: {e}");
+            None
+        });
+    serde_json::json!({
+        "last_pass_at": last_pass_at,
+        "stale": pass_is_stale(last_pass_at, Utc::now(), state.config.worker.schedule_tick_secs),
+    })
+}
+
+/// The only app whose schedules retirement can stop: its sources are
+/// `extractor/<params.dataset>`, a mapping the params state outright.
+const RETIRABLE_APP: &str = "extractor";
+
+/// The extractor's dataset when `params` names none (its documented default).
+const EXTRACTOR_DEFAULT_DATASET: &str = "extracted";
+
+/// The dataset whose source a schedule feeds, when retirement applies to it at
+/// all: `Some(params.dataset)` (default `extracted`) for an extractor schedule,
+/// `None` for every other app.
+pub(crate) fn retirement_dataset(app: &str, params: &Value) -> Option<String> {
+    (app == RETIRABLE_APP).then(|| {
+        params
+            .get("dataset")
+            .and_then(Value::as_str)
+            .unwrap_or(EXTRACTOR_DEFAULT_DATASET)
+            .to_string()
+    })
+}
+
+/// Whether a schedule must not fire because the source it feeds is retired.
+///
+/// Only an extractor schedule (see [`retirement_dataset`]), and only the
+/// stored state `retired` — `unknown` (a failed read) and every other rung
+/// fire, so a health read that fails can never stop a pipeline.
+pub(crate) fn schedule_blocked_by_retirement(
+    app: &str,
+    params: &Value,
+    stored: pumper_core::SourceState,
+) -> bool {
+    retirement_dataset(app, params).is_some() && stored == pumper_core::SourceState::Retired
 }
 
 /// Whether a schedule the pass read earlier may still be fired *now*.
@@ -1056,22 +1503,121 @@ mod tests {
     /// re-deriving `queued`/`running` for itself. A second hand-rolled status
     /// match anywhere in the schedules surface is how the two drifted apart in
     /// the first place.
+    /// The NON-test half of one server source file.
+    ///
+    /// A source-scanning test that reads its own module matches its own
+    /// needles: every "this string must be absent" assertion is then trivially
+    /// false, and every "must be present" one trivially true — an inventory
+    /// guard that cannot fail is worse than none, because it reads as coverage.
+    fn non_test_source(name: &str) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let body =
+            std::fs::read_to_string(src.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        body.split("#[cfg(test)]")
+            .next()
+            .expect("split yields the pre-test-module source")
+            .to_string()
+    }
+
+    /// The body of `enrich_schedules` alone — the health derivation, without
+    /// the create/enable doors in the same file, which legitimately ask the
+    /// registry their own questions.
+    fn enrich_schedules_body(route: &str) -> String {
+        let after = route
+            .split_once("async fn enrich_schedules")
+            .expect("routes/schedules.rs still defines enrich_schedules")
+            .1;
+        let body = after
+            .split_once("\n#[derive(")
+            .expect("enrich_schedules is followed by the next top-level item")
+            .0
+            .to_string();
+        assert!(
+            body.len() < route.len() / 2,
+            "the slice is supposed to be one function, not most of the file"
+        );
+        body
+    }
+
+    /// Every variant name declared by the `ScheduleAdmission` enum, in source
+    /// order. Scanned rather than enumerated in Rust so that the *declaration*
+    /// is the one list: a variant added to the enum and nowhere else fails
+    /// here, which is the whole point of a closed admission vocabulary.
+    fn declared_admission_variants(scheduler: &str) -> Vec<String> {
+        let block = scheduler
+            .split_once("pub(crate) enum ScheduleAdmission {")
+            .expect("scheduler.rs declares `pub(crate) enum ScheduleAdmission`")
+            .1
+            .split_once("\n}")
+            .expect("the enum declaration is closed")
+            .0;
+        block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+            .map(|l| {
+                l.split(['{', '(', ','])
+                    .next()
+                    .expect("a variant line has a name")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+            .collect()
+    }
+
+    /// The `(variant, health string)` pairs declared by
+    /// `ScheduleAdmission::health` — the only producer of those strings, read
+    /// out of the source so that a variant with no arm is a parse the test can
+    /// see rather than a silent omission.
+    fn declared_health_arms(scheduler: &str) -> Vec<(String, String)> {
+        let block = scheduler
+            .split_once("fn health(&self) -> &'static str {")
+            .expect("scheduler.rs declares ScheduleAdmission::health")
+            .1
+            .split_once("\n        }")
+            .expect("the match block is closed")
+            .0;
+        block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("Self::"))
+            .filter_map(|l| l.split_once("=> \""))
+            .map(|(lhs, rhs)| {
+                let variant = lhs
+                    .split([' ', '{', '('])
+                    .next()
+                    .expect("an arm names its variant")
+                    .to_string();
+                let health = rhs
+                    .split_once('"')
+                    .expect("the arm's string literal is closed")
+                    .0
+                    .to_string();
+                (variant, health)
+            })
+            .collect()
+    }
+
+    /// The `health` values the `GET /schedules` OpenAPI description publishes,
+    /// parsed out of the `#[utoipa::path]` attribute itself.
+    fn published_health_values(route: &str) -> Vec<String> {
+        let after = route
+            .split_once("`health` (")
+            .expect("the GET /schedules description still enumerates `health`")
+            .1;
+        let list = after
+            .split_once(')')
+            .expect("the enumeration is parenthesised")
+            .0;
+        list.split('|')
+            .map(|v| v.trim().trim_matches('`').to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    }
+
     #[test]
     fn health_and_guard_share_one_predicate() {
-        // Only the NON-test half of each file is scanned. A source-scanning test
-        // that reads its own module matches its own needles: every "this string
-        // must be absent" assertion is then trivially false, and every "must be
-        // present" one trivially true — an inventory guard that cannot fail is
-        // worse than none, because it reads as coverage.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let code = |name: &str| {
-            let body =
-                std::fs::read_to_string(src.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-            body.split("#[cfg(test)]")
-                .next()
-                .expect("split yields the pre-test-module source")
-                .to_string()
-        };
+        let code = non_test_source;
         let scheduler = code("scheduler.rs");
         let route = code("routes/schedules.rs");
         assert!(
@@ -1116,6 +1662,326 @@ mod tests {
             !scheduler.contains(existential_twin),
             "the existential overlap query is back; it is what wedged schedules \
              on `POST /jobs/retry`"
+        );
+
+        // One gate, one vocabulary. The overlap predicate above is ONE of the
+        // admission gates; guarding only that one is what let the retirement
+        // gate land in the fire path with no health branch at all. So the whole
+        // verdict is the shared thing now: `enrich_schedules` reads `admit` and
+        // may not re-answer ANY gate for itself.
+        let enrich = enrich_schedules_body(&route);
+        assert!(
+            enrich.contains("crate::scheduler::admit("),
+            "the health derivation must read the one admission verdict"
+        );
+        assert!(
+            scheduler.contains("admit(state, schedule).await?"),
+            "the fire path must reach its answer through the same `admit` call"
+        );
+        for gate in [
+            "registry.contains_key",
+            "validate_schedule_params",
+            "schedule_blocked_by_retirement",
+            "retirement_dataset",
+            "holds_slot",
+        ] {
+            assert!(
+                !enrich.contains(gate),
+                "enrich_schedules re-derives the `{gate}` gate instead of reading \
+                 the one admission verdict — exactly the drift that made a \
+                 retired source report health=ok"
+            );
+        }
+    }
+
+    /// The guard above can only work if its slicing does. Drives both slicers
+    /// and asserts they cut where they claim to.
+    #[test]
+    fn the_admission_guard_can_actually_fail() {
+        let route = non_test_source("routes/schedules.rs");
+        let enrich = enrich_schedules_body(&route);
+        assert!(
+            route.contains("registry.contains_key"),
+            "the create door legitimately asks the registry — so a whole-file \
+             scan could never have expressed this rule"
+        );
+        assert!(!enrich.contains("fn create_schedule"));
+        assert!(
+            enrich.contains("next_run"),
+            "the slice is the right function"
+        );
+    }
+
+    /// One vocabulary, published once. Every variant the admission enum
+    /// declares must appear in the `GET /schedules` OpenAPI description, and
+    /// the description may publish nothing the enum cannot produce — so a
+    /// seventh gate cannot land without the API learning its name.
+    #[test]
+    fn admission_variants_and_the_published_health_values_are_one_list() {
+        let scheduler = non_test_source("scheduler.rs");
+        let route = non_test_source("routes/schedules.rs");
+        let arms = declared_health_arms(&scheduler);
+        assert!(
+            arms.len() >= 6,
+            "implausibly few health arms parsed: {arms:?}"
+        );
+
+        // Every declared variant publishes a name...
+        let mut named: Vec<String> = arms.iter().map(|(v, _)| v.clone()).collect();
+        let mut declared = declared_admission_variants(&scheduler);
+        named.sort();
+        declared.sort();
+        assert_eq!(
+            named, declared,
+            "a ScheduleAdmission variant has no `health` arm, so the API cannot \
+             name the gate that produced it"
+        );
+
+        // ...and the API publishes exactly those names, no more.
+        let mut health: Vec<String> = arms.into_iter().map(|(_, h)| h).collect();
+        let mut published = published_health_values(&route);
+        health.sort();
+        published.sort();
+        assert_eq!(
+            health, published,
+            "the admission vocabulary and the `health` values GET /schedules \
+             publishes have drifted apart"
+        );
+    }
+
+    /// Source with every line comment removed, so a rule that is *described*
+    /// in a comment above code that breaks it cannot satisfy the scan. The two
+    /// ledger guards below both match on string literals, and this file's doc
+    /// comments quote those very literals.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.trim_start().starts_with("//") {
+                true => "",
+                false => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every `outcome:` literal the scheduler writes to the decision ledger, in
+    /// source order.
+    fn written_outcomes(code: &str) -> Vec<String> {
+        code.split("outcome: \"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(w, _)| w.to_string()))
+            .collect()
+    }
+
+    /// The ledger publishes a closed vocabulary
+    /// (`pumper_core::storage::SCHEDULE_OUTCOMES`) and the scheduler is its only
+    /// writer, so the two have to be one list. A seventh outcome cannot land
+    /// without the contract learning its name, and a word that stops being
+    /// written cannot linger in the contract as a value the API promises.
+    #[test]
+    fn ledger_outcomes_come_only_from_the_published_vocabulary() {
+        use pumper_core::storage::{SCHEDULE_OUTCOMES, SCHEDULE_OUTCOME_PASS};
+        let code = code_only(&non_test_source("scheduler.rs"));
+        let written = written_outcomes(&code);
+        assert!(
+            written.len() >= 6,
+            "implausibly few ledger writes parsed: {written:?}"
+        );
+        for word in &written {
+            assert!(
+                SCHEDULE_OUTCOMES.contains(&word.as_str()),
+                "`{word}` is written to schedule_runs but is not in \
+                 SCHEDULE_OUTCOMES, so the API promises a vocabulary the \
+                 scheduler does not keep"
+            );
+        }
+        // And nothing in the contract is dead. `pass` is the heartbeat's own
+        // word, written by `Storage::mark_schedule_pass` rather than from here.
+        for word in SCHEDULE_OUTCOMES {
+            if *word == SCHEDULE_OUTCOME_PASS {
+                continue;
+            }
+            assert!(
+                written.iter().any(|w| w == word),
+                "SCHEDULE_OUTCOMES publishes `{word}` but no decision point \
+                 writes it: {written:?}"
+            );
+        }
+    }
+
+    /// **The no-fourth-authority guard.** This context's whole problem was three
+    /// separate answers to "why isn't this firing?"; card A collapsed them into
+    /// one `ScheduleAdmission`. A ledger that spelled its own reason words would
+    /// put a fourth one back, in the surface an operator reads FIRST.
+    ///
+    /// So the scheduler may not contain a single `reason:` string literal: every
+    /// reason it records is `ScheduleAdmission::health()`, read off the one
+    /// verdict the fire path acts on.
+    #[test]
+    fn admission_reasons_come_only_from_the_shared_vocabulary() {
+        let code = code_only(&non_test_source("scheduler.rs"));
+        for spelling in ["reason: Some(\"", "reason: \""] {
+            assert!(
+                !code.contains(spelling),
+                "scheduler.rs spells a ledger `reason` as a literal; it must \
+                 come from ScheduleAdmission::health() so the ledger, the fire \
+                 path and GET /schedules cannot disagree"
+            );
+        }
+        assert!(
+            code.contains("let reason = verdict.health();"),
+            "the step must take its ledger reason off the one admission verdict"
+        );
+        // The two refusals reached BEFORE `admit` runs name their variant
+        // explicitly rather than inventing a word.
+        assert!(
+            code.contains("ScheduleAdmission::InvalidCron.health()")
+                && code.contains("ScheduleAdmission::Disabled.health()"),
+            "a pre-admission refusal must still name its reason from the enum"
+        );
+    }
+
+    /// The durable heartbeat and the in-memory `last_pass` must be gated by the
+    /// SAME fact, or the API's liveness answer and the scheduler's own notion of
+    /// "a pass already had its chance at this firing" drift apart — and that
+    /// drift is invisible, because both are only read long after the pass.
+    ///
+    /// `tick_once` computes `completed` and stamps the heartbeat under it; `run`
+    /// advances `last_pass` under the `Ok(true)` that `completed` becomes.
+    #[test]
+    fn the_heartbeat_and_last_pass_are_gated_by_the_same_completed_pass() {
+        let code = code_only(&non_test_source("scheduler.rs"));
+        let tick = code
+            .split_once("async fn tick_once")
+            .expect("scheduler.rs still defines tick_once")
+            .1
+            // A code marker, not a doc comment: `code_only` has already
+            // stripped every comment out of this slice.
+            .split_once("pub(crate) enum StepOutcome")
+            .expect("tick_once is followed by the StepOutcome declaration")
+            .0;
+        assert!(
+            tick.contains("if completed {") && tick.contains("mark_schedule_pass(now)"),
+            "the heartbeat must be stamped from tick_once's own `completed`, \
+             not from a second notion of a finished pass"
+        );
+        assert!(
+            !tick.contains("last_pass = "),
+            "the slice is tick_once, which must not be the thing advancing \
+             last_pass — `run` does that from the value tick_once returns"
+        );
+        assert!(
+            code.contains("Ok(true) => last_pass = Some(now),"),
+            "`run` still advances last_pass off the same completed-pass bool"
+        );
+    }
+
+    /// Both guards above can only work if their slicing and stripping do.
+    #[test]
+    fn the_ledger_vocabulary_guards_can_actually_fail() {
+        // The comment stripper really strips, and really keeps code.
+        let sample = "// outcome: \"ghost\"\nlet x = 1; // trailing\n    outcome: \"fired\",";
+        let stripped = code_only(sample);
+        assert!(
+            !stripped.contains("ghost"),
+            "a commented word still matched"
+        );
+        let found = written_outcomes(&stripped);
+        assert_eq!(found, vec!["fired".to_string()], "{stripped:?}");
+
+        // A seeded foreign word is caught.
+        let seeded = code_only("    outcome: \"swallowed\",");
+        assert_eq!(written_outcomes(&seeded), vec!["swallowed".to_string()]);
+        assert!(
+            !pumper_core::storage::SCHEDULE_OUTCOMES.contains(&"swallowed"),
+            "the guard's negative case is only a case while this is true"
+        );
+
+        // And the reason guard's forbidden spelling is a real match, not a
+        // pattern that could never fire.
+        assert!(code_only("    reason: Some(\"overlap\"),").contains("reason: Some(\""));
+    }
+
+    /// The runtime half of the vocabulary guard: the source scan above reads
+    /// the DECLARATION, this one reads the only producer of the strings. One
+    /// sample of every variant, in declaration order, so the precedence the
+    /// doc comment states is also asserted.
+    #[test]
+    fn every_declared_variant_has_exactly_one_health_string() {
+        let samples = [
+            ScheduleAdmission::Disabled,
+            ScheduleAdmission::InvalidCron,
+            ScheduleAdmission::UnregisteredApp,
+            ScheduleAdmission::InvalidParams {
+                reason: "/a: nope".into(),
+            },
+            ScheduleAdmission::Retired {
+                dataset: "extracted".into(),
+            },
+            ScheduleAdmission::Overlapping,
+            ScheduleAdmission::Fire {
+                params: Value::Null,
+            },
+        ];
+        let declared = declared_admission_variants(&non_test_source("scheduler.rs"));
+        assert_eq!(
+            samples.len(),
+            declared.len(),
+            "a variant was added to the enum but not to this sample set: {declared:?}"
+        );
+        // Declaration order IS the precedence order the doc comment states.
+        assert_eq!(
+            declared,
+            vec![
+                "Disabled",
+                "InvalidCron",
+                "UnregisteredApp",
+                "InvalidParams",
+                "Retired",
+                "Overlapping",
+                "Fire",
+            ],
+            "the declared precedence changed; `admit` and the docs must change with it"
+        );
+        let health: Vec<&str> = samples.iter().map(ScheduleAdmission::health).collect();
+        assert_eq!(
+            health,
+            vec![
+                "disabled",
+                "invalid_cron",
+                "unregistered_app",
+                "invalid_params",
+                "retired",
+                "overlapping",
+                "ok",
+            ]
+        );
+        let mut uniq: Vec<&str> = health.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), health.len(), "two verdicts share one name");
+    }
+
+    #[test]
+    fn the_variant_scanner_can_actually_fail() {
+        let fake = "pub(crate) enum ScheduleAdmission {\n    /// doc\n    Disabled,\n    \
+                    InvalidCron,\n    Fire { params: Value },\n}\n";
+        assert_eq!(
+            declared_admission_variants(fake),
+            vec!["Disabled", "InvalidCron", "Fire"]
+        );
+        let fake_health = "fn health(&self) -> &'static str {\n        match self {\n            \
+                           Self::Disabled => \"disabled\",\n            Self::Fire { .. } => \
+                           \"ok\",\n        }\n    }\n";
+        assert_eq!(
+            declared_health_arms(fake_health),
+            vec![
+                ("Disabled".to_string(), "disabled".to_string()),
+                ("Fire".to_string(), "ok".to_string()),
+            ]
+        );
+        assert_eq!(
+            published_health_values("and `health` (`ok` | `disabled` | `retired`) - so a"),
+            vec!["ok", "disabled", "retired"]
         );
     }
 

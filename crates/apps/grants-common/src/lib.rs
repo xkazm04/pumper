@@ -1836,6 +1836,109 @@ fn end_of_ambiguous_day(d: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc.from_utc_datetime(&next.and_hms_opt(AMBIGUOUS_DEADLINE_UTC_HOUR, 0, 0).unwrap())
 }
 
+/// How much time is left on a published deadline, measured at the ONE canonical
+/// instant [`deadline_end_utc`] defines.
+///
+/// This type exists because three surfaces wanted the same countdown and each
+/// one derived it itself, so each one got a different answer: grants.gov's
+/// digest counted calendar days from `Utc::now().date_naive()`, and
+/// `GET /grants/closing-soon` compared printed date strings lexicographically.
+/// Both were ~12 hours out of step with `grants/unified` for the first half of
+/// every UTC day, and the disagreement always fell in the direction that hides
+/// claimable money: the grant closing today — the single most valuable row in
+/// an urgency view — was live in the corpus and absent from the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Countdown {
+    /// The canonical lapse instant, from [`deadline_end_utc`].
+    pub closes_at: chrono::DateTime<chrono::Utc>,
+    /// Whole hours of real time left; `0` once the deadline has lapsed, never
+    /// negative.
+    pub hours_left: i64,
+    /// Whole days left, counted in the deadline's own vocabulary (see
+    /// [`deadline_countdown`]); `0` once lapsed, never negative.
+    pub days_left: i64,
+    /// `now` is past [`Self::closes_at`]: this row is provably no longer
+    /// claimable, whatever its stored `status` still says.
+    ///
+    /// Not a redundant encoding of `hours_left == 0` — a deadline 40 minutes
+    /// away also has zero whole hours left and is still open.
+    pub lapsed: bool,
+}
+
+/// The countdown for one published deadline, or `None` when neither field
+/// parses — an unknown deadline is never a lapsed one, the same rule
+/// [`deadline_end_utc`] follows.
+///
+/// `days_left` splits on exactly the axis [`deadline_end_utc`] splits on,
+/// because that split *is* the difference between the two kinds of fact a
+/// source gave us:
+///
+/// - **Zoned** (`close_at` parsed): whole days of real time,
+///   `hours_left / 24`. SEDIA's `…T17:00:00Z` topic at 23:00Z the night before
+///   has eighteen hours and therefore **zero** days left, which is the number a
+///   user acts on. Counting the calendar would print "1 day" and be wrong by a
+///   working day.
+/// - **Date-only**: the calendar distance from today to the printed date,
+///   floored at 0. The twelve-hour anywhere-on-Earth tail inside `closes_at` is
+///   deliberate conservatism about an unknown timezone, not claim time we can
+///   promise, so it must not inflate the count. A grant printed for yesterday
+///   whose tail has not run out is `0` — claimable TODAY. This is bit-for-bit
+///   the definition grants.gov's digest already used, which is what makes it
+///   safe for the digest to call this function instead of its own arithmetic.
+pub fn deadline_countdown(
+    close_date: Option<&str>,
+    close_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Countdown> {
+    let closes_at = deadline_end_utc(close_date, close_at)?;
+    let hours_left = (closes_at - now).num_hours().max(0);
+    let days_left = if close_at.and_then(parse_instant).is_some() {
+        hours_left / 24
+    } else {
+        close_date
+            .and_then(parse_date)
+            .map(|d| (d - now.date_naive()).num_days().max(0))
+            .unwrap_or(0)
+    };
+    Some(Countdown {
+        closes_at,
+        hours_left,
+        days_left,
+        lapsed: now > closes_at,
+    })
+}
+
+/// The printed-date bounds `GET /grants/closing-soon` hands the store, derived
+/// from the canonical instant so the SQL set and [`deadline_countdown`] cannot
+/// disagree.
+///
+/// The upper bound is the plain calendar one, `today + days`. The lower bound
+/// is the whole trick. A printed date `D` is still claimable while
+/// `D+1T12:00:00Z` has not passed, so the set of still-claimable printed dates
+/// is `D >= today - 1` for the first twelve hours of the UTC day and
+/// `D >= today` after it. Stating the canonical set that way keeps the bound a
+/// **lexicographic text compare**, which is what lets the COUNT and the page
+/// share one predicate — the property that stops `count` and `grants` from
+/// disagreeing — while selecting the instant-correct rows.
+///
+/// It is a bound on *membership*, not a filter on lapse: a row whose zoned
+/// `close_at` ran out earlier today is still inside these bounds and is still
+/// returned, marked `lapsed`. Dropping a row the COUNT included is a bug this
+/// route has already had once.
+pub fn closing_window_bounds(now: chrono::DateTime<chrono::Utc>, days: i64) -> (String, String) {
+    use chrono::Timelike;
+    let today = now.date_naive();
+    let lower = if now.hour() < AMBIGUOUS_DEADLINE_UTC_HOUR {
+        today.pred_opt().unwrap_or(today)
+    } else {
+        today
+    };
+    (
+        lower.to_string(),
+        (today + chrono::Duration::days(days)).to_string(),
+    )
+}
+
 /// When a single published deadline string lapses, whatever shape it has:
 /// exact when it is zoned, conservatively end-of-ambiguous-day when it is a bare
 /// date. Used to order SEDIA's multi-stage cutoffs by real time.
@@ -1873,9 +1976,12 @@ fn norm_status(s: Option<&str>) -> Value {
 /// `ca-grants` (`src/lib.rs`) nominated `grants_common` as its home in a
 /// comment: *"It lives here rather than in `grants-common` only because apps may
 /// not depend on apps and the shared crate was out of this change's write set."*
-/// This IS that home. The two existing copies are deliberately left in place —
-/// re-pointing ~45 references is churn, not a fix — so for now this is the
-/// canonical definition for **new** adopters, of which `eu-sedia` is the first.
+/// This IS that home. Adopted by `eu-sedia`, then by `cordis` — whose private
+/// fork had already **diverged** (it proved coverage from rows *requested*, the
+/// refuted form named in [`walk_end`]'s doc below, and that verdict wrapped its
+/// resume cursor on a truncated final page). `grants-gov`'s and `ca-grants`'
+/// copies are still in place and are still verbatim; folding them in is
+/// ~115 further references and is tracked as its own change.
 ///
 /// The arm apps keep missing is [`SweepEnd::UnknownTotal`], and the ledger
 /// records what it has cost three times: `grants-gov`'s renamed `hitCount`,
@@ -1918,7 +2024,7 @@ impl SweepEnd {
     }
 }
 
-/// How the walk ends after fetching the 1-based `page`, or `None` to keep going.
+/// How the walk ends after fetching a page, or `None` to keep going.
 ///
 /// `collected` is every record gathered so far **including this page**, and it —
 /// not offset arithmetic — is what proves coverage. The break these apps ship
@@ -1933,16 +2039,31 @@ impl SweepEnd {
 /// rate-limited upstream produces exactly the same shape as a genuine tail) and
 /// must never outrank the proof.
 ///
-/// Termination: every path either returns `Some` or leaves `page < max_pages`,
-/// so the page cap still bounds the walk — including on an `unknown_total` feed,
-/// where there is no total left to bound it.
+/// `capped` is **the caller's own statement that this run may take no more** —
+/// not a page count. It used to be `max_pages: u64`, compared here as
+/// `page >= max_pages`, which quietly assumed every caller's budget is
+/// denominated in pages. `cordis` caps on *projects* and can exhaust its budget
+/// in the middle of a page, so under the old shape it could not express its cap
+/// at all and forked the whole function instead. A boolean the caller computes
+/// (`page >= max_pages` for a page budget, `leftover > 0 || full` for a record
+/// budget) fits both, and the `page` parameter — read by nothing else — went
+/// with it.
+///
+/// Termination: every path either returns `Some` or leaves the caller's cap
+/// unreached, so the cap still bounds the walk — including on an
+/// `unknown_total` feed, where there is no total left to bound it.
+///
+/// `capped` does not outrank the proof of coverage, and must not: a cap reached
+/// exactly as the last record arrives is a finished sweep, not a truncated one.
+/// For a record-budget caller the two cannot collide anyway — an untaken
+/// leftover is by definition a record inside `total` that `collected` does not
+/// count, so `leftover > 0` implies `collected < total`.
 pub fn walk_end(
-    page: u64,
     page_size: u64,
     total: u64,
     got: u64,
     collected: u64,
-    max_pages: u64,
+    capped: bool,
 ) -> Option<SweepEnd> {
     if total == 0 {
         // No usable total. Two sub-cases, told apart by what the SAME response
@@ -1956,12 +2077,12 @@ pub fn walk_end(
         // Self-contradictory: records served under a zero total. Keep walking —
         // a short page or the cap is the only end signal left — but never report
         // complete.
-        return (got < page_size || page >= max_pages).then_some(SweepEnd::UnknownTotal);
+        return (got < page_size || capped).then_some(SweepEnd::UnknownTotal);
     }
     if collected >= total {
         return Some(SweepEnd::Complete);
     }
-    if page >= max_pages {
+    if capped {
         return Some(SweepEnd::Capped);
     }
     if got < page_size {
@@ -2040,6 +2161,53 @@ pub fn empty_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> b
     total > 0 && got == 0 && page.saturating_sub(1).saturating_mul(page_size) < total
 }
 
+// ── Horizon identifier grammar ──────────────────────────────────────────────
+
+/// Horizon topic-family key: the identifier with its call-year segment removed,
+/// so successor topics across work programmes collapse onto one lineage key
+/// (`HORIZON-CL4-2026-DATA-01` and `HORIZON-CL4-2024-DATA-01` →
+/// `HORIZON-CL4-DATA-01`).
+///
+/// **This is a join key, and a join key has two sides.** `eu-sedia` derives it
+/// for open SEDIA topics; `cordis` derives it for funded CORDIS outcomes and
+/// aggregates `topic_stats` per family. Two sides that must agree character for
+/// character, so it has exactly one definition — here, in the shared crate both
+/// may depend on. It used to live in `eu-sedia`, which made `cordis` declare
+/// `app-eu-sedia` as a dependency: an app→app edge the repo's own layering rule
+/// forbids, bought for these 23 lines.
+///
+/// **Horizon-only by design**: identifiers must start with `HORIZON-` and carry
+/// exactly one plausible call-year segment (2020–2039). Other programmes
+/// (Erasmus+, LIFE, CERV, …) use different, less regular grammars — returning
+/// `None` there is honest; guessing a family would fabricate lineage. Counter
+/// segments (`-01`, `-01-05`) are kept: they distinguish topics within a
+/// destination, which is exactly the granularity predecessor matching needs.
+/// If a second year-like segment appears, only the first is removed.
+pub fn topic_lineage(identifier: &str) -> Option<String> {
+    let id = identifier.trim();
+    let segments: Vec<&str> = id.split('-').collect();
+    if segments.first() != Some(&"HORIZON") || segments.len() < 3 {
+        return None;
+    }
+    let is_year = |s: &str| {
+        s.len() == 4
+            && s.chars().all(|c| c.is_ascii_digit())
+            && (2020..=2039).contains(&s.parse::<u32>().unwrap_or(0))
+    };
+    let year_pos = segments.iter().position(|s| is_year(s))?;
+    let family: Vec<&str> = segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != year_pos)
+        .map(|(_, s)| *s)
+        .collect();
+    // A family must still name something beyond the programme prefix.
+    if family.len() < 2 {
+        return None;
+    }
+    Some(family.join("-"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2056,18 +2224,18 @@ mod tests {
     fn a_missing_total_is_unknown_coverage_not_a_finished_sweep() {
         // Page 1 of a renamed-total feed: 100 records served under total 0.
         assert_eq!(
-            walk_end(1, 100, 0, 100, 100, 50),
+            walk_end(100, 0, 100, 100, false),
             None,
             "a full page under a zero total must keep walking, not stop at one page"
         );
         // ...and however far it walks, it never reads as complete.
         assert_eq!(
-            walk_end(3, 100, 0, 40, 240, 50),
+            walk_end(100, 0, 40, 240, false),
             Some(SweepEnd::UnknownTotal),
             "a short page ends the unknown-total walk without proving coverage"
         );
         assert_eq!(
-            walk_end(50, 100, 0, 100, 5000, 50),
+            walk_end(100, 0, 100, 5000, true),
             Some(SweepEnd::UnknownTotal),
             "so does the page cap"
         );
@@ -2075,7 +2243,7 @@ mod tests {
 
         // The boundary that must NOT be drift: no total AND no records is an
         // honestly empty result set, and it is fully swept.
-        assert_eq!(walk_end(1, 100, 0, 0, 0, 50), Some(SweepEnd::Complete));
+        assert_eq!(walk_end(100, 0, 0, 0, false), Some(SweepEnd::Complete));
     }
 
     #[test]
@@ -2084,20 +2252,109 @@ mod tests {
         // page). Offset arithmetic says 200 >= 137 — "complete". Collected says
         // 112 < 137, and a short page is evidence of nothing.
         assert_eq!(
-            walk_end(2, 100, 137, 12, 112, 50),
+            walk_end(100, 137, 12, 112, false),
             Some(SweepEnd::ShortPage),
             "112 of 137 collected is not a complete sweep, however far the offset ran"
         );
         // The same page, fully served, IS the end of the corpus.
-        assert_eq!(walk_end(2, 100, 137, 37, 137, 50), Some(SweepEnd::Complete));
+        assert_eq!(walk_end(100, 137, 37, 137, false), Some(SweepEnd::Complete));
         // The cap outranks a short page, and coverage outranks both.
         assert_eq!(
-            walk_end(50, 100, 100_000, 100, 5000, 50),
+            walk_end(100, 100_000, 100, 5000, true),
             Some(SweepEnd::Capped)
         );
         assert_eq!(
-            walk_end(50, 100, 5000, 100, 5000, 50),
+            walk_end(100, 5000, 100, 5000, true),
             Some(SweepEnd::Complete)
+        );
+    }
+
+    /// `capped` is the caller's budget, whatever it is denominated in. The old
+    /// `max_pages: u64` could only express a PAGE budget, which is why `cordis`
+    /// — whose budget is projects, and which can therefore exhaust it halfway
+    /// through a page — forked this function instead of calling it.
+    #[test]
+    fn a_record_budget_caps_the_walk_as_well_as_a_page_budget() {
+        // cordis's shape: `maxProjects` cut page 5 after 50 of 100 hits, so 50
+        // records of this page were never taken. The page arithmetic says
+        // 5 * 100 = 500 >= 450 — the refuted proof — but 450 collected of 450
+        // total is genuinely the whole corpus here, so it IS complete.
+        assert_eq!(walk_end(100, 450, 50, 450, true), Some(SweepEnd::Complete));
+        // Move the total out of reach and the same cap is a truncation.
+        assert_eq!(
+            walk_end(100, 23_361, 100, 450, true),
+            Some(SweepEnd::Capped)
+        );
+        // An untaken leftover can never coexist with a proven sweep: the
+        // leftover records are inside `total` and outside `collected`.
+        assert_eq!(walk_end(100, 500, 100, 450, true), Some(SweepEnd::Capped));
+        // A page budget reaches the identical verdict through the identical arm.
+        assert_eq!(
+            walk_end(100, 23_361, 100, 2500, true),
+            Some(SweepEnd::Capped)
+        );
+    }
+
+    /// The last-page truncation that cost cordis its resume cursor, stated as
+    /// the card's acceptance case: offset 234 * 100 = 23,400 clears the 23,361
+    /// total, but only 23,312 records ever arrived.
+    #[test]
+    fn a_short_final_page_is_short_page_not_complete() {
+        assert_eq!(
+            walk_end(100, 23_361, 12, 23_312, false),
+            Some(SweepEnd::ShortPage),
+            "23,312 of 23,361 is not a swept corpus, however far the offset ran"
+        );
+    }
+
+    // ---- Horizon identifier grammar ----
+
+    /// The join key, proved on both sides it joins: `eu-sedia` derives it for
+    /// open topics, `cordis` for funded outcomes, and they must agree exactly.
+    #[test]
+    fn topic_lineage_collapses_successor_topics_onto_one_family() {
+        // Real identifiers seen live 2026-07-30.
+        assert_eq!(
+            topic_lineage("HORIZON-EURATOM-2021-NRT-01").as_deref(),
+            Some("HORIZON-EURATOM-NRT-01")
+        );
+        assert_eq!(
+            topic_lineage("HORIZON-EURATOM-2023-NRT-01").as_deref(),
+            Some("HORIZON-EURATOM-NRT-01")
+        );
+        assert_eq!(
+            topic_lineage("HORIZON-CL4-2026-DATA-01").as_deref(),
+            Some("HORIZON-CL4-DATA-01")
+        );
+        // Successors across work programmes land on the SAME key — the whole
+        // point of the grammar.
+        assert_eq!(
+            topic_lineage("HORIZON-CL4-2024-DATA-01").as_deref(),
+            topic_lineage("HORIZON-CL4-2026-DATA-01").as_deref()
+        );
+    }
+
+    /// Guessing a family for a programme whose grammar this does not know would
+    /// fabricate lineage, and a fabricated join key silently merges unrelated
+    /// topics. `None` is the honest answer.
+    #[test]
+    fn topic_lineage_refuses_a_grammar_it_does_not_know() {
+        assert_eq!(topic_lineage("ERASMUS-EDU-2026-PEX-TEACH-ACA"), None);
+        assert_eq!(topic_lineage("LIFE-2025-SAP-NAT"), None);
+        // Horizon-shaped but with no call year to remove.
+        assert_eq!(topic_lineage("HORIZON-CL4-DATA-01"), None);
+        // A year outside the plausible window is not a call year.
+        assert_eq!(topic_lineage("HORIZON-CL4-1999-DATA-01"), None);
+        // Nothing left beyond the programme prefix once the year is removed.
+        assert_eq!(topic_lineage("HORIZON-2026"), None);
+        assert_eq!(topic_lineage(""), None);
+        // Pinned as-is, NOT endorsed: a bare counter after the year survives
+        // the `family.len() < 2` floor and yields `HORIZON-01`. The move into
+        // this crate is a move, not a redesign — recorded here so the next
+        // change to the floor is a decision rather than an accident.
+        assert_eq!(
+            topic_lineage("HORIZON-2026-01").as_deref(),
+            Some("HORIZON-01")
         );
     }
 

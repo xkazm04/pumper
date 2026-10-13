@@ -106,6 +106,18 @@ inventory:
     node --test scripts/docs/check-doc-sync.test.mjs
     node --test scripts/ci/mcp-gate-parity.test.mjs
 
+# Asserts the MCP surface's gated-tool vocabulary is spelled identically at all
+# three sites that spell it (advertised / dispatched / refused). Three
+# hand-maintained copies of one closed vocabulary is a race with a delay fuse,
+# and the loud direction is silent: listed-but-unguarded means a tool that is
+# hidden while [mcp] allow_enqueue is off and still CALLABLE.
+#
+# 0 clean / 2 findings / 3 cannot check. `--root <dir>` judges another checkout.
+#
+# Fail if the MCP gated-tool vocabulary has drifted between its three sites.
+mcp-gate-parity:
+    node scripts/ci/mcp-gate-parity.mjs
+
 # --- test harness: the flake register and the long lanes ----------------------
 
 # Reconciles .flake/register.json against every `#[ignore]` in crates/, IN BOTH
@@ -131,16 +143,25 @@ flake-check:
 flake-report:
     node scripts/ci/flake-check.mjs --report
 
-# The gate's own fixture suite. A gate that has never been observed to go red is
-# indistinguishable from a gate that cannot: this plants an expired entry, an
-# orphaned entry, an unregistered flake, a breached ceiling and a dead scanner,
-# and asserts each one reddens.
+# Each gate's own fixture suite. A gate that has never been observed to go red
+# is indistinguishable from a gate that cannot: these plant an expired entry, an
+# orphaned entry, an unregistered flake, a breached ceiling, a dead scanner, a
+# root with no Cargo.toml and a tree of only-live artifacts, and assert each one
+# reddens with the exit code it declares.
 #
-# Prove the flake gate and the lane certifier still fire.
+# THIS BODY IS A PROJECTION of scripts/ci/gates.json, not a second list. The
+# last line is the inventory test that holds it to that: a suite dropped from
+# here while its registry entry stands goes red, and so does a suite added here
+# that no gate owns. That reconciliation is why `disk-check.test.mjs` can no
+# longer be in this recipe and in no CI step, which is what it was.
+#
+# Prove every gate in the registry still fires.
 harness-test:
     node --test scripts/ci/flake-check.test.mjs
     node --test scripts/ci/lane-certify.test.mjs
     node --test scripts/ci/disk-check.test.mjs
+    node --test scripts/ci/gate-inventory.test.mjs
+    node --test scripts/ci/quality-report.test.mjs
 
 # Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
 # through the recorder (so the --ignored set finally accumulates history), then
@@ -198,8 +219,13 @@ lane-health:
 # absent: they are certifications on their own clock (`just lanes`), and hanging
 # a minutes-long run off the pre-push habit is how the habit stops happening.
 #
+# `mcp-gate-parity` joins it because `just inventory` only ever ran that gate's
+# FIXTURES: the checker's own verdict ran nowhere, locally or in CI, which is a
+# gate whose red nobody would ever see. gates.json records that binding and
+# gate-inventory.test.mjs reconciles this dependency list against it.
+#
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check
+ci: fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake-check harness-test disk-check
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:
@@ -216,6 +242,27 @@ ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-t
 # Prove the doc-sync hook still fires: runs its fixture suite.
 doc-sync:
     node --test scripts/docs/check-doc-sync.test.mjs
+
+# The whole posture in one run. `just ci` is a dependency chain and `just` aborts
+# at the first non-zero rung, so one red gate hides every other verdict until you
+# fix it and re-run the ladder. This runs every gate in scripts/ci/gates.json in
+# its NON-MUTATING mode, continues past every failure, and prints one table:
+# gate, verdict, the one-line finding, and the exact command that fixes it.
+#
+# Four verdicts, four columns, and CANNOT CHECK is its own — a broken instrument
+# counted as clean is the failure every gate header in this repo warns about and
+# nothing aggregated. NOT WIRED is a registered gate with no report mode: it gets
+# a row rather than vanishing, and reddens the run unless gates.json declares why
+# that rung is waived.
+#
+# Read-only: disk-check runs --no-prune. Three outcomes, three exit codes — 0
+# every gate clean, 2 some gate has findings, 3 some instrument could not be run.
+# Deliberately NOT a dependency of `ci`: every row's gate already blocks there on
+# its own rung, and running the suite twice to print it once is not a posture.
+#
+# Every gate's verdict and its remedy, in one table.
+quality:
+    node scripts/ci/quality-report.mjs
 
 # --- maintenance -------------------------------------------------------------
 

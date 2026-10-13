@@ -160,7 +160,7 @@ async fn scheduled_run_merges_over_defaults_not_replaces_them() {
 
     let job = state
         .storage
-        .list(Some("schema-app"), None, 1)
+        .list(&pumper_core::storage::JobQuery::for_app("schema-app"), 1)
         .await
         .unwrap()
         .pop()
@@ -203,7 +203,7 @@ async fn legacy_invalid_schedule_is_skipped_visibly_not_enqueued_or_silently_ok(
     assert_eq!(
         state
             .storage
-            .list(Some("schema-app"), None, 10)
+            .list(&pumper_core::storage::JobQuery::for_app("schema-app"), 10)
             .await
             .unwrap()
             .len(),
@@ -281,7 +281,7 @@ async fn trigger_with_a_bad_template_records_bad_params_instead_of_firing() {
     assert_eq!(
         state
             .storage
-            .list(Some("schema-app"), None, 10)
+            .list(&pumper_core::storage::JobQuery::for_app("schema-app"), 10)
             .await
             .unwrap()
             .len(),

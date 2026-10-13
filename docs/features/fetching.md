@@ -247,7 +247,7 @@ A tier no longer passes purely on char count. On escalating strategies (`auto`, 
 
 ### The Claude subprocess
 
-**A timeout _or a cancel_ kills the whole process tree, not just the shim.** The prompt is piped over stdin; everything else travels as CLI arguments. On Windows the configured `binary` (default `claude`, an npm `.cmd`/`.ps1` shim that `CreateProcess` cannot launch) is spawned through `cmd.exe /C`, so the direct child is `cmd.exe` and the CLI is its *grandchild*. Terminating the direct child — which is all `kill_on_drop` does — left that grandchild running its full agentic loop, spending real money nothing would ever meter. Every engine timeout now runs `taskkill /PID <shim pid> /T /F` **before** the child handle is released (the handle is what stops Windows from recycling the pid), then kills and reaps the direct child; the error says `timed out after Ns …; process tree killed` so an operator can tell a clean kill from a failed one (`process tree kill FAILED (…) — a spawned process may still be running`). On POSIX there is no shim: the child *is* the CLI, and killing it stops the spend at the source. Pointing `[claude] binary` at a real `.exe` also takes the direct path on Windows.
+**A timeout _or a cancel_ kills the whole process tree, not just the shim.** The prompt is piped over stdin. `append_system_prompt` is written to a scratch file and passed as `--append-system-prompt-file` — free-form prose is the value cmd.exe mangles, so it does not travel as an argument. Every other field travels as a CLI argument. On Windows the configured `binary` (default `claude`, an npm `.cmd`/`.ps1` shim that `CreateProcess` cannot launch) is spawned through `cmd.exe /C`, so the direct child is `cmd.exe` and the CLI is its *grandchild*. Terminating the direct child — which is all `kill_on_drop` does — left that grandchild running its full agentic loop, spending real money nothing would ever meter. Every engine timeout now runs `taskkill /PID <shim pid> /T /F` **before** the child handle is released (the handle is what stops Windows from recycling the pid), then kills and reaps the direct child; the error says `timed out after Ns …; process tree killed` so an operator can tell a clean kill from a failed one (`process tree kill FAILED (…) — a spawned process may still be running`). On POSIX there is no shim: the child *is* the CLI, and killing it stops the spend at the source. Pointing `[claude] binary` at a real `.exe` also takes the direct path on Windows.
 
 **The timeout was only half of it.** A cancelled job does not time out: `DELETE /jobs/{id}` and shutdown-suspend make the worker `break` out of its `select!`, which **drops** the research future — and a dropped future runs none of the paths above, so the tree kill was unreachable on the single most ordinary operator action there is. `kill_on_drop` was all that remained, and it terminates the *shim*. So the API answered `cancelled`, the job row said `cancelled`, and the grandchild kept running its agentic loop and kept spending. Cleanup therefore lives on no path at all — it lives in `Drop`: a `RunScope` owning the child, the pid and the three pipe tasks, mirroring the browser engine's `RenderScope`. Its drop aborts the tasks unconditionally (dropping a `JoinHandle` *detaches* rather than aborts, so all three leaked with every cancel too) and hands the tree kill to a detached task carrying the child handle with it. A successful run disarms it and pays for no `taskkill`. Best-effort in one narrow case, stated rather than hidden: a runtime *already shutting down* may never poll that task, leaving `kill_on_drop` as the backstop.
 
@@ -263,7 +263,23 @@ One deadline (`[claude] timeout_secs`, default 600; per-request `timeout_secs` o
 | `unmetered_timeout` | killed by the deadline; no envelope exists | `0` — a paid call vanished |
 | `cost_unreported` | a **successful** envelope with no `total_cost_usd` | `0` — unknown, not free |
 
-A failure that never started a process (a bad `binary`) writes no row at all — inventing one would be its own lie. Tier-3 has different plumbing (the fetcher drives the researcher itself and `ctx.fetch` meters the *outcome*, which does not exist when the ladder fails), so the paid tier's spend rides out on the `all fetch tiers exhausted …` error and is metered from there; the message is identical either way.
+A failure that never started a process (a bad `binary`) writes no row at all — inventing one would be its own lie.
+
+**Every way a run can end has one name, decided in one place.** `<class>` above is a closed vocabulary (`pumper_core::error::ClaudeFailure`), and the engine no longer picks a member at each return site: every ending of a run that *started* goes through a single classifier (`crates/engine-claude/src/outcome.rs`), so the class — and therefore the `cost_events` row derived from it — cannot drift between call sites. Four endings used to be fitted to whichever of five members was nearest, and since the ledger row comes from the member, each was a mislabelled **spend**.
+
+| `<class>` | the run ended because | `cost_usd` | ledger row |
+| --- | --- | --- | --- |
+| `spawn` | refused **before** anything spawned: unknown `role`, a non-plain `model`, a cmd.exe-shim refusal, an unwritable `isolation_dir`, or `claude` not on PATH | — | **none** — no process, no spend |
+| `prompt_undelivered` | the prompt never reached the CLI's stdin (write failed, EOF failed, or the task doing both did). The CLI then reads an empty question, answers it and exits 0 with a valid envelope — so this used to return `Ok` with a real bill for an answer to nothing | unknown | `failed_spend_unreported (prompt_undelivered)` |
+| `pipe_failure` | a pipe the host needs failed **after** a successful spawn: a missing stdin/stdout/stderr handle on a live child, an io error mid-drain (a truncated buffer must never be parsed as a whole envelope), or a drain task that did not finish | unknown | `failed_spend_unreported (pipe_failure)` |
+| `wait_failed` | `child.wait()` itself returned an io error. Nothing was killed and no deadline elapsed — reporting it as a timeout claimed a paid call had vanished | unknown | `failed_spend_unreported (wait_failed)` |
+| `timeout` | the engine deadline elapsed and the process tree was killed mid-run | unknown | `unmetered_timeout` |
+| `interrupted` | a signal ended the process (`ExitStatus::code()` is `None`; unix). It did not choose an exit code, so it is not a `nonzero_exit` | from the envelope, if one printed | `failed_spend (interrupted)` / `failed_spend_unreported (interrupted)` |
+| `nonzero_exit` | the CLI exited with a non-zero code. Its stdout may still hold a complete, billed envelope | from the envelope, if one printed | `failed_spend (nonzero_exit)` / `failed_spend_unreported (nonzero_exit)` |
+| `unparseable` | exit 0, but stdout is not an envelope. Exit 0 means the model answered, so the call *was* billed and the amount is merely unreadable — not free | unknown | `failed_spend_unreported (unparseable)` |
+| `is_error` | exit 0 and a well-formed envelope with `is_error: true` — the most expensive shape, because the run happened in full | what the CLI reported | `failed_spend (is_error)` |
+
+`spawn` is the only class that writes no row, and it means it literally. Every other class means a child existed and may have been spending, so the ledger says *unknown*, never *free* — a silent `$0` reads identically to a call that was never made, and the per-job `budget_usd` clamp cannot tell them apart either. Tier-3 has different plumbing (the fetcher drives the researcher itself and `ctx.fetch` meters the *outcome*, which does not exist when the ladder fails), so the paid tier's spend rides out on the `all fetch tiers exhausted …` error and is metered from there; the message is identical either way.
 
 **Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
 
@@ -300,6 +316,66 @@ Two honest limits:
 
 - `CLAUDE.md` discovery walks *upward*. If your storage root sits inside a Claude Code project (the default `data/pumper.db` does, when you run from a checkout), the parent project is still found. The escape hatch is the existing `[storage] database_path`: point it somewhere outside any such project and the context is genuinely empty. There is no new config key for this.
 - `[claude] bare` (default `false`, unchanged) remains the complete lever: it skips hooks, plugin sync, auto-memory and `CLAUDE.md` auto-discovery outright, regardless of where the process runs. Set it when you want the subprocess to carry nothing but your prompt.
+
+## The recipe lifecycle (candidate → validated → retired)
+
+The pre-archive `api_recipe` tier replays a JSON API the browser tier discovered
+behind a rendered page (`pumper_core::recipes`, table `api_recipes`). A recipe is
+in exactly one of three states, **derived** from two stored facts (`validated`,
+`retired_at`) in one place so the wire, the `?state=` filter and the fetcher can
+never disagree about what a row is:
+
+```
+  discovery ──► candidate ──(overlapping replay)──► validated
+                  ▲                                   │
+                  └──────(max_failures strikes)───────┘
+                  │
+                  ├──(retire_after strikes, or POST /recipes/{id}/retire)──► retired
+                  ◄─────────────(POST /recipes/{id}/revive)────────────┘
+```
+
+- **`candidate`** — discovered, never proven. Replayed only opportunistically
+  (`[recipes] auto_validate`).
+- **`validated`** — a successful overlapping replay proved it. Always replayed.
+- **`retired`** — out of selection. `retired` **outranks** `validated`: a recipe
+  that was trusted and then retired reads back as retired, not as trusted.
+
+**`candidate → retired` is the rung that was missing.** `record_failure`
+incremented `consecutive_failures` and the counter's only consumer was guarded
+on `validated != 0`, so once a recipe was unvalidated that branch was
+unreachable for that row *forever* — the counter was write-only. `best_for_host`
+read neither, so a candidate that had failed ten thousand consecutive times was
+still the first thing tried for its host, firing a live outbound replay ahead of
+the archive tier on every single fetch. `best_for_host` now carries
+`AND retired_at IS NULL`, so a retired recipe costs a fetch **nothing** — not a
+request, not even a tier-trace entry.
+
+**A success clears the whole slate**, not just the counter: `consecutive_failures`
+back to 0 *and* `last_failure_at` back to `NULL`, because a recipe still
+advertising a failure it has since recovered from is a surface that lies to the
+operator reading it.
+
+**Revive is probation, not trust.** `POST /recipes/{id}/revive` clears
+`retired_at`, the strikes and the failure stamp and returns the row to
+**`candidate`** — never straight back to `validated`. A recipe that earned its
+way out of selection re-earns validation the same way it did the first time,
+with a successful overlapping replay.
+
+**There is no `DELETE`.** Retirement is the terminal state and it destroys
+nothing: the row survives, and so does `consecutive_failures`, which is the
+evidence an operator reads before deciding whether to revive. Nothing in the
+tree deletes an `api_recipes` row and `api_recipes` is not in `prune_ledgers`.
+`routes/mod.rs` carries a standing assertion
+(`the_recipe_surface_has_no_irreversible_door`) that no `DELETE /recipes*`
+operation exists, separate from the route EXPECTED-diff, so adding an
+irreversible door has to delete a test that argues against it rather than append
+one line to a list.
+
+Config: `[recipes] enabled`, `auto_validate`, `max_failures` (3),
+`retire_after` (10; `0` disables the rung) — see
+[runtime.md § `[recipes]`](runtime.md#recipes--learned-api-recipe-replay-and-its-two-strike-rungs).
+Surface: `GET /recipes?host=&state=&limit=` plus the two actions, in
+[http-api.md](http-api.md). Columns: [datasets.md § Migration 0046](datasets.md#migration-0046--api_recipes-gains-two-lifecycle-columns).
 
 ## Politeness governor (adaptive)
 

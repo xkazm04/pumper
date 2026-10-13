@@ -12,6 +12,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 import {
   CEILING_GB,
@@ -20,6 +22,7 @@ import {
   findings,
   formatBytes,
   measure,
+  parseArgs,
   pruneTarget,
   splitArtifact,
   staleIncrementalDirs,
@@ -251,4 +254,112 @@ test('formatBytes_scales_so_a_report_is_readable_at_both_ends', () => {
   assert.equal(formatBytes(512), '512 B');
   assert.equal(formatBytes(5 * 1024 ** 2), '5 MB');
   assert.equal(formatBytes(280.8 * GB), '280.80 GB');
+});
+
+// --- the process contract: 0 / 2 / 3, observed as exit codes ----------------
+//
+// Everything above calls the pure helpers. The gate's declared three outcomes
+// (disk-check.mjs:42-44) were never executed by a test, because the root was
+// derived from import.meta.url with no override — the cannot-check branch could
+// not be reached from any fixture at all. `--root` is that seam; `--ceiling-gb`
+// and `--stale-gb` are what let a fixture be "over budget" without writing 40 GB.
+
+const CHECK = path.join(repoRoot(), 'scripts', 'ci', 'disk-check.mjs');
+
+function repoRoot() {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
+function runCheck(root, ...extra) {
+  return spawnSync(process.execPath, [CHECK, '--root', root, ...extra], {
+    encoding: 'utf8',
+  });
+}
+
+/** A scratch repo root: Cargo.toml plus a target/ tree, unless `bare`. */
+function fakeRepo({ cargo = true } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'disk-check-repo-'));
+  if (cargo) fs.writeFileSync(path.join(root, 'Cargo.toml'), '[workspace]\n');
+  return root;
+}
+
+test('exit_3_a_root_with_no_Cargo_toml_is_cannot_check_not_a_clean_pass', () => {
+  const root = fakeRepo({ cargo: false });
+  const r = runCheck(root);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stderr, /cannot check/);
+  assert.notEqual(r.status, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_2_over_the_ceiling_with_every_artifact_live_cannot_be_healed', () => {
+  // The case that earns a human's attention, now proven as a PROCESS: the
+  // self-heal runs, reclaims nothing, and the gate stays red.
+  const root = fakeRepo();
+  plant(path.join(root, 'target', 'debug', 'deps'), 'pumper-aaaaaaaaaaaaaaaa.pdb', 65536, 0);
+  const r = runCheck(root, '--ceiling-gb', '0.00001');
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /not enough|over the/);
+  assert.match(r.stderr, /LIVE|ceiling/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_0_over_the_ceiling_with_superseded_generations_self_heals', () => {
+  // Two generations of one target; the older one is a week stale, so the prune
+  // takes it and the re-measure lands back under budget.
+  const root = fakeRepo();
+  const deps = path.join(root, 'target', 'debug', 'deps');
+  plant(deps, 'pumper-aaaaaaaaaaaaaaaa.rlib', 65536, 30);
+  plant(deps, 'pumper-bbbbbbbbbbbbbbbb.rlib', 1024, 0);
+  const r = runCheck(root, '--ceiling-gb', '0.00005');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /Pruned 64 KB|Pruned/);
+  assert.match(r.stdout, /Within budget/);
+  assert.ok(!fs.existsSync(path.join(deps, 'pumper-aaaaaaaaaaaaaaaa.rlib')));
+  assert.ok(fs.existsSync(path.join(deps, 'pumper-bbbbbbbbbbbbbbbb.rlib')));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_2_no_prune_is_the_pure_verdict_and_mutates_nothing', () => {
+  const root = fakeRepo();
+  const deps = path.join(root, 'target', 'debug', 'deps');
+  plant(deps, 'pumper-aaaaaaaaaaaaaaaa.rlib', 65536, 30);
+  plant(deps, 'pumper-bbbbbbbbbbbbbbbb.rlib', 1024, 0);
+  const r = runCheck(root, '--no-prune', '--ceiling-gb', '0.00005');
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.ok(fs.existsSync(path.join(deps, 'pumper-aaaaaaaaaaaaaaaa.rlib')), 'pruned under --no-prune');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_0_a_root_within_budget_passes_as_a_process', () => {
+  const root = fakeRepo();
+  plant(path.join(root, 'target', 'debug', 'deps'), 'pumper-aaaaaaaaaaaaaaaa.rlib', 1024, 0);
+  const r = runCheck(root);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /Within budget/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// --- the seam itself --------------------------------------------------------
+
+test('parseArgs_falls_back_to_the_declared_budget_rather_than_to_NaN', () => {
+  // A ceiling of NaN compares false against every size, which is a gate that
+  // cannot fail — the exact shape of instrument this whole file exists to deny.
+  assert.equal(parseArgs(['--ceiling-gb', 'banana'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--ceiling-gb'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--ceiling-gb', '-5'], '/r').ceilingGb, CEILING_GB);
+  assert.equal(parseArgs(['--stale-gb', '0'], '/r').staleFindingGb, STALE_FINDING_GB);
+});
+
+test('parseArgs_reads_the_overrides_and_defaults_the_root_to_the_checkout', () => {
+  const a = parseArgs(['--ceiling-gb', '2.5', '--stale-gb', '1'], '/r');
+  assert.equal(a.ceilingGb, 2.5);
+  assert.equal(a.staleFindingGb, 1);
+  assert.equal(parseArgs([], '/r').root, '/r');
+  assert.equal(parseArgs(['--root', scratch()], '/r').root !== '/r', true);
+});
+
+test('findings_honours_an_overridden_budget_without_touching_the_default', () => {
+  assert.deepEqual(findings({ bytes: 5 * GB, staleBytes: 0 }), []);
+  assert.equal(findings({ bytes: 5 * GB, staleBytes: 0 }, { ceilingGb: 1 }).length, 1);
 });

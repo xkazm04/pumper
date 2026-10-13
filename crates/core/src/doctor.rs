@@ -19,8 +19,16 @@
 //!   Descriptive numbers that are not problems (per-dataset coverage, per-app
 //!   artifact bytes, per-table growth) live outside `findings`.
 //!
+//! - **"We did not look" is never published as "it is fine."** The report is a
+//!   roster ([`Check::ALL`]) of three-valued outcomes
+//!   ([`CheckOutcome`]) rolled up worst-of into a [`Verdict`], so a check that
+//!   could not run reports [`Verdict::Incomplete`] with the reason it could not,
+//!   instead of an empty `findings` list that reads exactly like a clean store.
+//!   `healthy` is [`DoctorReport::is_clean`], which is `verdict == Clean`.
+//!
 //! [`diagnose`] is pure: the caller gathers [`StoreFacts`] (full scans, on-demand
-//! only) and this decides what is worth saying about them.
+//! only) and this decides what is worth saying about them. [`examine`] wraps it
+//! with the roster and the rollup.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -39,10 +47,179 @@ pub enum Severity {
     Info,
 }
 
+/// Every check the doctor is capable of running.
+///
+/// The roster is the load-bearing part. The checks used to exist only as nine
+/// inline `&'static str` literals inside [`diagnose`], so nothing — not the
+/// response, not a test, not an operator — could enumerate what the doctor is
+/// *able* to check, which means nothing could notice when one of them did not
+/// run. A verdict computed from the absence of findings then conflates the two
+/// meanings of silence: "looked, nothing wrong" and "never looked".
+///
+/// Declared in the order [`diagnose`] evaluates them, which is the order
+/// `findings` and `checks` are published in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Check {
+    MissingArtifactBodies,
+    HalfStampedProvenance,
+    UnregisteredRulesets,
+    RecordsWithoutSimhash,
+    UnboundedTableGrowth,
+    OrphanDerivedSpecs,
+    StaleRebuildTables,
+    SchemaDrift,
+    SearchIndexEmpty,
+}
+
+impl Check {
+    /// The whole roster. A tenth check cannot be added without appearing here
+    /// (and without an arm in [`unverifiable_reason`], which is an exhaustive
+    /// `match`), so "the doctor can check this" is a compile-time fact.
+    pub const ALL: [Check; 9] = [
+        Check::MissingArtifactBodies,
+        Check::HalfStampedProvenance,
+        Check::UnregisteredRulesets,
+        Check::RecordsWithoutSimhash,
+        Check::UnboundedTableGrowth,
+        Check::OrphanDerivedSpecs,
+        Check::StaleRebuildTables,
+        Check::SchemaDrift,
+        Check::SearchIndexEmpty,
+    ];
+
+    /// The wire name, identical to the string literal each check used to carry,
+    /// so `findings[].check` is unchanged for every existing consumer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingArtifactBodies => "missing_artifact_bodies",
+            Self::HalfStampedProvenance => "half_stamped_provenance",
+            Self::UnregisteredRulesets => "unregistered_rulesets",
+            Self::RecordsWithoutSimhash => "records_without_simhash",
+            Self::UnboundedTableGrowth => "unbounded_table_growth",
+            Self::OrphanDerivedSpecs => "orphan_derived_specs",
+            Self::StaleRebuildTables => "stale_rebuild_tables",
+            Self::SchemaDrift => "schema_drift",
+            Self::SearchIndexEmpty => "search_index_empty",
+        }
+    }
+}
+
+/// What one check concluded — **three-valued on purpose**.
+///
+/// A check that can only say "clean" or "finding" is forced to lie whenever the
+/// honest answer is "I could not find out", and the doctor's checks reach that
+/// answer routinely: `skip_artifacts=true` drops the body sweep, a ceiling
+/// truncates it, Tantivy's `doc_count` can fail to read, and a [`StoreFacts`]
+/// built with `..Default::default()` consulted neither the index nor the schema.
+///
+/// This repo already litigated this class one module over:
+/// [`crate::resilience::SourceState::Unknown`] exists because a failed health
+/// read resolving to `Healthy` published "a confident green about a check that
+/// had not run — the exact shape of 'unknown rendering as a definite value' the
+/// enforcement design is built to avoid". The doctor rendered it anyway, until
+/// this type.
+///
+/// `Unverifiable` carries the reason the check could not run, because that is a
+/// fact about the *prober* and routes to a different fixer than a finding does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CheckOutcome {
+    /// Ran, concluded, nothing wrong.
+    Clean,
+    /// Ran and raised at least one entry in `findings`.
+    ///
+    /// A check that found something while its input was *also* incomplete
+    /// reports `Findings`, not `Unverifiable`: it concluded something
+    /// actionable, the rollup is already at its worst rung, and the partiality
+    /// stays visible in the finding's own summary (which states `N of M`) and in
+    /// the response's `artifacts` block.
+    Findings,
+    /// Did not run, or ran over an input that cannot support a clean claim. No
+    /// claim about the store is being made at all.
+    Unverifiable { reason: String },
+}
+
+/// One roster entry, as published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckReport {
+    pub check: Check,
+    #[serde(flatten)]
+    pub outcome: CheckOutcome,
+}
+
+/// The rollup, by **worst-of** — because `healthy` is a gate question ("may I
+/// trust this store?"), and for a gate question ninety-nine greens do not
+/// offset one member that nobody looked at.
+///
+/// Ordered `Clean < Incomplete < Findings`, so the aggregation is `max` and an
+/// actionable finding outranks incompleteness: both are "not clean", and the
+/// one with a remediation attached is the one worth reporting first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every check in the roster ran and found nothing.
+    Clean,
+    /// Nothing wrong was found, and at least one check could not run. **Not
+    /// `Clean`** — that collapse is the whole reason this enum exists.
+    Incomplete,
+    /// At least one check raised a finding.
+    Findings,
+}
+
+/// How far the per-revision artifact body sweep actually got.
+///
+/// The sweep is the one check whose completeness the pure core cannot infer
+/// from its own inputs: an empty `missing_bodies` means "none broken" after a
+/// full walk and "nobody looked" after a skipped one, and those were
+/// indistinguishable. The caller states which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArtifactScan {
+    /// The default: nothing stat'd anything, so the facts carry no claim.
+    #[default]
+    NotAttempted,
+    /// Deliberately skipped — `GET /datasets/doctor?skip_artifacts=true`.
+    Skipped,
+    /// Ran, but bounded: `checked` of `replayable` revisions were stat'd.
+    Truncated { checked: i64, replayable: i64 },
+    /// Every replayable revision in the store was stat'd.
+    Complete,
+}
+
+impl ArtifactScan {
+    /// Why this sweep cannot support a clean claim, or `None` when it examined
+    /// every replayable revision.
+    pub fn unverifiable_reason(self) -> Option<String> {
+        match self {
+            Self::Complete => None,
+            Self::NotAttempted => Some(
+                "the artifact sweep did not run, so no replayable revision's body was stat'd \
+                 and a missing archived body cannot be ruled out"
+                    .into(),
+            ),
+            Self::Skipped => Some(
+                "skip_artifacts=true dropped the artifact tree walk, so no replayable \
+                 revision's body was stat'd — re-request GET /datasets/doctor without \
+                 skip_artifacts to verify this check"
+                    .into(),
+            ),
+            Self::Truncated {
+                checked,
+                replayable,
+            } => Some(format!(
+                "{checked} of {replayable} replayable revisions stat'd (check_limit) — the \
+                 remaining {} were not looked at, so a missing archived body among them \
+                 cannot be ruled out",
+                replayable.saturating_sub(checked)
+            )),
+        }
+    }
+}
+
 /// One thing worth saying, with what to do about it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    pub check: &'static str,
+    pub check: Check,
     pub severity: Severity,
     pub summary: String,
     pub count: i64,
@@ -119,6 +296,11 @@ pub struct StoreFacts {
     pub missing_bodies: Vec<MissingBody>,
     /// How many replayable revisions were checked to find them.
     pub replayable_checked: i64,
+    /// How far that sweep got — and therefore whether an empty
+    /// `missing_bodies` is a clean result or an unexamined one. Defaults to
+    /// [`ArtifactScan::NotAttempted`], so a facts struct that never gathered
+    /// the artifact side cannot read as clean.
+    pub artifacts: ArtifactScan,
     /// `(app, dataset, count)` of revisions stamping exactly one of
     /// `artifact_sha` / `rules_hash`.
     pub half_stamped: Vec<(String, String, i64)>,
@@ -132,6 +314,14 @@ pub struct StoreFacts {
     pub orphan_derived: Vec<(String, String, String)>,
     /// Leftover `*_new` table-rebuild scaffolds.
     pub stale_rebuild_tables: Vec<String>,
+    /// The schema this store actually has, against the chain this binary
+    /// carries. `None` when the report did not consult it.
+    ///
+    /// On a booting server the unsound cases are mostly unreachable —
+    /// `Storage::connect` refuses them — with one deliberate exception:
+    /// `[storage] allow_schema_ahead = true` lets an ahead store through, and
+    /// this is the surface that keeps saying so afterwards.
+    pub schema: Option<crate::schema::SchemaReport>,
     /// Descriptive; only the unbounded-and-old ones become findings.
     pub tables: Vec<TableGrowth>,
     /// Descriptive; never a finding on its own — a dataset written by an app
@@ -149,7 +339,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     // "archived body unavailable" for exactly these revisions.
     if !facts.missing_bodies.is_empty() {
         out.push(Finding {
-            check: "missing_artifact_bodies",
+            check: Check::MissingArtifactBodies,
             severity: Severity::Warn,
             summary: format!(
                 "{} of {} replayable revisions stamp an archived body that is not on disk",
@@ -174,7 +364,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     let half: i64 = facts.half_stamped.iter().map(|(_, _, n)| n).sum();
     if half > 0 {
         out.push(Finding {
-            check: "half_stamped_provenance",
+            check: Check::HalfStampedProvenance,
             severity: Severity::Info,
             summary: format!(
                 "{half} revisions stamp exactly one of artifact_sha / rules_hash, so \
@@ -211,7 +401,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     let unregistered: i64 = facts.unregistered_rules.iter().map(|(_, n)| n).sum();
     if unregistered > 0 {
         out.push(Finding {
-            check: "unregistered_rulesets",
+            check: Check::UnregisteredRulesets,
             severity: Severity::Warn,
             summary: format!(
                 "{unregistered} revisions stamp a rules_hash that is not in the rules_versions \
@@ -239,7 +429,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     let null_sim: i64 = facts.null_simhash.iter().map(|(_, _, n)| n).sum();
     if null_sim > 0 {
         out.push(Finding {
-            check: "records_without_simhash",
+            check: Check::RecordsWithoutSimhash,
             severity: Severity::Info,
             summary: format!(
                 "{null_sim} live records have textual content but no SimHash fingerprint, and are \
@@ -269,7 +459,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     if !unbounded.is_empty() {
         let rows: i64 = unbounded.iter().map(|t| t.rows).sum();
         out.push(Finding {
-            check: "unbounded_table_growth",
+            check: Check::UnboundedTableGrowth,
             severity: Severity::Info,
             summary: format!(
                 "{} append-only table(s) hold {rows} rows going back over {UNBOUNDED_GROWTH_DAYS} \
@@ -294,7 +484,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     // A spec that recomputes forever over nothing.
     if !facts.orphan_derived.is_empty() {
         out.push(Finding {
-            check: "orphan_derived_specs",
+            check: Check::OrphanDerivedSpecs,
             severity: Severity::Info,
             summary: format!(
                 "{} derived spec(s) read a source dataset that holds no records",
@@ -320,7 +510,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     // never observable afterwards — a leftover means a rebuild did not land.
     if !facts.stale_rebuild_tables.is_empty() {
         out.push(Finding {
-            check: "stale_rebuild_tables",
+            check: Check::StaleRebuildTables,
             severity: Severity::Warn,
             summary: format!(
                 "leftover table-rebuild scaffold(s): {}",
@@ -337,6 +527,51 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
         });
     }
 
+    // The schema the store actually has, against the chain this binary carries.
+    // `Storage::connect` refuses both of these at boot, so reaching them here
+    // means either `[storage] allow_schema_ahead = true` or a table that
+    // vanished while the process was up.
+    if let Some(schema) = facts.schema.as_ref().filter(|s| !s.is_sound()) {
+        let mut parts = Vec::new();
+        if !schema.ahead.is_empty() {
+            parts.push(format!(
+                "the store has applied migration version(s) {} that this binary does not carry",
+                schema
+                    .ahead
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !schema.tables_missing.is_empty() {
+            parts.push(format!(
+                "table(s) the migration chain promises are absent: {}",
+                schema.tables_missing.join(", ")
+            ));
+        }
+        out.push(Finding {
+            check: Check::SchemaDrift,
+            severity: Severity::Warn,
+            summary: parts.join("; "),
+            count: (schema.ahead.len() + schema.tables_missing.len()) as i64,
+            remediation: "this build cannot fully read this store. If versions are AHEAD, run                           the newer pumper against it (there are no down migrations, so this                           build cannot undo them) or restore the pre-migration snapshot beside                           the database (`<database>.bak-premigrate-*`); `[storage]                           allow_schema_ahead = true` is what let this boot happen and should be                           turned back off once the right binary is running. If TABLES are                           missing, the ledger says the migration ran but the object is gone —                           restore that same snapshot and re-run so the chain replays, or move                           the database aside and let it rebuild from 0001. Do not create the                           table by hand: the chain is the only authority for its shape."
+                .into(),
+            examples: sample(
+                schema
+                    .ahead
+                    .iter()
+                    .map(|v| json!({ "ahead_version": v }))
+                    .chain(
+                        schema
+                            .tables_missing
+                            .iter()
+                            .map(|t| json!({ "missing_table": t })),
+                    ),
+            ),
+        });
+    }
+
     // The index went empty and nothing on this surface would ever have said so.
     if facts
         .search
@@ -345,7 +580,7 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     {
         let live = facts.search.as_ref().map_or(0, |s| s.live_records);
         out.push(Finding {
-            check: "search_index_empty",
+            check: Check::SearchIndexEmpty,
             severity: Severity::Warn,
             summary: format!(
                 "search is enabled but the index holds 0 documents while the store holds {live} \
@@ -363,6 +598,130 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     }
 
     out
+}
+
+/// The whole report: the findings, the roster of every check with what it
+/// concluded, and the worst-of rollup over the two.
+///
+/// The summary is a door, not a wall: `verdict` never travels without `checks`,
+/// so "incomplete" always names the member that could not run and the reason it
+/// could not.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    pub findings: Vec<Finding>,
+    pub checks: Vec<CheckReport>,
+    pub verdict: Verdict,
+}
+
+impl DoctorReport {
+    /// The boolean an operator and `just doctor` still read — now meaning "no
+    /// findings **and** nothing unexamined" rather than merely "no findings".
+    pub fn is_clean(&self) -> bool {
+        self.verdict == Verdict::Clean
+    }
+
+    /// What one roster member concluded. Total: every [`Check::ALL`] variant is
+    /// present in every report.
+    pub fn outcome(&self, check: Check) -> &CheckOutcome {
+        &self
+            .checks
+            .iter()
+            .find(|c| c.check == check)
+            .expect("every Check::ALL variant is reported")
+            .outcome
+    }
+}
+
+/// Why `check` cannot support a clean claim over these facts, or `None` when it
+/// was genuinely able to run.
+///
+/// This is where the three-state verdict is decided, and it is an exhaustive
+/// `match` on purpose: a tenth check cannot be added without stating, here,
+/// whether and how it can fail to run.
+///
+/// **The residue, stated.** Five checks (`half_stamped_provenance`,
+/// `unregistered_rulesets`, `records_without_simhash`, `orphan_derived_specs`,
+/// `stale_rebuild_tables`) read `Vec` fields whose empty value is ambiguous in
+/// exactly the same way `missing_bodies` was — but their only caller gathers
+/// all five unconditionally in one block, so no reachable request produces an
+/// ungathered one. They report `Clean`; the four that *can* be ungathered
+/// (`missing_artifact_bodies`, `unbounded_table_growth`, `schema_drift`,
+/// `search_index_empty`) are typed so that they cannot.
+pub fn unverifiable_reason(check: Check, facts: &StoreFacts) -> Option<String> {
+    match check {
+        Check::MissingArtifactBodies => facts.artifacts.unverifiable_reason(),
+        Check::SchemaDrift => facts.schema.is_none().then(|| {
+            "the report did not consult the schema ledger, so drift against the migration \
+             chain this binary carries cannot be ruled out"
+                .to_string()
+        }),
+        Check::UnboundedTableGrowth => facts.tables.is_empty().then(|| {
+            "no append-only table's growth was gathered, so an unbounded table cannot be \
+             ruled out"
+                .to_string()
+        }),
+        Check::SearchIndexEmpty => match facts.search.as_ref() {
+            None => Some(
+                "the report did not consult the search index, so a wiped index cannot be \
+                 ruled out"
+                    .into(),
+            ),
+            // A disabled index is a valid deployment, never an unexamined one:
+            // `NoSearch` answers every call with silent success, so there is
+            // nothing to look at and `clean` is the honest outcome. Sweeping it
+            // into `incomplete` would make every search-less store permanently
+            // un-green, which is the unverifiable-to-failed collapse.
+            Some(f) if !f.enabled => None,
+            Some(f) if f.doc_count.is_none() => Some(
+                "search is enabled but the index's doc_count could not be read, so an empty \
+                 index over a populated store cannot be ruled out"
+                    .into(),
+            ),
+            Some(_) => None,
+        },
+        Check::HalfStampedProvenance
+        | Check::UnregisteredRulesets
+        | Check::RecordsWithoutSimhash
+        | Check::OrphanDerivedSpecs
+        | Check::StaleRebuildTables => None,
+    }
+}
+
+/// [`diagnose`] plus the roster and the rollup: the report an operator actually
+/// reads.
+///
+/// `diagnose` answers "what is wrong"; this answers "and how much of the store
+/// did we actually look at", which is the question `healthy: findings.is_empty()`
+/// could not ask.
+pub fn examine(facts: &StoreFacts) -> DoctorReport {
+    let findings = diagnose(facts);
+    let checks: Vec<CheckReport> = Check::ALL
+        .iter()
+        .map(|&check| {
+            let outcome = if findings.iter().any(|f| f.check == check) {
+                CheckOutcome::Findings
+            } else if let Some(reason) = unverifiable_reason(check, facts) {
+                CheckOutcome::Unverifiable { reason }
+            } else {
+                CheckOutcome::Clean
+            };
+            CheckReport { check, outcome }
+        })
+        .collect();
+    let verdict = checks
+        .iter()
+        .map(|c| match c.outcome {
+            CheckOutcome::Clean => Verdict::Clean,
+            CheckOutcome::Findings => Verdict::Findings,
+            CheckOutcome::Unverifiable { .. } => Verdict::Incomplete,
+        })
+        .max()
+        .unwrap_or(Verdict::Clean);
+    DoctorReport {
+        findings,
+        checks,
+        verdict,
+    }
 }
 
 /// True when the search index is empty while the store holds records it could
@@ -477,6 +836,59 @@ mod tests {
         assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
     }
 
+    /// GUARD. A sound schema — and an extra table the chain never created —
+    /// must stay out of `findings`. The doctor's whole contract is that a
+    /// healthy store is silent, and the schema block is descriptive until
+    /// something is actually unsound.
+    #[test]
+    fn a_sound_schema_says_nothing_even_with_an_extra_table() {
+        let mut observed: std::collections::BTreeSet<String> = crate::schema::EXPECTED_TABLES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        observed.insert("operator_scratch".into());
+        let facts = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(
+                &[1, 2],
+                &[1, 2],
+                &observed,
+            )),
+            ..Default::default()
+        };
+        assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
+    }
+
+    /// The two unsound shapes, each naming the object and a reachable remedy.
+    #[test]
+    fn an_unsound_schema_names_the_object_and_the_way_back() {
+        let full: std::collections::BTreeSet<String> = crate::schema::EXPECTED_TABLES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        let ahead = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(&[1, 2, 3], &[1, 2], &full)),
+            ..Default::default()
+        };
+        let findings = diagnose(&ahead);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, Check::SchemaDrift);
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert!(findings[0].summary.contains('3'), "names the version");
+        assert!(findings[0].remediation.contains("allow_schema_ahead"));
+
+        let mut short = full.clone();
+        short.remove("golden_docs");
+        let gone = StoreFacts {
+            schema: Some(crate::schema::SchemaReport::new(&[1], &[1], &short)),
+            ..Default::default()
+        };
+        let findings = diagnose(&gone);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].summary.contains("golden_docs"));
+        assert!(findings[0].remediation.contains("bak-premigrate"));
+        assert_eq!(findings[0].count, 1);
+    }
+
     /// Growth is flagged on the conjunction, never on size alone — otherwise a
     /// legitimately large table nags forever.
     #[test]
@@ -517,7 +929,7 @@ mod tests {
         };
         let finding = diagnose(&facts)
             .into_iter()
-            .find(|f| f.check == "half_stamped_provenance")
+            .find(|f| f.check == Check::HalfStampedProvenance)
             .expect("finding raised");
         // It names the legitimate shape, and says which half is the real defect.
         assert!(
@@ -573,7 +985,7 @@ mod tests {
             ..Default::default()
         };
         let findings = diagnose(&facts);
-        let checks: Vec<&str> = findings.iter().map(|f| f.check).collect();
+        let checks: Vec<&str> = findings.iter().map(|f| f.check.as_str()).collect();
         assert_eq!(
             checks,
             vec![
@@ -589,14 +1001,14 @@ mod tests {
             "the check inventory changed — update this list deliberately"
         );
         for f in &findings {
-            assert!(f.count > 0, "{}: zero-count finding", f.check);
+            assert!(f.count > 0, "{}: zero-count finding", f.check.as_str());
             assert!(
                 f.remediation.len() > 40,
                 "{}: remediation must name a concrete action, got {:?}",
-                f.check,
+                f.check.as_str(),
                 f.remediation
             );
-            assert!(!f.examples.is_empty(), "{}: no examples", f.check);
+            assert!(!f.examples.is_empty(), "{}: no examples", f.check.as_str());
         }
     }
 
@@ -611,7 +1023,7 @@ mod tests {
         };
         let findings = diagnose(&facts);
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert_eq!(findings[0].check, "search_index_empty");
+        assert_eq!(findings[0].check, Check::SearchIndexEmpty);
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].count, 12_345);
         assert!(

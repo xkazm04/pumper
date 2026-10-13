@@ -27,7 +27,7 @@ Other durable references live outside `.perfect/`:
 
 ## Invariants and gotchas
 
-Six things this repo does that are **not** derivable from a skim, and that prose
+Eight things this repo does that are **not** derivable from a skim, and that prose
 elsewhere gets wrong.
 
 1. **CORS is OFF by default — README.md and ONBOARDING.md §2 say the opposite.**
@@ -90,6 +90,24 @@ elsewhere gets wrong.
    is a self-healing rung of `just ci`. Do not simplify `line-tables-only` to
    `debug = 0`: backtrace frames stop resolving to source, which is verified by a
    planted-panic probe, not assumed.
+
+7. **An equal-content upsert appends NO revision, so a stamp added later lands
+   nowhere.** `Datasets::upsert_in_tx` and the batch path return `Unchanged` and touch
+   only `last_seen`/`trust` when the value hash matches (`datasets.rs`). Anything you
+   start stamping on revisions — provenance, trust, a rules hash — reaches only rows
+   that CHANGE from then on; every existing record keeps its old head revision. The
+   ruleset-enrolment path hit exactly this: enrolled runs pinned every body, yet
+   `rederive` refused every pre-existing row until it learned to fall back to
+   `body_pins`, the per-OBSERVATION log (never deduplicated). Test any new stamping
+   path starting from a store that already holds the data, never from an empty one.
+
+8. **Never await the shared pool inside the worker's job `select!`.** The pool has 8
+   connections and a URL-mode fan-out runs 16 tasks. An arm that awaits a DB write
+   while the app future is unpolled waits on connections only that frozen future can
+   release. That froze jobs for the full 30s acquire timeout and failed most of a fan-out,
+   on every job type, from 2026-07-13 until the heartbeat moved to a spawn-per-tick
+   write (`worker.rs`, `should_beat`; `e2e/heartbeat_pool.rs`). The tick itself must stay
+   in the loop: a wedged job has to stop beating, or the reaper can never recover it.
 
 ## How to extend this file
 

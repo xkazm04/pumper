@@ -20,6 +20,8 @@ use axum::extract::State;
 use axum::Json;
 use serde_json::{json, Value};
 
+use pumper_core::costs::total_certainty;
+
 use crate::routes::error::ApiError;
 use crate::state::AppState;
 
@@ -39,7 +41,12 @@ struct AppWindow {
     /// datasets, a lower bound otherwise.
     jobs_with_yield: i64,
     calls: i64,
+    /// The BILLED money only. With `uncertain_calls() > 0` it is a floor.
     cost_usd: f64,
+    /// Calls that were billed and whose amount is unreadable (0045).
+    unmetered_calls: i64,
+    /// Calls where even "was this billed?" has no answer (0045).
+    unknown_calls: i64,
     claude_calls: i64,
     claude_cost_usd: f64,
     new: Option<i64>,
@@ -48,6 +55,38 @@ struct AppWindow {
     /// Per-dataset yield rows (counts only: the ledger attributes cost to apps,
     /// not datasets, and prorating would fabricate precision).
     datasets: Vec<Value>,
+}
+
+impl AppWindow {
+    /// Calls whose `cost_usd` is a floor rather than a price.
+    fn uncertain_calls(&self) -> i64 {
+        self.unmetered_calls + self.unknown_calls
+    }
+}
+
+/// The sentence appended to a planner recommendation derived from a spend
+/// figure that is a **floor**.
+///
+/// The division-by-zero discipline at the top of this module ("an unknown
+/// denominator is null, never $0") had a matching hole in the NUMERATOR: an
+/// unmetered call contributed `$0` to `cost_usd`, so every ratio built from it
+/// — `cost_per_new_usd`, `weighted_fresh_per_dollar`, the Claude worth-it score
+/// and the recommended budget — was confidently too cheap, and a *killed*
+/// paid run pushed them furthest in the wrong direction. The figures are still
+/// published (a floor is useful), but they no longer arrive unqualified.
+fn uncertain_spend_caveat(unmetered_calls: i64, unknown_calls: i64) -> Option<String> {
+    match (unmetered_calls, unknown_calls) {
+        (0, 0) => None,
+        (u, 0) => Some(format!(
+            "spend is a LOWER BOUND: {u} billed call(s) could not report an amount"
+        )),
+        (0, k) => Some(format!(
+            "spend is a LOWER BOUND: {k} call(s) may have been billed and left no amount"
+        )),
+        (u, k) => Some(format!(
+            "spend is a LOWER BOUND: {u} unmetered and {k} unknown call(s) left no amount"
+        )),
+    }
 }
 
 /// `None`-preserving addition: unknown + unknown stays unknown; a known count
@@ -217,6 +256,8 @@ async fn window(state: &AppState, days: i64) -> Result<BTreeMap<String, AppWindo
         let e = apps.entry(c.app.clone()).or_default();
         e.calls += c.calls;
         e.cost_usd += c.cost_usd;
+        e.unmetered_calls += c.unmetered_calls;
+        e.unknown_calls += c.unknown_calls;
         if c.engine == CLAUDE_ENGINE {
             e.claude_calls += c.calls;
             e.claude_cost_usd += c.cost_usd;
@@ -250,6 +291,9 @@ fn app_json(app: &str, w: &AppWindow, weight: f64) -> Value {
         "jobs_with_yield": w.jobs_with_yield,
         "engine_calls": w.calls,
         "cost_usd": w.cost_usd,
+        "unmetered_calls": w.unmetered_calls,
+        "unknown_calls": w.unknown_calls,
+        "cost_certainty": total_certainty(w.uncertain_calls()),
         "new": w.new,
         "changed": w.changed,
         "unchanged": w.unchanged,
@@ -274,7 +318,7 @@ fn app_json(app: &str, w: &AppWindow, weight: f64) -> Value {
     get,
     path = "/economics",
     tag = "costs",
-    responses((status = 200, description = "`{enforce, windows: {7d: {days, apps: [App]}, 30d: …}, advice: [{app, weight, recommended_budget_usd, cadence, reason}]}` — App = `{app, weight, jobs_with_yield, engine_calls, cost_usd, new, changed, unchanged, cost_per_new_usd, cost_per_changed_usd, weighted_fresh_per_dollar, claude: {cost_usd, calls, records_per_dollar, worth_it}, datasets}`. Advisory only; unknown/zero denominators are null."))
+    responses((status = 200, description = "`{enforce, windows: {7d: {days, apps: [App]}, 30d: …}, advice: [{app, weight, recommended_budget_usd, cadence, reason, cost_certainty}]}` — App = `{app, weight, jobs_with_yield, engine_calls, cost_usd, unmetered_calls, unknown_calls, cost_certainty, new, changed, unchanged, cost_per_new_usd, cost_per_changed_usd, weighted_fresh_per_dollar, claude: {cost_usd, calls, records_per_dollar, worth_it}, datasets}`. Advisory only; unknown/zero denominators are null."))
 )]
 pub(crate) async fn economics_report(
     State(state): State<AppState>,
@@ -304,12 +348,22 @@ pub(crate) async fn economics_report(
             let fresh_7d = recent.get(app).and_then(|w| opt_add(w.new, w.changed));
             let fresh_30d = opt_add(w30.new, w30.changed);
             let a = advise(w30.jobs_with_yield, w30.cost_usd, fresh_7d, fresh_30d);
+            // The caveat is appended OUTSIDE `advise` on purpose: the heuristic
+            // stays pure arithmetic over the two windows (same inputs, same
+            // advice, testably), and the honesty about the inputs rides beside
+            // it rather than inside it.
+            let caveat = uncertain_spend_caveat(w30.unmetered_calls, w30.unknown_calls);
+            let reason = match &caveat {
+                Some(c) => format!("{} — {c}", a.reason),
+                None => a.reason.clone(),
+            };
             json!({
                 "app": app,
                 "weight": state.config.economics.weight(app),
                 "recommended_budget_usd": a.budget_usd,
                 "cadence": a.cadence,
-                "reason": a.reason,
+                "reason": reason,
+                "cost_certainty": total_certainty(w30.uncertain_calls()),
             })
         })
         .collect();
@@ -326,6 +380,49 @@ pub(crate) async fn economics_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── spend certainty: a floor must never be advised on as a price ──
+
+    /// The anti-pattern: `cost_usd` built from rows that include a killed paid
+    /// run is a LOWER BOUND, and the planner recommended a budget from it as if
+    /// it were the bill. Silence about that is the part that costs money.
+    #[test]
+    fn a_floor_spend_is_announced_not_advised_on_silently() {
+        assert_eq!(
+            uncertain_spend_caveat(0, 0),
+            None,
+            "a priced window says nothing extra"
+        );
+        let u = uncertain_spend_caveat(2, 0).expect("unmetered calls must be announced");
+        assert!(u.contains("LOWER BOUND") && u.contains('2'), "{u}");
+        let k = uncertain_spend_caveat(0, 3).expect("unknown calls must be announced");
+        assert!(
+            k.contains("LOWER BOUND") && k.contains("may have been billed"),
+            "{k}"
+        );
+        let both = uncertain_spend_caveat(2, 3).expect("both must be announced");
+        assert!(both.contains('2') && both.contains('3'), "{both}");
+        assert_ne!(
+            u, k,
+            "unmetered and unknown are different facts for an operator"
+        );
+    }
+
+    /// The window rollup carries the counts through from the ledger summary,
+    /// and labels the total it built from them.
+    #[test]
+    fn a_window_labels_a_total_built_from_unmetered_calls() {
+        let mut w = AppWindow {
+            cost_usd: 0.30,
+            ..Default::default()
+        };
+        assert_eq!(w.uncertain_calls(), 0);
+        assert_eq!(total_certainty(w.uncertain_calls()), "exact");
+        w.unmetered_calls = 1;
+        assert_eq!(total_certainty(w.uncertain_calls()), "at_least");
+        w.unknown_calls = 2;
+        assert_eq!(w.uncertain_calls(), 3);
+    }
 
     // ── economics math: unknown/zero denominators are None, never 0 or ∞ ──
 

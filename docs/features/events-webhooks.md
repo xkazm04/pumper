@@ -27,13 +27,21 @@ Kinds (the `kind` column on a delivery row, and where its signing secret comes f
 | `change` | `dataset.changed` | watch id | the watch's `secret` |
 | `search` | `search.matched` | saved-search id | the saved search's `secret` |
 | `failure` | `job.failed` | job id | `[webhooks] failure_secret` (config, not a row) |
+| `health` | `source.degraded` / `source.quarantined` / `source.retired` | source id (`<app>/<dataset>`) | `[webhooks] health_secret` (config, not a row) |
 
 - **`job.terminal`** — job set `callback_url` (+ optional `callback_secret`) at enqueue; the finished job JSON is delivered on terminal state.
 - **`dataset.changed`** — dataset **watches** (`watches` table): standing subscriptions `{app, dataset|'*', url, secret?, sink}`. After a successful run, revisions are grouped by dataset and each covering watch receives `{event, watch_id, job_id, app, dataset, count, changes[]}` (field-level diffs included). CRUD: `GET/POST /watches`, `DELETE /watches/{id}`, `POST /watches/{id}/enabled`, plus the per-watch delivery log `GET /watches/{id}/deliveries`. See [Watchable namespaces](#watch-namespaces) for what `app` may be, and [Sinks](#sinks) for the non-HTTP delivery targets.
 - **`search.matched`** — saved-search alerts (see [search.md](search.md)).
 - **`job.failed`** — global permanent-failure firehose. When `[webhooks] failure_url` is configured, every job that fails **permanently** (attempts exhausted — app error, timeout, or a reaped stale lease) POSTs `{event, job_id, app, error, attempts, schedule_id}` there, HMAC-signed with `[webhooks] failure_secret` if set. This is distinct from `job.terminal`: a job's own `callback_url` already receives the full terminal JSON on failure, so `job.failed` is the cross-app subscription for "any job failed" (which has no natural per-resource key), not a per-job duplicate. Retryable requeues do **not** fire it — permanent failures only.
+- **`source.*`**: source health alerts. When `[webhooks] health_url` is configured, every run
+  that moves a source **into** `degraded`, `quarantined` or `retired` POSTs
+  `{source_id, app, dataset, from, to, reason, job_id, at}` there. Every key is always present
+  and is `null` when it has no value. The body is HMAC-signed with `[webhooks] health_secret`
+  if set. An entry fires once, and staying in the state does not re-fire. A manual
+  `POST /sources/{id}/state` into one of those states sends one too (`job_id: null`, `reason` =
+  the operator's). See [resilient-extraction.md §7.3](resilient-extraction.md).
 
-Every kind above resolves its secret again on **every** retry and replay, from the source row (or config for `failure`), so a rotated secret takes effect on the next send. A source that was deleted resolves to "no secret" and the delivery is re-sent unsigned — exactly as it was first sent.
+Every kind above resolves its secret again on **every** retry and replay, from the source row (or config for `failure` and `health`), so a rotated secret takes effect on the next send. A source that was deleted resolves to "no secret" and the delivery is re-sent unsigned — exactly as it was first sent.
 
 **A degrading source never pushes.** Before `dataset.changed` watches (and dataset triggers) are evaluated, the run's revision batch is filtered per **dataset** by extraction health: a dataset whose source state suppresses outbound pushes is dropped from the batch, so no watch and no trigger ever sees it. The filter runs *before* the hooks on purpose — a delivered webhook cannot be recalled, so the ordering is the enforcement. It is per-dataset rather than per-job, so a break in one of an app's datasets doesn't silence the others. **No-op unless `[resilience] enforce` is on** (default off — see [resilient-extraction.md](resilient-extraction.md)). Suppression is a silent drop plus a warn log, not a delivery-log row; the DLQ below is only about deliveries that were attempted.
 

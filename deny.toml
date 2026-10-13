@@ -43,21 +43,6 @@ unmaintained = "all"
 # Every entry below is an EXPLICIT, reasoned waiver. Adding one without a
 # `reason` naming the exposure is a review failure.
 ignore = [
-    # fxhash 0.2.1 — unmaintained (repo stale, owner inactive).
-    #   Path: pumper-core / app-hackernews -> scraper 0.23 -> selectors 0.26 -> fxhash
-    #   Upgrade path: NONE. `cargo update -p fxhash` resolves nothing newer;
-    #   the crate is dead upstream and `selectors` pins it. Fixing it requires
-    #   scraper/selectors to migrate to rustc-hash — out of our control.
-    #   Exposure: fxhash is used purely as a HashMap hasher inside the CSS
-    #   selector matcher. It is NOT a cryptographic hash and is not DoS-resistant,
-    #   so the theoretical risk is hash-collision CPU burn. Reaching it requires
-    #   attacker control of the *selector set*, which is operator-supplied config
-    #   in this workspace (extract rules / app code), not crawled content. The
-    #   crawled HTML side is bounded by the fetcher's body limits. Judged low.
-    #   Follow-up: drop this waiver when scraper ships a selectors release using
-    #   rustc-hash.
-    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive-only via scraper->selectors with no upgrade available; hasher for operator-supplied CSS selectors, not attacker-controlled input" },
-
     # paste 1.0.15 — unmaintained (author archived the repository).
     #   Path: pumper-server -> utoipa-axum 0.2 -> paste
     #   Upgrade path: NONE. The crate is archived at its final version; the

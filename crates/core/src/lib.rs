@@ -26,12 +26,14 @@ pub mod tiers;
 pub mod vcr;
 
 pub mod catalog;
+pub mod completeness;
 pub mod config;
 pub mod crawl;
 pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod fetcher;
+pub mod golden;
 pub mod governor;
 pub mod induce;
 pub mod jitter;
@@ -39,12 +41,14 @@ pub mod job;
 pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
+pub mod materiality;
 pub mod plugin;
 pub mod process_env;
 pub mod recipes;
 pub mod resilience;
 #[cfg(feature = "storage")]
 pub mod retention;
+pub mod schema;
 pub mod search;
 pub mod simhash;
 
@@ -106,13 +110,15 @@ pub use tiers::{
 pub use vcr::{Cassette, CassetteEntry, Recorder, Vcr};
 
 pub use catalog::{
-    Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable, PlanOrphan,
-    PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
+    uncovered_apps, Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable,
+    PlanOrphan, PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
 };
+pub use completeness::{judge, Completeness, Disposition, Expectation, Verdict};
 pub use config::Config;
 pub use crawl::{
-    change_weight, crawl, due_score, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot,
-    CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence, RevisitSeed,
+    change_weight, crawl, due_score, plan_revisit, CrawlConfig, CrawlPageRecord,
+    CrawlProgressSnapshot, CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence,
+    RevisitPlan, RevisitSeed, ScoredSeed,
 };
 pub use engine::{
     filled_fields_js, interaction_outcome, is_sensitive_input, parse_filled_fields,
@@ -141,10 +147,19 @@ pub use job::{Job, JobStatus};
 pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
+// `judge`, `Signal` and `Verdict` stay module-qualified
+// (`materiality::judge`): the top level already carries `completeness::judge`
+// and `completeness::Verdict`, and two judgments sharing one bare name at the
+// crate root is how a caller reaches for the wrong one.
+pub use materiality::{Sensitivity, Significance};
 pub use plugin::{NoPlugins, Plugins};
 #[cfg(feature = "storage")]
 pub use recipes::RecipeStore;
 pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
+pub use schema::{
+    ahead_refusal, classify, missing_tables_refusal, table_drift, LedgerVerdict, SchemaReport,
+    TableDrift, EXPECTED_TABLES,
+};
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
     SearchRequest, SearchResponse, SearchSort,

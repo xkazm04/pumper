@@ -1057,14 +1057,19 @@ fn digest_days_left(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<i64> {
     // Search2 publishes `MM/DD/YYYY` with no timezone, so `close_at` is always
-    // absent here and this always takes the conservative anywhere-on-Earth arm —
-    // the SAME arm the sweep takes for these rows.
-    if now > grants_common::deadline_end_utc(Some(close_raw), None)? {
+    // absent here and the countdown always takes the conservative
+    // anywhere-on-Earth arm - the SAME arm the sweep takes for these rows.
+    //
+    // The arithmetic used to live here, duplicated from the one in the server's
+    // closing-soon route and differing from it. It is now one function
+    // (`grants_common::deadline_countdown`) that both callers go through, so the
+    // two surfaces cannot drift apart again by editing only one of them. The
+    // numbers are unchanged: the countdown's date-only arm IS this expression.
+    let countdown = grants_common::deadline_countdown(Some(close_raw), None, now)?;
+    if countdown.lapsed {
         return None;
     }
-    let close = grants_common::parse_date(close_raw)?;
-    let days_left = (close - now.date_naive()).num_days().max(0);
-    (days_left <= window_days).then_some(days_left)
+    (countdown.days_left <= window_days).then_some(countdown.days_left)
 }
 
 /// Posted opportunities closing within `days` days, sorted soonest-first.
@@ -1650,6 +1655,31 @@ mod tests {
         // Past the anywhere-on-Earth end, both surfaces agree it is over.
         let afternoon = at("2026-08-13", 13);
         assert!(closing_soon_digest(&hits, 14, afternoon).is_empty());
+    }
+
+    /// One door. This digest and `GET /grants/closing-soon` now compute their
+    /// countdown with the same function, so the only way they can disagree is
+    /// if someone re-derives one of them locally again - which is exactly how
+    /// the ~12-hour split this crate already fixed once came about.
+    ///
+    /// Asserted against the arithmetic this function used to carry inline, so
+    /// the migration is pinned as behaviour-preserving rather than merely
+    /// claimed to be.
+    #[test]
+    fn the_digest_countdown_is_the_shared_one_not_a_local_copy() {
+        let now = at("2026-08-13", 9);
+        for raw in ["08/16/2026", "08/12/2026", "2026-08-13", "08/27/2026"] {
+            let shared = grants_common::deadline_countdown(Some(raw), None, now).unwrap();
+            let inline = (grants_common::parse_date(raw).unwrap() - now.date_naive())
+                .num_days()
+                .max(0);
+            assert_eq!(shared.days_left, inline, "{raw}");
+            assert_eq!(digest_days_left(raw, 14, now), Some(inline), "{raw}");
+        }
+        // Lapsed rows leave the digest, as before.
+        assert_eq!(digest_days_left("08/11/2026", 14, now), None);
+        // ...and beyond the window too.
+        assert_eq!(digest_days_left("09/30/2026", 14, now), None);
     }
 
     #[test]

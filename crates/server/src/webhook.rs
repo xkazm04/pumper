@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
 use pumper_core::config::WebhooksConfig;
+use pumper_core::resilience::{SourceRun, SourceState};
 use pumper_core::{Delivery, Job, Storage, Watch};
 use sha2::Sha256;
 use tracing::{debug, warn};
@@ -306,6 +307,201 @@ pub async fn dispatch_failure(state: &AppState, url: &str, secret: Option<String
     .await;
 }
 
+// ── source health events (`[webhooks] health_url`) ──────────────────────────
+
+/// The `source.*` event one health transition earns, or `None`.
+///
+/// Only **entry** into a state nobody stands behind is an alert: `degraded`,
+/// `quarantined` or `retired`, and only when the state before was something
+/// else (`prev` is `None` for a source's first recorded run). The anti-patterns
+/// it defends: a source that stays degraded re-alerting on every run (a pager
+/// that fires every six hours says nothing the first page did not), and a
+/// recovery reading as an alert. Escalation — `degraded` → `quarantined` — IS an
+/// entry, because it changes what the source is doing (writes now divert).
+pub fn health_transition(prev: Option<SourceState>, next: SourceState) -> Option<&'static str> {
+    if prev == Some(next) {
+        return None;
+    }
+    match next {
+        SourceState::Degraded => Some("source.degraded"),
+        SourceState::Quarantined => Some("source.quarantined"),
+        SourceState::Retired => Some("source.retired"),
+        SourceState::Healthy
+        | SourceState::Suspect
+        | SourceState::Probation
+        | SourceState::Unknown => None,
+    }
+}
+
+/// The body of a `source.*` delivery. Every key is always present — a `None`
+/// serializes as `null`, never as an absent key — so a receiver can tell "no
+/// previous state" from "a sender that forgot the field".
+///
+/// State strings are the `SourceState` wire strings (`SourceState::as_str`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SourceHealthEvent {
+    /// `<app>/<dataset>` — also the delivery's `ref_id`.
+    pub source_id: String,
+    pub app: String,
+    pub dataset: String,
+    /// The state before the transition; `null` for a source's first run.
+    pub from: Option<String>,
+    pub to: String,
+    /// The run's diagnosis (`markup_drift`, …) or the operator's reason;
+    /// `null` when none was recorded.
+    pub reason: Option<String>,
+    /// The run that moved the state; `null` for a manual override.
+    pub job_id: Option<String>,
+    /// When the transition was recorded (the run's `created_at`).
+    pub at: String,
+}
+
+/// Queues one `source.*` delivery to `[webhooks] health_url`, signed with
+/// `health_secret`. A no-op when `health_url` is unset, and when `ev` is not an
+/// entry into an alerting state ([`health_transition`] over `from`/`to`) — so
+/// every caller, the run path and the manual `POST /sources/{id}/state` path
+/// alike, is held to the same predicate rather than re-deciding it.
+pub async fn dispatch_health(state: &AppState, ev: &SourceHealthEvent) {
+    let Some(url) = &state.config.webhooks.health_url else {
+        return;
+    };
+    let prev = ev.from.as_deref().map(SourceState::parse);
+    let Some(event) = health_transition(prev, SourceState::parse(&ev.to)) else {
+        return;
+    };
+    dispatch_event(
+        state,
+        "health",
+        &ev.source_id,
+        url,
+        event,
+        ev,
+        state.config.webhooks.health_secret.clone(),
+    )
+    .await;
+}
+
+/// Where the run before this job's sits in one source's run history.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PriorRun {
+    /// This job's run was found; `None` inside means it is the source's first.
+    Found(Option<SourceState>),
+    /// This job's run is not in the window read — a later run already landed
+    /// on top of it. That run's own finalize reports its own transition, so
+    /// this one stays silent rather than guessing a `from`.
+    NotLocated,
+}
+
+/// The state the source was in before `job_id`'s run, read from the run
+/// history (`runs` is newest first, as [`HealthStore::runs`] returns it).
+///
+/// [`HealthStore::runs`]: pumper_core::resilience::HealthStore::runs
+pub(crate) fn prior_run_state(runs: &[SourceRun], job_id: &str) -> PriorRun {
+    match runs.iter().position(|r| r.job_id == job_id) {
+        Some(i) => PriorRun::Found(
+            runs.get(i + 1)
+                .map(|prev| SourceState::parse(&prev.state_after)),
+        ),
+        None => PriorRun::NotLocated,
+    }
+}
+
+/// Whether this run is the one that moved the source's stored state.
+///
+/// `commit_run` stamps `sources.state_since` with the run's own `created_at`
+/// (the same timestamp value) only on an actual transition, so equality means
+/// "this run moved it". The anti-pattern it defends: comparing the run with the
+/// previous RUN alone. An operator override (`POST /sources/{id}/state`) moves
+/// the state between runs without writing a run row, so a run that merely
+/// stays in the overridden state would read as a fresh entry and alert a
+/// second time for a transition the manual path already announced. It also
+/// stays silent when a later run has already moved the state again; that run
+/// reports its own transition.
+pub(crate) fn run_moved_state(run_created_at: &str, source_state_since: &str) -> bool {
+    !run_created_at.is_empty() && run_created_at == source_state_since
+}
+
+/// How many of a source's newest runs are read to find the run before this
+/// job's. Normally this job's run is the newest, so two would do; the slack
+/// absorbs a concurrent run of the same source landing just after it.
+const PRIOR_RUN_WINDOW: i64 = 8;
+
+/// After a job terminates: every health transition its runs caused into an
+/// alerting state goes to `[webhooks] health_url`.
+///
+/// Costs nothing when nobody would be told: with `health_url` unset or
+/// detection disabled (`[resilience] enabled = false`) it returns before any
+/// query. Otherwise one indexed read of this job's verdicts
+/// (`idx_source_runs_job`), and a history read only for a verdict that landed in
+/// an alerting state. Independent of `[resilience] enforce`: telling somebody
+/// gates nothing, so soak mode tells them too. Fail-open: a read failure is
+/// logged and costs the alert, never the job.
+pub async fn dispatch_job_health(state: &AppState, job_id: uuid::Uuid) {
+    if state.config.webhooks.health_url.is_none() {
+        return;
+    }
+    let Some(store) = state.health.store() else {
+        return;
+    };
+    let verdicts = match state.storage.job_health_verdicts(job_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(job = %job_id, "health webhook skipped: verdict read failed: {e}");
+            return;
+        }
+    };
+    let job = job_id.to_string();
+    for v in verdicts {
+        let next = SourceState::parse(&v.state_after);
+        // Nothing to find out about a run that did not land in an alerting
+        // state — skip the history read.
+        if health_transition(None, next).is_none() {
+            continue;
+        }
+        let runs = match store.runs(&v.source_id, PRIOR_RUN_WINDOW).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                warn!(job = %job, source = %v.source_id, "health webhook skipped: run history read failed: {e}");
+                continue;
+            }
+        };
+        let prev = match prior_run_state(&runs, &job) {
+            PriorRun::Found(prev) => prev,
+            PriorRun::NotLocated => {
+                debug!(job = %job, source = %v.source_id, "health webhook skipped: a later run superseded this one");
+                continue;
+            }
+        };
+        if health_transition(prev, next).is_none() {
+            continue;
+        }
+        let Ok(Some(source)) = store.source(&v.source_id).await else {
+            warn!(job = %job, source = %v.source_id, "health webhook skipped: source row unreadable");
+            continue;
+        };
+        let at = runs
+            .iter()
+            .find(|r| r.job_id == job)
+            .map(|r| r.created_at.clone())
+            .unwrap_or_default();
+        if !run_moved_state(&at, &source.state_since) {
+            debug!(job = %job, source = %v.source_id, "health webhook skipped: this run did not move the stored state");
+            continue;
+        }
+        let ev = SourceHealthEvent {
+            source_id: v.source_id.clone(),
+            app: source.app,
+            dataset: source.dataset,
+            from: prev.map(|s| s.as_str().to_string()),
+            to: next.as_str().to_string(),
+            reason: v.diagnosis.clone(),
+            job_id: Some(job.clone()),
+            at,
+        };
+        dispatch_health(state, &ev).await;
+    }
+}
+
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
 /// already resolved the signing secret from the delivery's source, and has
 /// already **claimed** the row.
@@ -526,6 +722,7 @@ pub async fn resolve_secret(
             .flatten()
             .and_then(|s| s.secret),
         "failure" => webhooks.failure_secret.clone(),
+        "health" => webhooks.health_secret.clone(),
         _ => None,
     }
 }
@@ -1211,5 +1408,190 @@ mod tests {
         assert!(!verify_signature(secret, Some((0, "x")), body, &github_hex));
         // Garbage hex never verifies (and never panics).
         assert!(!verify_signature(secret, None, body, "not-hex"));
+    }
+
+    // ── source health events ────────────────────────────────────────────────
+
+    use pumper_core::resilience::SourceState as S;
+
+    /// The anti-pattern: alerting on every run a source spends degraded, so the
+    /// pager repeats itself every schedule tick until someone mutes it.
+    #[test]
+    fn staying_degraded_does_not_re_alert() {
+        assert_eq!(health_transition(Some(S::Degraded), S::Degraded), None);
+        assert_eq!(
+            health_transition(Some(S::Quarantined), S::Quarantined),
+            None
+        );
+        assert_eq!(health_transition(Some(S::Retired), S::Retired), None);
+    }
+
+    /// The anti-pattern: "no previous run" read as "nothing changed". A source
+    /// whose very first recorded run lands degraded is the loudest case there is.
+    #[test]
+    fn first_run_straight_to_degraded_alerts() {
+        assert_eq!(
+            health_transition(None, S::Degraded),
+            Some("source.degraded")
+        );
+        assert_eq!(
+            health_transition(None, S::Quarantined),
+            Some("source.quarantined")
+        );
+    }
+
+    #[test]
+    fn entry_into_each_alerting_state_alerts_including_escalation() {
+        assert_eq!(
+            health_transition(Some(S::Suspect), S::Degraded),
+            Some("source.degraded")
+        );
+        assert_eq!(
+            health_transition(Some(S::Degraded), S::Quarantined),
+            Some("source.quarantined")
+        );
+        assert_eq!(
+            health_transition(Some(S::Probation), S::Quarantined),
+            Some("source.quarantined")
+        );
+        assert_eq!(
+            health_transition(Some(S::Healthy), S::Retired),
+            Some("source.retired")
+        );
+    }
+
+    /// The anti-pattern: "the state changed" as the alert predicate, which pages
+    /// on the good news too.
+    #[test]
+    fn recovery_is_not_an_alert() {
+        assert_eq!(health_transition(Some(S::Quarantined), S::Probation), None);
+        assert_eq!(health_transition(Some(S::Probation), S::Healthy), None);
+        assert_eq!(health_transition(Some(S::Degraded), S::Healthy), None);
+        // Suspect deliberately changes nothing downstream, so it tells nobody.
+        assert_eq!(health_transition(Some(S::Healthy), S::Suspect), None);
+        // Unknown is a failed read, never a state a run lands in.
+        assert_eq!(health_transition(Some(S::Healthy), S::Unknown), None);
+    }
+
+    /// The anti-pattern: `skip_serializing_if` on the optionals, which makes a
+    /// first-run event and a sender bug indistinguishable to the receiver.
+    #[test]
+    fn health_event_carries_every_key_null_not_omitted() {
+        let ev = SourceHealthEvent {
+            source_id: "a/d".into(),
+            app: "a".into(),
+            dataset: "d".into(),
+            from: None,
+            to: "degraded".into(),
+            reason: None,
+            job_id: None,
+            at: "t".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "source_id",
+            "app",
+            "dataset",
+            "from",
+            "to",
+            "reason",
+            "job_id",
+            "at",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}: {v}");
+        }
+        assert!(v["from"].is_null());
+        assert!(v["reason"].is_null());
+        assert!(v["job_id"].is_null());
+    }
+
+    /// A run row carrying only what `prior_run_state` reads; the rest is filler.
+    fn run(job: &str, state_after: &str) -> SourceRun {
+        SourceRun {
+            job_id: job.into(),
+            docs: 0,
+            fetch_ok_rate: 1.0,
+            d_text: None,
+            d_dom: None,
+            d_val: None,
+            compared: 0,
+            verdict: "ok".into(),
+            diagnosis: None,
+            score: 0.0,
+            reasons: None,
+            state_after: state_after.into(),
+            build_id: None,
+            created_at: "t".into(),
+        }
+    }
+
+    /// The anti-pattern: reading the NEWEST run as "the one before", which is
+    /// this job's own run — every transition then compares a state to itself
+    /// and nothing ever alerts.
+    #[test]
+    fn prior_run_is_the_one_after_this_job_not_the_newest() {
+        let runs = [run("j2", "degraded"), run("j1", "healthy")];
+        assert_eq!(
+            prior_run_state(&runs, "j2"),
+            PriorRun::Found(Some(S::Healthy))
+        );
+        assert_eq!(
+            prior_run_state(&runs[..1], "j2"),
+            PriorRun::Found(None),
+            "the source's first run has no prior"
+        );
+        // A later run landed on top: this job's run is not the newest, and its
+        // prior is still the one below it.
+        let runs = [
+            run("j3", "degraded"),
+            run("j2", "degraded"),
+            run("j1", "healthy"),
+        ];
+        assert_eq!(
+            prior_run_state(&runs, "j2"),
+            PriorRun::Found(Some(S::Healthy))
+        );
+        assert_eq!(prior_run_state(&runs, "gone"), PriorRun::NotLocated);
+    }
+
+    /// The anti-pattern: previous-RUN comparison alone. The operator sets
+    /// `degraded` by hand (`state_since` = the override's time, and the manual
+    /// path announces it), then the next run also lands `degraded`. Its prior
+    /// run was healthy, so a run-only check alerts a second time.
+    #[test]
+    fn manual_override_then_same_state_run_does_not_re_alert() {
+        let run_at = "2026-01-02T00:00:00.000Z";
+        let override_at = "2026-01-01T12:00:00.000Z";
+        assert!(!run_moved_state(run_at, override_at));
+        // The run that actually moved the state was stamped with its own time.
+        assert!(run_moved_state(run_at, run_at));
+        // An unknown run time never counts as a move.
+        assert!(!run_moved_state("", ""));
+    }
+
+    /// The anti-pattern the `failure` kind had: signed on first send, unsigned
+    /// on every retry, because the secret lives in config and `resolve_secret`
+    /// did not know the kind.
+    #[tokio::test]
+    async fn health_replay_signed_not_unsigned() {
+        let store = TempStore::new("resolve-health").await;
+        let cfg = WebhooksConfig {
+            health_secret: Some("s3-health".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("health", "a/d")).await,
+            Some("s3-health".to_string())
+        );
+        assert_eq!(
+            resolve_secret(
+                &store.storage,
+                &WebhooksConfig::default(),
+                &delivery("health", "a/d")
+            )
+            .await,
+            None
+        );
     }
 }

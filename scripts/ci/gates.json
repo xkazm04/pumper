@@ -1,0 +1,114 @@
+{
+  "_doc": "The gate registry: the ONE enumeration of this repo's node gates. A gate is a script that exports EXIT_CANNOT_CHECK (the repo's own definition of 'three outcomes, three exit codes'). Every projection of the suite -- the justfile recipes, the CI workflow steps, and the proof that each gate can produce each of its exit codes -- is asserted against this file by scripts/ci/gate-inventory.test.mjs. Add a gate by APPENDING one object to `gates`; never reflow the file, so concurrent additions stay compatible. Field order is stable: key, script, test, recipe, fixtureRecipes, ciStep, ciFixtureStep, blocksCi, exits, verdictWaived.",
+  "_fields": {
+    "key": "short name, unique",
+    "script": "repo-relative path to the gate itself",
+    "test": "repo-relative path to its fixture suite -- the thing that proves it can still go red",
+    "recipe": "justfile recipe that runs the gate's own verdict, or null (then verdictWaived is required)",
+    "fixtureRecipes": "justfile recipes that run `node --test <test>`; at least one",
+    "ciStep": "`- name:` of the .github/workflows/ci.yml step that runs the verdict on the binding rung, or null (then verdictWaived is required)",
+    "ciFixtureStep": "`- name:` of the ci.yml step that runs the fixture suite",
+    "blocksCi": "true when the gate's recipe is a dependency of the `ci` recipe, so the local ladder and the merge pipeline are the same policy",
+    "exits": "every exit code the gate's paired test must assert against a SPAWNED process, not an in-process call",
+    "verdictWaived": "why this gate has no standing verdict rung; present only when recipe or ciStep is null"
+  },
+  "inventoryTest": "scripts/ci/gate-inventory.test.mjs",
+  "gatePredicate": "export const EXIT_CANNOT_CHECK",
+  "scanRoots": ["scripts/ci", "scripts/docs"],
+  "extraFixtureTests": ["scripts/ci/ship-inventory.test.mjs"],
+  "gates": [
+    {
+      "key": "flake-check",
+      "script": "scripts/ci/flake-check.mjs",
+      "test": "scripts/ci/flake-check.test.mjs",
+      "recipe": "flake-check",
+      "fixtureRecipes": ["harness-test"],
+      "ciStep": "Flake register",
+      "ciFixtureStep": "Harness gate fixtures",
+      "blocksCi": true,
+      "exits": [0, 2, 3]
+    },
+    {
+      "key": "lane-certify",
+      "script": "scripts/ci/lane-certify.mjs",
+      "test": "scripts/ci/lane-certify.test.mjs",
+      "recipe": "lane-certify",
+      "fixtureRecipes": ["harness-test"],
+      "ciStep": "Certify",
+      "ciFixtureStep": "Harness gate fixtures",
+      "blocksCi": false,
+      "exits": [0, 2, 3]
+    },
+    {
+      "key": "disk-check",
+      "script": "scripts/ci/disk-check.mjs",
+      "test": "scripts/ci/disk-check.test.mjs",
+      "recipe": "disk-check",
+      "fixtureRecipes": ["harness-test"],
+      "ciStep": "Build cache budget",
+      "ciFixtureStep": "Harness gate fixtures",
+      "blocksCi": true,
+      "exits": [0, 2, 3]
+    },
+    {
+      "key": "mcp-gate-parity",
+      "script": "scripts/ci/mcp-gate-parity.mjs",
+      "test": "scripts/ci/mcp-gate-parity.test.mjs",
+      "recipe": "mcp-gate-parity",
+      "fixtureRecipes": ["inventory"],
+      "ciStep": "MCP gate parity",
+      "ciFixtureStep": "MCP gate parity fixtures",
+      "blocksCi": true,
+      "exits": [0, 2, 3]
+    },
+    {
+      "key": "check-doc-sync",
+      "script": "scripts/docs/check-doc-sync.mjs",
+      "test": "scripts/docs/check-doc-sync.test.mjs",
+      "recipe": null,
+      "fixtureRecipes": ["inventory", "doc-sync"],
+      "ciStep": null,
+      "ciFixtureStep": "Doc-sync hook fixtures",
+      "blocksCi": false,
+      "exits": [0, 2, 3],
+      "verdictWaived": "A Stop hook that judges ONE transcript handed to it on stdin; there is no standing tree to run it against, so the fixture suite IS the rung. Run `node scripts/docs/check-doc-sync.mjs <transcript>.jsonl` to replay one by hand."
+    },
+    {
+      "key": "quality-report",
+      "script": "scripts/ci/quality-report.mjs",
+      "test": "scripts/ci/quality-report.test.mjs",
+      "recipe": "quality",
+      "fixtureRecipes": ["harness-test"],
+      "ciStep": "Quality posture",
+      "ciFixtureStep": "Harness gate fixtures",
+      "blocksCi": false,
+      "exits": [0, 2, 3]
+    }
+  ],
+  "_reportDoc": "`reportModes` is how a gate joins the posture table that `just quality` (scripts/ci/quality-report.mjs) prints. Keyed by gate key; a gate with NO entry, or an entry with no `command`, still gets a row -- NOT WIRED -- because an inexpressible condition must still enumerate. `command` is argv, spawned with the repo root as cwd, and MUST be the gate's non-mutating mode (disk-check therefore carries --no-prune: the posture is read-only by construction). `remedy` is the command a human runs when that row is red -- refusal-names-a-reachable-remedy, asserted by quality-report.test.mjs to start with `just` or `node` and to name only paths that resolve inside this repo. `self: true` marks the reporter's own entry, which is the one row it must never emit.",
+  "reportModes": {
+    "flake-check": {
+      "command": ["node", "scripts/ci/flake-check.mjs"],
+      "remedy": "node scripts/ci/flake-check.mjs --report"
+    },
+    "lane-certify": {
+      "command": ["node", "scripts/ci/lane-certify.mjs"],
+      "remedy": "node scripts/ci/lane-certify.mjs --report"
+    },
+    "disk-check": {
+      "command": ["node", "scripts/ci/disk-check.mjs", "--no-prune"],
+      "remedy": "just disk-prune"
+    },
+    "mcp-gate-parity": {
+      "command": ["node", "scripts/ci/mcp-gate-parity.mjs"],
+      "remedy": "node scripts/ci/mcp-gate-parity.mjs"
+    },
+    "check-doc-sync": {
+      "remedy": "node --test scripts/docs/check-doc-sync.test.mjs"
+    },
+    "quality-report": {
+      "self": true,
+      "remedy": "node --test scripts/ci/quality-report.test.mjs"
+    }
+  }
+}

@@ -27,7 +27,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
-use pumper_core::{JobStatus, NewSchedule};
+use pumper_core::resilience::source_id;
+use pumper_core::{AppContext, JobStatus, NewSchedule, Result, ScrapeApp, SourceState};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -426,4 +427,157 @@ async fn disabled_and_invalid_cron_are_named_not_reported_as_ok() {
         .await
         .unwrap();
     assert_eq!(jobs_for_schedule(&state, &id).await, 0);
+}
+
+// ---- retirement: the sixth gate the health chain used to omit ---------------
+
+/// Registered under the name `extractor`, so the scheduler's retirement rule
+/// (extractor schedules only, source `extractor/<params.dataset>`) applies to
+/// it. It never actually runs in these cases — every one of them is decided at
+/// the admission step, before anything is enqueued.
+struct Extractor;
+
+#[async_trait::async_trait]
+impl ScrapeApp for Extractor {
+    fn name(&self) -> &'static str {
+        "extractor"
+    }
+    async fn run(&self, _ctx: AppContext) -> Result<Value> {
+        Ok(json!({ "ok": true }))
+    }
+}
+
+const RETIRED_DATASET: &str = "retired-ds";
+
+/// A headless state with source-health detection ON but **not** enforcing —
+/// retirement is a scheduling decision, so it has to hold in soak mode.
+async fn soak_state(apps: Vec<Arc<dyn ScrapeApp>>) -> (AppState, pumper_core::testing::TempStore) {
+    super::harness::test_state_with(apps, |c| {
+        c.resilience.enabled = true;
+        c.resilience.enforce = false;
+    })
+    .await
+}
+
+/// A due, every-minute schedule for `app` whose params name `dataset`.
+async fn due_schedule_with_dataset(state: &AppState, app: &'static str, dataset: &str) -> String {
+    let schedule = state
+        .storage
+        .create_schedule(NewSchedule {
+            app,
+            cron: "0 * * * * *",
+            params: json!({ "dataset": dataset }),
+            priority: 0,
+            timezone: None,
+            misfire_policy: "fire_once",
+            max_attempts: Some(1),
+            budget_usd: None,
+        })
+        .await
+        .expect("create schedule");
+    sqlx::query("UPDATE schedules SET created_at = ?1 WHERE id = ?2")
+        .bind((Utc::now() - Duration::minutes(5)).to_rfc3339())
+        .bind(&schedule.id)
+        .execute(&state.storage.pool())
+        .await
+        .unwrap();
+    schedule.id
+}
+
+async fn set_source_state(state: &AppState, app: &str, dataset: &str, to: SourceState) {
+    let hs = state.health.store().expect("health store");
+    hs.ensure_source(app, dataset).await.unwrap();
+    hs.set_state_manual(&source_id(app, dataset), to, "test")
+        .await
+        .unwrap();
+}
+
+/// The row as the store holds it, for "the verdict is derived, nothing was
+/// written" assertions.
+async fn stored_row(state: &AppState, id: &str) -> Value {
+    serde_json::to_value(state.storage.get_schedule(id).await.unwrap().unwrap()).unwrap()
+}
+
+/// The third way `GET /schedules` lied: a retired source's schedule eats a
+/// firing on every single tick while the API answers `health: "ok"` beside a
+/// confident future `next_run`. The scheduler had the gate; the health chain
+/// never learned about it.
+#[tokio::test]
+async fn a_retired_sources_schedule_reports_retired_not_ok() {
+    let (state, _store) = soak_state(vec![Arc::new(Extractor)]).await;
+    let router = routes::router(state.clone());
+    let id = due_schedule_with_dataset(&state, "extractor", RETIRED_DATASET).await;
+
+    assert_eq!(only_schedule(&router).await["health"], "ok");
+    set_source_state(&state, "extractor", RETIRED_DATASET, SourceState::Retired).await;
+
+    let row = only_schedule(&router).await;
+    assert_eq!(
+        row["health"], "retired",
+        "the scheduler refuses to fire this row; the API must say so: {row}"
+    );
+
+    // ...and the scheduler agrees: the firing is eaten, nothing is enqueued.
+    scheduler::reconcile(&state, &mut HashMap::new(), None, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(jobs_for_schedule(&state, &id).await, 0);
+
+    // The verdict is DERIVED, like `invalid_params`: restoring the source
+    // clears it on the very next read, with no write to the `schedules` row.
+    let before = stored_row(&state, &id).await;
+    set_source_state(&state, "extractor", RETIRED_DATASET, SourceState::Healthy).await;
+    let row = only_schedule(&router).await;
+    assert_eq!(row["health"], "ok", "{row}");
+    assert_eq!(
+        stored_row(&state, &id).await,
+        before,
+        "clearing the verdict must not write the schedules row"
+    );
+}
+
+/// `admit` answers with exactly ONE verdict, and the precedence is declared:
+/// a disabled schedule over a retired source is `disabled`, not `retired`.
+#[tokio::test]
+async fn disabled_outranks_retired_so_one_firing_has_one_verdict() {
+    let (state, _store) = soak_state(vec![Arc::new(Extractor)]).await;
+    let router = routes::router(state.clone());
+    let id = due_schedule_with_dataset(&state, "extractor", RETIRED_DATASET).await;
+    set_source_state(&state, "extractor", RETIRED_DATASET, SourceState::Retired).await;
+    assert_eq!(only_schedule(&router).await["health"], "retired");
+
+    assert!(state
+        .storage
+        .set_schedule_enabled(&id, false)
+        .await
+        .unwrap());
+    let row = only_schedule(&router).await;
+    assert_eq!(
+        row["health"], "disabled",
+        "one firing, one verdict — the higher gate wins: {row}"
+    );
+}
+
+/// The retirement rule is `extractor`-only, and widening the admission verdict
+/// must not widen it: another app whose params happen to carry a `dataset` key
+/// names no source, so it stays `ok` and keeps firing even with
+/// `<app>/<dataset>` retired.
+#[tokio::test]
+async fn a_non_extractor_apps_dataset_param_is_not_a_source() {
+    let (state, _store) = soak_state(vec![Arc::new(FakeApp)]).await;
+    let router = routes::router(state.clone());
+    let id = due_schedule_with_dataset(&state, "fake", RETIRED_DATASET).await;
+    set_source_state(&state, "fake", RETIRED_DATASET, SourceState::Retired).await;
+    set_source_state(&state, "extractor", RETIRED_DATASET, SourceState::Retired).await;
+
+    let row = only_schedule(&router).await;
+    assert_eq!(row["health"], "ok", "{row}");
+    scheduler::reconcile(&state, &mut HashMap::new(), None, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_for_schedule(&state, &id).await,
+        1,
+        "only an extractor schedule's params name a source"
+    );
 }

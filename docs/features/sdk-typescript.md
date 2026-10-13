@@ -67,21 +67,111 @@ Persistence and the product data model stay product-side. The consumer supplies:
   default for a straight canonical mirror).
 
 The watermark advances only after the sink commits, so a mid-run crash
-re-processes idempotently (upsert by key) rather than skipping.
+re-processes idempotently (upsert by key) rather than skipping. It advances
+**per page**, not once per run: the incremental drain reads the feed
+oldest-first (`order=asc`), applies one page of at most `batchSize` revisions
+through the sink, and only then stores that page's position. A consumer whose
+sink dies on page 7 keeps pages 1-6 and resumes at page 7 — it does not lose
+the run.
+
+### The watermark is a position, not a timestamp
+
+The stored value is the opaque token `<created_at>|<rowid>`: the same tuple the
+change feed pages by. **Never parse it, compare it, or synthesize one.**
+
+It has to be a tuple because `upsert_many` commits in chunks of 500 and every
+record in a chunk shares ONE revision `created_at`
+([datasets.md § Conventions](datasets.md)). An instant therefore cannot name a
+boundary *inside* a chunk, and resuming at `created_at > S` drops every sibling
+of S the previous run had not read — up to 499 revisions, silently, with no way
+to notice from the watermark's side.
+
+**Upgrading needs no resync.** A store holding the old bare RFC3339 value is
+read as the position `(that instant, rowid 0)`, which sits below every real
+rowid and therefore *re-reads* the boundary stamp instead of skipping it;
+re-delivery is idempotent through the sink. The first run rewrites the value as
+a token. Nothing to migrate, no cold-start snapshot forced.
 
 ## Public surface
 
-- `createPumperSync(config) → { run(): Promise<SyncResult> }` — the mirror. Config:
+- `createPumperSync(config) → { run(opts?): Promise<SyncResult>, status(): Promise<SyncStatus> }` — the mirror. Config:
   `dataset`, `filter?`, `watermark`, `sink`, `map?`, `batchSize?` (default 500),
   `baseUrl?` (default `$PUMPER_URL` → `http://127.0.0.1:8088`), `timeoutMs?`,
   `maxBytes?`, `onProgress?`, `signal?`.
 - `PumperClient` — stateless low-level reads: `exportRecords(ds, filter?, signal?)`
   (async generator, requests `trust=all&removed=include`) and
-  `changesPage(ds, since, cursor, limit?, trust?)` (defaults `trust="stable"`).
+  `changesPage(ds, since, cursor, limit?, trust?, order?)` (defaults
+  `trust="stable"`; `order` is omitted from the request entirely unless given,
+  so the default call is byte-identical to before).
 - `memoryWatermark()`, `kvWatermark(kv)` — `WatermarkStore` implementations.
+- `parseWatermark(stored)` / `formatWatermark(pos)` / `normalizeStamp(iso)` —
+  the position codec, exported for products that store the watermark in a typed
+  column. `parseWatermark` accepts both the token and the legacy bare instant.
 - `PumperHttpError` — carries Pumper's `{error, code}` envelope; branch on `.code`.
 
-`SyncResult` = `{ mode: "snapshot" | "incremental", upserted, tombstoned, watermark }`.
+`SyncResult` = `{ mode: "snapshot" | "incremental", upserted, tombstoned,
+watermark, anomalies?, stalled? }`. `anomalies` counts feed items the SDK
+refused to apply and `stalled` is true when the drain stopped at one instead of
+reaching the end of the feed — see § Known gaps.
+
+### Reporting: what a run read, and what it did not write
+
+`SyncResult` additionally carries `pagesRead`, `revisionsSeen`, `applied` and
+`skipped: { droppedByMap, nullPostImage, supersededDuplicate }`. All are
+optional to read and nothing above changed shape.
+
+They exist because `{ upserted: 0 }` was ambiguous. A feed with nothing new, a
+`map` that returns null for every record, and a page of superseded duplicates
+all produced the same four numbers. `revisionsSeen - upserted - tombstoned` is
+now accounted for item by item:
+
+- `droppedByMap` — the consumer's `map` returned null. The commonest wiring
+  mistake a new consumer makes, and previously indistinguishable from success.
+- `nullPostImage` — a non-`removed` revision with `data: null`. This is the
+  same event `anomalies` counts and it stalls the page (§ Known gaps); the
+  field only gives the anomaly a name.
+- `supersededDuplicate` — a later revision for the same key **in the same
+  page** replaced this one. Page-local by construction: the drain checkpoints
+  per page, so a key that reappears on a later page is re-applied
+  idempotently, not held back. On the ascending feed the LAST revision for a
+  key in a page is its newest, and that is the one applied.
+
+`onProgress` fires once per applied page (snapshot: once per sink flush) and
+now carries `page`, `revisionsSeen` and the running `skipped` counts, so the
+drop rate of a long backlog is visible while it drains.
+
+### `status()` — asking without writing
+
+`sync.status() → { mode, watermark, newestRevisionAt, lagSeconds, upToDate,
+pendingAtLeast }` answers "is a still cursor health or lag?" with **no sink
+call and no watermark write**. It costs at most two one-shot feed reads: the
+head (`order=desc&limit=1`) and, when a position is stored, one forward probe
+page from it.
+
+- `mode` is what `run()` would do next — `snapshot` when nothing is stored.
+- `lagSeconds` is whole seconds between the watermark's stamp and the feed
+  head, floored at 0 (a negative lag is a clock artefact, not information);
+  `null` on a cold start or an empty feed.
+- `pendingAtLeast` is a **lower bound** — one probe page, so it saturates at
+  `batchSize`. `null` on a cold start, where the pending population is the
+  whole dataset and the feed cannot say.
+- `upToDate` requires both an empty probe and a head that is not ahead. A cold
+  start is never up to date.
+
+### `run({ dryRun: true })` — rehearsing the first production run
+
+The dry run walks the **identical** code path with one substitution — a
+counting no-op sink — and skips every watermark write. `applied` is `false` and
+every other field, including the watermark it *would* have stored, equals what
+the real run reports. That equality is pinned by
+`clients/typescript/test/sync-report.test.ts`
+(`dry_run_writes_nothing_and_reports_exactly_what_the_real_run_reports`): a
+preview that computed its answer a different way would be a gate watching a
+proxy.
+
+The counts are what the SDK would hand the sink. A sink that writes fewer rows
+than it is given (its own dedupe, its own filter) returns a lower number on the
+real run, and the dry run cannot know that.
 
 ## Data model
 
@@ -92,13 +182,38 @@ watermark row.
 
 ## Known gaps
 
-- **Watermark boundary:** `since` is an exclusive micro-second lower bound; a
-  revision landing at the exact stored instant could be skipped (negligible at job
-  cadence; clear the watermark to force a fresh snapshot if suspected).
+- ~~**Watermark boundary:** a revision landing at the exact stored instant could
+  be skipped (negligible at job cadence).~~ **Fixed, and the dismissal was
+  wrong.** The population at "the exact stored instant" is not one revision: it
+  is an entire `upsert_many` chunk, up to 500 revisions sharing one stamp, so
+  the blast radius was up to 499 silently-lost records per occurrence. The
+  watermark is now the keyset position `<created_at>|<rowid>` and the drain
+  resumes with the tuple comparison the feed orders by. Pinned end-to-end by
+  `clients/typescript/test/conformance.test.ts` replaying
+  `test/fixtures/feed-shared-stamp.json`, which is emitted from a real
+  `Datasets` store by
+  `crates/core/tests/change_feed_keyset.rs::shared_stamp_feed_fixture_is_emitted_from_a_real_store`
+  rather than hand-authored.
+- **A malformed revision stalls the drain rather than skipping it.** A
+  non-`removed` revision with a null post-image is a contradiction in the feed;
+  the SDK applies nothing from that page, leaves the watermark *before* it, and
+  returns `stalled: true` with `anomalies > 0`. That is deliberate: the previous
+  behaviour marked the key consumed and advanced past it, so the record was
+  neither written nor ever reachable again. A stalled mirror is visible; a
+  diverged one is not. Fixing the feed makes the next run proceed.
 - **Types are hand-mirrored,** not generated — regenerate against `GET /openapi.json`
   if the record/revision shapes drift.
-- **No built-in retry/backoff:** a failed page aborts the run with the watermark
-  unadvanced; the next run resumes from the same point. Wrap `.run()` in the
+- **No built-in retry/backoff:** a failed page aborts the run; the pages already
+  applied keep their checkpoint and the next run resumes at the failed page. Wrap `.run()` in the
   caller's scheduler retry.
 - **TypeScript only** so far — a Rust/Python twin would generate off the same
   OpenAPI spec.
+- **`pendingAtLeast` is a lower bound,** not a backlog size: `status()` reads
+  one forward probe page and the number saturates at `batchSize`. There is no
+  cheap exact pending count on the change feed.
+- **A dry run cannot model a lossy sink.** It reports what the SDK would hand
+  the sink; a sink that acknowledges fewer rows than it is given diverges from
+  the preview on exactly those rows.
+- **`skipped.supersededDuplicate` is page-local.** A key repeated across two
+  pages is applied twice (idempotently) and counted once per page, because the
+  per-page checkpoint means the earlier page is already durable.

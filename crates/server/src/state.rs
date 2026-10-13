@@ -317,7 +317,15 @@ impl AppState {
         // Learned API-recipe source (`[recipes]`, M05): always wired so a
         // per-request `use_recipes` opt-in works even with the global switch
         // off; with neither opt-in the fetcher never consults it.
-        let recipes: Arc<dyn pumper_core::RecipeSource> = Arc::new(storage.recipes());
+        // `retire_after` (0046) rides on the handle, not on the trait: the
+        // `Fetcher` holds the source behind `dyn` and compiles without the
+        // `storage` feature, so the threshold is wired where the concrete
+        // store is built. 0 restores pre-0046 selection.
+        let recipes: Arc<dyn pumper_core::RecipeSource> = Arc::new(
+            storage
+                .recipes()
+                .with_retire_after(config.recipes.retire_after),
+        );
         // Remote fetch fabric (M17, `[remote]`, default OFF). Wired at the
         // live-HTTP tier position only when enabled AND nodes are configured
         // (enabled + no nodes = a serve-only node: /fetch-proxy answers peers,

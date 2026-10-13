@@ -453,6 +453,55 @@ async fn a_failure_without_an_envelope_reports_unknown_spend_not_zero() {
     assert_eq!(spend.class, pumper_core::error::ClaudeFailure::Unparseable);
 }
 
+/// THE anti-pattern, and the one this whole classifier was adopted from
+/// (backlog `optimize-2026-10-01`): `let _ = stdin.write_all(prompt)` threw the
+/// prompt's *delivery* result away. A CLI that never read stdin sees EOF, so it
+/// answers an EMPTY question, prints a perfectly valid envelope and exits 0 —
+/// and the engine returned `Ok(ResearchOutput)` with a real bill for an answer
+/// to nothing. The run ending "the prompt never reached the process" is a fact
+/// about *pumper*, not about the model, and it has to be reported as one.
+///
+/// The prompt is deliberately larger than any pipe buffer: the fake CLI exits
+/// without reading a byte, so the write cannot complete and the failure is the
+/// deterministic one rather than a race.
+#[tokio::test]
+async fn a_prompt_that_never_reached_the_cli_is_not_a_billable_answer() {
+    let cli = FakeCli::printing("undelivered", &ok_envelope());
+    let prompt = "x".repeat(8 * 1024 * 1024);
+
+    let err = cli
+        .engine(30)
+        .research(ResearchRequest::new(prompt))
+        .await
+        .expect_err("a run whose prompt never arrived answered a question nobody asked");
+    let spend = err
+        .claude_spend()
+        .expect("a post-spawn failure carries a spend class");
+    assert_eq!(
+        spend.class,
+        pumper_core::error::ClaudeFailure::PromptUndelivered,
+        "the prompt's delivery failure must have its own class, not be folded \
+         into a neighbouring one: {err}"
+    );
+    assert_eq!(
+        spend.cost_usd, None,
+        "nothing the CLI printed in answer to an empty prompt is a spend we can vouch for"
+    );
+    let (cost, certainty, detail) = spend
+        .ledger_event()
+        .expect("a child that ran leaves a ledger row");
+    assert_eq!(cost, 0.0);
+    assert!(
+        detail.contains("prompt_undelivered"),
+        "the ledger row must name the class: {detail}"
+    );
+    assert_eq!(
+        certainty,
+        pumper_core::costs::SpendCertainty::Unmetered,
+        "the CLI answered an empty question and was billed for it — the $0 is a          floor, and the typed column has to say so"
+    );
+}
+
 /// THE anti-pattern for schema-constrained calls: `result.as_str()` on an
 /// object yields `""`, and the research cache refuses to store an empty answer —
 /// so the call re-paid the model on every repeat, with nothing anywhere saying

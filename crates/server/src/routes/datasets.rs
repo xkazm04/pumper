@@ -613,6 +613,17 @@ fn file_component(raw: &str) -> String {
     }
 }
 
+/// `Content-Disposition` for a dataset export. The dataset name arrives on the
+/// URL, and [`file_component`] is the same flattening the pre-delete export
+/// already applies before a name becomes a filename. A raw interpolation lets
+/// a quote or semicolon add a second `filename=` parameter inside this header.
+fn export_content_disposition(dataset: &str, extension: &str) -> String {
+    format!(
+        "attachment; filename=\"{}.{extension}\"",
+        file_component(dataset)
+    )
+}
+
 #[utoipa::path(
     delete,
     path = "/datasets/{app}/{dataset}/records/{key}",
@@ -835,7 +846,7 @@ fn stream_export(
     include_removed: bool,
 ) -> Response {
     const BATCH: i64 = 1_000;
-    let filename = format!("attachment; filename=\"{dataset}.{}\"", format.extension());
+    let filename = export_content_disposition(&dataset, format.extension());
     let content_type = format.content_type();
     let stream = async_stream::stream! {
         match format {
@@ -992,6 +1003,32 @@ pub(crate) struct ChangesQuery {
     /// because an unstamped revision *is* stable.
     #[serde(default = "default_trust_stable")]
     trust: String,
+    /// Feed direction: `desc` (default, newest first — the historical shape) or
+    /// `asc`, a forward drain for a mirror that checkpoints page by page.
+    /// `asc` requires `cursor` (even empty), because the legacy
+    /// `{app, dataset, count, changes}` body has no position to resume from.
+    #[serde(default = "default_order_desc")]
+    order: String,
+}
+
+/// `/changes` stays newest-first unless a caller opts in: that body is a wire
+/// format consumed outside this tree.
+pub(crate) fn default_order_desc() -> String {
+    pumper_core::datasets::FeedOrder::Desc.as_str().to_string()
+}
+
+/// Parses `?order=` into the store's [`FeedOrder`]. Anything else is the
+/// client's mistake, not a silent fallback — the same posture as
+/// [`parse_removed`], and it matters more here: a typo resolving to `desc`
+/// would hand a forward drain the one direction it cannot checkpoint, and the
+/// consumer would mirror a prefix of its backlog forever without an error.
+pub(crate) fn parse_feed_order(raw: &str) -> Result<pumper_core::datasets::FeedOrder, ApiError> {
+    pumper_core::datasets::FeedOrder::parse(raw).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("order '{raw}' must be 'asc' or 'desc'"),
+        )
+    })
 }
 
 /// Change feed for a dataset: new/changed/removed revisions, newest first,
@@ -1006,8 +1043,8 @@ pub(crate) struct ChangesQuery {
         ChangesQuery,
     ),
     responses(
-        (status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed)."),
-        (status = 400, description = "Malformed `since` (not RFC 3339) or `cursor` (not the `<created_at>|<rowid>` token from `next_cursor`). A blank `cursor=` is valid and starts at the first page.", body = Object),
+        (status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed). `order=asc` drains oldest-first and always carries a `next_cursor` while the page is non-empty, so a mirror can checkpoint each page."),
+        (status = 400, description = "Malformed `since` (not RFC 3339), `cursor` (not the `<created_at>|<rowid>` token from `next_cursor`), or `order` (not `asc`/`desc`); also `order=asc` without `cursor`. A blank `cursor=` is valid and starts at the first page.", body = Object),
     )
 )]
 pub(crate) async fn dataset_changes(
@@ -1016,8 +1053,16 @@ pub(crate) async fn dataset_changes(
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let since = parse_since(query.since.as_deref())?;
+    let order = parse_feed_order(&query.order)?;
     let trust = trust_filter(&query.trust);
     let Some(cursor) = &query.cursor else {
+        if order == pumper_core::datasets::FeedOrder::Asc {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "order=asc requires 'cursor' (send it empty to start at the oldest                  revision): the uncursored body carries no position to resume from"
+                    .to_string(),
+            ));
+        }
         let changes = state
             .datasets
             .changes_since(
@@ -1039,13 +1084,14 @@ pub(crate) async fn dataset_changes(
     let after = parse_cursor_i64_arg(cursor)?;
     let page = state
         .datasets
-        .changes_page(
+        .changes_page_ordered(
             &app,
             Some(&dataset),
             since,
             after,
             query.limit.clamp(1, 1000),
             trust,
+            order,
         )
         .await?;
     Ok(Json(
@@ -1157,6 +1203,28 @@ mod cursor_arg_tests {
 #[cfg(test)]
 mod export_honesty_tests {
     use super::*;
+
+    /// The pre-delete export flattens a dataset name before it becomes a
+    /// filename. The download header used to interpolate the raw name, so a
+    /// quote added a second `filename=` parameter in the same header.
+    #[test]
+    fn export_filename_flattens_disposition_metacharacters() {
+        let header = export_content_disposition("q\"; filename=\"injected", "csv");
+        assert_eq!(
+            header.matches("filename=").count(),
+            1,
+            "one filename parameter, got {header}"
+        );
+        assert!(
+            !header.contains('\n') && !header.contains('\r'),
+            "no header break, got {header}"
+        );
+        assert_eq!(
+            header.chars().filter(|c| *c == '"').count(),
+            2,
+            "the quotes are only the filename delimiters, got {header}"
+        );
+    }
 
     fn record(key: &str) -> pumper_core::Record {
         let now = chrono::Utc::now();
@@ -1455,5 +1523,69 @@ mod sdk_fixture_conformance_tests {
             "and one must model honest-Null provenance, which the mirror keeps as \
              unknown rather than inventing the feed URL"
         );
+    }
+}
+
+/// `?order=` on `/changes`: the one new knob on a wire format consumed outside
+/// this tree. These pin that the default did not move and that a bad value is
+/// a 400 in the SAME envelope as every other bad enum value on this route —
+/// never a silent fallback to `desc`, which would leave a forward drain
+/// mirroring a prefix of its backlog forever with no error anywhere.
+#[cfg(test)]
+mod feed_order_tests {
+    use super::{default_order_desc, parse_feed_order, parse_removed};
+    use axum::http::StatusCode;
+    use pumper_core::datasets::FeedOrder;
+
+    #[test]
+    fn omitted_order_is_desc_and_resolves_identically_to_an_explicit_desc() {
+        // Acceptance case 3's guard, at the param layer: no `order` and
+        // `order=desc` must reach the store as the same FeedOrder, so the body
+        // cannot differ. The byte-level half lives in
+        // crates/core/tests/change_feed_keyset.rs against a golden captured
+        // before this param existed.
+        assert_eq!(default_order_desc(), "desc");
+        assert_eq!(
+            parse_feed_order(&default_order_desc()).unwrap(),
+            FeedOrder::Desc
+        );
+        assert_eq!(parse_feed_order("desc").unwrap(), FeedOrder::Desc);
+        assert_eq!(parse_feed_order("asc").unwrap(), FeedOrder::Asc);
+    }
+
+    #[test]
+    fn bad_order_is_a_400_not_a_silent_fallback_to_desc() {
+        let err = parse_feed_order("bogus").expect_err("an unknown order must not resolve");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("bogus") && err.1.contains("'asc'") && err.1.contains("'desc'"),
+            "the body must name the offending value and the allowed set: {}",
+            err.1
+        );
+        // Same envelope as the route's other bad-enum rejection, so a client
+        // sees one shape across the surface rather than a per-param dialect.
+        let removed = parse_removed("bogus").expect_err("control: the existing bad-value shape");
+        assert_eq!(err.0, removed.0);
+        assert_eq!(
+            err.1
+                .split_once(' ')
+                .map(|(_, rest)| rest.starts_with("'bogus'")),
+            removed
+                .1
+                .split_once(' ')
+                .map(|(_, rest)| rest.starts_with("'bogus'")),
+            "both read `<param> '<value>' must be …`"
+        );
+    }
+
+    #[test]
+    fn case_sensitivity_and_whitespace_do_not_sneak_past_the_parser() {
+        for raw in ["ASC", "Desc", " asc", "asc ", "", "ascending"] {
+            assert!(
+                parse_feed_order(raw).is_err(),
+                "'{raw}' must be rejected, not normalized — a near-miss that \
+                 resolved to desc is the silent-fallback bug this guards"
+            );
+        }
     }
 }

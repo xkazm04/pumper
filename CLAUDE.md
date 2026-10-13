@@ -23,10 +23,11 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just fmt` / `just fmt-check` | `cargo fmt` / `cargo fmt --check` — CI gate |
 | `just flake-check` | the quarantine register as a gate — expiry, ceiling, and both reconciliation directions; 0 clean / 2 findings / **3 cannot check** |
 | `just flake-report` | register size **with its trend**, age of the oldest entry, and the labelled set with its full predicate |
-| `just harness-test` | the fixture suites that prove `flake-check`, `lane-certify` and `disk-check` can still go red |
+| `just harness-test` | the fixture suites that prove every gate in `scripts/ci/gates.json` can still go red, plus `gate-inventory.test.mjs` which reconciles this recipe, `just inventory`, `just ci` and `.github/workflows/ci.yml` against that registry |
+| `just mcp-gate-parity` | the MCP gated-tool vocabulary as a gate: one spelling at all three sites; 0 clean / 2 drift / **3 cannot check**. `just inventory` only ever ran its fixtures |
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
-| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |
@@ -43,6 +44,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
 | `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |
 | `just datahub-preview [port]` | `GET /datahub/governance/preview` — what the DataHub governance poll would do right now, writes nothing (server RUNNING) |
+| `just quality` | the whole posture in one run — `node scripts/ci/quality-report.mjs`: every gate in `scripts/ci/gates.json` in its **non-mutating** mode, one table of gate / verdict / finding / **remedy**, and a footer counting clean / findings / **cannot-check** / not wired in four separate columns. Continues past every red row (`just ci` aborts at the first), exits with the worst verdict, mutates nothing. `--markdown` is what the CI step summary publishes |
 | `just smoke [args]` | `pwsh -File scripts/smoke.ps1` — boots the real binary against a scratch config, drives one real job end-to-end, and curls the doctor/retention/enforcement-preview/openapi/receipt surfaces; PASS/FAIL/SKIP per check, tears down after itself |
 
 `--bin pumper` is **required**: the `pumper-server` package ships three binaries
@@ -50,6 +52,24 @@ Everything runs **from the repo root**: the `.env` loader and the default
 `cargo run -p pumper-server` errors with *"could not determine which binary to
 run"*. The two maintenance binaries must run with the **server stopped** (Tantivy
 holds an exclusive writer lock; `reindex` rewrites derived columns).
+
+**The gate registry.** [`scripts/ci/gates.json`](scripts/ci/gates.json) is the
+single enumeration of this repo's node gates — a gate being any script that
+exports `EXIT_CANNOT_CHECK`, the repo's own definition of "three outcomes,
+three exit codes". Each entry names the script, its fixture suite, the justfile
+recipe and CI step that run each of them, and the exit codes the suite must
+assert **against a spawned process**. `scripts/ci/gate-inventory.test.mjs` is the
+EXPECTED-diff inventory test that holds every projection to it: an unregistered
+gate, a gate missing from CI, a gate whose cannot-check branch no test has ever
+observed, and a recipe line belonging to no gate all go red there. **Add a gate by
+appending one object to `gates`** — never reflow the file.
+
+The same file carries `reportModes`: per gate, the **non-mutating** argv
+`just quality` spawns and the remedy it prints when that row is red. A gate with
+no entry there still gets a row (`NOT WIRED`) rather than disappearing from the
+posture, and that row reddens the run unless the gate's entry declares a
+`verdictWaived`. Register the gate, declare its report mode, and both the table
+and the CI step summary pick it up with no second list anywhere.
 
 Config is `config.toml`, or `$PUMPER_CONFIG`; every key is optional (defaults in
 `crates/core/src/config.rs`).
@@ -119,26 +139,24 @@ Do not let a hard-won fact live only in the transcript.
 When docs disagree with each other, trust the code, then fix whichever doc is stale.
 
 <!-- personas:context-map:start -->
-## Git policy (harness-enforced)
-
-**Commit on the current branch; never push.** The owner pushes after reading the log. Do not push, force-push, or open a pull request unless this session's prompt asks for it. This line exists because the harness's own default for an unattended session is to push and open a draft PR when the file says nothing (measured 2026-09-08: without such a line the agent pushed; with it the agent stopped at the commit). The gate bypass is denied to agents at the permission layer (`.claude/settings.json` `permissions.deny`: `--no-verify`, force-push) - do not work around it; if a gate is red, fix the tree.
-
 ## Project Context Map
 
-This project is organized into **46 contexts** across **8 groups**. The full machine-readable map lives in `context-map.json` at the project root — read it at task start to scope your edits to the relevant context's files.
+This project is organized into **30 contexts** across **10 groups**. The full machine-readable map lives in `context-map.json` at the project root — read it at task start to scope your edits to the relevant context's files.
 
 Taxonomy: each context has a `category` (ui · api · lib · data · test · config); each group has a `domain` (feature · infrastructure · shared · integration · data).
 
 ### Groups
 
-- **Scraping Engines** _(domain: shared · 8 contexts)_
+- **Consumer SDK** _(domain: integration · 1 contexts)_
+- **Build & CI Infrastructure** _(domain: infrastructure · 2 contexts)_
+- **Scraping Engines** _(domain: shared · 3 contexts)_
 - **Core Platform** _(domain: shared · 8 contexts)_
 - **HTTP API** _(domain: infrastructure · 4 contexts)_
 - **Job Orchestration** _(domain: infrastructure · 3 contexts)_
 - **Event Pipeline** _(domain: integration · 4 contexts)_
-- **Content & Research Apps** _(domain: feature · 10 contexts)_
-- **Grants Intelligence** _(domain: feature · 5 contexts)_
-- **Market Data** _(domain: feature · 4 contexts)_
+- **Content & Research Apps** _(domain: feature · 2 contexts)_
+- **Grants Intelligence** _(domain: feature · 1 contexts)_
+- **Market Data** _(domain: feature · 2 contexts)_
 
 > Auto-generated by Personas on each context scan. Edits between the markers are overwritten on the next scan; edit `context-map.json` or rescan instead.
 <!-- personas:context-map:end -->

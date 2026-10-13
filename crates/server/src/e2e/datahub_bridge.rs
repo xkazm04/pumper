@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::harness::{test_state_with, wait_for, FakeApp};
+use super::harness::{test_state_with, timed_claim, wait_for, Claim, FakeApp};
 use crate::datahub::SyncOutcome;
 use crate::state::AppState;
 
@@ -282,7 +282,9 @@ async fn a_job_emission_is_tracked_by_the_drain_not_silently_detached() {
     assert_eq!(
         state.fanout.inflight(),
         1,
-        "the emission must be a tracked fan-out unit, not a detached spawn"
+        "the emission must be a tracked fan-out unit, not a detached spawn (the mock \
+         holds each POST for 300ms, so the unit is still in flight here unless it was \
+         never tracked)"
     );
 
     // What the shutdown drain does: wait, bounded — and here it completes, so
@@ -766,7 +768,9 @@ async fn a_tick_during_a_hanging_poll_does_not_start_a_second_poll() {
     assert_eq!(
         gms.graphql_reads(),
         1,
-        "a tick during an in-flight poll must not start a second poll"
+        "a tick during an in-flight poll must not start a second poll (observed 300ms \
+         into a GraphQL read the mock holds for 3s, so a second read here is the guard \
+         failing, not the window closing early)"
     );
 
     // And the guard is not a wedge: completion clears it and re-stamps.
@@ -776,9 +780,15 @@ async fn a_tick_during_a_hanging_poll_does_not_start_a_second_poll() {
     })
     .await;
     let g = state.datahub_govern.lock().unwrap();
-    assert!(
-        g.last_poll
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(60)),
-        "completion must re-stamp last_poll, so the interval restarts from the END"
+    let stamp_age = g
+        .last_poll
+        .expect("completion must re-stamp last_poll, so the interval restarts from the END")
+        .elapsed();
+    timed_claim(
+        "completion re-stamps last_poll, so the interval restarts from the END",
+        Claim::AtMost {
+            measured_ms: stamp_age.as_millis() as f64,
+            limit_ms: 60_000.0,
+        },
     );
 }

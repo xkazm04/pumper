@@ -67,6 +67,88 @@ pub const CONSEQUENCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// How much of the fleet enforcement is armed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmedScope {
+    /// `[resilience] enforce = true`: every source, including ones added after
+    /// the config was written.
+    All,
+    /// `enforce = false` with a non-empty `enforce_sources`: exactly the listed
+    /// sources.
+    Some,
+    /// The shipping default. Nothing is gated and nothing is read on the write
+    /// path.
+    None,
+}
+
+/// The arming posture a preview is reported against: which sources enforcement
+/// is allowed to act on right now.
+///
+/// Carries the configured list rather than a boolean, because "what would
+/// `enforce = true` do to my fleet" and "what is being enforced right now" stop
+/// being the same question the moment arming is per-source — and a preview that
+/// cannot tell them apart is a leaflet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Arming {
+    /// `[resilience] enforce`, already ANDed with `enabled` by the caller.
+    pub enforce: bool,
+    /// `[resilience] enforce_sources`, verbatim.
+    pub sources: Vec<String>,
+}
+
+impl Arming {
+    /// Everything armed — the fleet-wide flip.
+    pub fn all() -> Self {
+        Self {
+            enforce: true,
+            sources: Vec::new(),
+        }
+    }
+
+    /// Exactly these sources armed.
+    pub fn only(sources: &[&str]) -> Self {
+        Self {
+            enforce: false,
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Whether one source is armed. Delegates to the single predicate in
+    /// [`super::detect::enforcement_armed`] — this type reports arming, it does
+    /// not define it.
+    pub fn armed(&self, source_id: &str) -> bool {
+        super::detect::enforcement_armed(self.enforce, &self.sources, source_id)
+    }
+
+    /// Whether any source at all is armed.
+    pub fn anywhere(&self) -> bool {
+        super::detect::enforcement_armed_anywhere(self.enforce, &self.sources)
+    }
+
+    pub fn scope(&self) -> ArmedScope {
+        if self.enforce {
+            ArmedScope::All
+        } else if self.sources.is_empty() {
+            ArmedScope::None
+        } else {
+            ArmedScope::Some
+        }
+    }
+
+    /// Configured entries that are doing nothing because `enforce = true`
+    /// already arms everything. Reported, not silently honoured in either
+    /// direction: the list cannot narrow arming, and an operator who thinks it
+    /// can has to be told.
+    pub fn redundant(&self) -> &[String] {
+        if self.enforce {
+            &self.sources
+        } else {
+            &[]
+        }
+    }
+}
+
 /// Why the replayed state moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +291,11 @@ pub fn gates_of(state: SourceState) -> Vec<&'static str> {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourcePreview {
     pub id: String,
+    /// Whether enforcement is armed on THIS source right now — the field that
+    /// turns the preview from a leaflet into a control surface. `false` means
+    /// everything below it is still hypothetical; `true` means it is a record
+    /// of what happened.
+    pub armed: bool,
     pub runs_replayed: u64,
     /// Runs the detector could not judge (`inconclusive`, `content_empty`,
     /// `below_cohort`). They moved nothing, and are counted here rather than
@@ -249,12 +336,41 @@ pub struct NotReady {
     pub since: Option<PreviewTransition>,
 }
 
+/// Consequences split by whether they are already happening.
+///
+/// Before per-source arming, `totals` could only mean one thing, because arming
+/// was one boolean for the whole fleet. Now a single rollup would add a number
+/// that describes the past to a number that describes a hypothesis, and present
+/// the sum as a fact. So they are counted apart.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ArmedSplit {
+    /// Sources enforcement is armed on: what IS being gated.
+    pub armed: PreviewConsequences,
+    /// Sources still soaking: what WOULD be gated if they were armed.
+    pub soaking: PreviewConsequences,
+}
+
 /// The whole answer to "is my fleet ready for `enforce = true`".
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetPreview {
-    /// Whether enforcement is already on — in which case this is a description
-    /// of what DID happen, not of what would have.
+    /// Whether the **fleet-wide** flip (`[resilience] enforce`) is on. Kept
+    /// unchanged in name and meaning; `armed` beside it is the finer answer.
     pub enforcing: bool,
+    /// How much of the fleet is armed: `all` (the flip), `some` (a list), or
+    /// `none` (the shipping default).
+    pub armed: ArmedScope,
+    /// `[resilience] enforce_sources`, echoed verbatim so the operator can see
+    /// what the server actually loaded rather than what the file on the box is
+    /// believed to say.
+    pub enforce_sources: Vec<String>,
+    /// Configured entries that do nothing because `enforce = true` already
+    /// arms everything. A list beside the flip is redundant, never a
+    /// restriction — said out loud rather than left to be inferred.
+    pub redundant_sources: Vec<String>,
+    /// Configured entries that match no replayed source. A typo arms nothing,
+    /// and arming nothing looks exactly like a healthy fleet, so an unmatched
+    /// entry is named instead of reading as a successful rollout.
+    pub armed_unseen: Vec<String>,
     pub runs_per_source: i64,
     pub sources_replayed: usize,
     /// True when no source's current state gates anything: flipping `enforce`
@@ -266,8 +382,12 @@ pub struct FleetPreview {
     /// they do not block readiness — but a preview of a source nobody could
     /// judge is weak evidence, so they are named rather than counted silently.
     pub unmonitored: Vec<String>,
-    /// Summed over every replayed source.
+    /// Summed over every replayed source, armed or not. Unchanged.
     pub totals: PreviewConsequences,
+    /// The same sum, split by arming: `armed` is happening, `soaking` is
+    /// hypothetical. Arming one source moves exactly that source's counts from
+    /// `soaking` to `armed` and changes no other number.
+    pub consequences: ArmedSplit,
     pub sources: Vec<SourcePreview>,
 }
 
@@ -279,6 +399,7 @@ pub fn replay(
     id: &str,
     live_state: SourceState,
     monitored: bool,
+    armed: bool,
     runs_oldest_first: &[SourceRun],
 ) -> SourcePreview {
     let opens_in = runs_oldest_first
@@ -325,6 +446,7 @@ pub fn replay(
 
     SourcePreview {
         id: id.to_string(),
+        armed,
         runs_replayed: runs_oldest_first.len() as u64,
         unjudged_runs: unjudged,
         window_opens_at: runs_oldest_first.first().map(|r| r.created_at.clone()),
@@ -342,21 +464,16 @@ pub fn replay(
 /// `Inconclusive` — "we cannot tell what this run said" must never be rounded up
 /// to "it was fine", because a judged verdict is what moves a state.
 fn verdict_of(run: &SourceRun) -> RunVerdict {
-    match run.verdict.as_str() {
-        "ok" => RunVerdict::Ok,
-        "broken" => RunVerdict::Broken,
-        "self_inflicted" => RunVerdict::SelfInflicted,
-        "content_empty" => RunVerdict::ContentEmpty,
-        "below_cohort" => RunVerdict::BelowCohort,
-        _ => RunVerdict::Inconclusive,
-    }
+    // One parse for every stored verdict, so a variant the store writes (e.g.
+    // `golden_ok`) cannot be misread here as unjudged.
+    RunVerdict::parse(&run.verdict)
 }
 
 /// Replays the whole fleet. **Read-only**: `list_sources` + one `runs` read per
 /// source, and nothing else.
 pub async fn preview_fleet(
     store: &HealthStore,
-    enforcing: bool,
+    arming: &Arming,
     app: Option<&str>,
     runs_per_source: i64,
     source_limit: i64,
@@ -365,15 +482,24 @@ pub async fn preview_fleet(
     let rows = store.list_sources(None, app, source_limit).await?;
     let mut sources = Vec::with_capacity(rows.len());
     let mut totals = PreviewConsequences::default();
+    let mut split = ArmedSplit::default();
     let mut not_ready = Vec::new();
     let mut unmonitored = Vec::new();
+    let mut seen: Vec<String> = Vec::with_capacity(rows.len());
 
     for row in rows {
         // `runs` is newest-first; the ladder only makes sense forwards.
         let mut runs = store.runs(&row.id, runs_per_source).await?;
         runs.reverse();
-        let preview = replay(&row.id, row.state, row.monitored, &runs);
+        let armed_here = arming.armed(&row.id);
+        seen.push(row.id.clone());
+        let preview = replay(&row.id, row.state, row.monitored, armed_here, &runs);
         totals.merge(preview.consequences);
+        if armed_here {
+            split.armed.merge(preview.consequences);
+        } else {
+            split.soaking.merge(preview.consequences);
+        }
         if !preview.gates.is_empty() {
             not_ready.push(NotReady {
                 id: preview.id.clone(),
@@ -394,13 +520,22 @@ pub async fn preview_fleet(
     }
 
     Ok(FleetPreview {
-        enforcing,
+        enforcing: arming.enforce,
+        armed: arming.scope(),
+        enforce_sources: arming.sources.clone(),
+        redundant_sources: arming.redundant().to_vec(),
+        // Judged against the sources this replay actually saw, which is the
+        // only roster the preview can honestly speak for. A `?app=` filter or a
+        // `limit` can hide a real source, so the field says "unseen", not
+        // "unknown to the server".
+        armed_unseen: super::detect::unseen_armed_sources(&arming.sources, &seen),
         runs_per_source,
         sources_replayed: sources.len(),
         ready: not_ready.is_empty(),
         not_ready,
         unmonitored,
         totals,
+        consequences: split,
         sources,
     })
 }
@@ -453,7 +588,13 @@ mod tests {
                 0.95,
             ),
         ];
-        let p = replay("extractor/products", SourceState::Quarantined, true, &runs);
+        let p = replay(
+            "extractor/products",
+            SourceState::Quarantined,
+            true,
+            false,
+            &runs,
+        );
         assert_eq!(p.runs_replayed, 5);
         assert_eq!(
             p.consequences.diverted_writes,
@@ -498,7 +639,13 @@ mod tests {
                 0.9,
             ),
         ];
-        let p = replay("extractor/thin", SourceState::Quarantined, false, &runs);
+        let p = replay(
+            "extractor/thin",
+            SourceState::Quarantined,
+            false,
+            false,
+            &runs,
+        );
         assert_eq!(p.unjudged_runs, 1);
         assert_eq!(p.transitions.len(), 2);
         assert_eq!(p.transitions[0].cause, TransitionCause::Outside);
@@ -519,7 +666,13 @@ mod tests {
             run("a", "2026-08-01T00:00:00Z", "ok", "quarantined", 50, 0.1),
             run("b", "2026-08-02T00:00:00Z", "ok", "quarantined", 50, 0.1),
         ];
-        let p = replay("extractor/old", SourceState::Quarantined, true, &runs);
+        let p = replay(
+            "extractor/old",
+            SourceState::Quarantined,
+            true,
+            false,
+            &runs,
+        );
         assert_eq!(p.window_opens_in, SourceState::Quarantined);
         assert!(p.transitions.is_empty());
         assert_eq!(p.consequences.diverted_writes.runs, 2);
@@ -527,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_source_with_no_retained_runs_reports_its_live_state_and_nothing_else() {
-        let p = replay("extractor/silent", SourceState::Degraded, false, &[]);
+        let p = replay("extractor/silent", SourceState::Degraded, false, false, &[]);
         assert_eq!(p.state, SourceState::Degraded);
         assert_eq!(p.window_opens_in, SourceState::Degraded);
         assert!(p.window_opens_at.is_none());
@@ -610,7 +763,12 @@ mod tests {
             vec![CONSEQUENCES[1].0, CONSEQUENCES[2].0, CONSEQUENCES[3].0],
             "degraded keeps writing to the live dataset"
         );
-        assert_eq!(gates_of(SourceState::Retired), vec![CONSEQUENCES[2].0]);
+        // A retired source keeps writing to its live dataset, but infers no
+        // removals, pushes nothing and indexes nothing.
+        assert_eq!(
+            gates_of(SourceState::Retired),
+            vec![CONSEQUENCES[1].0, CONSEQUENCES[2].0, CONSEQUENCES[3].0]
+        );
 
         // Every consequence name is reachable from some state, so none of them
         // is a label nothing can ever produce.
@@ -647,7 +805,7 @@ mod tests {
             5,
             0.0,
         )];
-        let p = replay("extractor/x", SourceState::Healthy, true, &runs);
+        let p = replay("extractor/x", SourceState::Healthy, true, false, &runs);
         assert_eq!(p.unjudged_runs, 1);
     }
 }

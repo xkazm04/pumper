@@ -66,14 +66,14 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["catch-panic", "trace", "cors", "compression-gzip", "compression-br"] }
 
 # OpenAPI spec generation (machine-readable route surface at /openapi.json)
-utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
-utoipa-axum = "0.2"
+utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.3"
 
 # storage
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 
 # scraping engines
-reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "socks"] }
+reqwest = { version = "0.13", features = ["json", "cookies", "gzip", "brotli", "socks"] }
 # Serializable cookie jar behind reqwest's `cookie_provider` (session vault).
 # Already in the tree as reqwest's own cookie store — this is a direct edge, not
 # a new dependency.
@@ -90,11 +90,11 @@ futures = "0.3"
 # high-throughput extraction (no-GIL parallelism + SIMD)
 regex = "1"
 rayon = "1"
-simd-json = "0.14"
+simd-json = "0.18"
 url = "2"
 
 # sandboxed WASM plugin runtime
-wasmtime = "48"
+wasmtime = "49"
 
 # embedded full-text search (in-process, no external service)
 tantivy = "0.26"
@@ -109,8 +109,8 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Params-schema validation for app manifests (enqueue 422s + the MCP surface).
-jsonschema = { version = "0.52", default-features = false }
-toml = "0.9"
+jsonschema = { version = "0.58", default-features = false }
+toml = "1.1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -121,11 +121,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # pull a second reqwest MAJOR (0.13 alongside the workspace's 0.12), which is the
 # accepted cost of a supported transport. `sentry-tracing` bridges the existing
 # `tracing::error!` sites into Sentry rather than replacing stdout logging.
-sentry = "0.48"
+sentry = "0.49"
 sentry-tracing = "0.49"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.9"
+chrono-tz = "0.10"
 cron = "0.17"
 
 [profile.release]

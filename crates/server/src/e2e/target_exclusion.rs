@@ -144,7 +144,7 @@ async fn fire_schedule(state: &AppState, router: &axum::Router, params: Value) -
         .unwrap();
     let job = state
         .storage
-        .list(Some("targeted"), None, 50)
+        .list(&pumper_core::storage::JobQuery::for_app("targeted"), 50)
         .await
         .unwrap()
         .into_iter()
@@ -227,7 +227,9 @@ async fn two_jobs_against_different_targets_still_run_concurrently() {
     assert_eq!(
         peak.load(Ordering::SeqCst),
         2,
-        "different targets must still overlap; the exclusion has widened into a serialiser"
+        "different targets must still overlap; the exclusion has widened into a \
+         serialiser — or, on a box loaded enough that neither job was scheduled inside \
+         the other's {OVERLAP_WINDOW:?} probe window, the overlap was never observable"
     );
 }
 

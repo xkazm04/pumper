@@ -12,6 +12,7 @@
 //! path.
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +23,22 @@ use pumper_core::Result as CoreResult;
 
 use super::error::ApiError;
 use crate::state::AppState;
+
+/// Day count `Duration::days` can apply. `days` is a `u64` on the query and in
+/// config; casting it with `as i64` wraps, and a wrapped negative count moves
+/// the cutoff the other way. `Duration::days` panics when the span does not
+/// fit in a `Duration`, so an oversized window is refused here instead.
+pub(crate) fn retention_day_count(days: u64) -> Result<i64, String> {
+    let days = i64::try_from(days)
+        .map_err(|_| "retention days do not fit in a signed day count".to_string())?;
+    // `Duration::days` panics when the span does not fit. `try_days` is that
+    // check without the panic, so the preview can answer 400 and the janitor
+    // can record a failure.
+    if chrono::Duration::try_days(days).is_none() {
+        return Err("retention days are outside the range a cutoff can express".into());
+    }
+    Ok(days)
+}
 
 /// Builds the artifact retention plan for a given age cutoff: read the pins from
 /// the provenance graph, scan the tree, and let the pins veto the cutoff.
@@ -39,7 +56,8 @@ pub(crate) async fn artifact_retention_plan(
         tokio::task::spawn_blocking(move || pumper_core::retention::scan_artifact_tree(&root))
             .await
             .map_err(|e| pumper_core::Error::App(format!("artifact scan panicked: {e}")))?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+    let cutoff = chrono::Utc::now()
+        - chrono::Duration::days(retention_day_count(days).map_err(pumper_core::Error::App)?);
     let protect_cassettes = !state.config.storage.artifact_retention_include_cassettes;
     let plan = plan_artifact_retention(&files, &pinned, cutoff, protect_cassettes);
     Ok((files, plan))
@@ -73,6 +91,11 @@ pub(crate) async fn retention_preview(
 ) -> Result<Json<Value>, ApiError> {
     let cfg = &state.config.storage;
     let days = q.days.unwrap_or(cfg.artifact_retention_days);
+    // The plan builder refuses the same values. Checking here keeps the
+    // refusal a 400 with the reason, instead of a redacted 500.
+    if let Err(msg) = retention_day_count(days) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, msg));
+    }
     let (_files, plan) = artifact_retention_plan(&state, days).await?;
     let ledgers: Vec<Value> = state
         .storage
@@ -115,4 +138,37 @@ pub(crate) async fn retention_preview(
             "saved_search_seen_retention_days": cfg.saved_search_seen_retention_days,
         },
     })))
+}
+
+#[cfg(test)]
+mod retention_day_tests {
+    use super::retention_day_count;
+
+    /// The anti-pattern: `days as i64` wraps `u64::MAX` to `-1`, and
+    /// `Duration::days` panics once the span does not fit in a `Duration`.
+    /// Either one makes a preview describe the wrong window.
+    #[test]
+    fn retention_days_past_the_cutoff_range_are_refused() {
+        assert_eq!(retention_day_count(90).unwrap(), 90);
+        assert_eq!(retention_day_count(0).unwrap(), 0);
+        assert!(retention_day_count(u64::MAX).is_err());
+        // One past the widest span `Duration::try_days` accepts. That is the
+        // input on which `Duration::days` panics.
+        let mut too_wide = 1i64;
+        while chrono::Duration::try_days(too_wide).is_some() {
+            too_wide = too_wide.saturating_mul(2);
+            if too_wide == i64::MAX {
+                break;
+            }
+        }
+        assert!(
+            chrono::Duration::try_days(too_wide).is_none(),
+            "expected a day count Duration cannot express"
+        );
+        assert!(retention_day_count(too_wide as u64).is_err());
+        assert!(
+            (u64::MAX as i64) < 0,
+            "the old cast wraps, which is the window this test refuses"
+        );
+    }
 }

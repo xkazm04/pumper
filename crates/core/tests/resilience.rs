@@ -119,6 +119,7 @@ async fn observe(health: &Resilience, docs: &[ObservedDoc]) -> pumper_core::Sour
                 fetch: FetchHealth {
                     attempted: docs.len() as u32,
                     ok: docs.len() as u32,
+                    ..Default::default()
                 },
                 build_id: Some("test".into()),
             },
@@ -391,6 +392,7 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
                 fetch: FetchHealth {
                     attempted: 30,
                     ok: 3,
+                    ..Default::default()
                 },
                 build_id: None,
             },
@@ -788,4 +790,272 @@ async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
     // is about to compare against.
     let baseline = store.baseline("extractor/products", 3).await.unwrap();
     assert_eq!(baseline.runs("price"), 3);
+}
+
+// ---- arming: which sources a stored verdict is allowed to act on -----------
+//
+// These two are GUARD tests. They pin the behaviour per-source arming must not
+// alter: the shipping default reads nothing on the write path, and
+// `[resilience] enabled = false` is an absolute kill switch that no arming key
+// can talk its way past. Both are green before per-source arming exists, by
+// design — that is what makes them worth having afterwards.
+
+/// Soak mode does not merely *answer* `Healthy`; it never asks.
+///
+/// Proving "zero state reads" without a mock: close the pool first. A read that
+/// happened would fail and `state` would report `Unknown` (the honest fail-open
+/// name for a failed read). `enforced_state` answering `Healthy` on a closed
+/// pool therefore proves the short-circuit returned *before* the read, which is
+/// the property the four worker gates depend on for their cheapness.
+#[tokio::test]
+async fn soak_mode_answers_healthy_without_reading_the_state_at_all() {
+    let store = fresh_db("resilience-soak-no-read").await;
+    let storage = &store.storage;
+    // The shipping default: detection on, nothing armed.
+    let health = Resilience::new(storage.pool(), &cfg());
+    let hstore = health.store().unwrap();
+    hstore.ensure_source("extractor", "products").await.unwrap();
+    hstore
+        .set_state_manual("extractor/products", SourceState::Quarantined, "test")
+        .await
+        .unwrap();
+
+    storage.pool().close().await;
+
+    assert_eq!(
+        health.state("extractor", "products").await,
+        SourceState::Unknown,
+        "a read against a closed pool must report `unknown` — if this is not \
+         Unknown the rest of this test proves nothing"
+    );
+    assert_eq!(
+        health.enforced_state("extractor", "products").await,
+        SourceState::Healthy,
+        "soak mode must short-circuit BEFORE the read, not fail-open after it"
+    );
+}
+
+/// `[resilience] enabled = false` is the absolute off. It fronts every other
+/// arming decision, so no later key — including a per-source arming list — can
+/// reach a consequence past it.
+#[tokio::test]
+async fn detection_disabled_is_the_absolute_kill_switch() {
+    let store = fresh_db("resilience-kill-switch").await;
+    let storage = &store.storage;
+    let health = Resilience::new(
+        storage.pool(),
+        &ResilienceConfig {
+            enabled: false,
+            // Deliberately contradictory: the loudest possible "enforce", under
+            // the master off.
+            enforce: true,
+            ..cfg()
+        },
+    );
+    assert!(!health.enabled(), "enabled = false must disable the store");
+    assert!(
+        !health.enforcing(),
+        "enforce = true under enabled = false must not report as enforcing"
+    );
+    let ctx = ctx(storage, Arc::new(health));
+    let datasets = Datasets::new(storage.pool());
+
+    // A quarantined verdict cannot even be recorded (there is no store), so the
+    // write path is plainly ungated: live dataset, no stamp, removals detected.
+    ctx.sync_many("products", &items(&["a", "b"]))
+        .await
+        .unwrap();
+    let summary = ctx.sync_many("products", &items(&["a"])).await.unwrap();
+    assert_eq!(summary.removed, vec!["b".to_string()]);
+    assert_eq!(
+        datasets
+            .get("extractor", "products", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
+}
+
+/// Case 1: one source armed by name, its neighbour under the same app still
+/// soaking. The whole card in one test.
+#[tokio::test]
+async fn an_armed_source_is_gated_while_its_neighbour_keeps_soaking() {
+    let store = fresh_db("resilience-armed-one").await;
+    let storage = &store.storage;
+    // No fleet-wide flip. One source named.
+    let health = Arc::new(Resilience::new(
+        storage.pool(),
+        &ResilienceConfig {
+            enforce: false,
+            enforce_sources: vec!["extractor/hn-items".to_string()],
+            ..cfg()
+        },
+    ));
+    let ctx = ctx(storage, health.clone());
+    let datasets = Datasets::new(storage.pool());
+    let hstore = health.store().unwrap();
+
+    // BOTH sources are quarantined. The only difference between them is one
+    // line of config.
+    for dataset in ["hn-items", "other"] {
+        hstore.ensure_source("extractor", dataset).await.unwrap();
+        hstore
+            .set_state_manual(
+                &format!("extractor/{dataset}"),
+                SourceState::Quarantined,
+                "test",
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        health.enforcing_any(),
+        "a non-empty list must arm the short-circuits"
+    );
+    assert!(
+        !health.enforcing(),
+        "the fleet-wide flip is still off, and must still report as off"
+    );
+    assert_eq!(
+        health.enforced_state("extractor", "hn-items").await,
+        SourceState::Quarantined,
+        "the armed source's stored verdict must reach its consequence"
+    );
+    assert_eq!(
+        health.enforced_state("extractor", "other").await,
+        SourceState::Healthy,
+        "the unarmed source must keep soaking: nothing refused today becomes \
+         refused by arming a different source"
+    );
+
+    // ...and the consequence is real, not just the state: the armed source's
+    // write is diverted to the shadow dataset and stamped.
+    ctx.upsert_many("hn-items", &items(&["a"])).await.unwrap();
+    assert!(datasets
+        .get("extractor", "hn-items", "a")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        datasets
+            .get("extractor", "hn-items@q", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "quarantined"
+    );
+
+    // The neighbour's write lands live and unstamped, exactly as in soak mode.
+    ctx.upsert_many("other", &items(&["b"])).await.unwrap();
+    assert!(datasets
+        .get("extractor", "other@q", "b")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        datasets
+            .get("extractor", "other", "b")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
+}
+
+/// Case 2 (guard): the fleet-wide flip keeps its exact old meaning, and a list
+/// beside it widens nothing because there is nothing left to widen.
+#[tokio::test]
+async fn the_fleet_wide_flip_still_arms_every_source_list_or_no_list() {
+    let store = fresh_db("resilience-flip-still-all").await;
+    let storage = &store.storage;
+    for sources in [vec![], vec!["extractor/hn-items".to_string()]] {
+        let health = Resilience::new(
+            storage.pool(),
+            &ResilienceConfig {
+                enforce: true,
+                enforce_sources: sources.clone(),
+                ..cfg()
+            },
+        );
+        let hstore = health.store().unwrap();
+        hstore.ensure_source("extractor", "other").await.unwrap();
+        hstore
+            .set_state_manual("extractor/other", SourceState::Quarantined, "test")
+            .await
+            .unwrap();
+        assert!(health.enforcing() && health.enforcing_any());
+        assert_eq!(
+            health.enforced_state("extractor", "other").await,
+            SourceState::Quarantined,
+            "a source absent from the list must stay armed under enforce = true \
+             (list: {sources:?}) — a list that could narrow arming would silently \
+             un-enforce every deployment that enforces today"
+        );
+    }
+}
+
+/// Case 3: nothing armed still reads nothing — now proved with the list key in
+/// play, and with `enabled = false` proved to front it.
+#[tokio::test]
+async fn nothing_armed_reads_nothing_and_enabled_fronts_the_list() {
+    let store = fresh_db("resilience-armed-none").await;
+    let storage = &store.storage;
+    let soaking = Resilience::new(
+        storage.pool(),
+        &ResilienceConfig {
+            enforce: false,
+            enforce_sources: Vec::new(),
+            ..cfg()
+        },
+    );
+    // `enabled = false` with the loudest possible arming above it: the list is
+    // not a way around the absolute off.
+    let off = Resilience::new(
+        storage.pool(),
+        &ResilienceConfig {
+            enabled: false,
+            enforce: true,
+            enforce_sources: vec!["extractor/products".to_string()],
+            ..cfg()
+        },
+    );
+    assert!(!soaking.enforcing_any(), "empty list arms nothing");
+    assert!(
+        !off.enforcing_any(),
+        "enabled = false must front enforce AND enforce_sources"
+    );
+    assert!(!off.armed("extractor", "products"));
+    assert!(
+        !off.arming().anywhere(),
+        "and the preview sees the same off"
+    );
+
+    let hstore = soaking.store().unwrap();
+    hstore.ensure_source("extractor", "products").await.unwrap();
+    hstore
+        .set_state_manual("extractor/products", SourceState::Quarantined, "test")
+        .await
+        .unwrap();
+
+    // Same closed-pool proof as the guard case, now with the list key present:
+    // a read that happened would answer `unknown`.
+    storage.pool().close().await;
+    assert_eq!(
+        soaking.state("extractor", "products").await,
+        SourceState::Unknown
+    );
+    assert_eq!(
+        soaking.enforced_state("extractor", "products").await,
+        SourceState::Healthy,
+        "an empty list must short-circuit BEFORE the read"
+    );
+    assert_eq!(
+        off.enforced_state("extractor", "products").await,
+        SourceState::Healthy
+    );
 }

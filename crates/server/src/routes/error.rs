@@ -135,7 +135,12 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
-        E::Storage(_)
+        // A boot-time refusal about the store on disk. It can only reach an
+        // HTTP boundary if a schema fault appeared while the process was up
+        // (`Storage::connect` refuses it at boot), and its message names
+        // absolute paths under the data dir, so it redacts like the rest.
+        E::Schema(_)
+        | E::Storage(_)
         | E::Parse { .. }
         | E::Config { .. }
         | E::App(_)
@@ -223,18 +228,29 @@ pub(crate) fn lock_advisory<'a, T>(
     }
 }
 
+/// Parses an optional RFC-3339 date query param, naming the param it refused.
+///
+/// One function for every date param on the API: a caller who mistyped `until`
+/// must be told `until`, and a second copy of this three-line parse is exactly
+/// how one surface comes to answer `400 invalid 'since'` for a bad `until`.
+pub(crate) fn parse_rfc3339_param(
+    name: &'static str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    raw.map(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid '{name}': {e}")))
+    })
+    .transpose()
+}
+
 /// Parses an optional RFC-3339 `since` query param. A malformed value is the
 /// client's mistake, so it is a 400 — not the blanket 500 a bare `?` would give.
 pub(crate) fn parse_since(
     since: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
-    since
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
-        })
-        .transpose()
+    parse_rfc3339_param("since", since)
 }
 
 pub(crate) fn default_limit() -> i64 {

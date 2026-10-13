@@ -1,0 +1,115 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a9ba0faf-a094-4f9b-adb0-7789dc02d2e2",
+ "subject": "web-scraping",
+ "evaluatedAt": "2026-10-13T04:09:27.372477+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "web-crawl-extraction",
+   "subject": "web-scraping",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/extractor/src/lib.rs:1642 Inline rules are registered after compilation without a live preview gate, allowing unverified extraction rules to persist and execute.",
+   "techniques": [
+    {
+     "technique": "dry-run-preview",
+     "verdict": "deviation",
+     "evidence": "crates/apps/extractor/src/lib.rs:1642 The inline run path compiles and registers rules without requiring a successful live preview; stored-body replay is a separate mode."
+    },
+    {
+     "technique": "extraction-rule-dsl",
+     "verdict": "deviation",
+     "evidence": "crates/apps/extractor/tests/listing_reports.rs:82 The real app accepts rules without declared required/optional failure semantics; the test successfully runs this rule and receives null prices."
+    },
+    {
+     "technique": "llm-assisted-rule-authoring",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/extractor/src/induce.rs:4 Rule induction uses Rust heuristics; searches of the app sources found no model-authored rule proposal/adoption loop."
+    },
+    {
+     "technique": "negotiated-representation-probe",
+     "verdict": "deviation",
+     "evidence": "crates/apps/extractor/src/induce.rs:171 Authoring proceeds over stored page bodies without a representation probe; searches found no weighted alternate-representation request or origin-versus-derived classification in the acquisition and app code."
+    }
+   ]
+  },
+  {
+   "context": "core-extraction",
+   "subject": "web-scraping",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/extract.rs:980 Extraction inserts missing or uncoercible values into records without declared required-field rejection, while the removal test confirms tombstoning on the first missing snapshot.",
+   "techniques": [
+    {
+     "technique": "dedup-and-datasets",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/removal_guard.rs:98 The test removes c after the first snapshot omitting it; production detect_removed immediately tombstones missing live keys rather than accumulating healthy-harvest absence evidence."
+    },
+    {
+     "technique": "extraction-rule-dsl",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/extract.rs:980 FieldRule contains a locator and transforms but no required/optional failure declaration; misses and coercion failures remain values in the returned object instead of rejecting a required-field record."
+    },
+    {
+     "technique": "llm-assisted-rule-authoring",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/induce.rs:3 Rule induction is heuristic rather than model-assisted; the inspected tier-3 eval concerns model document acquisition, not model-authored rules."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "web-scraping",
+   "context": "ai-extraction-engines",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "web-scraping",
+   "context": "e2e-data-integrity",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "web-scraping",
+   "context": "web-scraping-engines",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-13T04:09:27.372477+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "web-scraping"
+   ],
+   "techniques": [
+    "dry-run-preview",
+    "extraction-rule-dsl",
+    "llm-assisted-rule-authoring",
+    "negotiated-representation-probe"
+   ],
+   "deviations": 1,
+   "context": "web-crawl-extraction",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-13T04:09:27.372477+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "web-scraping"
+   ],
+   "techniques": [
+    "dedup-and-datasets",
+    "extraction-rule-dsl",
+    "llm-assisted-rule-authoring"
+   ],
+   "deviations": 1,
+   "context": "core-extraction",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

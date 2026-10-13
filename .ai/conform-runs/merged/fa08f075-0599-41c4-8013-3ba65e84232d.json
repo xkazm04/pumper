@@ -1,0 +1,201 @@
+{
+  "schema": "conform-run/1",
+  "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
+  "subject": "document-text-extraction",
+  "evaluatedAt": "2026-10-13T11:43:16.127275+00:00",
+  "provider": "grok",
+  "model": "grok-4.7",
+  "pairs": [
+    {
+      "context": "core-extraction",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/markdown.rs:341 The HTML-to-Markdown converter blanket-replaces every pipe in a table cell and otherwise copies text runs into markup unchanged, so characters that parse as Markdown syntax are not escaped from the assembled output.",
+      "techniques": [
+        {
+          "technique": "unreadable-region-refusal",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:401 html_to_markdown returns a String and drops whole subtrees such as form, so a content-bearing region is omitted with no region list on the result."
+        },
+        {
+          "technique": "screen-then-confirm-detection",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:61 text_len_capped is a per-page character-count shortcut, not a readability screen later confirmed by extraction."
+        },
+        {
+          "technique": "extraction-yield-bands",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/markdown.rs:58 Re-acquisition is reduced to one character threshold, with no complete/sparse/corrupt/empty band and no measurement stored beside it."
+        },
+        {
+          "technique": "recognition-boundary-and-escalation",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:186 An img becomes alt Markdown; this module has no scanned-page or optical-recognition path whose boundary would need publishing."
+        },
+        {
+          "technique": "escalation-adjudication",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:357 The eval forces an empty cheap path and grades the model answer; it does not choose between two non-empty readings."
+        },
+        {
+          "technique": "structure-saturation-guard",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:189 Heading level is copied from the source tag name; there is no local-census structural classifier."
+        },
+        {
+          "technique": "band-calibration-by-construction",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:262 The length window is a bare constant with no constructed damage corpus, threshold sweep, or reader binding; the pass baseline is the recorded model's own score."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/markdown.rs:275 The walker visits each parsed child once; this module adds no repeat or reference expansion construct."
+        },
+        {
+          "technique": "context-decided-escaping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/markdown.rs:341 Only table-cell pipes are escaped, and every pipe is escaped after the cell is assembled; push_text copies other text characters straight into the markup, including html_fragment_to_markdown output a caller will embed."
+        }
+      ],
+      "registryProposal": "The Rust application rust--context-decided-escaping.md describes a shipped lookahead escaper for this repository's Markdown converter, but markdown.rs still writes text through push_text and blanket-replaces only '|'. The application and the tree disagree, so that write-up is not evidence the technique is implemented."
+    },
+    {
+      "context": "ai-extraction-engines",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/engine-search/src/enrich.rs:3 Search of crates/engine-claude, crates/engine-wasm, and crates/engine-search for tesseract, pdfium, glyph, text_layer, and lopdf found no matches; search regex-enriches title and body text that is already extracted, Claude runs a research subprocess, and the wasm host meters plugin fuel and linear memory.",
+      "techniques": [
+        {
+          "technique": "extraction-yield-bands",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-search/src/enrich.rs:5 A missed money or date regex omits an entity field; it is not a yield band over a document region."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:2 Fuel and linear-memory limits sandbox a plugin call; they are not count and payload caps on a document expansion construct."
+        }
+      ],
+      "absenceTerms": [
+        "tesseract",
+        "pdfium",
+        "glyph",
+        "text_layer",
+        "lopdf"
+      ]
+    },
+    {
+      "context": "wasm-plugins",
+      "subject": "document-text-extraction",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "plugins-src/title-extractor/src/lib.rs:39 The plugins slice HTML tags into JSON, slim trigger payloads, or burn fuel; a search of plugins-src for tesseract, pdfium, glyph, text_layer, and lopdf found no matches.",
+      "techniques": [
+        {
+          "technique": "unreadable-region-refusal",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:84 A missing tag becomes None via ?, then a null JSON field, not a named unread region of a container."
+        },
+        {
+          "technique": "structure-saturation-guard",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:40 h1 text is the slice between literal tags, not a census-based structure classifier."
+        },
+        {
+          "technique": "context-decided-escaping",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:39 Output is serde JSON, which the technique treats as a total quoted encoding rather than Markdown escaping."
+        }
+      ],
+      "absenceTerms": [
+        "tesseract",
+        "pdfium",
+        "glyph",
+        "text_layer",
+        "lopdf"
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "document-text-extraction",
+      "context": "web-crawl-extraction",
+      "reason": "withdrawn after review: reviewer (sonnet): The not-applicable anchor result_honesty.rs:71 is an assertion in a sweep-cap test (`out[\"mode\"] == \"source\"`), so it is incidental. It does not show that the crawl and extractor crates have no document-container (PDF/OCR) path, and the cited technique claim about CSS-to-JSON output rests on that sa"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-13T11:43:16.127275+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "document-text-extraction"
+      ],
+      "techniques": [
+        "context-decided-escaping",
+        "extraction-yield-bands",
+        "structural-amplification-caps",
+        "unreadable-region-refusal"
+      ],
+      "deviations": 0,
+      "context": "web-crawl-extraction",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T11:43:16.127275+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "document-text-extraction"
+      ],
+      "techniques": [
+        "band-calibration-by-construction",
+        "context-decided-escaping",
+        "escalation-adjudication",
+        "extraction-yield-bands",
+        "recognition-boundary-and-escalation",
+        "screen-then-confirm-detection",
+        "structural-amplification-caps",
+        "structure-saturation-guard",
+        "unreadable-region-refusal"
+      ],
+      "deviations": 1,
+      "context": "core-extraction",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T11:43:16.127275+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "document-text-extraction"
+      ],
+      "techniques": [
+        "extraction-yield-bands",
+        "structural-amplification-caps"
+      ],
+      "deviations": 0,
+      "context": "ai-extraction-engines",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T11:43:16.127275+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "document-text-extraction"
+      ],
+      "techniques": [
+        "context-decided-escaping",
+        "structure-saturation-guard",
+        "unreadable-region-refusal"
+      ],
+      "deviations": 0,
+      "context": "wasm-plugins",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    }
+  ]
+}

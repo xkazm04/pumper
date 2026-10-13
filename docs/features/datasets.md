@@ -8,7 +8,7 @@ Persistent, queryable record store (`records` table): apps upsert typed JSON rec
 - **Removal detection** (inferred): `AppContext::sync_many` treats the batch as a **full snapshot** — previously-live keys absent from it get `records.removed_at` set + a `removed` revision; reappearing records are revived and reported Changed. `upsert_many` (partial batches) never marks removals — do not conflate them. `detect_removed` refuses an **empty** batch outright (a failed scrape must not tombstone everything), and `sync_many` downgrades itself to `upsert_many` when the source's health state suppresses removals — a *partial* batch is the case the empty-batch guard does not cover.
   - **The health check is a precondition of the store, not a courtesy of the caller.** `Datasets::detect_removed` takes a `RemovalGuard`, and the only public way to obtain one is `RemovalGuard::for_source_state(state)`, which returns `None` for a degrading source. An app that hand-rolls `upsert_many` + removal detection therefore cannot skip the check — it has to ask the health state to get the token. An inventory test (`crates/core/tests/removal_guard.rs`) pins the call sites.
 - **Removal by name** (not inferred): `Datasets::tombstone_keys(app, dataset, keys)` tombstones exactly the keys given — same `removed_at` + `removed` revision, same change-feed signal — for callers that already hold the per-record removal fact (the `peer` app applying an origin feed's `removed` revisions — see [peering.md](peering.md)). Nothing is inferred from a snapshot, so no guard applies; a caller who wants "everything except this list" wants `sync_many`.
-- **APIs**: `GET /datasets/{app}/{ds}/changes?since=&limit=&trust=` (change feed, newest first, diffs included), `GET /datasets/{app}/{ds}/history?key=` (per-record revision trail).
+- **APIs**: `GET /datasets/{app}/{ds}/changes?since=&limit=&cursor=&trust=&order=` (change feed, newest first by default, diffs included; `order=asc` drains oldest-first for a resumable mirror), `GET /datasets/{app}/{ds}/history?key=` (per-record revision trail).
 
 ### Derived paths — a producer can say which fields aren't its own news
 
@@ -38,6 +38,38 @@ It is **producer-facing only — no HTTP API change** — and narrows exactly on
 
 **One-time transition cost, by design.** Records whose stored hash was computed over the full value re-hash the first time their producer adopts the seam, so they report `changed` **once** — bounded by the number of records carrying the declared path (for eu-sedia: `historyJoined`, the joined Horizon topics) — and settle from then on. Budget one noisy run per adopting producer, not a corpus rewrite.
 
+### Materiality — one verdict for "is this change news?" (`pumper_core::materiality`)
+
+`new | changed | unchanged` is an **identity** answer: the sha256 moved, or it did not. It cannot say *how far*, so it cannot say no. That left every monitor to invent its own magnitude rule, and five of them did — `watch` had none at all and reported the raw `ChangeKind` to every subscribed webhook, `connector-api-watch` had two (an empty line diff plus a Claude severity ladder), `plugin`'s observatory declared `DerivedPaths`, `hackernews` had none, and `crawl::change_weight` had the only correct one, in `core`, reached by nobody.
+
+`crates/core/src/materiality.rs` is that judgment, once:
+
+```rust
+use pumper_core::materiality::{self, Sensitivity, Signal};
+
+let verdict = materiality::judge(
+    &Signal::records(&previous, &current),      // or ::bodies(a, b) / ::fingerprints(prev, cur)
+    &Sensitivity::default().noise(["fetched_at"]),
+);
+verdict.is_news()                               // false for Cosmetic
+```
+
+| field | meaning |
+| --- | --- |
+| `significance` | `cosmetic` (bytes moved, content did not) \| `material` \| `structural` (may not be the same document) |
+| `distance` | SimHash Hamming distance between the two noise-stripped fingerprints; `null` for a first sighting, never a fabricated `0` |
+| `weight` | the magnitude in `[0,1]`: `0.0` at or below the cosmetic ceiling, `1.0` at the structural bound. This is exactly what `crawl::change_weight` returns — it **delegates** here rather than keeping a second copy of the ramp |
+| `moved_paths` / `noise_paths_moved` | which record paths differ, split by the declared noise |
+| `reason` | one line an operator can read, naming the path or the bit count — never the bare word "changed" |
+
+Bounds are data (`Sensitivity::new(cosmetic_at_or_below, structural_at_or_above)`, default `3` / `16`, inverted bounds clamped), because a monitor over a handful of tokens moves more bits per real change than one over a whole page.
+
+**The declared noise is the same list the write narrows.** `Sensitivity::derived_paths()` hands the monitor the `DerivedPaths` for its upsert, so a path that is noise to the judge is noise to the change-detection hash by construction. It is deliberately a property of the *sensitivity* and not of the verdict: the stored hash was taken over whatever the previous write declared, so narrowing only on the runs you want suppressed compares a narrow hash against a wide one and reports `changed` — the opposite of the intent. The derived set must be constant for one producer.
+
+**Acting on a `Cosmetic` verdict** is then the monitor's own write decision. `watch` holds its baseline record and refreshes only the `materiality` block, which leaves the hash input byte-identical, so no revision is appended and nothing subscribed fires — see [apps.md](apps.md#watch). No HTTP API change; the verdict travels in each monitor's job result and (for `watch`) on the record.
+
+**Known gap:** the store's own per-revision SimHash (`records.sim`, computed on every upsert since migration 0004) is still not exposed on the public `Revision` struct, so a consumer cannot read the magnitude of a change it did not produce. `watch` works around it by storing its own whole-body fingerprint; the other monitors cannot.
+
 ## Trust
 
 Records and revisions carry a `trust` stamp recording how much the write is stood behind: `stable`, `provisional` (written while its source was degrading) or `quarantined`. Stamping comes from extraction health — see [resilient-extraction.md](resilient-extraction.md) — and only happens when `[resilience] enforce = true`.
@@ -47,6 +79,7 @@ Stored `NULL` **means** `stable`. That is a semantic default, not a sentinel: ev
 Filtering follows push-versus-pull: **pushes suppress, pulls filter**. A webhook cannot be recalled, so watches/triggers are dropped at the source; a pull API is re-readable, so it filters and stays inspectable.
 
 - `GET /datasets/{app}/{ds}/changes?trust=` defaults to **`stable`** — accepts `all`, `provisional`, `quarantined`.
+- `GET /datasets/{app}/{ds}/changes?order=` defaults to **`desc`** (newest first — the historical shape, unchanged byte for byte) and accepts `asc`. Anything else is a `400` naming the allowed set, never a silent fallback. `order=asc` requires `cursor=` (send it empty to start at the oldest revision), because the uncursored `{app, dataset, count, changes}` body carries no position to resume from.
 - `GET /datasets/{app}/{ds}?trust=` defaults to **`all`**: each record carries its own stamp, so the raw dataset view stays complete. Honored identically whether or not `filter=` is present — see the read-path unification below.
 - `GET /datasets/{app}/{ds}/export?trust=` defaults to **`all`** (a complete copy by default; the stamp rides in the payload) but now honors an explicit value instead of silently ignoring it.
 - `GET /grants?trust=` defaults to **`all`**, same vocabulary.
@@ -65,6 +98,7 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 
 - `GET /datasets/{app}/{ds}?limit=&cursor=&trust=&removed=` — records newest-updated first; `cursor=` (even empty) switches to `{items, next_cursor}` keyset pagination (`updated_at|key`); absent = legacy bare array.
 - `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv&trust=&removed=` — all three formats **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted); none is buffered or capped. A mid-stream store failure aborts the HTTP response without its clean terminator (no closing `]` for json) — chunked-encoding client libraries surface that as a transfer error, not a 200 with a plausible-looking short body — and is logged at `error`. A per-row JSON serialization failure is counted and logged at `error` rather than silently skipped.
+- **A records walk is not a snapshot.** The cursor-paged list and every `/export` batch are independent reads that seek on `(updated_at, key)` descending, and `updated_at` moves on every change. A record the walk has not reached yet that changes mid-walk jumps ahead of the position and appears on **no** page of that walk (and a record deleted ahead of it is simply absent). Do not reconcile against a walk ("delete what it did not return"). A consumer that needs completeness reads `/changes?since=<highest updated_at the walk saw>` afterwards, which carries every jumped record; that is what `@pumper/sync` does on the run after its cold-start export. Pinned by `records_walk_misses_a_record_updated_mid_walk_and_the_change_feed_recovers_it` in `crates/core/tests/datasets.rs`. The change feed and record history do not have this gap, because a revision's `created_at` never changes.
 - `GET /apps/{name}/datasets` — dataset names per app. `GET /datasets/{app}/{ds}/duplicates?distance=` — SimHash near-duplicate pairs.
 
 > **Behavior change — `/changes` and `/history` reject a malformed `cursor` with 400.** On those two routes only (the incremental-sync surfaces `@pumper/sync` and the `peer` app walk), a `cursor=` value that is not the opaque `<created_at>|<tiebreak>` token the API itself returned in `next_cursor` is now a `400 {"error":…,"code":"bad_request"}` naming the expected format. It previously decoded to the same "no cursor" as an absent one and answered **200 with page one** — a walk silently rewound to the newest revision with no signal anywhere, which for a mirror is a livelock rather than a reset (every page re-dedupes, the per-run budget burns, the walk re-suspends near the top forever). A blank `cursor=` is still valid and still means "start at the first page" — that presence-only form is what selects `{items, next_cursor}` mode. Only a *corrupted* cursor is affected: the SDK and the peer app only ever replay server-issued tokens. The other cursor routes (`/jobs`, `/watches`, `/schedules`, the record list above, …) are browse surfaces where restarting at page one is visible and harmless, and keep the lenient parse.
@@ -72,7 +106,29 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 ## Conventions
 
 - Keys are stable external ids (opportunity id, URL, `czisco|kraj|org`). Timestamps are fixed-width RFC 3339 UTC micros (`ts()` helpers) so lexicographic SQL comparison = chronological.
-- **Batch writes are set-shaped.** `upsert_many` commits in chunks of 500 on one held connection, and within a chunk issues a bounded number of statements (two batched reads + multi-row writes) rather than one triple per record — the statement count per chunk *is* the write-lock hold time other apps wait on. Consequence for consumers: **every record in one chunk shares one `last_seen`/`updated_at`/revision `created_at` stamp**. Ordered reads already tiebreak that — `/datasets/{app}/{ds}` by `key`, `/changes` by rowid — so paging stays stable; do not rely on records within a batch having distinct timestamps.
+- **Batch writes are set-shaped.** `upsert_many` commits in chunks of 500 on one held connection, and within a chunk issues a bounded number of statements (two batched reads + multi-row writes) rather than one triple per record — the statement count per chunk *is* the write-lock hold time other apps wait on. Consequence for consumers: **every record in one chunk shares one `last_seen`/`updated_at`/revision `created_at` stamp**. Ordered reads already tiebreak that — `/datasets/{app}/{ds}` by `key`, `/changes` by rowid — so paging stays stable; do not rely on records within a batch having distinct timestamps. **And do not resume a mirror from a timestamp:** `since=` is a bare `created_at > S` with no tiebreak, so a consumer that stores "the newest stamp I saw" and comes back with it skips every sibling of S it had not read — up to 499 revisions per occurrence, with no error on either side. Resume from the opaque `<created_at>|<rowid>` cursor instead (`order=asc&cursor=`), which compares the same tuple the feed orders by. Pinned by `keyset_resume_returns_stamp_siblings_that_since_silently_drops` in `crates/core/tests/change_feed_keyset.rs`.
+
+### Draining the feed forward (`order=asc`)
+
+`order=asc&cursor=<token>` returns the feed oldest-first, with the keyset
+predicate flipped to match (`created_at > ?` **or** equal-stamp-and-higher-rowid)
+and `ORDER BY created_at ASC, rowid ASC`. `next_cursor` names the **last**
+(newest) row of the page.
+
+The direction is what makes a mirror resumable. On the default newest-first
+feed, page 1 is the newest, so a position taken from it jumps over every older
+page not yet applied — the only sound strategy is to buffer the whole backlog
+and commit once, which is why a consumer that cannot finish one run never makes
+progress. Ascending, the last row of each page is a position every earlier
+revision is behind, so a consumer may apply the page, store that position, and
+resume there.
+
+One deliberate asymmetry: an ascending page carries a `next_cursor` whenever it
+is **non-empty**, including the final short one, while a descending page only
+carries one when it is full. For a browse order a short page means "stop
+asking"; for a drain it means "you are caught up HERE", and the consumer needs
+that position for the next run. Re-reading it later returns an empty page,
+which is the correct answer.
 - **Virtual namespaces**: several apps may feed one cross-source dataset by passing an explicit app name to `ctx.datasets` (e.g. `grants/unified`, `census/market_blend`, `cz-labour/salary_gap`). The key shape is whatever makes concurrent writers agree rather than collide, and it differs per namespace: `grants/unified` prefixes the source (`<source>:<id>`) because two sources can list the same grant; `census/market_blend` keys on the join's own dimensions (`{naics4}:{state_fips}`), `census/saturation` on `{geo}|{denominator_kind}|{place}` and `cz-labour/salary_gap` on `{isco4}|{sphere}` — there every writer recomputes the same cell, so a source prefix would fork one cell into several. Writing through `ctx.datasets` bypasses `AppContext`'s automatic provenance stamping, so a virtual-namespace writer must pass its own `Provenance` (`upsert_many_stamped`) or every revision it appends is anonymous.
 - Big payloads go to `ctx.save_artifact` (files under `data/artifacts/<app>/<job>/`); records and results stay compact.
 
@@ -124,7 +180,7 @@ folklore. See
 | `revision_retention_days` | `record_revisions` past the window | the newest `revision_retention_keep_min` revisions of every record |
 | `artifact_retention_days` | bodies under `artifacts_dir` past the window | **any body a live record or a replayable revision still addresses**, plus VCR cassettes |
 | `artifact_retention_include_cassettes` | (flag) lets retention reclaim `cassette.ndjson` too | — |
-| `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling) |
+| `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling). Pruning is by age only and ignores `spend_certainty` (0045), so a pruned `unmetered` row takes the evidence that a paid call vanished with it — see [runtime.md](runtime.md#was-it-billed-unmetered-or-genuinely-free) |
 | `webhook_delivery_retention_days` | `delivered` rows in `webhook_deliveries` | `pending`/`failed` — the live retry queue and the replayable DLQ |
 | `webhook_dead_letter_retention_days` | `dead` rows (the exhausted DLQ tail) | as above |
 | `job_yield_retention_days` | `job_yield` (backs `GET /economics`) | — |
@@ -139,6 +195,19 @@ different questions, so `Datasets::pinned_artifact_refs` has two arms:
 | --- | --- | --- |
 | `AppContext::read_source_artifact` (the crawl → extract/plugin seam) | a **live record** whose data carries `job_id` + `artifact_path` — the exact triple the reader resolves | **no** |
 | `POST /provenance/{app}/{ds}/{key}/rederive` | a **replayable revision**'s snapshot (`artifact_sha` **and** `rules_hash` stamped) — where the body was when that revision was written | **yes** |
+
+### Record provenance
+
+`GET /provenance/{app}/{dataset}/{key}?limit=` is the read of that chain.
+It returns `{app, dataset, key, trust, removed_at, coverage, chain}`. `limit`
+defaults to 50 and is clamped to 1..=500. `chain` is newest-first and stops at
+that cap. `coverage` is `{revisions, with_job, replayable}` for the **whole**
+chain, not the returned page. Each chain entry is `{revision, change,
+created_at, trust, provenance, job}`. `provenance` is `{job_id, source_url,
+artifact_sha, rules_hash, replayable}`, and a stamp the write path did not know
+is null. `job` is `{app, status, schedule_id, trigger_id, created_at}`, or null
+when there is no `job_id`, the id is not a uuid, or the queue no longer has
+that job. An unknown record is 404.
 
 Round 24 fixed the first arm: it used to also require the key to have a
 replayable revision. `rules_hash` answers *"did a RuleSet make a provenance claim
@@ -181,7 +250,11 @@ so cassettes and young bodies were an unlabelled residue and "why did this free
 so little" had no answer in the response. `days` defaults to the configured
 `artifact_retention_days`, so you can model a window the deployment has not
 enabled. The preview and the janitor call the **same** plan builder, so they cannot
-disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
+disagree. A `days` value that does not fit in a signed day count, or whose
+cutoff `Duration` cannot express, is `400` on the preview (the reason is the
+body) and a recorded failure on the janitor — the same check, so a wrapped
+`u64 as i64` cannot move the cutoff the other way. Both walk the whole artifact
+tree — on-demand only, never a hot path.
 
 ## Derived datasets (`/derived`)
 
@@ -216,14 +289,65 @@ is a `SELECT`, every filesystem touch is a `stat`; it reports and never repairs,
 so you can always tell whether the store was healthy or merely healed. It performs
 **full scans** (`record_revisions`, `records`, the whole artifact tree), so it is
 an on-demand operator tool — never on a hot path, never on a timer.
-`skip_artifacts=true` drops the tree walk and the per-body checks.
+`skip_artifacts=true` drops the tree walk and the per-body checks — and says so
+in the verdict (below).
 
-**A healthy store returns `findings: []` and `healthy: true`.** Descriptive
-numbers that are not problems live outside `findings` (`coverage`, `tables`,
-`artifacts`), because a report that always says something gets ignored.
+**A healthy store returns `findings: []`, `verdict: "clean"` and
+`healthy: true`.** Descriptive numbers that are not problems live outside
+`findings` (`coverage`, `tables`, `artifacts`), because a report that always says
+something gets ignored.
 
 Each finding carries a concrete remediation — the binary to run, the config key
 to set, the route to call — never a bare count, plus up to 10 examples.
+
+### The verdict, and the check roster
+
+`verdict` is a **worst-of rollup over every check the doctor can run**, and it is
+three-valued, because "nothing is wrong" and "nothing was looked at" are
+different answers:
+
+| `verdict` | meaning |
+| --- | --- |
+| `clean` | every check in the roster ran and found nothing |
+| `findings` | at least one check raised a finding (outranks `incomplete` — it carries a remediation) |
+| `incomplete` | nothing wrong was found **and** at least one check could not run |
+
+`healthy` is retained and is exactly `verdict == "clean"`. It used to be
+`findings.is_empty()`, which answered `true` over a check that never ran — the
+cheapest request (`?skip_artifacts=true`) was the one that examined least and
+still came back green.
+
+`checks[]` is the roster: one entry per check, always all nine, in the order
+below.
+
+```json
+{ "check": "missing_artifact_bodies",
+  "outcome": "unverifiable",
+  "reason": "skip_artifacts=true dropped the artifact tree walk, so no replayable revision's body was stat'd — re-request GET /datasets/doctor without skip_artifacts to verify this check" }
+```
+
+`outcome` is `clean`, `findings`, or `unverifiable` with a `reason`. The summary
+never travels without the roster, so `incomplete` always names the member that
+could not run and why. The reasons a check comes back `unverifiable`:
+
+| check | `unverifiable` when |
+| --- | --- |
+| `missing_artifact_bodies` | `skip_artifacts=true`; or the sweep hit its `check_limit` of 5,000 revisions (the reason states `N of M replayable revisions stat'd`, and `artifacts.replayable_total` is the denominator) |
+| `search_index_empty` | `[search] enabled = true` but `doc_count` could not be read |
+| `schema_drift` | the schema ledger was not consulted |
+| `unbounded_table_growth` | no table's growth was gathered |
+
+A **disabled** search index (`[search] enabled = false`) is `clean`, never
+`unverifiable`: a deliberately absent subsystem is not an unexamined one, and
+counting it as "could not look" would make every search-less store permanently
+un-green. The other five checks read `SELECT`s this route always issues
+together, so no request can leave one of them ungathered; they are therefore
+only ever `clean` or `findings`.
+
+A check that found something while its input was *also* partial reports
+`findings`, not `unverifiable` — it concluded something actionable, and the
+partiality stays visible in the finding's own `N of M` summary and in the
+`artifacts` block.
 
 | Check | Fires when | Remediation |
 | --- | --- | --- |
@@ -236,7 +360,10 @@ to set, the route to call — never a bare count, plus up to 10 examples.
 | `stale_rebuild_tables` | a `*_new` table-rebuild scaffold survived in `sqlite_master` | restore from backup and re-run migrations; do not drop it by hand |
 | `search_index_empty` | `[search] enabled = true`, the index holds **0 documents**, and the store holds at least one live record | `search-backfill -- --all` with the server stopped ([search.md](search.md)) |
 
-`artifacts.per_app` reports files and bytes on disk per app — the numbers that
+`artifacts` reports `scanned`, and when it ran, `bodies_checked`,
+`replayable_total` and `check_limit` — the fraction behind the body check, so a
+partial green is quantifiable rather than merely flagged. `artifacts.per_app`
+reports files and bytes on disk per app — the numbers that
 make the retention decisions above inspectable. `search` reports
 `{enabled, doc_count, live_records}` — the numbers behind the search finding,
 so the verdict is inspectable without a second request. `doc_count` is `null`
@@ -272,6 +399,73 @@ reindex` will rewrite, so running the remediation clears the finding.
 > `stale_rebuild_tables` exists to catch a rebuild that genuinely did not land —
 > it is empty on every correctly-migrated database, which
 > `the_triggers_rebuild_scaffold_does_not_survive_migration` pins.
+
+## Migration 0046 — `api_recipes` gains two lifecycle columns
+
+Additive and nullable, so the chain stays zero-downtime:
+
+| column | meaning |
+| --- | --- |
+| `retired_at` | `NULL` = live (candidate or validated); stamped = **retired**, and a retired recipe is invisible to `best_for_host` at every opt-in level. Reversible — `POST /recipes/{id}/revive` clears it. |
+| `last_failure_at` | when the most recent strike landed, so `GET /recipes` can show *when* a recipe started failing and not only how often. Cleared by a successful replay. |
+
+**The back-fill, and the three guards on it.** A candidate already past the
+shipping `[recipes] retire_after` (10) was being replayed on every fetch of its
+host before the rung existed, so it retires on arrival rather than needing ten
+more live strikes. The `UPDATE` is guarded on `retired_at IS NULL` (idempotent,
+and a second pass never re-stamps), on `validated = 0` (a validated recipe takes
+the *other* rung — `max_failures` demotes it to candidate first — so retiring one
+here would skip its demotion), and it writes **nothing** to
+`consecutive_failures`: the strike count is the evidence an operator reads
+before deciding to revive, and a back-fill that reset it would retire the row
+and erase the reason in the same statement. All three are pinned by
+`crates/core/tests/recipes_lifecycle.rs`, which executes the shipped SQL read
+out of the migration file itself rather than a paraphrase of it.
+
+`api_recipes` is **not** in `prune_ledgers` and still has no `DELETE` anywhere
+in the tree. That is deliberate: retirement is the terminal state and it is
+reversible. See [fetching.md § The recipe lifecycle](fetching.md#the-recipe-lifecycle-candidate--validated--retired).
+
+## Migration 0047 — `schedule_runs`, the schedule decision ledger
+
+A new table, additive: nothing existing changes shape and there is no back-fill
+to do (the history it records could not be reconstructed anyway — re-deriving a
+past tick's verdict would run today's logic against state that has moved).
+
+| column | meaning |
+| --- | --- |
+| `schedule_id` | the schedule the decision is about, or `*` for the pass heartbeat, which is a fact about the reconcile **loop** rather than any one schedule |
+| `outcome` | `fired` \| `skipped` \| `held` \| `refused` \| `failed` \| `pass` (`storage::SCHEDULE_OUTCOMES`) |
+| `reason` | the admission `health` word, read verbatim off `scheduler::admit()`. `NULL` only when admission never ran |
+| `due_at` | the firing this row is about |
+| `job_id` | the job enqueued, or (for `held`) the job holding the slot |
+| `missed` | firings advanced past by `misfire_policy = "skip"` |
+| `detail` | free text: an error message, the retired dataset, the collapsed backlog size |
+
+Two indexes: `(schedule_id, created_at DESC, id DESC)` for the newest-first read
+path, `(created_at)` for the prune sweep.
+
+**Diagnostic, not evidence — which decides its retention.** Like `trigger_runs`
+(migration 0036) and unlike the opt-in `LEDGER_TABLES`, losing an old row loses
+no history anyone can act on, so it is bounded **by default** rather than by an
+operator knob: the worker's reaper tick prunes past 14 days, in the same
+function and under the same hourly due-check as the trigger ledger. A second
+diagnostic ledger with its own clock is how one of them ends up swept and the
+other growing forever.
+
+**One row is exempt from the sweep: the pass heartbeat.** It is a single row with
+a fixed primary key, upserted in place rather than appended, so the table's size
+is independent of the tick rate — an append-only heartbeat on a 15-second tick
+writes ~5,700 rows a day, and the trigger ledger already shows that a
+written-once fact in that shape paginates out of reach of the newest-first page
+it was meant to be read from. Pruning it would delete the evidence of the very
+wedge it exists to prove, so `prune_schedule_runs` excludes it in SQL.
+
+`schedule_runs` is declared in `schema::EXPECTED_TABLES`, so a store missing it
+is **refused at boot** rather than failing at the first write, and
+`crates/core/tests/migrations.rs` guards its columns against a 0001→NNNN replay.
+Full read surface and the operator story: [runtime.md § The decision
+ledger](runtime.md#the-decision-ledger-get-schedulesidruns).
 
 ## Known gaps
 

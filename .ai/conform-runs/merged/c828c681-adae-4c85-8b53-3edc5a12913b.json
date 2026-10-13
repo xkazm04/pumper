@@ -1,0 +1,97 @@
+{
+ "schema": "conform-run/1",
+ "worker": "c828c681-adae-4c85-8b53-3edc5a12913b",
+ "subject": "docs-sync",
+ "evaluatedAt": "2026-10-13T08:33:47.709156+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "docs-sync",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/docs/feature-doc-map.json:3 Declared catalog and plugin couplings are excluded before matching, so their documentation obligations cannot trigger the reminder.",
+   "techniques": [
+    {
+     "technique": "same-change-enforcement",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:56 The collector accepts only these transcript tool names rather than a VCS change record, leaving shell-driven changes, deletions and rename origins outside its observation."
+    },
+    {
+     "technique": "source-as-data-without-the-app",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/check-doc-sync.mjs:302 This checker consumes a standalone JSON map; it does not need to extract a registry from application source."
+    },
+    {
+     "technique": "source-doc-mapping",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/feature-doc-map.json:3 These recorded couplings have no effective enforcement; in-memory evaluation confirmed both paths return skipped-only."
+    }
+   ]
+  },
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "docs-sync",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/README.md:140 The README preserves and corrects its false watermark-risk claim without dating the correction, preventing readers from establishing its chronology.",
+   "techniques": [
+    {
+     "technique": "dated-corrections",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/README.md:140 Lines 138\u2013143 retain the false claim and explain the corrected boundary, but supply no correction date; the linked feature-document correction is also undated."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "docs-sync",
+   "context": "ci-quality-gates",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "docs-sync",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "docs-sync",
+   "context": "pricing-valuation",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-13T08:33:47.709156+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "docs-sync"
+   ],
+   "techniques": [
+    "same-change-enforcement",
+    "source-as-data-without-the-app",
+    "source-doc-mapping"
+   ],
+   "deviations": 1,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-13T08:33:47.709156+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "docs-sync"
+   ],
+   "techniques": [
+    "dated-corrections"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

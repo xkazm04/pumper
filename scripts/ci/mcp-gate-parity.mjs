@@ -41,6 +41,9 @@
 // The fix that removes the class is one authority the other sites derive from.
 // Until then this is the floor: a build-time check over the registration sites.
 //
+// `--root <dir>` points it at another checkout; that seam is what lets the
+// fixture suite drive the findings and cannot-check branches as real processes.
+//
 // Exit codes follow this repo's lane convention: 0 clean, 2 findings,
 // 3 cannot-check (the file moved or the shapes it parses are gone — which is a
 // result, not a pass, because a parser that silently matches nothing is exactly
@@ -237,8 +240,21 @@ export function check(root = defaultRepoRoot()) {
 const isMain =
   process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
+/**
+ * `--root <dir>` judges THAT tree instead of the checkout this script lives in.
+ *
+ * Without it `check()` always read the real source, so the status -> exit-code
+ * mapping below could only ever produce 0: neither the findings branch nor the
+ * cannot-check branch was reachable from a fixture, and a cannot-check branch
+ * nobody has watched fire is a branch that may be exiting 0.
+ */
+export function rootFromArgv(argv, fallback = defaultRepoRoot()) {
+  const i = argv.indexOf('--root');
+  return i !== -1 && argv[i + 1] ? path.resolve(argv[i + 1]) : fallback;
+}
+
 if (isMain) {
-  const result = check();
+  const result = check(rootFromArgv(process.argv.slice(2)));
   const s = result.sites;
   if (s) {
     console.log(`gated (advertised): ${s.listedGated.join(', ') || '-'}`);

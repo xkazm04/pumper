@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pumper_core::resilience::SourceState;
 use pumper_core::storage::FailReason;
 use pumper_core::{AppContext, Job, JobStatus, SearchDoc};
 use serde_json::Value;
@@ -768,11 +769,15 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // spend must still count toward the ceiling. Fail-open per the worker
     // convention — an unreadable ledger must not block the run, it only means
     // this attempt starts its accounting from zero.
-    let spent_seed = match state.costs.job_total(job.id).await {
-        Ok(total) => total,
+    //
+    // Seeded as a `JobSpend`, not a bare `f64`: prior attempts' *unreadable*
+    // bills count against the ceiling too, and a retry that forgot them would
+    // hand a job that spent unmeasurable money a clean, confident headroom.
+    let spent_seed = match state.costs.job_spend(job.id).await {
+        Ok(spend) => spend,
         Err(e) => {
             warn!(job = %job.id, "cost ledger read failed, seeding spend at 0: {e}");
-            0.0
+            pumper_core::costs::JobSpend::default()
         }
     };
     // Held past the run: the sink is the only place that knows a checkpoint did
@@ -797,11 +802,19 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         // M26: a `cost:pause` DataHub tag on the app's datasets forces $0 —
         // the budget governor then serves free tiers only (reversible pause).
         budget_usd: crate::datahub::effective_budget(&state, &job.app, job.budget_usd),
-        spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
+        spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::from_spend(
+            spent_seed,
+            state.config.costs.budget_imputation,
+        )),
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
-        recipes: Arc::new(state.storage.recipes()),
+        recipes: Arc::new(
+            state
+                .storage
+                .recipes()
+                .with_retire_after(state.config.recipes.retire_after),
+        ),
         plugins: state.plugins.clone(),
         progress: state
             .progress
@@ -847,6 +860,15 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // Race the app future against the wall-clock timeout, the cancel token, and
     // the heartbeat tick.
     let run_started = std::time::Instant::now();
+    // The beat in flight, if any. The tick arm SPAWNS the write rather than
+    // awaiting it: awaited inside this select, the write stopped `run` from
+    // being polled, and the app's own in-flight queries — each holding one of
+    // the pool's 8 connections until polled again — were exactly the
+    // connections the beat was waiting for. Every tick that landed during a
+    // fetch fan-out froze the job for the 30s acquire timeout. The TICK still
+    // needs this loop to be polled, so a wedged job still stops beating and
+    // the reaper still recovers it.
+    let mut beat: Option<tokio::task::JoinHandle<()>> = None;
     let outcome = loop {
         tokio::select! {
             biased;
@@ -859,7 +881,18 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 }
             },
             _ = maybe_tick(&mut heartbeat) => {
-                let _ = state.storage.heartbeat(job.id, job.attempts).await;
+                if should_beat(beat.as_ref().is_some_and(|b| !b.is_finished())) {
+                    let storage = state.storage.clone();
+                    let (id, attempt) = (job.id, job.attempts);
+                    // Fenced on (status = 'running', attempts) in
+                    // `Storage::heartbeat`, so a beat landing after the job
+                    // finished (or was re-claimed) updates nothing.
+                    beat = Some(tokio::spawn(async move {
+                        let _ = storage.heartbeat(id, attempt).await;
+                    }));
+                } else {
+                    debug!(job = %job.id, "heartbeat skipped: previous beat still in flight");
+                }
             }
         }
     };
@@ -1216,7 +1249,13 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     let indexed_apps = run_indexed_apps(&job.app, &index_specs);
     stages
         .time(Stage::Index, async {
-            let mut docs = search_docs(&job.app, job.id, &result);
+            // A degrading source never poisons the index through its echo either
+            // — the same gate `dataset_search_docs` applies per spec.
+            let mut docs = if echo_index_withheld(&state, &job).await {
+                Vec::new()
+            } else {
+                search_docs(&job.app, job.id, &result)
+            };
             // Ghost-doc GC: identity-less job-result docs embed the job id, so
             // every run used to mint a permanent new set. Sweep the app's prior
             // snapshot BEFORE adding this run's (delete-then-add in opstamp
@@ -1289,6 +1328,11 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     // to DataHub. Off-slot (on this pool) and fail-open — a down GMS never
     // touches jobs, and a shutdown drains or loudly counts the emission
     // rather than dropping it.
+    // Did this run write where it never said it would? Both populations were
+    // already computed — `index_specs` is the declaration, the run's own
+    // revision log is the observation — and nothing diffed them. Fail-open and
+    // purely a report: it runs after the fan-out and cannot touch the outcome.
+    report_undeclared_writes(&state, &job, &index_specs).await;
     crate::datahub::on_job_success(&state, &job, index_specs).await;
 
     // Stamp where the wall-clock went before the terminal event, so the event
@@ -1336,6 +1380,13 @@ fn vcr_params(params: &Value) -> Result<(bool, Option<Uuid>), String> {
 
 /// Ticks the heartbeat interval when enabled, or waits forever when it isn't —
 /// so the heartbeat select branch simply never fires with heartbeating disabled.
+/// Whether a heartbeat tick may start a write: at most ONE beat in flight. A
+/// beat still waiting on the pool when the next tick fires means the store is
+/// saturated; queueing a second write behind it would only add a waiter.
+pub(crate) fn should_beat(prev_write_in_flight: bool) -> bool {
+    !prev_write_in_flight
+}
+
 async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
     match hb {
         Some(interval) => {
@@ -1351,10 +1402,10 @@ async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
 /// through `finalize` so their callback + terminal triggers fire like any other
 /// failure. Piggybacks the scheduler tick (`stale_after_secs == 0` disables it).
 pub async fn reap_once(state: &AppState) {
-    // The trigger decision ledger rides this tick (see `prune_trigger_ledger`)
+    // Both decision ledgers ride this tick (see `prune_decision_ledgers`)
     // — before the `stale_after_secs == 0` early return, because a deployment
     // with the reaper disabled still writes decisions.
-    prune_trigger_ledger(state).await;
+    prune_decision_ledgers(state).await;
     let stale = state.config.worker.stale_after_secs;
     if stale == 0 {
         return;
@@ -1412,10 +1463,14 @@ fn prune_is_due(
     }
 }
 
-/// Bounds `trigger_runs` by age, at most once per [`TRIGGER_RUN_PRUNE_EVERY`].
-/// Fail-open and quiet: a ledger that could not be pruned is a disk-space
-/// concern, never a reason to disturb the queue.
-async fn prune_trigger_ledger(state: &AppState) {
+/// Bounds `trigger_runs` and `schedule_runs` by age, at most once per
+/// [`TRIGGER_RUN_PRUNE_EVERY`]. Fail-open and quiet: a ledger that could not be
+/// pruned is a disk-space concern, never a reason to disturb the queue.
+///
+/// One function for both on purpose. A second ledger with its own clock and its
+/// own due-check is how one of them ends up swept and the other growing
+/// forever; the bound is the same and the sweep is one indexed `DELETE` each.
+async fn prune_decision_ledgers(state: &AppState) {
     let now = std::time::Instant::now();
     {
         // The guard is dropped before the await: a std Mutex must never be held
@@ -1446,6 +1501,24 @@ async fn prune_trigger_ledger(state: &AppState) {
         ),
         Ok(_) => {}
         Err(e) => warn!("trigger decision ledger prune failed: {e}"),
+    }
+    // The schedule decision ledger (migration 0047) is bounded on the SAME
+    // clock and inside the SAME due-check, so the two diagnostic ledgers cannot
+    // drift into one being swept and the other growing forever. The pass
+    // heartbeat is exempt from the sweep by the query itself -- see
+    // `Storage::prune_schedule_runs`.
+    match state
+        .storage
+        .prune_schedule_runs(TRIGGER_RUN_RETENTION_DAYS)
+        .await
+    {
+        Ok(n) if n > 0 => info!(
+            pruned = n,
+            days = TRIGGER_RUN_RETENTION_DAYS,
+            "pruned old schedule decisions"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("schedule decision ledger prune failed: {e}"),
     }
 }
 
@@ -1522,12 +1595,13 @@ fn group_by_app_dataset(
 ///
 /// Per-dataset rather than per-job: one app can serve several datasets, and a
 /// break in one must not silence the others. A no-op unless
-/// `[resilience] enforce` is on.
+/// `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
 async fn suppress_unhealthy(
     state: &AppState,
     by_dataset: &mut HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
-    if !state.health.enforcing() {
+    if !state.health.enforcing_any() {
         return;
     }
     // The app comes from the batch key, not from the job: a run can write under
@@ -1545,6 +1619,190 @@ async fn suppress_unhealthy(
             );
             by_dataset.remove(&(app, dataset));
         }
+    }
+}
+
+/// Enforced health per distinct `(app, dataset)` pair, for the gates whose batch
+/// mixes sources — a saved search's hits, a view's deltas, the pairs one run was
+/// judged on. The one read those gates share, so the enforcement preview's
+/// inventory sees one call site for all of them.
+///
+/// Empty while nothing is armed: soak mode reads nothing and gates
+/// nothing, and an absent pair reads as "not suppressed" in every predicate
+/// below, exactly like `Unknown` does.
+async fn enforced_states(
+    state: &AppState,
+    pairs: Vec<(String, String)>,
+) -> HashMap<(String, String), SourceState> {
+    let mut out = HashMap::new();
+    if !state.health.enforcing_any() {
+        return out;
+    }
+    for pair in pairs {
+        if out.contains_key(&pair) {
+            continue;
+        }
+        let health = state.health.enforced_state(&pair.0, &pair.1).await;
+        out.insert(pair, health);
+    }
+    out
+}
+
+/// Whether `states` says the `(app, dataset)` pair may not push. A pair with no
+/// entry pushes — enforcement off, or a pair nobody judged.
+fn pair_suppresses_pushes(
+    states: &HashMap<(String, String), SourceState>,
+    app: &str,
+    dataset: &str,
+) -> bool {
+    states
+        .get(&(app.to_string(), dataset.to_string()))
+        .is_some_and(|s| s.suppresses_pushes())
+}
+
+/// The saved-search hits that may alert: those whose OWN source pair (the hit's
+/// `app`/`dataset`, i.e. the dataset the document was indexed from) does not
+/// suppress pushes.
+///
+/// The anti-pattern: gating watches and triggers but not `search.matched` — the
+/// same irreversible push, reached through the index instead of the change
+/// feed. Filtered BEFORE `claim_unseen`, so a withheld hit is not marked seen:
+/// it alerts once its source is trusted again, if it still matches.
+fn alertable_hits<'a>(
+    hits: &'a [pumper_core::SearchHit],
+    states: &HashMap<(String, String), SourceState>,
+) -> Vec<&'a pumper_core::SearchHit> {
+    hits.iter()
+        .filter(|h| !pair_suppresses_pushes(states, &h.app, &h.dataset))
+        .collect()
+}
+
+/// The source pair a saved-search view record was materialized from — its
+/// `source.{app,dataset}` provenance block (`SearchHit::materialize_value`).
+/// `None` when the block is absent, which gates nothing.
+fn view_delta_source(data: &Value) -> Option<(String, String)> {
+    let src = data.get("source")?;
+    Some((
+        src.get("app")?.as_str()?.to_string(),
+        src.get("dataset")?.as_str()?.to_string(),
+    ))
+}
+
+/// Splits a view's deltas into those that may push and a count of those
+/// withheld, judging each by its UNDERLYING source (`sources[i]` for
+/// `changes[i]`), not by the view's own pair.
+///
+/// The anti-pattern: gating a view on `(view app, view dataset)`. No app ever
+/// calls `observe_extraction` for a view, so that pair is always `Healthy` and
+/// the gate would pass a degraded source's hits straight through the view's
+/// watches and triggers. A delta whose source is unknown is kept.
+fn pushable_view_deltas(
+    changes: Vec<pumper_core::Revision>,
+    sources: &[Option<(String, String)>],
+    states: &HashMap<(String, String), SourceState>,
+) -> (Vec<pumper_core::Revision>, usize) {
+    let mut kept = Vec::with_capacity(changes.len());
+    let mut withheld = 0;
+    for (rev, src) in changes.into_iter().zip(sources) {
+        match src {
+            Some((app, dataset)) if pair_suppresses_pushes(states, app, dataset) => withheld += 1,
+            _ => kept.push(rev),
+        }
+    }
+    (kept, withheld)
+}
+
+/// [`pushable_view_deltas`] with the sources resolved: from each delta's own
+/// snapshot, or — for a `removed` delta, which carries none — from the view
+/// record it tombstoned (tombstoning keeps the row's data). A no-op that reads
+/// nothing unless `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
+async fn gate_view_deltas(
+    state: &AppState,
+    search_id: &str,
+    changes: Vec<pumper_core::Revision>,
+) -> Vec<pumper_core::Revision> {
+    if !state.health.enforcing_any() {
+        return changes;
+    }
+    let mut sources = Vec::with_capacity(changes.len());
+    for rev in &changes {
+        let src = match &rev.data {
+            Some(data) => view_delta_source(data),
+            None => match state.datasets.get(&rev.app, &rev.dataset, &rev.key).await {
+                Ok(Some(rec)) => view_delta_source(&rec.data),
+                _ => None,
+            },
+        };
+        sources.push(src);
+    }
+    let states = enforced_states(state, sources.iter().flatten().cloned().collect()).await;
+    let (kept, withheld) = pushable_view_deltas(changes, &sources, &states);
+    if withheld > 0 {
+        warn!(
+            search = %search_id, withheld,
+            "view pushes suppressed: these deltas come from a source whose health is degraded"
+        );
+    }
+    kept
+}
+
+/// The first judged pair whose enforced state keeps it out of the search index,
+/// if any — the reason a run's job-result echo is not indexed.
+fn echo_withheld_by(
+    states: &HashMap<(String, String), SourceState>,
+) -> Option<(&str, &str, SourceState)> {
+    let mut offending: Vec<_> = states
+        .iter()
+        .filter(|(_, s)| s.skips_search_index())
+        .map(|((app, dataset), s)| (app.as_str(), dataset.as_str(), *s))
+        .collect();
+    // Deterministic for the log line: `HashMap` order is not.
+    offending.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    offending.into_iter().next()
+}
+
+/// Whether this run's job-result echo (`search_docs`: the `records`/`stories`/
+/// `items` arrays and the `_job` snapshot) stays out of the index.
+///
+/// The echo is this run's extraction output, and the pairs it came from are the
+/// ones this run was judged on (`source_runs` for the job). If any of them may
+/// not index, none of the echo is indexed — it cannot be attributed per record,
+/// and the index is a derived artifact a later healthy run refills. Withholding
+/// every doc also withholds the `_job` sweep, so the last trusted snapshot
+/// stays findable. Fail-open on a read failure, and a no-op unless
+/// `[resilience]` arms at least one source (`enforce`, or a
+/// non-empty `enforce_sources`).
+async fn echo_index_withheld(state: &AppState, job: &Job) -> bool {
+    if !state.health.enforcing_any() {
+        return false;
+    }
+    let Some(store) = state.health.store() else {
+        return false;
+    };
+    let verdicts = match state.storage.job_health_verdicts(job.id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(job = %job.id, "echo index gate: verdict read failed (indexing anyway): {e}");
+            return false;
+        }
+    };
+    let mut pairs = Vec::with_capacity(verdicts.len());
+    for v in verdicts {
+        if let Ok(Some(src)) = store.source(&v.source_id).await {
+            pairs.push((src.app, src.dataset));
+        }
+    }
+    let states = enforced_states(state, pairs).await;
+    match echo_withheld_by(&states) {
+        Some((app, dataset, health)) => {
+            warn!(
+                job = %job.id, %app, %dataset, state = health.as_str(),
+                "job-result echo not indexed: source health"
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -1707,7 +1965,7 @@ fn watch_covers_entry(watch: &pumper_core::Watch, app: &str, dataset: &str) -> b
 ///
 /// Order-preserving and de-duplicated (job app first); empty app names are
 /// dropped, since an empty namespace matches nothing.
-fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<String> {
+pub(crate) fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<String> {
     let mut apps: Vec<String> = Vec::with_capacity(1 + index_specs.len());
     for app in std::iter::once(job_app).chain(index_specs.iter().map(|(a, _)| a.as_str())) {
         if !app.is_empty() && !apps.iter().any(|seen| seen == app) {
@@ -1715,6 +1973,73 @@ fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<Stri
         }
     }
     apps
+}
+
+/// The `(app, dataset)` pairs a run actually WROTE that its own declaration
+/// does not name — the diff this repo computed neither half of until now.
+///
+/// **The two populations already existed.** `run_indexed_apps` /
+/// `index_dataset_specs` are what the run DECLARED; `Storage::job_revision_counts`
+/// (`WHERE job_id = ?1 GROUP BY app, dataset`) is what it OBSERVABLY wrote.
+/// Nothing diffed them, so a namespace written and not declared was found only
+/// by a human noticing — twice so far (`ca-grants` writing `grants/unified`,
+/// `peer` writing `peer_<origin>/<dataset>`; see `load_run_changes`).
+///
+/// **Why a write under `job_app` is never undeclared.** An app owns its own
+/// namespace and writes plenty of internal datasets there (`mpsv-vpm` alone has
+/// eight it deliberately excludes from indexing). Flagging those would make the
+/// signal fire on every run, and a signal that is always on is not a signal.
+/// A VIRTUAL namespace is different: it is a declaration contract, and the only
+/// thing that puts a record in reach of a watch, a dataset trigger or a saved
+/// search scoped to it is the run naming it. So the rule is: outside `job_app`,
+/// the exact `(app, dataset)` pair must be declared.
+///
+/// Deduplicated and sorted, so the receipt does not shuffle between reads.
+pub(crate) fn undeclared_write_namespaces(
+    observed: &[(String, String)],
+    job_app: &str,
+    declared_specs: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in observed {
+        let (app, dataset) = pair;
+        if app == job_app {
+            continue;
+        }
+        if declared_specs.iter().any(|(a, d)| a == app && d == dataset) {
+            continue;
+        }
+        if out.iter().any(|(a, d)| a == app && d == dataset) {
+            continue;
+        }
+        out.push(pair.clone());
+    }
+    out.sort();
+    out
+}
+
+/// Logs one WARN per namespace this run wrote and did not declare. Fail-open in
+/// the strict sense: a store error is warned and dropped, and NOTHING here can
+/// change the job outcome — this is a report about a run that already happened.
+async fn report_undeclared_writes(state: &AppState, job: &Job, index_specs: &[(String, String)]) {
+    let counts = match state.storage.job_revision_counts(job.id).await {
+        Ok(counts) => counts,
+        Err(e) => {
+            warn!(job = %job.id, app = %job.app, "write-coverage check skipped: {e}");
+            return;
+        }
+    };
+    let observed: Vec<(String, String)> = counts
+        .iter()
+        .map(|c| (c.app.clone(), c.dataset.clone()))
+        .collect();
+    for (app, dataset) in undeclared_write_namespaces(&observed, &job.app, index_specs) {
+        warn!(
+            job = %job.id, job_app = %job.app, %app, %dataset,
+            "undeclared write: this run wrote `{app}/{dataset}`, a namespace outside its own              app that its result's `index_datasets` does not name. Those records get no              per-record search document, and unless another spec declares `{app}` they are              out of reach of every watch and dataset trigger too. See              GET /jobs/{job_id}/receipt -> coverage.undeclared",
+            job_id = job.id
+        );
+    }
 }
 
 /// Whether a saved search's `app` filter covers a run that indexed under
@@ -1788,7 +2113,27 @@ async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[Stri
                 continue;
             }
         };
-        let ids: Vec<String> = results.hits.iter().map(|h| h.id.clone()).collect();
+        // A degrading source never alerts: same gate as watches and triggers,
+        // judged per hit on the pair the document was indexed from.
+        let states = enforced_states(
+            state,
+            results
+                .hits
+                .iter()
+                .map(|h| (h.app.clone(), h.dataset.clone()))
+                .collect(),
+        )
+        .await;
+        let alertable = alertable_hits(&results.hits, &states);
+        if alertable.len() < results.hits.len() {
+            warn!(
+                search = %search.id, job = %job.id,
+                withheld = results.hits.len() - alertable.len(),
+                "saved-search alerts suppressed: these hits come from a source whose health is \
+                 degraded, and a delivered webhook cannot be recalled"
+            );
+        }
+        let ids: Vec<String> = alertable.iter().map(|h| h.id.clone()).collect();
         if ids.is_empty() {
             debug!(
                 search = %search.id, job = %job.id, query = %search.query,
@@ -1812,8 +2157,7 @@ async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[Stri
                 continue;
             }
         };
-        let matches: Vec<_> = results
-            .hits
+        let matches: Vec<_> = alertable
             .iter()
             .filter(|h| unseen.contains(&h.id))
             .collect();
@@ -1905,6 +2249,10 @@ async fn materialize_saved_search(
             return;
         }
     };
+    // A view is a push surface for its SOURCES' data, so a degrading source's
+    // hits do not reach the view's watches or triggers. The view records
+    // themselves are written regardless: suppression gates pushes, never data.
+    let changes = gate_view_deltas(state, &search.id, changes).await;
     if changes.is_empty() {
         return;
     }
@@ -1913,7 +2261,11 @@ async fn materialize_saved_search(
     // without re-badging the job. (This used to need a `view_job` clone with
     // `app = mat.app`; the widened batch keying makes that unnecessary, and the
     // real job now flows through, so provenance and lookup no longer disagree.)
-    let by_dataset = group_by_app_dataset(&changes);
+    let mut by_dataset = group_by_app_dataset(&changes);
+    // …and the main path's gate on the view's own pair, so a view pair the
+    // ladder DOES judge is held to it too. Usually a no-op: nothing observes a
+    // view, so its own pair reads `Healthy`.
+    suppress_unhealthy(state, &mut by_dataset).await;
     notify_watches(state, job, &by_dataset).await;
     // The view's hops ride the SOURCE job's id (provenance), so their dedup keys
     // are scoped by the saved search — otherwise a view whose target app is the
@@ -2027,6 +2379,11 @@ async fn finalize_with_stages(
             .await;
         }
     }
+    // Source health events: every transition this run's verdicts caused into
+    // `degraded` / `quarantined` / `retired` tells `[webhooks] health_url`.
+    // Here rather than in the success fan-out because a failed run can have
+    // been judged too. Returns before any query when nobody would be told.
+    webhook::dispatch_job_health(state, job.id).await;
     // Terminal-job triggers: the job's final status is an event other apps can
     // chain on (e.g. "when crawl succeeds, run extract").
     crate::triggers::fire_terminal_triggers(state, &job).await;
@@ -2904,6 +3261,142 @@ mod hook_scope_tests {
 }
 
 #[cfg(test)]
+mod health_gate_tests {
+    use std::collections::HashMap;
+
+    use pumper_core::datasets::{Provenance, Revision};
+    use pumper_core::resilience::SourceState;
+    use pumper_core::SearchHit;
+    use serde_json::json;
+
+    use super::{alertable_hits, echo_withheld_by, pushable_view_deltas, view_delta_source};
+
+    fn states(pairs: &[(&str, &str, SourceState)]) -> HashMap<(String, String), SourceState> {
+        pairs
+            .iter()
+            .map(|(a, d, s)| ((a.to_string(), d.to_string()), *s))
+            .collect()
+    }
+
+    fn hit(app: &str, dataset: &str, key: &str) -> SearchHit {
+        SearchHit {
+            id: format!("{app}:{dataset}:{key}"),
+            app: app.into(),
+            dataset: dataset.into(),
+            url: String::new(),
+            title: key.into(),
+            score: 1.0,
+            snippet: String::new(),
+        }
+    }
+
+    fn view_rev(key: &str, data: Option<serde_json::Value>) -> Revision {
+        Revision {
+            app: "view".into(),
+            dataset: "hits".into(),
+            key: key.into(),
+            revision: 1,
+            change: if data.is_some() { "new" } else { "removed" }.into(),
+            data,
+            diff: None,
+            created_at: chrono::Utc::now(),
+            trust: "stable".into(),
+            provenance: Provenance::default(),
+        }
+    }
+
+    /// The anti-pattern: `search.matched` fired for every hit while watches and
+    /// triggers were gated — a degrading source's documents reached subscribers
+    /// through the index instead of the change feed.
+    #[test]
+    fn a_degraded_sources_hits_do_not_alert_but_a_healthy_sources_do() {
+        let hits = [hit("bad", "d", "1"), hit("ok", "d", "2")];
+        let st = states(&[
+            ("bad", "d", SourceState::Degraded),
+            ("ok", "d", SourceState::Healthy),
+        ]);
+        let alertable: Vec<&str> = alertable_hits(&hits, &st)
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(alertable, vec!["ok:d:2"]);
+    }
+
+    /// Enforcement off reads no states at all, and an empty map gates nothing —
+    /// soak mode is byte-for-byte the old behaviour.
+    #[test]
+    fn no_states_read_means_every_hit_alerts_not_none() {
+        let hits = [hit("bad", "d", "1"), hit("ok", "d", "2")];
+        assert_eq!(alertable_hits(&hits, &HashMap::new()).len(), 2);
+        // Probation and Unknown do not suppress pushes either.
+        let st = states(&[
+            ("bad", "d", SourceState::Probation),
+            ("ok", "d", SourceState::Unknown),
+        ]);
+        assert_eq!(alertable_hits(&hits, &st).len(), 2);
+    }
+
+    #[test]
+    fn view_delta_source_reads_the_materialized_provenance_block() {
+        let data = hit("src", "d", "k").materialize_value();
+        assert_eq!(
+            view_delta_source(&data),
+            Some(("src".to_string(), "d".to_string()))
+        );
+        assert_eq!(view_delta_source(&json!({ "title": "no block" })), None);
+    }
+
+    /// The anti-pattern: gating a view's fan-out on the VIEW's own pair, which
+    /// nothing ever judges — so it always reads healthy and a degraded source's
+    /// hits pass straight through the view's watches and triggers.
+    #[test]
+    fn view_deltas_are_judged_by_their_source_not_the_view_pair() {
+        let changes = vec![
+            view_rev("bad:d:1", Some(hit("bad", "d", "1").materialize_value())),
+            view_rev("ok:d:2", Some(hit("ok", "d", "2").materialize_value())),
+            view_rev("unknown", None),
+        ];
+        let sources = vec![
+            Some(("bad".to_string(), "d".to_string())),
+            Some(("ok".to_string(), "d".to_string())),
+            None,
+        ];
+        let st = states(&[
+            ("bad", "d", SourceState::Quarantined),
+            ("ok", "d", SourceState::Healthy),
+            // The view's own pair says healthy — and must not be what decides.
+            ("view", "hits", SourceState::Healthy),
+        ]);
+        let (kept, withheld) = pushable_view_deltas(changes, &sources, &st);
+        let kept: Vec<&str> = kept.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["ok:d:2", "unknown"],
+            "an unattributable delta gates nothing"
+        );
+        assert_eq!(withheld, 1);
+    }
+
+    /// The anti-pattern: indexing a run's echo while the same run's dataset
+    /// revisions are held out of the index — the degraded records reach search
+    /// under a second id.
+    #[test]
+    fn echo_is_withheld_when_any_judged_pair_skips_the_index_not_only_all() {
+        assert_eq!(echo_withheld_by(&HashMap::new()), None);
+        let st = states(&[
+            ("fake", "a", SourceState::Healthy),
+            ("fake", "b", SourceState::Degraded),
+        ]);
+        assert_eq!(
+            echo_withheld_by(&st),
+            Some(("fake", "b", SourceState::Degraded))
+        );
+        let st = states(&[("fake", "a", SourceState::Suspect)]);
+        assert_eq!(echo_withheld_by(&st), None);
+    }
+}
+
+#[cfg(test)]
 mod saved_search_scope_tests {
     use super::{run_indexed_apps, search_covers_run};
     use serde_json::json;
@@ -2964,6 +3457,91 @@ mod saved_search_scope_tests {
             run_indexed_apps("grants", &specs),
             vec!["grants".to_string()],
             "job app equal to the virtual app collapses to one entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_coverage_tests {
+    use super::undeclared_write_namespaces;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, d)| (a.to_string(), d.to_string()))
+            .collect()
+    }
+
+    /// The anti-pattern this guards: a detector that flags **every write whose
+    /// app is not `job.app`**. That would fire on every `peer` pull, every
+    /// `ca-grants` run and every MPSV run — all of which write outside their
+    /// job app on purpose and SAY SO. A signal that is always on is not one.
+    #[test]
+    fn undeclared_write_namespaces_not_every_write_outside_job_app() {
+        // The card's base case: `b/y` is outside the job app and undeclared.
+        assert_eq!(
+            undeclared_write_namespaces(&pairs(&[("a", "x"), ("b", "y")]), "a", &[]),
+            pairs(&[("b", "y")])
+        );
+        // Declaring it is what makes it not rogue — this is the control.
+        assert_eq!(
+            undeclared_write_namespaces(
+                &pairs(&[("a", "x"), ("b", "y")]),
+                "a",
+                &pairs(&[("b", "y")])
+            ),
+            Vec::<(String, String)>::new()
+        );
+        // Nothing written, nothing reported.
+        assert_eq!(
+            undeclared_write_namespaces(&[], "a", &pairs(&[("b", "y")])),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// An app's own namespace is its own business: `mpsv-vpm` writes eight
+    /// datasets it deliberately keeps out of `INDEXED_DATASETS`, and none of
+    /// them is a coverage defect. Only a VIRTUAL namespace is a contract.
+    #[test]
+    fn a_runs_own_app_is_never_undeclared_however_many_datasets_it_writes() {
+        let observed = pairs(&[
+            ("mpsv-vpm", "vacancy_samples"),
+            ("mpsv-vpm", "employers"),
+            ("mpsv-vpm", "region_agg"),
+        ]);
+        assert!(
+            undeclared_write_namespaces(&observed, "mpsv-vpm", &[]).is_empty(),
+            "the job app owns its namespace; indexing it is a separate decision"
+        );
+    }
+
+    /// The real shape of the defect: a declared virtual app, an UNDECLARED
+    /// dataset inside it. `cz-labour` is named by the run; `skill_demand` is
+    /// not, so its records get no per-record document and no operator who
+    /// subscribed to the namespace learns they exist.
+    #[test]
+    fn a_declared_app_does_not_launder_an_undeclared_dataset() {
+        let declared = pairs(&[("cz-labour", "salary_gap"), ("mpsv-vpm", "region_agg")]);
+        let observed = pairs(&[
+            ("cz-labour", "salary_gap"),
+            ("cz-labour", "skill_demand"),
+            ("mpsv-vpm", "region_agg"),
+        ]);
+        assert_eq!(
+            undeclared_write_namespaces(&observed, "mpsv-vpm", &declared),
+            pairs(&[("cz-labour", "skill_demand")])
+        );
+    }
+
+    /// `job_revision_counts` groups by `(app, dataset, change)`, so one dataset
+    /// with new + changed + removed rows arrives three times. A receipt that
+    /// listed it three times would read as three defects.
+    #[test]
+    fn one_rogue_dataset_is_reported_once_however_many_change_kinds_it_has() {
+        let observed = pairs(&[("g", "u"), ("g", "u"), ("g", "u"), ("f", "t")]);
+        assert_eq!(
+            undeclared_write_namespaces(&observed, "src", &[]),
+            pairs(&[("f", "t"), ("g", "u")]),
+            "deduplicated, and sorted so the receipt is stable between reads"
         );
     }
 }

@@ -1,0 +1,149 @@
+{
+  "schema": "conform-run/1",
+  "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
+  "subject": "agent-instruction-files",
+  "evaluatedAt": "2026-10-13T02:05:23.384167+00:00",
+  "provider": "grok",
+  "model": "grok-4.7",
+  "pairs": [
+    {
+      "context": "pumper-sync-sdk",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "clients/typescript/package.json:4 A search of the listed TypeScript sources, tests, fixtures, and README for CLAUDE.md, AGENTS.md, instruction, skill, agent, and prompt found no matches, so this package does not author or load a coding-agent instruction file.",
+      "techniques": []
+    },
+    {
+      "context": "ci-quality-gates",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/ci/flake-id.mjs:53 The only harness token in these gate scripts is CLAUDE_PROJECT_DIR used as a checkout root for test identity; a search found no instruction file, skill manifest, or agent brief, and mcp-gate-parity only checks spellings of gated MCP tool names.",
+      "techniques": []
+    },
+    {
+      "context": "api-server-core",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/state.rs:303 The research CLI is given a workdir derived under the storage root, and the same comment says total isolation from a Claude Code project's instruction files still requires moving database_path.",
+      "techniques": [
+        {
+          "technique": "workspace-ancestry-isolation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/state.rs:303 The launch directory stays under the storage root; leaving the instruction ancestry is an operator relocation, not the layout."
+        },
+        {
+          "technique": "capability-coverage-contract",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:393 list_apps builds the agent-facing app catalog from the live registry rather than a handwritten name list."
+        },
+        {
+          "technique": "enforcement-demotion",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:341 Advertised tool-argument constraints are checked in code instead of left for the model to obey."
+        },
+        {
+          "technique": "capability-before-steering",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/registry.rs:420 A test requires a worked example whenever a params schema exists, so the agent is not steered at a call shape the manifest never supplies."
+        }
+      ],
+      "registryProposal": "workspace-ancestry-isolation's fallbacks are path exclusion or moving the directory; they do not name a host flag that disables instruction discovery when the scratch directory must stay under a storage root inside the checkout."
+    }
+  ],
+  "declined": [
+    {
+      "subject": "agent-instruction-files",
+      "context": "core-platform-services",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor, crates/core/src/catalog.rs:2, is only the catalog module's doc line. It does not show that the other core modules and tests lack an instruction-file surface, so it is an incidental anchor for a not-applicable verdict."
+    },
+    {
+      "subject": "agent-instruction-files",
+      "context": "docs-and-ops-scripts",
+      "reason": "withdrawn after review: reviewer (sonnet): The technique claim that 'the hook's own comment says it never blocks' is not in the file. check-doc-sync.mjs has no such comment, and main() writes the reminder to stderr and calls process.exit(2) at line 315, which blocks the Stop event."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-13T02:05:23.384167+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-instruction-files"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "pumper-sync-sdk",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T02:05:23.384167+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-instruction-files"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T02:05:23.384167+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-instruction-files"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "core-platform-services",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T02:05:23.384167+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-instruction-files"
+      ],
+      "techniques": [
+        "capability-before-steering",
+        "capability-coverage-contract",
+        "enforcement-demotion",
+        "workspace-ancestry-isolation"
+      ],
+      "deviations": 1,
+      "context": "api-server-core",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    },
+    {
+      "ts": "2026-10-13T02:05:23.384167+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-instruction-files"
+      ],
+      "techniques": [
+        "capability-before-steering",
+        "capability-coverage-contract",
+        "enforcement-demotion",
+        "host-contract-compilation",
+        "inherited-default-ownership",
+        "instruction-freshness",
+        "line-earning",
+        "machine-owned-regions",
+        "restraint-amplifier-balance",
+        "sibling-floor-ownership",
+        "substrate-coupled-expiry",
+        "workspace-ancestry-isolation",
+        "write-back-sink-class"
+      ],
+      "deviations": 0,
+      "context": "docs-and-ops-scripts",
+      "via": "curator-multi:grok",
+      "model": "grok-4.7"
+    }
+  ]
+}

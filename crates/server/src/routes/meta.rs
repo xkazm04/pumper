@@ -114,15 +114,7 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         "pumper_job_queue_wait_seconds_max {}\n",
         timing.wait_max
     ));
-    out.push_str(
-        "# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n",
-    );
-    for entry in state.costs.summary(None, None).await? {
-        out.push_str(&format!(
-            "pumper_cost_usd{{app=\"{}\",engine=\"{}\"}} {}\n",
-            entry.app, entry.engine, entry.cost_usd
-        ));
-    }
+    out.push_str(&cost_metrics(&state.costs.summary(None, None).await?));
     out.push_str(
         "# HELP pumper_apps Registered apps (ready = all preconditions satisfied)\n\
          # TYPE pumper_apps gauge\n",
@@ -629,6 +621,47 @@ fn activity_metrics(reading: u64, pool_saturated: bool) -> String {
 /// janitor can lower `_total` series. The existing `pumper_job_failures_total`
 /// sets that precedent and states it in its HELP; these do the same rather than
 /// pretending to be monotonic.
+/// The cost series, from the `CostSummary` rows the ledger already groups by
+/// `(app, engine)`.
+///
+/// Extracted so the one gauge an operator wires a spend alert to is testable
+/// without a database — and so the rows' certainty columns have a single place
+/// to be rendered rather than being dropped at the render site.
+fn cost_metrics(rows: &[pumper_core::CostSummary]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n",
+    );
+    for entry in rows {
+        out.push_str(&format!(
+            "pumper_cost_usd{{app=\"{}\",engine=\"{}\"}} {}\n",
+            entry.app, entry.engine, entry.cost_usd
+        ));
+    }
+    // The companion series that makes the gauge above answerable. Without it a
+    // month of unmetered failures reads as a flat, reassuring spend line: the
+    // money is a LOWER BOUND and these rows already carry the counts saying so.
+    out.push_str(
+        "# HELP pumper_cost_uncertain_calls Calls in this group whose bill could not be read \
+         (unmetered + unknown). Non-zero means the matching pumper_cost_usd is a floor, not a \
+         price — see GET /costs?certainty=unmetered\n\
+         # TYPE pumper_cost_uncertain_calls gauge\n",
+    );
+    for entry in rows {
+        // Explicit zero, never an absent series: a clean group and a group that
+        // was never scraped must not look the same to an alert — the discipline
+        // pumper_remote_egress_fetches and pumper_checkpoint_failures_total
+        // already keep in this module.
+        out.push_str(&format!(
+            "pumper_cost_uncertain_calls{{app=\"{}\",engine=\"{}\"}} {}\n",
+            entry.app,
+            entry.engine,
+            entry.uncertain_calls()
+        ));
+    }
+    out
+}
+
 fn webhook_metrics(
     health: &pumper_core::DeliveryHealth,
     now: chrono::DateTime<chrono::Utc>,
@@ -678,6 +711,55 @@ fn webhook_metrics(
         health.delivered
     ));
     out
+}
+
+#[cfg(test)]
+mod cost_metric_tests {
+    use super::cost_metrics;
+    use pumper_core::CostSummary;
+
+    fn group(app: &str, engine: &str, cost_usd: f64, unmetered: i64, unknown: i64) -> CostSummary {
+        CostSummary {
+            app: app.into(),
+            engine: engine.into(),
+            calls: 3,
+            cost_usd,
+            unmetered_calls: unmetered,
+            unknown_calls: unknown,
+        }
+    }
+
+    /// Acceptance 6. The anti-pattern: a month of unmetered failures reads as a
+    /// flat, reassuring `pumper_cost_usd` line, because the gauge iterates rows
+    /// that CARRY `unmetered_calls` / `unknown_calls` and emits neither. A
+    /// spend alert has to be answerable.
+    #[test]
+    fn the_cost_gauge_publishes_the_uncertainty_the_rows_already_carry() {
+        let body = cost_metrics(&[group("demo", "claude", 1.25, 2, 1)]);
+        assert!(
+            body.contains("pumper_cost_usd{app=\"demo\",engine=\"claude\"} 1.25\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pumper_cost_uncertain_calls{app=\"demo\",engine=\"claude\"} 3\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("# TYPE pumper_cost_uncertain_calls gauge\n"),
+            "a Prometheus series needs its TYPE line: {body}"
+        );
+    }
+
+    /// An absent series and a zero series are different answers — the explicit-
+    /// zero discipline the rest of this module already keeps.
+    #[test]
+    fn a_clean_group_emits_an_explicit_zero_not_an_absent_series() {
+        let body = cost_metrics(&[group("demo", "http", 0.0, 0, 0)]);
+        assert!(
+            body.contains("pumper_cost_uncertain_calls{app=\"demo\",engine=\"http\"} 0\n"),
+            "{body}"
+        );
+    }
 }
 
 #[cfg(test)]

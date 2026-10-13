@@ -466,3 +466,475 @@ mod manifest_tests {
         }
     }
 }
+/// **The materiality inventory.** The sibling of
+/// `completeness_inventory_tests`, one layer down: that one pins "did this run
+/// get enough?", this one pins "is this change news?".
+///
+/// The defect it ratchets is identical in shape and was found in the same
+/// context. Four monitors lived in `crates/apps/` with four different answers —
+/// `watch` had none and reported the store's raw exact-hash `ChangeKind`,
+/// `connector-api-watch` had two (an empty line diff plus a Claude severity
+/// ladder), `plugin`'s observatory had a third, `hackernews` had none — and a
+/// fifth, `pumper_core::crawl::change_weight`, was already correct in `core`
+/// and reached by nobody. None of them could see the others, because apps may
+/// not depend on apps.
+#[cfg(test)]
+mod materiality_inventory_tests {
+    use super::apps;
+    use std::collections::BTreeSet;
+
+    /// The block a monitor puts in its declared `output_shape` once its answer
+    /// to "is this change news?" is a VERDICT from `pumper_core::materiality`
+    /// rather than a private rule. The brace is part of the marker: the word
+    /// alone appears in prose, the block is a declaration.
+    const VERDICT_MARKER: &str = "materiality {";
+
+    /// **EXACTLY** the registered apps that declare a materiality verdict.
+    /// Pinned as a set rather than a count, so a monitor that is added — or one
+    /// that quietly stops declaring — fails BY NAME instead of drifting.
+    const JUDGED_MONITORS: [&str; 2] = ["connector-api-watch", "watch"];
+
+    /// The monitors that still answer privately. They are listed, not
+    /// tolerated: `the_un_judged_monitor_list_only_ever_shrinks` fails the
+    /// moment one adopts the judge, which forces the entry out rather than
+    /// letting a permanent exemption accumulate.
+    ///
+    /// Out of this round's write set on purpose. `plugin`'s observatory already
+    /// solved its own case correctly with `DerivedPaths`, and `hackernews`'s
+    /// volatile `points`/`comments` is a *completeness* question entangled with
+    /// a materiality one — bundling them is how a card stops being falsifiable.
+    const MONITORS_AWAITING_THE_JUDGE: [&str; 2] = ["hackernews", "plugin"];
+
+    fn shape_of(name: &str) -> String {
+        apps()
+            .iter()
+            .find(|a| a.name() == name)
+            .unwrap_or_else(|| panic!("'{name}' is not a registered app — the list is stale"))
+            .manifest()
+            .output_shape
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The EXPECTED-diff, reported in both directions so neither a new monitor
+    /// nor a silently-dropped verdict can slide past.
+    #[test]
+    fn the_monitors_that_declare_a_materiality_verdict_are_exactly_the_listed_ones() {
+        let found: BTreeSet<String> = apps()
+            .iter()
+            .filter(|a| {
+                a.manifest()
+                    .output_shape
+                    .unwrap_or("")
+                    .contains(VERDICT_MARKER)
+            })
+            .map(|a| a.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = JUDGED_MONITORS.iter().map(|n| n.to_string()).collect();
+        let added: Vec<&String> = found.difference(&expected).collect();
+        let gone: Vec<&String> = expected.difference(&found).collect();
+        assert!(
+            added.is_empty() && gone.is_empty(),
+            "the materiality inventory drifted. App(s) newly declaring a verdict: \
+             {added:?} — add them to JUDGED_MONITORS. Listed app(s) that no longer \
+             declare one: {gone:?} — a verdict that vanished means that monitor went \
+             back to answering 'is this change news?' privately, which is exactly how \
+             four monitors ended up with four answers."
+        );
+    }
+
+    /// Every listed monitor must be a registered app with an `output_shape` —
+    /// a hand-kept list that outlives its apps is a lie.
+    #[test]
+    fn every_listed_monitor_is_registered() {
+        for name in JUDGED_MONITORS
+            .iter()
+            .chain(MONITORS_AWAITING_THE_JUDGE.iter())
+        {
+            assert!(
+                !shape_of(name).is_empty(),
+                "app '{name}' declares no output_shape at all, so nothing can be \
+                 asserted about its verdict"
+            );
+        }
+    }
+
+    /// The exemption list is a countdown, not a carve-out, and it may not grow:
+    /// a fifth private answer to "is this change news?" is the defect, not a
+    /// new entry.
+    #[test]
+    fn the_un_judged_monitor_list_only_ever_shrinks() {
+        for name in MONITORS_AWAITING_THE_JUDGE {
+            assert!(
+                !shape_of(name).contains(VERDICT_MARKER),
+                "app '{name}' now declares a `{VERDICT_MARKER}` block, so it is no \
+                 longer awaiting the judge — drop it from MONITORS_AWAITING_THE_JUDGE"
+            );
+        }
+        assert!(
+            MONITORS_AWAITING_THE_JUDGE.len() <= 2,
+            "the un-judged monitor list grew; a new monitor routes through \
+             `pumper_core::materiality`, it does not join the exemption"
+        );
+    }
+}
+
+#[cfg(test)]
+mod completeness_inventory_tests {
+    use super::apps;
+    use std::collections::BTreeSet;
+
+    /// The word an app puts in its declared `output_shape` once its
+    /// completeness floor became a VERDICT rather than a private const.
+    const VERDICT_MARKER: &str = "completeness";
+    /// The legacy vocabulary: every floor written before the judge existed
+    /// described itself as a `floor` in the block it reported.
+    const LEGACY_FLOOR_MARKER: &str = "floor";
+
+    /// **EXACTLY** the apps that route a completeness floor through
+    /// `pumper_core::completeness`. Pinned as a set rather than a count, so a
+    /// market-data app that is added — or one that quietly stops reporting its
+    /// verdict — fails this test BY NAME instead of drifting.
+    ///
+    /// That naming is the durable change of this round: the silent-partial-
+    /// success defect had been fixed four times by four authors, in four
+    /// vocabularies, and generalised zero times. The guard that stops a fifth
+    /// private fix is a list that cannot be out of date.
+    const JUDGED: [&str; 8] = [
+        "homewyse-pricing",
+        "mpsv-ispv",
+        "mpsv-vpm",
+        "smlouvy-dump-watch",
+        "state-licensing",
+        "state-tax",
+        "trade-wages",
+        "valuation-multiples",
+    ];
+
+    /// The ONE app that still judges its floor privately. It is listed, not
+    /// tolerated: `the_un_judged_list_only_ever_shrinks` fails the moment it
+    /// routes through the judge, which forces the entry out rather than letting
+    /// a permanent exemption accumulate.
+    ///
+    /// Out of this round's write set on purpose — `hackernews` is the generic
+    /// template app, not a market-data one, and its parsed/seen share over a
+    /// fixed-size front page moves with its own change.
+    const AWAITING_THE_JUDGE: [&str; 1] = ["hackernews"];
+
+    fn shape_of(name: &str) -> String {
+        apps()
+            .iter()
+            .find(|a| a.name() == name)
+            .unwrap_or_else(|| panic!("'{name}' is not a registered app — the list is stale"))
+            .manifest()
+            .output_shape
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The EXPECTED-diff, reported in both directions so neither a new app nor
+    /// a silently-dropped verdict can slide past.
+    #[test]
+    fn the_apps_that_declare_a_verdict_are_exactly_the_listed_ones() {
+        let found: BTreeSet<String> = apps()
+            .iter()
+            .filter(|a| {
+                a.manifest()
+                    .output_shape
+                    .unwrap_or("")
+                    .contains(VERDICT_MARKER)
+            })
+            .map(|a| a.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = JUDGED.iter().map(|n| n.to_string()).collect();
+        let added: Vec<&String> = found.difference(&expected).collect();
+        let gone: Vec<&String> = expected.difference(&found).collect();
+        assert!(
+            added.is_empty() && gone.is_empty(),
+            "the completeness inventory drifted. App(s) newly declaring a verdict: \
+             {added:?} — add them to JUDGED. Listed app(s) that no longer declare one: \
+             {gone:?} — a verdict that vanished is how the silent-partial-success \
+             defect comes back."
+        );
+    }
+
+    /// **The ratchet.** An app that still describes a `floor` in the legacy
+    /// vocabulary must also report the verdict that floor produces. Computing
+    /// the judgment and discarding it is the exact shape four of five apps
+    /// shipped: a 1-of-5 run was a green job carrying a string in `warnings[]`
+    /// that nothing reads.
+    #[test]
+    fn an_app_that_declares_a_floor_also_declares_its_verdict() {
+        for app in apps() {
+            let name = app.name();
+            if AWAITING_THE_JUDGE.contains(&name) {
+                continue;
+            }
+            let shape = app.manifest().output_shape.unwrap_or("");
+            if !shape.contains(LEGACY_FLOOR_MARKER) {
+                continue;
+            }
+            assert!(
+                shape.contains(VERDICT_MARKER),
+                "app '{name}' declares a completeness floor but no `{VERDICT_MARKER}` \
+                 block — it computes the judgment and throws it away. Judge it with \
+                 `pumper_core::completeness` and report `completeness` in its \
+                 output_shape."
+            );
+        }
+    }
+
+    /// Every judged app must be registered, and every app named in either list
+    /// must exist — a hand-kept list that outlives its apps is a lie.
+    #[test]
+    fn every_listed_app_is_registered() {
+        for name in JUDGED.iter().chain(AWAITING_THE_JUDGE.iter()) {
+            assert!(
+                !shape_of(name).is_empty(),
+                "app '{name}' declares no output_shape at all, so nothing can be \
+                 asserted about its verdict"
+            );
+        }
+    }
+
+    /// The exemption list is a countdown, not a carve-out: once an app routes
+    /// through the judge, leaving it here is itself the failure.
+    #[test]
+    fn the_un_judged_list_only_ever_shrinks() {
+        for name in AWAITING_THE_JUDGE {
+            assert!(
+                !shape_of(name).contains(VERDICT_MARKER),
+                "app '{name}' now declares `{VERDICT_MARKER}`, so it is no longer \
+                 awaiting the judge — drop it from AWAITING_THE_JUDGE"
+            );
+        }
+        assert!(
+            AWAITING_THE_JUDGE.len() <= 1,
+            "the un-judged floor list grew; a new app must route through \
+             `pumper_core::completeness`, not join the exemption"
+        );
+    }
+}
+
+// ---- The catalog denominator -------------------------------------------------
+//
+// `ONBOARDING.md` §10 says adding an app REQUIRES its `[[source]]` row in
+// `catalog/data-sources.toml`. For most of this registry's life that rule was
+// a sentence, and nine registered apps missed it. The roster below plus
+// `the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster` turn it
+// into a gate, and `pumper_core::uncovered_apps` renders the same join on
+// `GET /sources` so an operator never has to diff two files by hand.
+
+/// A registered app that deliberately has no `[[source]]` row.
+pub(crate) struct NonSourceApp {
+    /// The app's `name()`.
+    pub name: &'static str,
+    /// Why it is not a catalog source. An exemption without a reason is how a
+    /// roster becomes a dumping ground.
+    pub reason: &'static str,
+}
+
+/// Registered apps that are NOT data sources, each with its reason.
+///
+/// The bar is narrow on purpose: an app qualifies only when there is no single
+/// upstream to declare — generic tooling the caller points at a URL, or a
+/// control-plane app that writes nothing scheduled. "This source belongs to a
+/// sibling product" is NOT a reason; such an app still publishes a dataset on
+/// a cadence, and leaving it out is exactly the drift that made `declared: 12`
+/// unreadable. Every app here is one whose dataset no catalog row could ever
+/// describe.
+pub(crate) const NON_SOURCE_APPS: &[NonSourceApp] = &[
+    NonSourceApp {
+        name: "crawl",
+        reason: "generic multi-page crawler; the caller supplies the seed URL",
+    },
+    NonSourceApp {
+        name: "extractor",
+        reason: "generic rule-driven extractor; the caller supplies the page and the rules",
+    },
+    NonSourceApp {
+        name: "peer",
+        reason: "pulls from another Pumper instance into a caller-named namespace — \
+                 its upstream is whatever remote the job points at",
+    },
+    NonSourceApp {
+        name: "plugin",
+        reason: "runs a WASM guest from data/plugins/; the plugin, not the app, has the source",
+    },
+    NonSourceApp {
+        name: "provisioner",
+        reason: "an on-demand compiler that PROPOSES catalog rows for human review; it \
+                 deliberately never appears in the catalog it writes proposals for",
+    },
+    NonSourceApp {
+        name: "readable",
+        reason: "generic article extractor; the caller supplies the URL",
+    },
+    NonSourceApp {
+        name: "research",
+        reason: "generic Claude research runner; the caller supplies the question",
+    },
+    NonSourceApp {
+        name: "transact",
+        reason: "an on-demand dry-run browser-flow executor that writes no dataset at all \
+                 (no ctx.upsert/sync call in crates/apps/transact/src/lib.rs), so there is \
+                 nothing for a contract or a staleness window to attach to",
+    },
+    NonSourceApp {
+        name: "watch",
+        reason: "generic change watcher; the caller supplies the URL",
+    },
+];
+
+/// The roster as it is rendered on `GET /sources`: one `{app, reason}` object
+/// per entry, in declaration order.
+///
+/// The reasons exist to be READ. A `uncovered_apps: []` beside a roster nobody
+/// can see is an unexplained claim, and an exemption whose justification lives
+/// only in a source comment is how the previous 18-entry list drifted into a
+/// scope argument for nine publishing apps.
+pub(crate) fn non_source_roster() -> Value {
+    Value::Array(
+        NON_SOURCE_APPS
+            .iter()
+            .map(|e| json!({ "app": e.name, "reason": e.reason }))
+            .collect(),
+    )
+}
+
+/// The names on [`NON_SOURCE_APPS`], for the catalog join.
+pub(crate) fn non_source_app_names() -> Vec<&'static str> {
+    NON_SOURCE_APPS.iter().map(|e| e.name).collect()
+}
+
+/// Every registered app's `name()`.
+pub(crate) fn app_names() -> Vec<&'static str> {
+    apps().iter().map(|a| a.name()).collect()
+}
+
+#[cfg(test)]
+mod catalog_coverage_tests {
+    use super::{app_names, non_source_app_names, NON_SOURCE_APPS};
+    use pumper_core::Catalog;
+    use std::collections::BTreeSet;
+
+    /// Embedded at compile time so the check does not depend on the test's
+    /// working directory — the same trick `routes::catalog_tests` uses.
+    const CATALOG_TOML: &str = include_str!("../../../catalog/data-sources.toml");
+
+    fn catalog() -> Catalog {
+        Catalog::parse(CATALOG_TOML).expect("catalog/data-sources.toml parses")
+    }
+
+    /// **The gate.** ONBOARDING §10 as an EXPECTED-diff, reported in both
+    /// directions: an app with neither a live `[[source]]` row nor a
+    /// `NON_SOURCE_APPS` entry fails BY NAME, and a roster entry for an app
+    /// that has since grown a row fails too, so the exemption list cannot
+    /// outlive its reason.
+    #[test]
+    fn the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster() {
+        let catalog = catalog();
+        let sourced = catalog.sourced_apps();
+        let exempt = non_source_app_names();
+        let registered = app_names();
+
+        let uncovered = pumper_core::uncovered_apps(&registered, &exempt, &sourced);
+        assert!(
+            uncovered.is_empty(),
+            "registered app(s) with no live [[source]] row and no NON_SOURCE_APPS entry: \
+             {uncovered:?}. ONBOARDING §10: add the row to catalog/data-sources.toml, or \
+             add the app to NON_SOURCE_APPS with the reason it can never have one."
+        );
+
+        let redundant: Vec<&str> = exempt
+            .iter()
+            .copied()
+            .filter(|name| sourced.contains(name))
+            .collect();
+        assert!(
+            redundant.is_empty(),
+            "NON_SOURCE_APPS claims {redundant:?} can never have a catalog row, but the \
+             catalog now names them. Drop the exemption — a stale carve-out is how the \
+             roster stops meaning anything."
+        );
+    }
+
+    /// An exemption for an app nobody registers is dead weight that hides the
+    /// next real gap.
+    #[test]
+    fn every_roster_entry_is_a_registered_app_with_a_reason() {
+        let registered: BTreeSet<&str> = app_names().into_iter().collect();
+        for entry in NON_SOURCE_APPS {
+            assert!(
+                registered.contains(entry.name),
+                "NON_SOURCE_APPS names '{}', which is not a registered app",
+                entry.name
+            );
+            assert!(
+                entry.reason.len() > 20,
+                "NON_SOURCE_APPS entry '{}' has no real reason",
+                entry.name
+            );
+        }
+        let names: BTreeSet<&str> = NON_SOURCE_APPS.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names.len(),
+            NON_SOURCE_APPS.len(),
+            "NON_SOURCE_APPS has a duplicate entry"
+        );
+    }
+
+    /// The roster `GET /sources` renders must carry every entry WITH its
+    /// reason — `transact` specifically, because it writes no dataset at all
+    /// and is therefore the clearest case that the bar is "no upstream to
+    /// declare", not "out of scope".
+    #[test]
+    fn the_rendered_roster_carries_a_reason_for_every_entry() {
+        let rendered = super::non_source_roster();
+        let rows = rendered.as_array().expect("an array of {app, reason}");
+        assert_eq!(rows.len(), NON_SOURCE_APPS.len());
+        for row in rows {
+            assert!(row["app"].as_str().is_some_and(|a| !a.is_empty()), "{row}");
+            assert!(
+                row["reason"].as_str().is_some_and(|r| r.len() > 20),
+                "an exemption without a readable reason: {row}"
+            );
+        }
+        let transact = rows
+            .iter()
+            .find(|r| r["app"] == "transact")
+            .expect("transact is on the roster");
+        assert!(
+            transact["reason"].as_str().unwrap().contains("no dataset"),
+            "transact's reason must say it writes no dataset: {transact}"
+        );
+    }
+
+    /// The roster is a carve-out for tooling, not a scope argument. It must
+    /// never regrow into the "sibling-product consumer" exemption that hid
+    /// nine publishing apps from governance.
+    #[test]
+    fn the_roster_never_exempts_an_app_that_publishes_a_dataset() {
+        const NEVER_EXEMPT: &[&str] = &[
+            "census-density",
+            "census-nonemp",
+            "cms-fee-schedule",
+            "hackernews",
+            "homewyse-pricing",
+            "smlouvy-dump-watch",
+            "state-tax",
+            "trade-wages",
+            "valuation-multiples",
+        ];
+        let names: BTreeSet<&str> = NON_SOURCE_APPS.iter().map(|e| e.name).collect();
+        let regressed: Vec<&&str> = NEVER_EXEMPT
+            .iter()
+            .filter(|n| names.contains(**n))
+            .collect();
+        assert!(
+            regressed.is_empty(),
+            "{regressed:?} publish datasets and were exempted once already — they get a \
+             [[source]] row, not an exemption"
+        );
+    }
+}

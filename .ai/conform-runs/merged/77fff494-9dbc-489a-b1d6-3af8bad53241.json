@@ -1,0 +1,138 @@
+{
+ "schema": "conform-run/1",
+ "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+ "subject": "prompt-assembly",
+ "evaluatedAt": "2026-10-13T01:11:05.706350+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/mcp/mod.rs:144 The server maintains handwritten MCP tool definitions separately from its dispatch match, leaving two authorities for the capability vocabulary.",
+   "techniques": [
+    {
+     "technique": "capability-documentation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:144 server_tools manually enumerates names and descriptions at lines 141\u2013319; tools_call separately enumerates handlers at lines 361\u2013376, rather than rendering documentation from a registry containing dispatch bindings."
+    }
+   ]
+  },
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "scripts/docs/check-doc-sync.mjs:314 Context and repository searches found transcript inspection and a Stop-hook reminder delivered through stderr, with complete model prompt assembly owned by the external coding harness.",
+   "techniques": [
+    {
+     "technique": "layered-composition",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/check-doc-sync.mjs:314 This hook contributes reminder text to an assembler it does not control, which the golden path distinguishes from owning prompt assembly."
+    }
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/provisioner/src/lib.rs:1013 Provisioner constructs model-facing prose directly inside run(), bypassing an owned assembler that could enforce section contracts, trust classification, total context budget, and fingerprinting.",
+   "techniques": [
+    {
+     "technique": "context-budgeting",
+     "verdict": "deviation",
+     "evidence": "crates/apps/connector-api-watch/src/lib.rs:429 The diff drops added lines at this cap, and clamp() later drops further lines at MAX_DIFF_CHARS; the assembled ADDED/REMOVED sections give no omission notice or dropped count."
+    },
+    {
+     "technique": "context-ownership-regimes",
+     "verdict": "conformant",
+     "evidence": "crates/apps/research/src/lib.rs:526 The research app delegates conversation continuation to the stateful CLI agent using its session identifier; it does not maintain or compact a client message list."
+    },
+    {
+     "technique": "continuation-prompts",
+     "verdict": "deviation",
+     "evidence": "crates/apps/provisioner/src/lib.rs:1145 The repair branch sends only feedback and a revision instruction even when session_id is None; that fresh session receives neither the original goal nor the sampled page and rule contract."
+    },
+    {
+     "technique": "fingerprinting-and-cache-keys",
+     "verdict": "deviation",
+     "evidence": "crates/apps/research/src/lib.rs:126 Checkpoint admission checks state version and spend sanity before resuming, but RunState carries no standing-prompt, capability-set, or model fingerprint to compare against current configuration."
+    },
+    {
+     "technique": "layered-composition",
+     "verdict": "deviation",
+     "evidence": "crates/apps/provisioner/src/lib.rs:1013 Discovery prose is constructed at the execution call site; drafting and repair prose are likewise formatted inside run(), without independently rendered sections or a sealed assembled artifact."
+    },
+    {
+     "technique": "variable-interpolation",
+     "verdict": "deviation",
+     "evidence": "crates/apps/provisioner/src/lib.rs:1142 Scraped page content enters an ordinary formatting slot with no template-level declaration of its untrusted class or mechanically enforced insertion-point policy."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "prompt-assembly",
+   "context": "pumper-sync-sdk",
+   "reason": "pair anchor refused: clients/typescript/package.json:4 does not contain the quoted text"
+  },
+  {
+   "subject": "prompt-assembly",
+   "context": "grants-intelligence",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-13T01:11:05.706350+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [
+    "capability-documentation"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-13T01:11:05.706350+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [
+    "layered-composition"
+   ],
+   "deviations": 0,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-13T01:11:05.706350+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [
+    "context-budgeting",
+    "context-ownership-regimes",
+    "continuation-prompts",
+    "fingerprinting-and-cache-keys",
+    "layered-composition",
+    "variable-interpolation"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

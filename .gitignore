@@ -41,6 +41,7 @@ plugins-src/*/Cargo.lock
 !.claude/explorer/
 !.claude/perfect/
 !.claude/research/
+!.claude/contest/
 # ship-loop keeps its mutable loop state in the same directory — track only the
 # hand-maintained overlay, never state.md / backlog.md / journal.md / decisions.md.
 !.claude/ship-loop/
@@ -75,9 +76,19 @@ Thumbs.db
 /.claude/skills/research
 /.claude/skills/scan-sweep
 /.claude/skills/ship-loop
+/.claude/skills/spark
 /.claude/skills/test-before-commit
 /.claude/skills/tiger
 /.claude/rules/ai-registry-access.md
 /.claude/rules/ai-registry-software-engineering.md
 /.claude/rules/ai-registry-llm-observability.md
 # END ai-registry linked skills
+
+# /contest arena, staging and vault - entries and material, never committed
+/.contest/
+
+# /spark's memory vault (idea notes, design briefs, session records). Obsidian-
+# openable working state, not a reviewable artifact - the same posture as the
+# other loop vaults. What a spark actually SHIPS is its commits and the feature
+# docs they carry.
+/.spark/

@@ -1,0 +1,386 @@
+{
+  "dataset": {
+    "app": "grants",
+    "name": "unified"
+  },
+  "distinct_keys": 20,
+  "generated_by": "crates/core/tests/change_feed_keyset.rs::shared_stamp_feed_fixture_is_emitted_from_a_real_store",
+  "note": "Emitted from a real Datasets store: two upsert_many chunks, each sharing one revision created_at, paged ascending at limit 7 so the page boundaries cut through a stamp group. Only the wall-clock instants are normalized. Re-emit with PUMPER_UPDATE_FIXTURES=1.",
+  "pages": [
+    {
+      "items": [
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 0,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k00",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 1,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k01",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 2,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k02",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 3,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k03",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 4,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k04",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 5,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k05",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 6,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k06",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        }
+      ],
+      "next_cursor": "2026-01-01T00:00:00.000000Z|7"
+    },
+    {
+      "items": [
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 7,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k07",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 8,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k08",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 9,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k09",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 10,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k10",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:00.000000Z",
+          "data": {
+            "n": 11,
+            "wave": 1
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k11",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 12,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k12",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 13,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k13",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        }
+      ],
+      "next_cursor": "2026-01-01T00:00:01.000000Z|14"
+    },
+    {
+      "items": [
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 14,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k14",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 15,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k15",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 16,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k16",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 17,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k17",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 18,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k18",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        },
+        {
+          "app": "grants",
+          "artifact_sha": null,
+          "change": "new",
+          "created_at": "2026-01-01T00:00:01.000000Z",
+          "data": {
+            "n": 19,
+            "wave": 2
+          },
+          "dataset": "unified",
+          "diff": null,
+          "job_id": null,
+          "key": "k19",
+          "revision": 1,
+          "rules_hash": null,
+          "source_url": null,
+          "trust": "stable"
+        }
+      ],
+      "next_cursor": "2026-01-01T00:00:01.000000Z|20"
+    }
+  ]
+}

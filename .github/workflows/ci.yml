@@ -240,7 +240,15 @@ jobs:
       - name: Doc-sync hook fixtures
         if: ${{ !cancelled() }}
         run: node --test scripts/docs/check-doc-sync.test.mjs
+      # The gate's own VERDICT against this checkout. It ran nowhere before:
+      # the step below runs its fixtures, which proves the checker can still go
+      # red but never asks it what it thinks of the tree being merged.
       - name: MCP gate parity
+        if: ${{ !cancelled() }}
+        # Exit 2 = the gated-tool vocabulary has drifted between its three
+        # sites. Exit 3 = COULD NOT CHECK, which is not a pass.
+        run: node scripts/ci/mcp-gate-parity.mjs
+      - name: MCP gate parity fixtures
         if: ${{ !cancelled() }}
         run: node --test scripts/ci/mcp-gate-parity.test.mjs
 
@@ -272,25 +280,47 @@ jobs:
         # Exit 2 = findings (an expired entry, an orphan, an unregistered flake,
         # a breached ceiling). Exit 3 = COULD NOT CHECK, which is not a pass.
         run: node scripts/ci/flake-check.mjs
+      # `just disk-check` was a blocking rung of the LOCAL ladder that this
+      # workflow did not mention once: the string "disk" appeared zero times in
+      # this file. A check that runs locally and not on the merge pipeline is a
+      # courtesy, not a gate. --no-prune is the pure verdict on purpose: a CI
+      # runner must not self-heal a cache it throws away at the end of the job.
+      - name: Build cache budget
+        if: ${{ !cancelled() }}
+        # Exit 2 = target/ is over its declared ceiling. Exit 3 = COULD NOT
+        # CHECK, which is not a pass.
+        run: node scripts/ci/disk-check.mjs --no-prune
+      # This list is a projection of scripts/ci/gates.json, and the last line is
+      # the inventory test that holds it to that: a gate whose fixture suite is
+      # missing from this step reddens there. disk-check.test.mjs was exactly
+      # that gap -- in `just harness-test` and in no CI step at all.
       - name: Harness gate fixtures
         if: ${{ !cancelled() }}
         run: |
           node --test scripts/ci/flake-check.test.mjs
           node --test scripts/ci/lane-certify.test.mjs
-      # Register size WITH its trend and the age of the oldest entry, published
-      # wherever the suite's health is published — a size with no trend is a
-      # number, and a register growing monotonically is deletion with a slower
-      # fuse. Lane health goes in the same summary so "never green" is visible
-      # to whoever is already looking at the board.
-      - name: Publish harness health
+          node --test scripts/ci/disk-check.test.mjs
+          node --test scripts/ci/gate-inventory.test.mjs
+          node --test scripts/ci/quality-report.test.mjs
+      # The published posture, as a PROJECTION of scripts/ci/gates.json rather
+      # than a hand-walked subset of it. What was here before named two of the
+      # five gates — flake-check and lane-certify, each with `|| true` — so
+      # disk-check and mcp-gate-parity contributed nothing to the summary and a
+      # cannot-check in either of the two named ones was invisible as well. One
+      # table now, every registered gate in it, CANNOT CHECK counted in its own
+      # column, and a runnable remedy on every red row.
+      #
+      # Non-blocking on purpose, and `if: always()` on purpose: every row's gate
+      # has its own blocking rung in this same job, so failing here would red the
+      # job twice for one cause — and the summary is most worth having precisely
+      # on the runs where a rung above already failed.
+      - name: Quality posture
         if: ${{ !cancelled() }}
         run: |
           {
-            echo '## Test harness health'
-            echo '```'
-            node scripts/ci/flake-check.mjs --report || true
-            node scripts/ci/lane-certify.mjs --report || true
-            echo '```'
+            echo '## Quality posture'
+            echo
+            node scripts/ci/quality-report.mjs --markdown || true
           } >> "$GITHUB_STEP_SUMMARY"
 
   # The long lanes: nightly and on demand, never on a per-change gate.

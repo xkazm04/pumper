@@ -27,6 +27,11 @@ app-research.workspace = true
 app-readable.workspace = true
 app-watch.workspace = true
 app-grants-gov.workspace = true
+# The deadline rule, not two strings: `GET /grants/closing-soon` decides urgency
+# at `grants_common::deadline_end_utc`, the one instant the corpus sweep and the
+# per-source digests already decide at. The server is the wiring layer (it
+# already declares the three grants apps), so this edge is the legal one.
+grants-common.workspace = true
 app-cms-fee-schedule.workspace = true
 app-census-density.workspace = true
 app-census-nonemp.workspace = true

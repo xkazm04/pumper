@@ -4,10 +4,18 @@
 
 export { PumperClient, type PumperClientConfig } from "./client.js";
 export { createPumperSync, type PumperSyncConfig } from "./sync.js";
-export { memoryWatermark, kvWatermark } from "./watermark.js";
+export {
+  memoryWatermark,
+  kvWatermark,
+  parseWatermark,
+  formatWatermark,
+  normalizeStamp,
+  type FeedPosition,
+} from "./watermark.js";
 export { PumperHttpError, type HttpOptions } from "./http.js";
 export type {
   DatasetRef,
+  FeedOrder,
   PumperRecord,
   PumperRevision,
   RevisionChange,
@@ -17,5 +25,8 @@ export type {
   SyncMode,
   SyncResult,
   SyncProgress,
+  SyncRunOptions,
+  SyncSkipped,
+  SyncStatus,
   MapContext,
 } from "./types.js";

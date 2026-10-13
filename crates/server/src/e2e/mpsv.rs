@@ -37,6 +37,14 @@ use crate::state::AppState;
 /// assertions are about reachability, not about volume.
 const CELL: &str = "5223|MZDOVA";
 
+/// The namespace/dataset pair the rogue arm writes: a REAL virtual namespace
+/// (`cz-labour` is declared) with a dataset that is NOT in `INDEXED_DATASETS`.
+/// Picked this way on purpose — it keeps the control honest, because a detector
+/// that merely flagged "any app that is not `job.app`" would also flag the four
+/// declared `cz-labour` datasets and be useless.
+const ROGUE_APP: &str = "cz-labour";
+const ROGUE_DATASET: &str = "skill_demand";
+
 /// Stands in for an `mpsv-vpm` run: writes one record into **each dataset the
 /// real app declares**, and returns the real app's own `index_datasets` value.
 struct LabourProducer;
@@ -53,9 +61,39 @@ impl ScrapeApp for LabourProducer {
 
     async fn run(&self, ctx: AppContext) -> CoreResult<Value> {
         let cycle = ctx.params.get("cycle").and_then(Value::as_i64).unwrap_or(1);
+        // The ROGUE arm: one record under a namespace/dataset pair the result's
+        // `index_datasets` does NOT name. Without it this suite is structurally
+        // incapable of staging the bug its own module doc describes — the
+        // producer's write targets would be the same constant the assertions
+        // read, so no oracle here could ever disagree with the implementation.
+        // `cz-labour/skill_demand` is deliberately one of the eight names
+        // `indexed_datasets_exclude_the_high_cardinality_and_identity_less_tables`
+        // lists as excluded: a real app starting to write it is exactly the
+        // move nothing in this repo noticed.
+        // Stamped with this job's id, exactly as the real app does for its
+        // cross-namespace writes (`upsert_many_stamped(GAP_APP, .., Some(&job_prov))`
+        // — `ctx.upsert` can only write under `job.app`, so a virtual namespace
+        // has to carry the provenance explicitly). Unstamped writes are
+        // invisible to every job-scoped audit read, the receipt included.
+        let job_prov = pumper_core::datasets::Provenance {
+            job_id: Some(ctx.job_id.to_string()),
+            ..Default::default()
+        };
+        if ctx.params.get("rogue").and_then(Value::as_bool) == Some(true) {
+            ctx.datasets
+                .upsert_stamped(
+                    ROGUE_APP,
+                    ROGUE_DATASET,
+                    CELL,
+                    &json!({ "title": "undeclared skill demand", "cycle": cycle }),
+                    None,
+                    Some(&job_prov),
+                )
+                .await?;
+        }
         for (app, dataset) in app_mpsv_vpm::INDEXED_DATASETS {
             ctx.datasets
-                .upsert(
+                .upsert_stamped(
                     app,
                     dataset,
                     CELL,
@@ -63,6 +101,8 @@ impl ScrapeApp for LabourProducer {
                         "title": format!("CZ-ISCO 5223 MZDOVA — {dataset} cycle {cycle}"),
                         "cycle": cycle,
                     }),
+                    None,
+                    Some(&job_prov),
                 )
                 .await?;
         }
@@ -148,18 +188,26 @@ async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
 /// Runs one producer job through the real worker seam, so its writes and its
 /// declaration reach the fan-out exactly as in production.
 async fn run_cycle(state: &AppState, cycle: i64) {
-    state
+    run_cycle_maybe_rogue(state, cycle, false).await;
+}
+
+/// `run_cycle`, plus the job id and the switch that makes the producer write
+/// outside its own declaration. Returns the job id so the run can be read back
+/// through `GET /jobs/{id}/receipt` — the surface an operator actually reads.
+async fn run_cycle_maybe_rogue(state: &AppState, cycle: i64, rogue: bool) -> uuid::Uuid {
+    let job = state
         .storage
         .enqueue(
             "mpsv-vpm",
             pumper_core::EnqueueOptions {
-                params: json!({ "cycle": cycle }),
+                params: json!({ "cycle": cycle, "rogue": rogue }),
                 ..Default::default()
             },
         )
         .await
         .expect("enqueue");
     crate::worker::run_one(state).await;
+    job.id
 }
 
 /// The headline: a watch on the shared labour namespace is creatable AND fires.
@@ -314,4 +362,68 @@ async fn each_declared_dataset_is_indexed_as_its_own_titled_document() {
 
 fn ids(docs: &[pumper_core::SearchDoc]) -> Vec<&str> {
     docs.iter().map(|d| d.id.as_str()).collect()
+}
+
+// ── the write/declaration diff ──────────────────────────────────────────────
+
+/// Pulls `coverage` off the run's receipt, which is where an operator reads it.
+async fn coverage_of(router: &axum::Router, id: uuid::Uuid) -> Value {
+    let (status, receipt) = get_json(router, &format!("/jobs/{id}/receipt")).await;
+    assert_eq!(status, StatusCode::OK, "receipt: {receipt}");
+    receipt["coverage"].clone()
+}
+
+/// The headline. A run writes one record under `cz-labour/skill_demand`, a pair
+/// its result's `index_datasets` never names, and the receipt says so.
+///
+/// Before this existed there was NO signal of any kind: `run_indexed_apps` knew
+/// the declared set, `job_revision_counts` knew the observed set, and nothing
+/// in the repo diffed them. The class had already bitten `ca-grants` and `peer`
+/// — both found by a human, after shipping.
+#[tokio::test]
+async fn a_write_outside_the_declaration_is_named_on_the_receipt() {
+    let (state, _store, _search) = labour_state().await;
+    let router = routes::router(state.clone());
+    let id = run_cycle_maybe_rogue(&state, 1, true).await;
+
+    let coverage = coverage_of(&router, id).await;
+    let undeclared = coverage["undeclared"]
+        .as_array()
+        .unwrap_or_else(|| panic!("coverage.undeclared is absent: {coverage}"));
+    assert_eq!(
+        undeclared.len(),
+        1,
+        "exactly the rogue pair, not every write: {coverage}"
+    );
+    assert_eq!(undeclared[0]["app"], ROGUE_APP);
+    assert_eq!(undeclared[0]["dataset"], ROGUE_DATASET);
+    assert_eq!(
+        coverage["complete"],
+        json!(true),
+        "every revision of this run carries a job_id stamp, so the diff is \
+         complete and may be trusted: {coverage}"
+    );
+}
+
+/// The control arm, in the same run: the four pairs the result DOES declare
+/// stay out of `undeclared`, and `declared` is exactly `run_indexed_apps` —
+/// the job's own app plus the virtual apps its result names, in that order.
+#[tokio::test]
+async fn the_declared_namespaces_are_not_reported_and_declared_lists_the_run_apps() {
+    let (state, _store, _search) = labour_state().await;
+    let router = routes::router(state.clone());
+    let id = run_cycle_maybe_rogue(&state, 1, false).await;
+
+    let coverage = coverage_of(&router, id).await;
+    assert_eq!(
+        coverage["undeclared"],
+        json!([]),
+        "a run that wrote only what it declared has nothing to report: {coverage}"
+    );
+    assert_eq!(
+        coverage["declared"],
+        json!(["mpsv-vpm", "cz-labour"]),
+        "`declared` is run_indexed_apps(job.app, index_specs): the job's own \
+         app first, then the virtual apps the result names: {coverage}"
+    );
 }

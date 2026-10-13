@@ -1366,6 +1366,82 @@ async fn history_page_survives_clock_skew_without_skip_or_repeat() {
     );
 }
 
+/// The records walk — the `cursor=` form of `GET /datasets/{app}/{ds}` and every
+/// `/export` batch — seeks on `(updated_at, key)` DESC, and `updated_at` is
+/// mutable. A record the walk has not reached yet that is updated mid-walk jumps
+/// above the position, into the region already emitted, and appears on no page.
+/// This pins the contract docs/features/datasets.md § Querying & export states:
+/// a walk is not a snapshot, and the change feed read from the highest
+/// `updated_at` the walk saw is what recovers the jumped record (the
+/// `@pumper/sync` cold start does exactly that on its next run).
+#[tokio::test]
+async fn records_walk_misses_a_record_updated_mid_walk_and_the_change_feed_recovers_it() {
+    let store = fresh_db("datasets-walk-mutable-order").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    for key in ["a", "b", "c", "d"] {
+        ds.upsert("app", "d", key, &json!({ "v": 1 }))
+            .await
+            .unwrap();
+    }
+
+    // Page one: the two newest-updated records.
+    let first = ds
+        .list_records_view("app", "d", &[], None, 2, None, false)
+        .await
+        .unwrap();
+    let mut seen: Vec<String> = first.iter().map(|r| r.key.clone()).collect();
+    assert_eq!(seen, vec!["d", "c"], "newest-updated first");
+    let watermark = first.iter().map(|r| r.updated_at).max().unwrap();
+    let last = first.last().unwrap();
+    let mut after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
+
+    // Control: from this position, before anything moves, the rest of the walk
+    // still holds "a" — so its absence below is the update, not the seek.
+    let rest: Vec<String> = ds
+        .list_records_view("app", "d", &[], after.clone(), 10, None, false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(rest, vec!["b", "a"]);
+
+    // Mid-walk: the oldest record, not reached yet, changes.
+    ds.upsert("app", "d", "a", &json!({ "v": 2 }))
+        .await
+        .unwrap();
+
+    loop {
+        let page = ds
+            .list_records_view("app", "d", &[], after.clone(), 2, None, false)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
+        seen.extend(page.iter().map(|r| r.key.clone()));
+        if page.len() < 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        vec!["d", "c", "b"],
+        "the record updated mid-walk moved ahead of the position and is on no page"
+    );
+
+    let feed = ds
+        .changes_page("app", Some("d"), Some(watermark), None, 100, None)
+        .await
+        .unwrap();
+    let recovered: Vec<&str> = feed.items.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        recovered,
+        vec!["a"],
+        "the change feed since the walk's highest updated_at carries the jumped record"
+    );
+}
+
 // ── derived: trust inheritance + provenance ──────────────────────────────────
 
 /// The laundering hole: derived rows used to be written with `trust = None`,
