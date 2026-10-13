@@ -86,7 +86,7 @@ impl JobQuery {
 ///
 /// Values are **bound**, never interpolated. The only text this function
 /// pushes is its own column names.
-fn push_job_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, q: &JobQuery) {
+fn push_job_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, q: &JobQuery) {
     if let Some(app) = &q.app {
         qb.push(" AND app = ");
         qb.push_bind(app.clone());
@@ -122,12 +122,12 @@ fn push_job_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, q: &JobQuery)
 /// their `WHERE` from here, so no two of them can disagree about what a
 /// filter means. `select` is the projection (and, for the probe, carries
 /// the `EXPLAIN QUERY PLAN` prefix).
-fn job_query_builder<'a>(
+fn job_query_builder(
     select: &str,
     q: &JobQuery,
-    after: Option<&'a (String, String)>,
+    after: Option<&(String, String)>,
     order_and_limit: Option<i64>,
-) -> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     // `WHERE 1 = 1` so every predicate below is uniformly ` AND …`; SQLite
     // folds the constant away before planning, which the plan assertion in
     // `crates/core/tests/jobs.rs` is what actually proves.
@@ -755,7 +755,7 @@ impl Storage {
 
     async fn get_by_idempotency_key(&self, key: &str) -> Result<Option<Job>> {
         let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE idempotency_key = ?1");
-        let row: Option<JobRow> = sqlx::query_as(&sql)
+        let row: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -811,7 +811,7 @@ impl Storage {
         );
         let row = self
             .metered(StoreOp::JobClaim, |mut conn| async move {
-                let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(now());
+                let mut query = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql)).bind(now());
                 for app in blocked {
                     query = query.bind(app);
                 }
@@ -1094,7 +1094,7 @@ impl Storage {
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Job>> {
         let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
-        let row: Option<JobRow> = sqlx::query_as(&sql)
+        let row: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -1279,11 +1279,11 @@ impl Storage {
     /// the gauge cannot drift from the guard it reports on.
     pub async fn held_by_target(&self) -> Result<i64> {
         self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
-            let (n,): (i64,) = sqlx::query_as(&format!(
+            let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM jobs \
                  WHERE status = 'queued' AND available_at <= ?1 \
                    AND NOT (1 = 1{TARGET_EXCLUSION})"
-            ))
+            )))
             .bind(now())
             .fetch_one(&mut *conn)
             .await?;
@@ -1447,7 +1447,7 @@ impl Storage {
         );
         let rows: Vec<JobRow> = self
             .metered(StoreOp::JobRecovery, |mut conn| async move {
-                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(RECOVERY_SWEEP_LIMIT)
                     .fetch_all(&mut *conn)
                     .await?;
@@ -1547,7 +1547,7 @@ impl Storage {
         );
         let rows: Vec<JobRow> = self
             .metered(StoreOp::JobRecovery, |mut conn| async move {
-                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(&cutoff)
                     .bind(RECOVERY_SWEEP_LIMIT)
                     .fetch_all(&mut *conn)
@@ -1614,9 +1614,9 @@ impl Storage {
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+        let rows: Vec<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY app"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Schedule::try_from).collect()
@@ -1630,11 +1630,11 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<Schedule>> {
         let (after_ts, after_id) = split_after(after);
-        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+        let rows: Vec<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules \
              WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2)) \
              ORDER BY created_at DESC, id DESC LIMIT ?3"
-        ))
+        )))
         .bind(after_ts)
         .bind(after_id)
         .bind(limit)
@@ -1644,9 +1644,9 @@ impl Storage {
     }
 
     pub async fn get_schedule(&self, id: &str) -> Result<Option<Schedule>> {
-        let row: Option<ScheduleRow> = sqlx::query_as(&format!(
+        let row: Option<ScheduleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -2052,9 +2052,9 @@ impl Storage {
     }
 
     pub async fn get_trigger(&self, id: &str) -> Result<Option<Trigger>> {
-        let row: Option<TriggerRow> = sqlx::query_as(&format!(
+        let row: Option<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE id = ?1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -2063,10 +2063,10 @@ impl Storage {
 
     /// All triggers, optionally filtered by source app.
     pub async fn list_triggers(&self, source_app: Option<&str>) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE (?1 IS NULL OR source_app = ?1) ORDER BY created_at"
-        ))
+        )))
         .bind(source_app)
         .fetch_all(&self.pool)
         .await?;
@@ -2082,12 +2082,12 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<Trigger>> {
         let (after_ts, after_id) = split_after(after);
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE (?1 IS NULL OR source_app = ?1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4"
-        ))
+        )))
         .bind(source_app)
         .bind(after_ts)
         .bind(after_id)
@@ -2103,10 +2103,10 @@ impl Storage {
         source_kind: &str,
         source_app: &str,
     ) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE source_kind = ?1 AND source_app = ?2 AND enabled = 1"
-        ))
+        )))
         .bind(source_kind)
         .bind(source_app)
         .fetch_all(&self.pool)
@@ -2139,7 +2139,7 @@ impl Storage {
             "SELECT {JOB_COLUMNS} FROM jobs WHERE trigger_id = ?1 \
              ORDER BY created_at DESC LIMIT ?2"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(trigger_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -2160,7 +2160,7 @@ impl Storage {
             "SELECT {JOB_COLUMNS} FROM jobs WHERE schedule_id = ?1 \
              ORDER BY created_at DESC LIMIT ?2"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(schedule_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -2957,10 +2957,11 @@ impl Storage {
         let mut out = Vec::new();
         for table in LEDGER_TABLES {
             // `table` comes from a crate constant, never from a caller.
-            let row: (i64, Option<String>) =
-                sqlx::query_as(&format!("SELECT COUNT(*), MIN(created_at) FROM {table}"))
-                    .fetch_one(&self.pool)
-                    .await?;
+            let row: (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*), MIN(created_at) FROM {table}"
+            )))
+            .fetch_one(&self.pool)
+            .await?;
             out.push(LedgerStat {
                 table: table.to_string(),
                 rows: row.0,
@@ -3063,11 +3064,11 @@ impl Storage {
     /// Enabled external-kind triggers for one ingress source — the evaluation
     /// set for an inbound event. `source_app = '*'` triggers match every source.
     pub async fn enabled_external_triggers(&self, source_id: &str) -> Result<Vec<Trigger>> {
-        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+        let rows: Vec<TriggerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE source_kind = 'external' AND (source_app = ?1 OR source_app = '*') \
              AND enabled = 1"
-        ))
+        )))
         .bind(source_id)
         .fetch_all(&self.pool)
         .await?;
@@ -3414,7 +3415,7 @@ impl Storage {
     pub async fn triggered_hops(&self, job_id: Uuid) -> Result<Vec<Job>> {
         let sql =
             format!("SELECT {JOB_COLUMNS} FROM jobs WHERE source_job_id = ?1 ORDER BY created_at");
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(job_id.to_string())
             .fetch_all(&self.pool)
             .await?;
@@ -3485,23 +3486,24 @@ impl Storage {
     }
 
     pub async fn get_derived_spec(&self, id: &str) -> Result<Option<DerivedSpec>> {
-        let row: Option<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
-            "SELECT {} FROM derived WHERE id = ?1",
-            crate::datasets::DERIVED_COLUMNS
-        ))
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<crate::datasets::DerivedRow> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM derived WHERE id = ?1",
+                crate::datasets::DERIVED_COLUMNS
+            )))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(DerivedSpec::try_from).transpose()
     }
 
     /// All derived specs, optionally filtered by source app.
     pub async fn list_derived_specs(&self, app: Option<&str>) -> Result<Vec<DerivedSpec>> {
-        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM derived WHERE (?1 IS NULL OR source_app = ?1) \
              ORDER BY created_at, id",
             crate::datasets::DERIVED_COLUMNS
-        ))
+        )))
         .bind(app)
         .fetch_all(&self.pool)
         .await?;

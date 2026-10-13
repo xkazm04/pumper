@@ -162,11 +162,11 @@ impl HealthStore {
         app: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SourceHealth>> {
-        let rows: Vec<SourceRow> = sqlx::query_as(&format!(
+        let rows: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "{SOURCE_COLUMNS_LIST_SQL} \
              WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR app = ?2) \
              ORDER BY degradation_score DESC, id ASC LIMIT ?3"
-        ))
+        )))
         .bind(state)
         .bind(app)
         .bind(limit)
@@ -217,12 +217,12 @@ impl HealthStore {
     /// rows rather than accumulated in a counter, so it cannot drift out of sync
     /// with the history it claims to summarize.
     async fn recent_trips(&self, id: &str, n: i64, degrade_score: f64) -> Result<u32> {
-        let scores: Vec<f64> = sqlx::query_scalar(&format!(
+        let scores: Vec<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT score FROM source_runs WHERE source_id = ?1 \
              AND verdict IN {} \
              ORDER BY created_at DESC LIMIT ?2",
             RunVerdict::JUDGED_SQL
-        ))
+        )))
         .bind(id)
         .bind(n)
         .fetch_all(&self.pool)
@@ -248,12 +248,12 @@ impl HealthStore {
         degrade_score: f64,
         limit: i64,
     ) -> Result<u32> {
-        let scores: Vec<f64> = sqlx::query_scalar(&format!(
+        let scores: Vec<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT score FROM source_runs WHERE source_id = ?1 \
              AND verdict IN {} AND created_at > ?2 \
              ORDER BY created_at DESC LIMIT ?3",
             RunVerdict::JUDGED_SQL
-        ))
+        )))
         .bind(id)
         .bind(since)
         .bind(limit)
@@ -699,18 +699,18 @@ impl HealthStore {
              WHERE n.source_id = {t}.source_id \
                AND n.created_at >= (SELECT r.created_at FROM source_runs AS r \
                                     WHERE r.source_id = {t}.source_id AND r.job_id = {t}.job_id))";
-        let sketches = sqlx::query(&format!(
+        let sketches = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM field_sketches WHERE {} > ?1",
             newer_than_mine.replace("{t}", "field_sketches")
-        ))
+        )))
         .bind(keep)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        let runs = sqlx::query(&format!(
+        let runs = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM source_runs WHERE {} > ?1",
             newer_than_mine.replace("{t}", "source_runs")
-        ))
+        )))
         .bind(keep)
         .execute(&self.pool)
         .await?

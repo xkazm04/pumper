@@ -127,10 +127,12 @@ async fn dump(pool: &SqlitePool) -> String {
         ("field_invariants", "source_id, field"),
     ] {
         out.push_str(&format!("-- {table}\n"));
-        let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY {order}"))
-            .fetch_all(pool)
-            .await
-            .expect("dump table");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT * FROM {table} ORDER BY {order}"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("dump table");
         for row in rows {
             for i in 0..row.len() {
                 // Read every column as raw bytes so BLOBs (the sketch encodings)

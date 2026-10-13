@@ -37,12 +37,14 @@ async fn table_names(pool: &SqlitePool) -> BTreeSet<String> {
 }
 
 async fn column_names(pool: &SqlitePool, table: &str) -> BTreeSet<String> {
-    sqlx::query_scalar::<_, String>(&format!("SELECT name FROM pragma_table_info('{table}')"))
-        .fetch_all(pool)
-        .await
-        .expect("pragma_table_info")
-        .into_iter()
-        .collect()
+    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+        "SELECT name FROM pragma_table_info('{table}')"
+    )))
+    .fetch_all(pool)
+    .await
+    .expect("pragma_table_info")
+    .into_iter()
+    .collect()
 }
 
 /// Replays the whole chain into a brand-new database and diffs the schema.
