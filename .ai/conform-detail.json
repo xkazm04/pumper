@@ -1375,6 +1375,79 @@
           "evidence": "scripts/docs/fixtures/README.md:8 Test fixtures use synthetic transcript entries rather than attributing substituted tool frame results."
         }
       ]
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/prompt-assembly": {
+      "context": "api-server-core",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T01:11:05.706Z",
+      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "techniques": [
+        {
+          "technique": "capability-documentation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:144 server_tools manually enumerates names and descriptions at lines 141–319; tools_call separately enumerates handlers at lines 361–376, rather than rendering documentation from a registry containing dispatch bindings."
+        }
+      ]
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/prompt-assembly": {
+      "context": "docs-and-ops-scripts",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T01:11:05.706Z",
+      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "techniques": [
+        {
+          "technique": "layered-composition",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:314 This hook contributes reminder text to an assembler it does not control, which the golden path distinguishes from owning prompt assembly."
+        }
+      ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/prompt-assembly": {
+      "context": "content-monitoring",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-13",
+      "evaluatedTs": "2026-10-13T01:11:05.706Z",
+      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "techniques": [
+        {
+          "technique": "context-budgeting",
+          "verdict": "deviation",
+          "evidence": "crates/apps/connector-api-watch/src/lib.rs:429 The diff drops added lines at this cap, and clamp() later drops further lines at MAX_DIFF_CHARS; the assembled ADDED/REMOVED sections give no omission notice or dropped count."
+        },
+        {
+          "technique": "context-ownership-regimes",
+          "verdict": "conformant",
+          "evidence": "crates/apps/research/src/lib.rs:526 The research app delegates conversation continuation to the stateful CLI agent using its session identifier; it does not maintain or compact a client message list."
+        },
+        {
+          "technique": "continuation-prompts",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:1145 The repair branch sends only feedback and a revision instruction even when session_id is None; that fresh session receives neither the original goal nor the sampled page and rule contract."
+        },
+        {
+          "technique": "fingerprinting-and-cache-keys",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:126 Checkpoint admission checks state version and spend sanity before resuming, but RunState carries no standing-prompt, capability-set, or model fingerprint to compare against current configuration."
+        },
+        {
+          "technique": "layered-composition",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:1013 Discovery prose is constructed at the execution call site; drafting and repair prose are likewise formatted inside run(), without independently rendered sections or a sealed assembled artifact."
+        },
+        {
+          "technique": "variable-interpolation",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:1142 Scraped page content enters an ordinary formatting slot with no template-level declaration of its untrusted class or mechanically enforced insertion-point policy."
+        }
+      ]
     }
   }
 }
