@@ -1,0 +1,100 @@
+{
+  "schema": "conform-run/1",
+  "worker": "5c0b45c7-1d55-4ba6-ba71-7a60d7bf1438",
+  "subject": "session-continuation",
+  "evaluatedAt": "2026-10-14T23:24:33.157747+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [
+    {
+      "context": "content-monitoring",
+      "subject": "session-continuation",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/apps/research/src/lib.rs:478 Research bounds continuation by total attempts without identifying repeated failures, allowing identical unsuccessful outputs to consume the remaining step or spend budget.",
+      "techniques": [
+        {
+          "technique": "advisory-guard-fail-mode",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:118 This parses a restored job checkpoint, not a boundary interceptor; its Fresh fallback does not establish this technique's hook registry, risk classes or timeouts."
+        },
+        {
+          "technique": "continuation-as-state",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:126 An unfinished current-version checkpoint resumes without an age check; RunState carries no continuation lease or armed/confirmed timestamp."
+        },
+        {
+          "technique": "ordered-yield-composition",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:551 The research loop has one local completion predicate; no independently authored continuation frames or ordered yield claimants were found."
+        },
+        {
+          "technique": "sealed-stage-advance",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:869 Provisioner's discovery-to-drafting resume checks only the prompt key and candidates; its checkpoint lacks a content-hash seal of the stage shape and a compare-before-write stage cursor."
+        },
+        {
+          "technique": "single-loop-authority",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:526 Steps resume the existing CLI session; no second armed continuation authority or host goal evaluator was found in this context."
+        },
+        {
+          "technique": "stuck-loop-detection",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:1290 The test feeds the same unshaped response repeatedly and expects all MAX_STEPS calls; the loop tracks neither normalized failure signatures nor separate failure and stagnation counters."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "session-continuation",
+      "context": "job-triggers-pipeline",
+      "reason": "withdrawn after review: reviewer (sonnet): The not-applicable anchor triggers.rs:1399 is an incidental `source_job_id`/enqueue_dedup line that does not itself show that no session continuation exists, and the absence rests only on a grep for two terms, one of which (`resume_session`) is a research-app request field rather than a generic mark"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-14T23:24:33.157747+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "session-continuation"
+      ],
+      "techniques": [
+        "advisory-guard-fail-mode",
+        "continuation-as-state",
+        "ordered-yield-composition",
+        "sealed-stage-advance",
+        "single-loop-authority",
+        "stuck-loop-detection"
+      ],
+      "deviations": 1,
+      "context": "content-monitoring",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "ts": "2026-10-14T23:24:33.157747+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "session-continuation"
+      ],
+      "techniques": [
+        "advisory-guard-fail-mode",
+        "boundary-applied-stop",
+        "compaction-checkpoint",
+        "continuation-as-state",
+        "gate-state-lifetimes",
+        "ordered-teardown",
+        "ordered-yield-composition",
+        "sealed-stage-advance",
+        "single-loop-authority",
+        "stuck-loop-detection"
+      ],
+      "deviations": 0,
+      "context": "job-triggers-pipeline",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}

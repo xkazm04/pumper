@@ -3574,6 +3574,122 @@
         "at": "2026-10-13T13:03:54.281470+00:00",
         "reason": "reviewer (sonnet): The technique anchor research/src/lib.rs:641 is `is_report_shaped` and says nothing about citations or grounding (the word 'citation' never appears in that file), so that claim is unsupported. The 515, 550 and 592 anchors did check out."
       }
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/session-continuation": {
+      "context": "content-monitoring",
+      "subject": "session-continuation",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T23:24:33.157Z",
+      "worker": "5c0b45c7-1d55-4ba6-ba71-7a60d7bf1438",
+      "techniques": [
+        {
+          "technique": "advisory-guard-fail-mode",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:118 This parses a restored job checkpoint, not a boundary interceptor; its Fresh fallback does not establish this technique's hook registry, risk classes or timeouts."
+        },
+        {
+          "technique": "continuation-as-state",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:126 An unfinished current-version checkpoint resumes without an age check; RunState carries no continuation lease or armed/confirmed timestamp."
+        },
+        {
+          "technique": "ordered-yield-composition",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:551 The research loop has one local completion predicate; no independently authored continuation frames or ordered yield claimants were found."
+        },
+        {
+          "technique": "sealed-stage-advance",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:869 Provisioner's discovery-to-drafting resume checks only the prompt key and candidates; its checkpoint lacks a content-hash seal of the stage shape and a compare-before-write stage cursor."
+        },
+        {
+          "technique": "single-loop-authority",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:526 Steps resume the existing CLI session; no second armed continuation authority or host goal evaluator was found in this context."
+        },
+        {
+          "technique": "stuck-loop-detection",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:1290 The test feeds the same unshaped response repeatedly and expects all MAX_STEPS calls; the loop tracks neither normalized failure signatures nor separate failure and stagnation counters."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:478 halts the continuation loop on a bare attempt count (MAX_STEPS, :36) with no failure signature, which stuck-loop-detection names as wrong in both directions; a step whose output fails is_report_shaped (:634) identically every time runs to the step, turn or dollar ceiling, so a wedged research run pays its full budget - and :545 already holds the prior text that would give the signature. Realized: continuation-as-state (:45 RunState persisted through the checkpoint seam, :114 plan_from_restore re-reads it), the enumerated yield set (:194 StopReason, Completed only on a report that matched the promised shape), boundary-applied-stop (:268 the spend wall consulted before every step, :254 refusing a step too small to finish), advisory-guard-fail-mode (:114 an unparseable or version-mismatched blob restores Fresh, never errors), sealed-stage-advance in the part that applies (:28 STATE_VERSION seals the resumable shape; a mismatch restores fresh rather than guessing).",
+          "evaluatedAt": "2026-09-22",
+          "worker": null,
+          "reason": "replaced by 5c0b45c7-1d55-4ba6-ba71-7a60d7bf1438"
+        }
+      ]
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/session-continuation": {
+      "context": "job-triggers-pipeline",
+      "subject": "session-continuation",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T23:24:33.157Z",
+      "techniques": [
+        {
+          "technique": "advisory-guard-fail-mode",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:436 These plugins evaluate trigger envelopes before scheduling a hop; they do not intercept an agent's turn boundary."
+        },
+        {
+          "technique": "boundary-applied-stop",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1390 The budget configures a downstream job, not a stop pending inside a session's running tool batch."
+        },
+        {
+          "technique": "compaction-checkpoint",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:724 Restored evaluation data consists of configured event edges, not control state crossing model-context compaction."
+        },
+        {
+          "technique": "continuation-as-state",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1141 A terminal source job schedules another job; it does not refuse a model's candidate stop."
+        },
+        {
+          "technique": "gate-state-lifetimes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:717 This keys a configuration cache by event kind and app, not mutable stop-gate state by conversation."
+        },
+        {
+          "technique": "ordered-teardown",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/job_control_honesty.rs:165 The tested cancellation ends a queued execution's recovery state; this context has no session stop-blocking guard group."
+        },
+        {
+          "technique": "ordered-yield-composition",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:441 A predicate veto consumes a pipeline hop, not a candidate yield offered to ordered continuation frames."
+        },
+        {
+          "technique": "sealed-stage-advance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1380 Configured trigger edges supply downstream job parameters; this is an authored event pipeline, not a closed staged session advanced by model completion evidence."
+        },
+        {
+          "technique": "single-loop-authority",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1119 This matches a durable job status against an event filter; no competing session continuation authorities are involved."
+        },
+        {
+          "technique": "stuck-loop-detection",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:51 The guard detects a cycle among trigger IDs, not an agent repeatedly attempting repairs with the same failure signature."
+        }
+      ],
+      "withdrawn": {
+        "worker": "5c0b45c7-1d55-4ba6-ba71-7a60d7bf1438",
+        "state": "not-applicable",
+        "at": "2026-10-14T23:25:00.167676+00:00",
+        "reason": "reviewer (sonnet): The not-applicable anchor triggers.rs:1399 is an incidental `source_job_id`/enqueue_dedup line that does not itself show that no session continuation exists, and the absence rests only on a grep for two terms, one of which (`resume_session`) is a research-app request field rather than a generic mark"
+      }
     }
   }
 }

@@ -1941,18 +1941,17 @@
           ],
           "grounding": "use_when",
           "state": "deviation",
-          "evidence": "crates/apps/research/src/lib.rs:478 halts the continuation loop on a bare attempt count (MAX_STEPS, :36) with no failure signature, which stuck-loop-detection names as wrong in both directions; a step whose output fails is_report_shaped (:634) identically every time runs to the step, turn or dollar ceiling, so a wedged research run pays its full budget - and :545 already holds the prior text that would give the signature. Realized: continuation-as-state (:45 RunState persisted through the checkpoint seam, :114 plan_from_restore re-reads it), the enumerated yield set (:194 StopReason, Completed only on a report that matched the promised shape), boundary-applied-stop (:268 the spend wall consulted before every step, :254 refusing a step too small to finish), advisory-guard-fail-mode (:114 an unparseable or version-mismatched blob restores Fresh, never errors), sealed-stage-advance in the part that applies (:28 STATE_VERSION seals the resumable shape; a mismatch restores fresh rather than guessing).",
+          "evidence": "crates/apps/research/src/lib.rs:478 Research bounds continuation by total attempts without identifying repeated failures, allowing identical unsuccessful outputs to consume the remaining step or spend budget.",
           "confidence": "strong",
-          "evaluatedAt": "2026-09-22",
-          "evaluatedAgainst": "sha256-b2:89e82a9f790ac3fb",
-          "evaluatedRevision": 6,
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:b0eabf78abd856a4",
+          "evaluatedRevision": 8,
           "digest": "sha256-b2:b0eabf78abd856a4",
           "revision": 8,
           "changedAt": "2026-10-09",
           "source": "conform",
           "adoptedFrom": "86170021-1e6d-44b3-ab87-f570cd95fb11",
-          "revisionsBehind": 2,
-          "stale": true
+          "revisionsBehind": 2
         }
       ],
       "governance": "governed"
