@@ -1,0 +1,78 @@
+{
+  "worker": "straighten-20261014T1720-pumper-w1",
+  "evaluatedAt": "2026-10-14T17:25:48Z",
+  "pairs": [
+    {
+      "context": "637fe113-22d8-4d1a-bbb6-3de8199aa6bd",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/ci/lane-certify.mjs:178 bound() starts ok=true and only comparisons flip it, so a series of non-numeric or null samples (p95 = null) certifies as pass instead of cannot-see; reproduced with judge() on ['x','y',null] against max 10.",
+      "techniques": [
+        { "technique": "unmeasurable-criteria", "verdict": "deviation", "evidence": "scripts/ci/lane-certify.mjs:178" },
+        { "technique": "gate-liveness", "verdict": "conformant", "evidence": "scripts/ci/lane-certify.mjs:263" }
+      ]
+    },
+    {
+      "context": "f49d6e82-d094-4a4b-b3dd-9d46ce0db001",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/docs/check-doc-sync.mjs:167 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parsed exits 0 (checked and consistent) instead of the hook's own exit 3 could-not-check.",
+      "techniques": [
+        { "technique": "gate-liveness", "verdict": "deviation", "evidence": "scripts/docs/check-doc-sync.mjs:167" },
+        { "technique": "unmeasurable-criteria", "verdict": "conformant", "evidence": "scripts/docs/check-doc-sync.mjs:266" }
+      ]
+    },
+    {
+      "context": "413dd239-ed7e-4318-bd93-f2c3bd72c7b7",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/engine_conformance.rs:664 the production HttpClient inventory matches only the literal one-line 'impl HttpClient for' spellings, so a generic, path-qualified, aliased or multiline impl is neither in the battery nor exempt and the test stays green without reporting the unrecognised form.",
+      "techniques": [
+        { "technique": "unparseable-form-is-a-finding", "verdict": "deviation", "evidence": "crates/server/src/e2e/engine_conformance.rs:664" },
+        { "technique": "gate-liveness", "verdict": "conformant", "evidence": "crates/server/src/e2e/engine_conformance.rs:725" }
+      ]
+    },
+    {
+      "context": "f900cd3c-7445-4e85-936b-32135e8fb605",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) falls into the absent-field arm, so the predicate ran, could not classify the input and still answers pass.",
+      "techniques": [
+        { "technique": "unmeasurable-criteria", "verdict": "deviation", "evidence": "plugins-src/trigger-gate/src/lib.rs:107" }
+      ]
+    },
+    {
+      "context": "571cf8b4-4f98-4205-b9c7-270fce8277e1",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/state.rs:359 with search disabled boot installs NoSearch as a full Search whose index and query no-op successfully, so saved searches are still accepted and silently never alert; only GET /search discloses the degradation through config, outside the type.",
+      "techniques": [
+        { "technique": "seams-and-adapters", "verdict": "deviation", "evidence": "crates/server/src/state.rs:359" }
+      ]
+    },
+    {
+      "context": "fc25f145-0e20-4ffc-801f-4c2dfb7780ee",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/engine.rs:1193 HttpClient's default fetch_bytes refuses the verb, so wrappers type-check as the full client while implementing only text fetch; the crawl MeteringHttpClient decorator still drops fetch_bytes this way.",
+      "techniques": [
+        { "technique": "seams-and-adapters", "verdict": "deviation", "evidence": "crates/core/src/engine.rs:1193" }
+      ]
+    }
+  ],
+  "declined": [],
+  "consults": [
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["quality-gates"], "techniques": ["unmeasurable-criteria", "gate-liveness"], "deviations": 1 },
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["quality-gates"], "techniques": ["gate-liveness", "unmeasurable-criteria"], "deviations": 1 },
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["quality-gates"], "techniques": ["unparseable-form-is-a-finding", "gate-liveness"], "deviations": 1 },
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["quality-gates"], "techniques": ["unmeasurable-criteria"], "deviations": 1 },
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["module-design"], "techniques": ["seams-and-adapters"], "deviations": 1 },
+    { "ts": "2026-10-14T17:25:48Z", "bundle": "software-engineering", "subjects": ["module-design"], "techniques": ["seams-and-adapters"], "deviations": 1 }
+  ]
+}

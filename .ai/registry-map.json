@@ -1353,12 +1353,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/state.rs:359 With search disabled, boot installs NoSearch as the Search implementation, so index and query succeed without storing or returning documents.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
-          "evaluatedRevision": 17,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/state.rs:359 with search disabled boot installs NoSearch as a full Search whose index and query no-op successfully, so saved searches are still accepted and silently never alert; only GET /search discloses the degradation through config, outside the type.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18,
+          "revisionsBehind": 1
         },
         {
           "subject": "fleet-orchestration",
@@ -1588,12 +1587,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "scripts/ci/lane-certify.mjs:178 Lane certification can return pass for malformed or non-finite measurements because its comparisons leave ok true.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
-          "evaluatedRevision": 53,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "scripts/ci/lane-certify.mjs:178 bound() starts ok=true and only comparisons flip it, so a series of non-numeric or null samples (p95 = null) certifies as pass instead of cannot-see; reproduced with judge() on ['x','y',null] against max 10.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54,
+          "revisionsBehind": 1
         },
         {
           "subject": "test-harness",
@@ -1652,12 +1650,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:2 A search of the twelve gate scripts for memory, episodic, consolidation, belief, recall, and distill found no matches; they judge a flake register, a build-cache ceiling, lane artifacts, and MCP tool-name spelling.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
-          "evaluatedRevision": 47,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "scripts/ci/flake-check.mjs:2 The twelve CI gate scripts judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, and a search for memory, episodic, consolidation, belief, recall and distill finds no match, so no agent carries state forward here.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
+          "evaluatedRevision": 48,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-instruction-files",
@@ -2230,12 +2227,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/src/engine.rs:1193 HttpClient's default fetch_bytes refuses the verb, so adapters type-check as the full client while implementing only text fetch.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
-          "evaluatedRevision": 17,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/engine.rs:1193 HttpClient's default fetch_bytes refuses the verb, so wrappers type-check as the full client while implementing only text fetch; the crawl MeteringHttpClient decorator still drops fetch_bytes this way.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18,
+          "revisionsBehind": 1
         },
         {
           "subject": "test-harness",
@@ -2941,12 +2937,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/src/search.rs:258 NoSearch implements Search by returning a successful empty page, so a disabled index is a substitute that keeps none of the trait's behavior.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
-          "evaluatedRevision": 17,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/search.rs:258 NoSearch still implements Search by answering query with a successful empty page, so the disabled state lives only in config checks at the HTTP route and doctor while the saved-search runner (crates/server/src/worker.rs:2109) reads disabled as no new matches and never alerts.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18,
+          "revisionsBehind": 1
         },
         {
           "subject": "data-access",
@@ -3308,12 +3303,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0025 the word memory is only the HTTP-versus-browser strike table, and the other nearby tables are a TTL cache of Claude responses, per-job checkpoint blobs, and discovered API URL templates, with no episode or belief table.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
-          "evaluatedRevision": 47,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0047 the only memory table is a fetcher's per-host HTTP-versus-browser strike counter, and the nearby LLM table is a TTL cache of Claude research responses, so no episode, belief or recall store exists for the subject to govern.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
+          "evaluatedRevision": 48,
+          "revisionsBehind": 1
         },
         {
           "subject": "mcp-tools",
@@ -3541,12 +3535,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.mjs:167 The hook silently skips malformed transcript records and can exit clean after parsing no usable events.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
-          "evaluatedRevision": 53,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "scripts/docs/check-doc-sync.mjs:167 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parsed exits 0 (checked and consistent) instead of the hook's own exit 3 could-not-check.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54,
+          "revisionsBehind": 1
         },
         {
           "subject": "prompt-assembly",
@@ -3910,12 +3903,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 The production-engine inventory recognizes literal implementation spellings and silently misses equivalent aliased or multiline implementations.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
-          "evaluatedRevision": 53,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 the production HttpClient inventory matches only the literal one-line 'impl HttpClient for' spellings, so a generic, path-qualified, aliased or multiline impl is neither in the battery nor exempt and the test stays green without reporting the unrecognised form.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-memory",
@@ -3932,12 +3924,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 A search of these eight files for memory, episodic, consolidation, recall, belief, and distill found a wasm linear-memory export, a dataset-provenance comment, and a VCR replay stamp, and no agent belief, episode, or recall pipeline.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
-          "evaluatedRevision": 47,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The eight e2e files pin dataset read, delete, report, engine, VCR, exclusion, degraded-search and dynamic-app behavior, and the only memory hit is a wasm linear-memory export, so no agent memory pipeline is under test.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
+          "evaluatedRevision": 48,
+          "revisionsBehind": 1
         },
         {
           "subject": "voice-io",
@@ -4829,12 +4820,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "conformant",
-          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:258 Whether a partial index may tombstone is a pure function of the parse, so the decision is tested without a database.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
-          "evaluatedRevision": 17,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:265 Whether a partial index may tombstone is a pure function of the parse, and all eight apps route their completeness floor through the one pumper_core::completeness judge, so the decision is tested without a store and changed in one place.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18,
+          "revisionsBehind": 1
         },
         {
           "subject": "fleet-orchestration",
@@ -5070,12 +5060,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "clients/typescript/README.md:27 The package is a stateless dataset client plus a watermarked change-feed mirror, and the only memory hits are an in-process Map of feed positions and a constant-RAM ndjson stream.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:23599eae61aa7119",
-          "evaluatedRevision": 47,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "clients/typescript/README.md:27 The SDK is a stateless dataset client that owns transport, decode and a change-feed watermark and explicitly not persistence, and its only memory hit is an in-process watermark store for tests, so no agent memory exists here.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
+          "evaluatedRevision": 48,
+          "revisionsBehind": 1
         },
         {
           "subject": "bounded-enumeration",
@@ -5200,12 +5189,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 A present but nonnumeric count becomes indistinguishable from an absent field, so the predicate can pass an input it could not classify.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:6e635d76a310aa4b",
-          "evaluatedRevision": 53,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) falls into the absent-field arm, so the predicate ran, could not classify the input and still answers pass.",
+          "evaluatedAt": "2026-10-14",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-runtime-assembly",

@@ -492,44 +492,28 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T21:56:36.968Z",
-      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
-        {
-          "technique": "gate-liveness",
-          "verdict": "deviation",
-          "evidence": "scripts/ci/disk-check.mjs:124 measure catches directory and stat failures without reporting lost coverage; an unreadable population can become zero bytes and no findings."
-        },
-        {
-          "technique": "instrument-answers-only-its-own-question",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/flake-check.test.mjs:477 The fixture emits an apparently successful test record while independently varying the command's exit code, proving recording cannot replace the command's verdict."
-        },
-        {
-          "technique": "match-the-resolved-artifact",
-          "verdict": "deviation",
-          "evidence": "scripts/ci/mcp-gate-parity.mjs:217 The checker matches raw Rust text without removing comments; an in-memory probe removed a dispatch guard, retained its spelling in a block comment, and produced no findings."
-        },
-        {
-          "technique": "severity-by-construction",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/flake-check.mjs:434 In verdict mode, a nonempty findings population reaches EXIT_FINDINGS; paired process fixtures assert exit 2."
-        },
         {
           "technique": "unmeasurable-criteria",
           "verdict": "deviation",
-          "evidence": "scripts/ci/lane-certify.mjs:169 There is no finite-number validation before comparison; read-only probes returned pass for a percentile measured as 'bad' and a slope measured as NaN."
+          "evidence": "scripts/ci/lane-certify.mjs:178"
         },
         {
-          "technique": "unparseable-form-is-a-finding",
-          "verdict": "deviation",
-          "evidence": "scripts/ci/mcp-gate-parity.mjs:163 An unguarded Rust binding pattern such as name @ \"deep_research\" is neither recognized nor rejected; the in-memory probe demonstrated this escape."
-        },
-        {
-          "technique": "waiver-names-its-finding",
+          "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "scripts/ci/flake-check.mjs:132 Exemption rows join mechanically to scanned test identities, and unmatched rows produce an orphan finding instead of granting a blanket exemption."
+          "evidence": "scripts/ci/lane-certify.mjs:263"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:178 Lane certification can return pass for malformed or non-finite measurements because its comparisons leave ok true.",
+          "evaluatedAt": "2026-10-12T21:56:36.968Z",
+          "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
         }
       ]
     },
@@ -538,34 +522,28 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T21:56:36.968Z",
-      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
-        {
-          "technique": "instrument-answers-only-its-own-question",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/store_reports.rs:301 The paired cheap and full requests explicitly prevent a skipped artifact sweep from licensing a clean full-report verdict."
-        },
-        {
-          "technique": "match-the-resolved-artifact",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:761 The wiring assertion searches normalized source text after removing only whole-line // comments; block comments or string literals containing the expected expressions can satisfy it."
-        },
-        {
-          "technique": "unmeasurable-criteria",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/store_reports.rs:141 The tests require an incomplete verdict, healthy false, and an unverifiable roster entry when the artifact sweep was skipped."
-        },
         {
           "technique": "unparseable-form-is-a-finding",
           "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 The scanner accepts only two literal trait spellings and has no finding for alias-based, generic, or multiline implementations outside those patterns."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664"
         },
         {
-          "technique": "waiver-names-its-finding",
+          "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:730 The exemption table names exact path-and-type identities with reasons, and reverse reconciliation rejects exemptions whose named implementor disappeared."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:725"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 The production-engine inventory recognizes literal implementation spellings and silently misses equivalent aliased or multiline implementations.",
+          "evaluatedAt": "2026-10-12T21:56:36.968Z",
+          "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
         }
       ]
     },
@@ -574,24 +552,23 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T21:56:36.968Z",
-      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
-        {
-          "technique": "gate-liveness",
-          "verdict": "conformant",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:257 The predicate's test supplies a known count-bar violation and requires a veto; a separate assertion also exercises a dataset mismatch."
-        },
-        {
-          "technique": "severity-by-construction",
-          "verdict": "conformant",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:111 A present numeric count below the bar directly produces pass false, which extract_v2 serializes into the predicate result."
-        },
         {
           "technique": "unmeasurable-criteria",
           "verdict": "deviation",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:116 For valid JSON containing count:\"bad\", numeric conversion returns None and this branch announces a missing field before returning true; an executed but unclassifiable input should fail closed."
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 A present but nonnumeric count becomes indistinguishable from an absent field, so the predicate can pass an input it could not classify.",
+          "evaluatedAt": "2026-10-12T21:56:36.968Z",
+          "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
         }
       ]
     },
@@ -600,29 +577,28 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T21:56:36.968Z",
-      "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
         {
           "technique": "gate-liveness",
           "verdict": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.mjs:167 No parsed-event assertion distinguishes an unreadable transcript from a no-edit turn; a read-only invocation using Cargo.toml as the transcript exited 0 silently."
+          "evidence": "scripts/docs/check-doc-sync.mjs:167"
         },
         {
-          "technique": "refusal-names-a-reachable-remedy",
+          "technique": "unmeasurable-criteria",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:220 The reminder names each mapped document, all current targets resolve in the checkout, and editing that exact document clears its own finding."
-        },
+          "evidence": "scripts/docs/check-doc-sync.mjs:266"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "self-reported-gate-inputs",
-          "verdict": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.mjs:174 The population depends on the author's choice of editing tool: Bash-driven source writes leave no recognized edit, and no independent filesystem or diff check recovers them."
-        },
-        {
-          "technique": "severity-by-construction",
-          "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:315 A detected doc mismatch reaches exit 2, while cannot-check uses exit 3; the code explicitly describes the hook as a reminder rather than merge enforcement."
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:167 The hook silently skips malformed transcript records and can exit clean after parsing no usable events.",
+          "evaluatedAt": "2026-10-12T21:56:36.968Z",
+          "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
         }
       ]
     },
@@ -631,64 +607,23 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:01:40.578Z",
-      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
-        {
-          "technique": "durable-store-failure-posture",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The empty-versus-miss distinction is a dataset search page for an MCP caller, not a memory store that failed to parse."
-        },
-        {
-          "technique": "lane-reconciliation",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/store_reports.rs:8 The doctor gap is the scrape search index versus the dataset store, not memory retrieval lanes."
-        },
-        {
-          "technique": "episodic-capture",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/vcr_attempts.rs:451 Provenance here is a VCR replay stamp on a job result, not an episode record."
-        },
-        {
-          "technique": "working-memory",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:488 Session here is an HTTP profile cookie jar, not operative task state."
-        },
-        {
-          "technique": "addresses-not-atoms",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23 The only memory token in this file is a wasm linear-memory export."
-        },
-        {
-          "technique": "memory-governance",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/target_exclusion.rs:191 Provenance is a dataset row an operator can check after a run, not a belief write lane."
-        },
-        {
-          "technique": "loss-site-inventory",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:5 The disagreement is among dataset read shapes, not memory failing to reach an agent."
-        },
         {
           "technique": "recall-injection",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:1 Labeling a search hit's index is not a budgeted recall injection of beliefs."
-        },
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "coverage-instrumentation",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/store_reports.rs:11 The doctor reports an empty scrape index, not uncovered agent-memory subjects."
-        },
-        {
-          "technique": "decay-and-forgetting",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_delete_gate.rs:1 This is the dataset delete gate, not a belief demotion or expiry policy."
-        },
-        {
-          "technique": "baseline-ladder",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:1 The battery probes engine capabilities, not memory-pipeline rungs."
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 A search of these eight files for memory, episodic, consolidation, recall, belief, and distill found a wasm linear-memory export, a dataset-provenance comment, and a VCR replay stamp, and no agent belief, episode, or recall pipeline.",
+          "evaluatedAt": "2026-10-12T23:01:40.578Z",
+          "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
@@ -697,54 +632,23 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:01:40.578Z",
-      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
         {
           "technique": "working-memory",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/watermark.ts:69 memoryWatermark is a process-local Map of feed cursors that a restart drops."
-        },
+          "evidence": "clients/typescript/src/watermark.ts:71"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "observation-clock",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/watermark.ts:2 The watermark is a (created_at, rowid) feed position, not a distillation clock."
-        },
-        {
-          "technique": "episodic-capture",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:2 The client is a stateless read wrapper and stores no episode."
-        },
-        {
-          "technique": "probe-without-write-back",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:4 The write-back is the consumer's change-feed cursor after the sink commits, not a recall usage counter."
-        },
-        {
-          "technique": "owner-and-counterpart-scope",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/watermark.ts:66 The cursor key is app/dataset, not an owner and a counterpart."
-        },
-        {
-          "technique": "recall-injection",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/http.ts:85 Constant memory is a stream buffer bound, not a recall budget."
-        },
-        {
-          "technique": "addresses-not-atoms",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:35 The word memory is RAM used while streaming snapshot rows."
-        },
-        {
-          "technique": "consolidation",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:1 The module mirrors dataset revisions; it does not distill beliefs."
-        },
-        {
-          "technique": "durable-store-failure-posture",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/README.md:22 The silent-empty case described is a response-shape drift in a hand-rolled parser, not a corrupt memory store."
+          "state": "not-applicable",
+          "evidence": "clients/typescript/README.md:27 The package is a stateless dataset client plus a watermarked change-feed mirror, and the only memory hits are an in-process Map of feed positions and a constant-RAM ndjson stream.",
+          "evaluatedAt": "2026-10-12T23:01:40.578Z",
+          "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
@@ -753,49 +657,28 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:01:40.578Z",
-      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
         {
-          "technique": "decay-and-forgetting",
+          "technique": "episodic-capture",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0016_host_profiles.sql:7 The TTL ages fetch-tier strikes, not beliefs."
-        },
-        {
-          "technique": "working-memory",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0022_checkpoints.sql:2 The blob is a scrape job's resume snapshot, not an agent's operative synthesis."
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1"
         },
         {
           "technique": "consolidation",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0009_research_cache.sql:2 Identical Claude requests are cached by hash; nothing is distilled into a belief."
-        },
+          "evidence": "crates/core/migrations/0009_research_cache.sql:1"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "observation-clock",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0009_research_cache.sql:3 The cache key keeps the raw prompt fields and does not ground relative time."
-        },
-        {
-          "technique": "procedure-promotion",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0025_api_recipes.sql:2 Recipes are discovered URL templates, not procedures promoted from agent episodes."
-        },
-        {
-          "technique": "episodic-capture",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0005_change_intelligence.sql:1 Revisions are dataset change history, not episodes of an agent."
-        },
-        {
-          "technique": "memory-value-model",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0025_api_recipes.sql:11 The score is extracted-value overlap of an API recipe, not trust, half-life, and usage."
-        },
-        {
-          "technique": "stale-served-versus-stale-answered",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0005_change_intelligence.sql:10 Change kinds append dataset revisions; they are not superseded beliefs served to a reader."
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0025 the word memory is only the HTTP-versus-browser strike table, and the other nearby tables are a TTL cache of Claude responses, per-job checkpoint blobs, and discovered API URL templates, with no episode or belief table.",
+          "evaluatedAt": "2026-10-12T23:01:40.578Z",
+          "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
@@ -804,54 +687,28 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:01:40.578Z",
-      "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
         {
-          "technique": "decay-and-forgetting",
+          "technique": "working-memory",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:14 Expiry is a flake-quarantine rule, not belief demotion."
+          "evidence": "scripts/ci/flake-check.mjs:2"
         },
         {
-          "technique": "coverage-instrumentation",
+          "technique": "episodic-capture",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/ship-inventory.test.mjs:1 The denominator is package manifests claimed by CI, not memory subjects."
-        },
+          "evidence": "scripts/ci/flake-check.mjs:2"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "baseline-ladder",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-certify.mjs:16 The artifact is a lane measurement, not a memory-pipeline rung."
-        },
-        {
-          "technique": "probe-without-write-back",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-record.mjs:2 The wrapper records test outcomes and does not increment a recall counter."
-        },
-        {
-          "technique": "diagnosis-withheld-from-the-executor",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-canary.mjs:2 The canary checks that the lane judge still fires; there is no executor and reviser."
-        },
-        {
-          "technique": "memory-governance",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/mcp-gate-parity.mjs:2 The gate checks tool-name spelling, not who may write a belief."
-        },
-        {
-          "technique": "durable-store-failure-posture",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:33 An unreadable quarantine register exits 3; that register is not a memory store."
-        },
-        {
-          "technique": "addresses-before-compression",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/disk-check.mjs:14 The ceiling prunes cargo build artifacts, not redundant memory items."
-        },
-        {
-          "technique": "rollup-compaction",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/disk-check.mjs:21 supersededFiles are stale build artifacts, not a family of beliefs."
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:2 A search of the twelve gate scripts for memory, episodic, consolidation, belief, recall, and distill found no matches; they judge a flake register, a build-cache ceiling, lane artifacts, and MCP tool-name spelling.",
+          "evaluatedAt": "2026-10-12T23:01:40.578Z",
+          "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
@@ -2454,59 +2311,23 @@
       "subject": "module-design",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T10:28:44.015Z",
-      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
-        {
-          "technique": "module-depth",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/catalog.rs:405 status is a String matched on the literal live; STATUSES is a runtime table, so a constructed Source can still carry a value the type does not close."
-        },
         {
           "technique": "seams-and-adapters",
           "verdict": "deviation",
-          "evidence": "crates/core/src/search.rs:258 NoSearch type-checks as Search and no-ops query, index, and delete; NoPlugins in the same context errors instead."
-        },
+          "evidence": "crates/core/src/search.rs:258"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "io-free-core",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/recipes.rs:214 strike_verdict takes the counters and thresholds and returns a verdict; RecipeStore only applies it."
-        },
-        {
-          "technique": "concurrency-at-the-edge",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/crawl.rs:1052 The bounded in-flight set is the crawl's backpressure rule, not a keyword sprinkled over ordinary work."
-        },
-        {
-          "technique": "locality-and-leverage",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/crawl.rs:180 The change-weight judgment was restated by several apps and now lives once, with the crawler delegating."
-        },
-        {
-          "technique": "declarative-or-sequential",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/catalog.rs:234 Contract checks are one-input counts, written as filters rather than a multi-output loop."
-        },
-        {
-          "technique": "marked-unverifiable-region",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/recipes.rs:668 SQL in these files is bound with placeholders; no unsafe or assembled statement showed up."
-        },
-        {
-          "technique": "mirror-type-at-the-edge",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/plugin.rs:81 The plugin contract takes strings and JSON; no host-minted wasmtime type is accepted here."
-        },
-        {
-          "technique": "state-carrier-decides-the-lane",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/costs.rs:328 Job spend is an atomic shared across metered calls, so a concurrent lane does not add into a discarded copy."
-        },
-        {
-          "technique": "host-primitive-facade",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/process_env.rs:31 The cfg split is an environment allowlist, not a facade over spawn, sleep, and timers for two runtimes."
+          "state": "deviation",
+          "evidence": "crates/core/src/search.rs:258 NoSearch implements Search by returning a successful empty page, so a disabled index is a substitute that keeps none of the trait's behavior.",
+          "evaluatedAt": "2026-10-13T10:28:44.015Z",
+          "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
@@ -2582,121 +2403,48 @@
       "subject": "module-design",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T10:28:44.015Z",
-      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
-        {
-          "technique": "module-depth",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/engine.rs:470 interaction_outcome hides the found-versus-acted matrix behind one function so callers do not re-encode it."
-        },
         {
           "technique": "seams-and-adapters",
           "verdict": "deviation",
-          "evidence": "crates/core/src/engine.rs:1193 The default method throws for a verb most engines do not implement; Browser::transact does the same. The trait is one capability wider than its adapters."
-        },
-        {
-          "technique": "borrowed-surface",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/fetcher.rs:200 Egress attribution uses a header name this crate owns, so an origin echo cannot forge a peer-served fetch."
-        },
-        {
-          "technique": "io-free-core",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/tiers.rs:432 plan_weather_import returns what to adopt and returns no I/O; the caller applies the plan."
-        },
-        {
-          "technique": "concurrency-at-the-edge",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/governor.rs:143 Spacing is the governor's policy, and the one non-blocking caller is a single try_acquire rather than a second pipeline."
-        },
-        {
-          "technique": "locality-and-leverage",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/fetcher.rs:219 The egress sentence is one constant beside its only reader, because core cannot depend on the remote engine."
-        },
-        {
-          "technique": "declarative-or-sequential",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/tiers.rs:446 The import rules are an ordered sequence of different decisions, not a uniform map over one element type."
-        },
-        {
-          "technique": "marked-unverifiable-region",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/engine.rs:866 The generated page script states the fact that makes interpolation safe: selectors are JSON-encoded."
-        },
-        {
-          "technique": "mirror-type-at-the-edge",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/engine.rs:1735 Redaction is tested from a JSON value; the test does not construct a browser DOM node."
-        },
-        {
-          "technique": "state-carrier-decides-the-lane",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/fetcher.rs:278 Egress totals are atomics shared across Fetcher clones, so a clone does not keep a private counter."
-        },
-        {
-          "technique": "emitted-code-names-from-a-root",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/engine.rs:876 Caller-supplied selectors enter the generated script as JSON literals, so they cannot break out as code."
-        },
-        {
-          "technique": "host-primitive-facade",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/governor.rs:18 The governor calls one runtime's clock directly; these files do not run the same logic on a second host."
+          "evidence": "crates/core/src/engine.rs:1193"
         }
       ],
-      "registryProposal": "seams-and-adapters treats a default that throws on an unsupported verb as a broken substitute and says to split the trait. It does not say how to score a Rust default whose error is the documented terminal refusal while a split is explicitly deferred, and this seat still scored that default as the named failure."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/engine.rs:1193 HttpClient's default fetch_bytes refuses the verb, so adapters type-check as the full client while implementing only text fetch.",
+          "evaluatedAt": "2026-10-13T10:28:44.015Z",
+          "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
+        }
+      ]
     },
     "571cf8b4-4f98-4205-b9c7-270fce8277e1/module-design": {
       "context": "api-server-core",
       "subject": "module-design",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T10:28:44.015Z",
-      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:48.000Z",
+      "worker": "straighten-20261014T1720-pumper-w1",
       "techniques": [
-        {
-          "technique": "module-depth",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/main.rs:86 Sentry boot distinguishes absent from malformed instead of collapsing both into one optional."
-        },
         {
           "technique": "seams-and-adapters",
           "verdict": "deviation",
-          "evidence": "crates/server/src/state.rs:359 This is the enabling point: disabled search is wired as a successful no-op, while disabled plugins on the previous lines are wired as NoPlugins."
-        },
+          "evidence": "crates/server/src/state.rs:359"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "io-free-core",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/main.rs:101 sentry_plan decides from the raw env strings; init_sentry is the only caller that touches the process."
-        },
-        {
-          "technique": "concurrency-at-the-edge",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/state.rs:81 Webhook delivery moved off bare spawns onto one bounded pool owned by AppState."
-        },
-        {
-          "technique": "locality-and-leverage",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/mcp/mod.rs:707 Tool-argument checks go through validate_tool_args so each handler does not keep its own subset."
-        },
-        {
-          "technique": "declarative-or-sequential",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/maintenance.rs:156 The maintenance gate is an ordered sequence of different rungs, each returning a different decision."
-        },
-        {
-          "technique": "marked-unverifiable-region",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/mcp/mod.rs:701 An uncompilable schema skips the check inside the one validator, and the comment states why that skip is valid."
-        },
-        {
-          "technique": "state-carrier-decides-the-lane",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/activity.rs:65 Every request lane updates one atomic gauge; the count is not copied into the handler."
+          "state": "deviation",
+          "evidence": "crates/server/src/state.rs:359 With search disabled, boot installs NoSearch as the Search implementation, so index and query succeed without storing or returning documents.",
+          "evaluatedAt": "2026-10-13T10:28:44.015Z",
+          "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+          "reason": "replaced by straighten-20261014T1720-pumper-w1"
         }
       ]
     },
@@ -2705,64 +2453,58 @@
       "subject": "module-design",
       "bundle": "software-engineering",
       "state": "conformant",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T10:28:44.015Z",
-      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "evaluatedAt": "2026-10-14",
+      "evaluatedTs": "2026-10-14T17:25:05.000Z",
+      "worker": "straighten-20261014T1720-pumper-w2",
       "techniques": [
-        {
-          "technique": "module-depth",
-          "verdict": "conformant",
-          "evidence": "crates/apps/state-tax/src/lib.rs:103 income_tax_type stays open in the model schema and is closed where the record is stored, so a recoverable phrasing does not fail the paid call."
-        },
-        {
-          "technique": "seams-and-adapters",
-          "verdict": "conformant",
-          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:272 The app's tests substitute StubHttp for HttpClient rather than calling the live source."
-        },
-        {
-          "technique": "borrowed-surface",
-          "verdict": "conformant",
-          "evidence": "crates/apps/state-tax/src/lib.rs:62 Model phrasings are restated in a table this app owns, so an upstream wording change shows up in this file."
-        },
         {
           "technique": "io-free-core",
           "verdict": "conformant",
-          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:258 removal_suppression_reason takes the parse and returns whether tombstones are allowed."
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:265"
         },
         {
-          "technique": "concurrency-at-the-edge",
+          "technique": "mirror-type-at-the-edge",
           "verdict": "conformant",
-          "evidence": "crates/apps/state-tax/src/lib.rs:248 The run awaits one research call and then classifies locally; these apps do not keep a worker pool of their own."
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:367"
         },
         {
           "technique": "locality-and-leverage",
           "verdict": "conformant",
-          "evidence": "crates/apps/state-tax/src/lib.rs:304 The shared normalizer lives once; each app keeps the vocabulary that changes for its own source."
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:159"
         },
         {
-          "technique": "declarative-or-sequential",
+          "technique": "seams-and-adapters",
           "verdict": "conformant",
-          "evidence": "crates/apps/valuation-multiples/src/lib.rs:252 collect_valuation_records fills three results in one pass, which is the case for an explicit loop."
+          "evidence": "crates/apps/state-tax/tests/partial_run_cannot_delete.rs:16"
         },
         {
-          "technique": "mirror-type-at-the-edge",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/valuation-multiples/src/lib.rs:258 Record classification takes JSON values tests can build; these apps do not accept a Claude session type."
-        },
-        {
-          "technique": "state-carrier-decides-the-lane",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/state-licensing/src/lib.rs:445 Resume reads a checkpoint payload written for that purpose; it is not a shared runtime aggregate copied onto another thread."
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:497"
         },
         {
           "technique": "emitted-code-names-from-a-root",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/state-licensing/src/lib.rs:463 This builds a prompt string for the model; it is not a macro expanded into a Rust caller's scope."
+          "evidence": "crates/apps/smlouvy-dump-watch/Cargo.toml:6"
         },
         {
           "technique": "host-primitive-facade",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/state-tax/src/lib.rs:179 Async is the ScrapeApp trait. These apps do not spawn, sleep, or target a second execution host."
+          "evidence": "crates/apps/smlouvy-dump-watch/Cargo.toml:6"
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/smlouvy-dump-watch/Cargo.toml:6"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "conformant",
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:258 Whether a partial index may tombstone is a pure function of the parse, so the decision is tested without a database.",
+          "evaluatedAt": "2026-10-13T10:28:44.015Z",
+          "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+          "reason": "replaced by straighten-20261014T1720-pumper-w2"
         }
       ]
     },
