@@ -1053,7 +1053,9 @@ impl ScrapeApp for Crawl {
          existing dataset prune API / janitor, no separate knob. Each kept \
          page's outbound links are persisted into the `edges` dataset (key \
          `{from_url}|{to_url}`; per-page out-degree cap 200, dropped counted) — \
-         the run's most-linked-to pages are echoed as `top_linked`. Bounded \
+         the run's most-linked-to pages are echoed as `top_linked`: a count \
+         (`links_in`) of distinct links from the pages this run fetched, NOT page \
+         importance, authority or PageRank, and NOT a statement about the whole site. Bounded \
          memory: the within-run edge bookkeeping is capped at 200,000 distinct \
          edges; past it edges still stream to the dataset but stop feeding the \
          ranking (`edges_untracked`, `top_linked_complete: false`). Every write \
@@ -1699,6 +1701,23 @@ mod tests {
              past the ~32 MB ceiling the 10,000-record limit was justified against (~23 MB when \
              measured); either shrink what the sink retains per seed or lower REVISIT_SEED_LIMIT"
         );
+    }
+
+    /// `top_linked` is a derived view, and a derived view is read as stronger evidence
+    /// than it is: "top" and "most-linked" invite "most important page" or "page
+    /// authority". It is an in-degree count over the links of the pages THIS run fetched,
+    /// so the manifest description must deny the stronger claims by name
+    /// (declared-truth-boundary). Fails if the clause is dropped or softened to a bare
+    /// "approximate" disclaimer.
+    #[test]
+    fn description_declares_what_top_linked_does_not_claim() {
+        let d = Crawl.description();
+        for denied in ["importance", "authority", "PageRank", "whole site"] {
+            assert!(
+                d.contains(denied),
+                "description must say top_linked does not claim {denied:?}: {d}"
+            );
+        }
     }
 
     #[test]
