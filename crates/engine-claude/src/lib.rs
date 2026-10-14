@@ -225,6 +225,20 @@ impl Drop for ScratchFile {
 
 #[async_trait]
 impl Researcher for ClaudeEngine {
+    fn answer_fingerprint(&self, req: &ResearchRequest) -> String {
+        // An unresolvable request (unknown role, bad model id) refuses before
+        // spawn and is never cached, so an empty fingerprint is harmless there.
+        let Ok(r) = self.resolve(req) else {
+            return String::new();
+        };
+        format!(
+            "model={};effort={};tools={}",
+            r.model.as_deref().unwrap_or(""),
+            r.effort.as_deref().unwrap_or(""),
+            self.cfg.allowed_tools.join(",")
+        )
+    }
+
     async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput> {
         let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(self.cfg.timeout_secs));
         let resolved = self.resolve(&req)?;
@@ -1081,6 +1095,42 @@ mod tests {
             },
         );
         ClaudeEngine::new(&cfg)
+    }
+
+    /// A role is a NAME; the model behind it is config. Editing the role's model
+    /// must not let the 24h research cache keep answering with the old model.
+    #[test]
+    fn editing_a_role_changes_the_research_cache_key() {
+        use pumper_core::{ResearchCache, Researcher};
+        let build = |model: &str| {
+            let mut cfg = ClaudeConfig::default();
+            cfg.roles.clear();
+            cfg.roles.insert(
+                "research".into(),
+                ClaudeRole {
+                    model: Some(model.into()),
+                    effort: Some("high".into()),
+                    max_budget_usd: None,
+                },
+            );
+            ClaudeEngine::new(&cfg)
+        };
+        let req = ResearchRequest::new("q").with_role("research");
+        let (a, b) = (build("sonnet-x"), build("opus-y"));
+        // The request-only key cannot tell the two configs apart: this is the
+        // stale-answer case the fingerprint exists to close.
+        assert_eq!(ResearchCache::key(&req), ResearchCache::key(&req));
+        let (fa, fb) = (a.answer_fingerprint(&req), b.answer_fingerprint(&req));
+        assert_ne!(fa, fb);
+        assert_ne!(
+            ResearchCache::key_with(&req, &fa),
+            ResearchCache::key_with(&req, &fb)
+        );
+        // Same config, same request: still one key, so real hits survive.
+        assert_eq!(fa, build("sonnet-x").answer_fingerprint(&req));
+        // An unresolvable role is never cached; its fingerprint is empty.
+        let bad = ResearchRequest::new("q").with_role("nope");
+        assert_eq!(a.answer_fingerprint(&bad), "");
     }
 
     #[test]

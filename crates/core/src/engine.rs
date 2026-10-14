@@ -1238,6 +1238,19 @@ pub trait Browser: Send + Sync {
 #[async_trait]
 pub trait Researcher: Send + Sync {
     async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput>;
+
+    /// What this researcher will actually run `req` with, as a stable string
+    /// the research cache folds into its key.
+    ///
+    /// A request names a role (`"research"`), not a model: the model, effort and
+    /// tool allow-list behind that name live in this researcher's config, which
+    /// the request cannot see. A cache keyed on the request alone keeps serving
+    /// the *previous* model's answers after `[claude.roles]` is edited, for the
+    /// whole TTL, with no error and no log line. Default: empty (nothing the
+    /// request does not already say).
+    fn answer_fingerprint(&self, _req: &ResearchRequest) -> String {
+        String::new()
+    }
 }
 
 /// Everything an app can scrape with, handed over via [`crate::AppContext`].

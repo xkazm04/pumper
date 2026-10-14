@@ -503,7 +503,9 @@ impl AppContext {
             return Ok(out);
         }
         let cacheable = req.resume_session.is_none() && self.research_cache.enabled();
-        let key = cacheable.then(|| ResearchCache::key(&req));
+        let key = cacheable.then(|| {
+            ResearchCache::key_with(&req, &self.engines.researcher().answer_fingerprint(&req))
+        });
         if let Some(key) = &key {
             if let Some(mut hit) = self.research_cache.get(key).await? {
                 let saved = hit.cost_usd.take();
