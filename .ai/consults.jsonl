@@ -234,3 +234,15 @@
 {"ts":"2026-10-13T13:02:04.905824+00:00","bundle":"software-engineering","subjects":["structured-output"],"techniques":["extraction-observability","extraction-strategies","schema-validation-and-repair"],"deviations":1,"context":"core-extraction","via":"curator-multi:agy","model":"gemini-3.8-flash-high"}
 {"ts":"2026-10-13T13:02:04.905824+00:00","bundle":"software-engineering","subjects":["structured-output"],"techniques":["constrained-decoding-is-a-shared-budget","constraint-and-tool-channel-exclusion","extraction-observability","extraction-strategies","output-budget-signal"],"deviations":1,"context":"ai-extraction-engines","via":"curator-multi:agy","model":"gemini-3.8-flash-high"}
 {"ts":"2026-10-13T13:02:04.905824+00:00","bundle":"software-engineering","subjects":["structured-output"],"techniques":["answer-coverage-gating","display-vs-machine-channels","extraction-strategies","graded-span-grounding","schema-validation-and-repair"],"deviations":1,"context":"content-monitoring","via":"curator-multi:agy","model":"gemini-3.8-flash-high"}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["agent-memory"],"techniques":["working-memory","episodic-capture"],"deviations":0}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["agent-memory"],"techniques":["episodic-capture","consolidation"],"deviations":0}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["agent-memory"],"techniques":["recall-injection"],"deviations":0}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["agent-memory"],"techniques":["working-memory"],"deviations":0}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["module-design"],"techniques":["seams-and-adapters"],"deviations":1}
+{"ts":"2026-10-14T17:25:05Z","bundle":"software-engineering","subjects":["module-design"],"techniques":["io-free-core","mirror-type-at-the-edge","locality-and-leverage","seams-and-adapters","concurrency-at-the-edge","emitted-code-names-from-a-root","host-primitive-facade","marked-unverifiable-region"],"deviations":0}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["quality-gates"],"techniques":["unmeasurable-criteria","gate-liveness"],"deviations":1}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["quality-gates"],"techniques":["gate-liveness","unmeasurable-criteria"],"deviations":1}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["quality-gates"],"techniques":["unparseable-form-is-a-finding","gate-liveness"],"deviations":1}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["quality-gates"],"techniques":["unmeasurable-criteria"],"deviations":1}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["module-design"],"techniques":["seams-and-adapters"],"deviations":1}
+{"ts":"2026-10-14T17:25:48Z","bundle":"software-engineering","subjects":["module-design"],"techniques":["seams-and-adapters"],"deviations":1}
