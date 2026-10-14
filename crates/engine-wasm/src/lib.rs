@@ -1472,6 +1472,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The runaway-plugin stop, tested by lowering the limit instead of reaching
+    /// the default one. A budget of 20_000 fuel against a loop of a million
+    /// iterations traps in microseconds on every machine; the same module under
+    /// the same host with the budget raised completes, so the failure is the
+    /// limit's doing and not the module's. The limit goes through
+    /// `PluginConfig`, the host's one door, never a back channel.
+    #[tokio::test]
+    async fn a_runaway_plugin_is_stopped_by_a_lowered_fuel_budget() {
+        let dir = fresh_host_dir("runaway");
+        std::fs::write(dir.join("spin.wasm"), burner_wat(1_000_000)).expect("write");
+        std::fs::write(dir.join("short.wasm"), burner_wat(100)).expect("write");
+        let tight = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            fuel: 20_000,
+            ..Default::default()
+        })
+        .expect("host");
+        let err = tight
+            .run_metered("spin", "<doc/>", &Value::Null)
+            .await
+            .expect_err("a million iterations cannot fit in 20_000 fuel");
+        assert_eq!(err.plugin_failure(), Some(PluginFailure::Trap), "{err}");
+        let (_, ok) = tight
+            .run_metered("short", "<doc/>", &Value::Null)
+            .await
+            .expect("a short plugin still fits the tight budget");
+        assert!(ok.fuel_used.expect("metered") <= 20_000);
+
+        // A fresh store per call: the trap above leaves no residue, and raising
+        // the budget lets the very same module finish.
+        let roomy = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            fuel: 50_000_000,
+            ..Default::default()
+        })
+        .expect("host");
+        roomy
+            .run_metered("spin", "<doc/>", &Value::Null)
+            .await
+            .expect("the same module completes under a roomy budget");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The memory cap refuses growth rather than trapping: a lowered cap must
+    /// leave the plugin's memory at its declared size, not at what it asked for.
+    #[tokio::test]
+    async fn a_lowered_memory_cap_refuses_growth_beyond_it() {
+        let dir = fresh_host_dir("memcap");
+        const PAGE: usize = 64 * 1024;
+        std::fs::write(dir.join("greedy.wasm"), growing_wat(40)).expect("write");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            max_memory_mb: 1,
+            ..Default::default()
+        })
+        .expect("host");
+        let (_, m) = host
+            .run_metered("greedy", "<doc/>", &Value::Null)
+            .await
+            .expect("a refused grow returns -1, it does not trap");
+        assert_eq!(
+            m.memory_bytes,
+            Some(PAGE),
+            "40 pages must not fit in a 1 MiB cap"
+        );
+        assert_eq!(m.memory_cap_bytes, Some(1024 * 1024));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A plugin built before the params envelope exports only `extract`. It must
     /// keep running unchanged — and be metered like any other call.
     #[tokio::test]
