@@ -3751,6 +3751,78 @@
           "evidence": "crates/engine-search/src/lib.rs:791 The search implementation reached through run_search orders newest hits by indexed_at without the required immutable record-identity tiebreaker."
         }
       ]
+    },
+    "e070c6d1-28bc-4b66-bdac-e9a46f152f10/client-fetch-cache": {
+      "context": "core-http-cache",
+      "subject": "client-fetch-cache",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T00:52:57.967Z",
+      "techniques": [
+        {
+          "technique": "admission-hypothesis",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:279 HttpCache::put admits any successful 2xx response into SQLite without naming an admission hypothesis or filtering unreusable one-off responses."
+        },
+        {
+          "technique": "cache-key-discipline",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/cache.rs:68 HttpCache::key derives a stable SHA-256 hash over method, url, body, canonically sorted headers, and proxy delimited by null bytes."
+        },
+        {
+          "technique": "in-flight-dedup",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:98 HttpCache queries SQLite directly without an in-flight request map, allowing duplicate concurrent fetches for the same key to fly in parallel."
+        },
+        {
+          "technique": "parse-and-derive-caches",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:1 HttpCache caches network HTTP responses in SQLite rather than local in-memory derivations keyed by input content identity."
+        },
+        {
+          "technique": "plural-policy-claims",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:290 On conflict, put overwrites expires_at with the latest write's TTL rather than resolving claimant lifetimes monotonically by maximum."
+        },
+        {
+          "technique": "portable-read-definitions",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:38 Key generation is decoupled from fetcher invocation without a unified portable read triple (key, fetcher, policies) shared across consumers."
+        },
+        {
+          "technique": "prefetch-and-defer",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:227 HttpCache calculates learned change intervals for keys but lacks launch priority queuing to prevent prefetch traffic from delaying blocking fetches."
+        },
+        {
+          "technique": "sibling-entry-warmth",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:19 Entries are complete raw HTTP responses rather than projected entity summaries borrowed from listing reads."
+        },
+        {
+          "technique": "similarity-keyed-admission",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:69 HttpCache is strictly identity-keyed via SHA-256 rather than resemblance-keyed, so similarity thresholds and fuzzy metrics do not apply."
+        },
+        {
+          "technique": "swr-design",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:33 HttpCache configures a single default_ttl rather than declaring both a fresh window and a stale ceiling, and expired entries miss rather than serving stale with background revalidation."
+        },
+        {
+          "technique": "warm-remount-caches",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:41 HttpCache is a database-backed storage layer rather than a module-scoped UI view remount cache surviving component lifecycles."
+        }
+      ],
+      "registryProposal": "The client-fetch-cache golden path is oriented around interactive client UI architectures (e.g. view lifecycles, UI remount caches, in-flight component joins). Extending or clarifying how its four policies (Key, Lifetime, Eviction, Admission) apply to backend crawler/scraper transport-level response caches would improve coverage for automated data-gathering client engines.",
+      "withdrawn": {
+        "worker": "83249c0b-d8f7-4318-ac56-a6a0b87a53f9",
+        "state": "deviation",
+        "at": "2026-10-15T00:53:13.544116+00:00",
+        "reason": "reviewer (sonnet): The claim that expired entries are treated as full cache misses is contradicted by cache.rs: get_stale (line 130) returns expired entries with their ETag/Last-Modified validators for conditional-GET revalidation, and refresh (line 175) extends them on a 304; the in-flight dedup gap is also not shown"
+      }
     }
   }
 }

@@ -1,0 +1,47 @@
+{
+  "schema": "conform-run/1",
+  "worker": "83249c0b-d8f7-4318-ac56-a6a0b87a53f9",
+  "subject": "client-fetch-cache",
+  "evaluatedAt": "2026-10-15T00:52:57.967774+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "client-fetch-cache",
+      "context": "api-data-access",
+      "reason": "Axum server-side route handlers serving scraped dataset records, full-text search, provenance tracing, and recipes from backend storage do not implement client fetch caching architecture; per seat instructions prohibiting not-applicable, the context is declined to focus on core-http-cache."
+    },
+    {
+      "subject": "client-fetch-cache",
+      "context": "core-http-cache",
+      "reason": "withdrawn after review: reviewer (sonnet): The claim that expired entries are treated as full cache misses is contradicted by cache.rs: get_stale (line 130) returns expired entries with their ETag/Last-Modified validators for conditional-GET revalidation, and refresh (line 175) extends them on a 304; the in-flight dedup gap is also not shown"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-15T00:52:57.967774+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "client-fetch-cache"
+      ],
+      "techniques": [
+        "admission-hypothesis",
+        "cache-key-discipline",
+        "in-flight-dedup",
+        "parse-and-derive-caches",
+        "plural-policy-claims",
+        "portable-read-definitions",
+        "prefetch-and-defer",
+        "sibling-entry-warmth",
+        "similarity-keyed-admission",
+        "swr-design",
+        "warm-remount-caches"
+      ],
+      "deviations": 1,
+      "context": "core-http-cache",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}
