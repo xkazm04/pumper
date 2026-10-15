@@ -85,6 +85,18 @@ impl FakeCli {
     }
 
     fn in_dir(dir: tempfile::TempDir, body: &str) -> Self {
+        Self::in_dir_reading(dir, body, true)
+    }
+
+    /// `reads_stdin = true` makes a unix script consume its stdin to EOF before
+    /// the body runs, the way the real CLI reads its prompt. Without it a body
+    /// like `echo ...` can exit before the engine writes the prompt, the write
+    /// hits a closed pipe, and the run is correctly classed `PromptUndelivered`
+    /// instead of what the test meant to pin: a race in the harness, not the
+    /// engine (it flaked `test (ubuntu-latest)` on 2026-10-14 in two different
+    /// tests). Only the test that WANTS an unread prompt passes `false`.
+    fn in_dir_reading(dir: tempfile::TempDir, body: &str, reads_stdin: bool) -> Self {
+        let drain = if reads_stdin { "cat >/dev/null\n" } else { "" };
         let binary = dir.path().join(if cfg!(windows) {
             "fake-claude.cmd"
         } else {
@@ -97,7 +109,7 @@ impl FakeCli {
             // `settle_exec` below prove the script is executable without running
             // the body. The engine never passes this argument, so no test's
             // behaviour changes.
-            format!("#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE_ARG}\" ] && exit 0\n{body}\n")
+            format!("#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE_ARG}\" ] && exit 0\n{drain}{body}\n")
         };
         std::fs::write(&binary, script).expect("write fake cli");
         #[cfg(unix)]
@@ -118,6 +130,15 @@ impl FakeCli {
     /// A fake CLI that prints `envelope` on stdout and then exits `code` — the
     /// real CLI's "complete envelope, non-zero exit" shape.
     fn printing_then_exit(tag: &str, envelope: &serde_json::Value, code: i32) -> Self {
+        Self::printing_then_exit_reading(tag, envelope, code, true)
+    }
+
+    fn printing_then_exit_reading(
+        tag: &str,
+        envelope: &serde_json::Value,
+        code: i32,
+        reads_stdin: bool,
+    ) -> Self {
         let dir = Self::temp_dir(tag);
         let payload = dir.path().join("envelope.json");
         std::fs::write(
@@ -132,7 +153,7 @@ impl FakeCli {
         } else {
             format!("cat \"{}\"\nexit {code}", payload.display())
         };
-        Self::in_dir(dir, &body)
+        Self::in_dir_reading(dir, &body, reads_stdin)
     }
 
     /// A fake CLI that records what it was actually handed — its working
@@ -466,7 +487,7 @@ async fn a_failure_without_an_envelope_reports_unknown_spend_not_zero() {
 /// deterministic one rather than a race.
 #[tokio::test]
 async fn a_prompt_that_never_reached_the_cli_is_not_a_billable_answer() {
-    let cli = FakeCli::printing("undelivered", &ok_envelope());
+    let cli = FakeCli::printing_then_exit_reading("undelivered", &ok_envelope(), 0, false);
     let prompt = "x".repeat(8 * 1024 * 1024);
 
     let err = cli
