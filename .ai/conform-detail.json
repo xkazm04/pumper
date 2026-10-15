@@ -3690,6 +3690,67 @@
         "at": "2026-10-14T23:25:00.167676+00:00",
         "reason": "reviewer (sonnet): The not-applicable anchor triggers.rs:1399 is an incidental `source_job_id`/enqueue_dedup line that does not itself show that no session continuation exists, and the absence rests only on a grep for two terms, one of which (`resume_session`) is a research-app request field rather than a generic mark"
       }
+    },
+    "6fb74ed1-c2ac-4e2e-99b4-5415a68bc3d2/table": {
+      "context": "api-data-access",
+      "subject": "table",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T00:01:16.381Z",
+      "worker": "845df081-8155-48d9-8b31-9c7baf96e044",
+      "techniques": [
+        {
+          "technique": "client-server-split",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:282 The server executes the dataset predicate and window, but the response omits the required echo of the query state actually answered."
+        },
+        {
+          "technique": "clipboard-range-round-trip",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:775 This path serializes downloaded exports; searches of the supplied handlers found no cell-range clipboard copy/paste pair."
+        },
+        {
+          "technique": "compressed-scroll-space",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:908 The handler streams an HTTP body; searches found no virtualized table spacer or browser scroll-coordinate mapping."
+        },
+        {
+          "technique": "export-escapes-for-its-consumer",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:918 Record keys pass directly through the quoting-only encoder at line 915, without guarding spreadsheet formula triggers."
+        },
+        {
+          "technique": "grid-keyboard-model",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/derived.rs:40 These handlers return API payloads; searches found no native-table/grid markup or keyboard traversal implementation."
+        },
+        {
+          "technique": "loading-and-empty-states",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/search.rs:201 Search supplies index-health metadata, but the inspected context contains no displayed table body, skeleton, or refresh-state renderer."
+        },
+        {
+          "technique": "one-door-for-range-writes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/derived.rs:6 The derived routes manage specifications and backfills; searches found no editable-cell paste, fill, cut, or clear gestures."
+        },
+        {
+          "technique": "pagination",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/datasets.rs:1294 The change-feed implementation called by dataset_changes encodes timestamp and rowid without direction; the route accepts asc/desc independently, permitting a cursor to be replayed under another order."
+        },
+        {
+          "technique": "performance",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/datasets.rs:242 The dataset read bounds the requested window before passing its limit into SQL, realizing the technique's first optimization rung."
+        },
+        {
+          "technique": "sorting",
+          "verdict": "deviation",
+          "evidence": "crates/engine-search/src/lib.rs:791 The search implementation reached through run_search orders newest hits by indexed_at without the required immutable record-identity tiebreaker."
+        }
+      ]
     }
   }
 }
