@@ -1,0 +1,39 @@
+{
+  "schema": "conform-run/1",
+  "worker": "908290a8-cd76-4d8e-a34f-543612c6a452",
+  "subject": "webhook-ingestion",
+  "evaluatedAt": "2026-10-15T22:50:52.618316+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "webhook-ingestion",
+      "context": "core-schema-migrations",
+      "reason": "The core-schema-migrations context consists of SQLite DDL migration scripts (0001_init.sql through 0025_api_recipes.sql) managing database schema. While 0021_ingress.sql defines table ingress_sources, the context contains no network listener, HTTP endpoints, or request-handling runtime code for webhook ingestion."
+    },
+    {
+      "subject": "webhook-ingestion",
+      "context": "webhook-event-delivery",
+      "reason": "withdrawn after review: reviewer (sonnet): Only the single-secret claim holds (ingress.rs:335 passes `source.secret.as_bytes()`). The hex-decode early return acts on the attacker-supplied digest, not the secret, so it is no constant-time deviation, and `Mac::verify_slice` does the comparison in constant time, as the doc comment at webhook.rs"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-15T22:50:52.618316+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "webhook-ingestion"
+      ],
+      "techniques": [
+        "delivery-logging-and-replay",
+        "duplicate-and-replay-dedup",
+        "sender-authentication"
+      ],
+      "deviations": 1,
+      "context": "webhook-event-delivery",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}

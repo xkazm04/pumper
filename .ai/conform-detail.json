@@ -3948,6 +3948,38 @@
           "evidence": "crates/core/src/app.rs:525 The complete wrapper handles replay, caching, and budget but has no dependency capability gate; the concrete Claude researcher proceeds directly to spawning the configured executable."
         }
       ]
+    },
+    "571c7935-fe1d-4818-bced-5005f04ecf96/webhook-ingestion": {
+      "context": "webhook-event-delivery",
+      "subject": "webhook-ingestion",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T22:50:52.618Z",
+      "techniques": [
+        {
+          "technique": "sender-authentication",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:999 verify_signature accepts only a single secret slice instead of supporting a plurality of active secrets for zero-downtime rotation, and early-returns on hex decode failure at line 1004."
+        },
+        {
+          "technique": "delivery-logging-and-replay",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:581 Delivery logging and replay in webhook.rs apply solely to outbound HTTP dispatches; inbound deliveries are neither logged nor replayable."
+        },
+        {
+          "technique": "duplicate-and-replay-dedup",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/events.rs:58 JobEvent::external mints inbound events directly to the event bus without checking a deduplication store."
+        }
+      ],
+      "registryProposal": "The standard should explicitly clarify boundary separation when signature verification primitives for ingress are housed within outbound delivery modules to prevent context-classification ambiguity.",
+      "withdrawn": {
+        "worker": "908290a8-cd76-4d8e-a34f-543612c6a452",
+        "state": "deviation",
+        "at": "2026-10-15T22:51:08.895706+00:00",
+        "reason": "reviewer (sonnet): Only the single-secret claim holds (ingress.rs:335 passes `source.secret.as_bytes()`). The hex-decode early return acts on the attacker-supplied digest, not the secret, so it is no constant-time deviation, and `Mac::verify_slice` does the comparison in constant time, as the doc comment at webhook.rs"
+      }
     }
   }
 }
