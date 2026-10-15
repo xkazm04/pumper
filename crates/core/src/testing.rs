@@ -44,7 +44,34 @@ use crate::tiers::TierMemory;
 /// files).
 pub struct TempStore {
     pub storage: Storage,
-    dir: tempfile::TempDir,
+    /// `None` only inside `Drop`, once the directory has been handed on.
+    dir: Option<tempfile::TempDir>,
+}
+
+thread_local! {
+    /// Directories a store could not remove while its pool still held a file open.
+    static PENDING_REMOVAL: PendingRemoval = const { PendingRemoval(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Removes the directories its thread's stores left behind, when that thread ends.
+///
+/// A `#[tokio::test]` thread drops its runtime (and the pooled connections the
+/// runtime's tasks still own) *before* the thread exits, so by the time this runs the
+/// SQLite files are releasable. SQLite's worker threads close the handles a moment
+/// later, hence the bounded retry.
+struct PendingRemoval(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for PendingRemoval {
+    fn drop(&mut self) {
+        for path in self.0.get_mut().drain(..) {
+            for _ in 0..100 {
+                if std::fs::remove_dir_all(&path).is_ok() || !path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 impl TempStore {
@@ -59,7 +86,10 @@ impl TempStore {
             ..StorageConfig::default()
         };
         let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-        Self { storage, dir }
+        Self {
+            storage,
+            dir: Some(dir),
+        }
     }
 
     pub fn datasets(&self) -> Datasets {
@@ -68,7 +98,22 @@ impl TempStore {
 
     /// The temp root (the database and artifacts dir live under it).
     pub fn path(&self) -> &std::path::Path {
-        self.dir.path()
+        self.dir.as_ref().expect("dir lives until drop").path()
+    }
+}
+
+impl Drop for TempStore {
+    /// Removes the temp dir, deferring to thread exit when the database is still open.
+    ///
+    /// Field order alone does not close the pool: a test holds clones of it (an
+    /// `AppState`, a spawned task), so on Windows the open `.db` cannot be deleted here,
+    /// and `TempDir`'s own drop swallows that error, leaving one directory behind per test.
+    fn drop(&mut self) {
+        let Some(dir) = self.dir.take() else { return };
+        let path = dir.path().to_path_buf();
+        if dir.close().is_err() {
+            let _ = PENDING_REMOVAL.try_with(|p| p.0.borrow_mut().push(path));
+        }
     }
 }
 
