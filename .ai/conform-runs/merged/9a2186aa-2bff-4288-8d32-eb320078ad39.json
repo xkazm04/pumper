@@ -1,0 +1,99 @@
+{
+ "schema": "conform-run/1",
+ "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+ "subject": "retry-backoff",
+ "evaluatedAt": "2026-10-15T21:07:38.519134+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "webhook-event-delivery",
+   "subject": "retry-backoff",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/webhook.rs:906 The sender shortens dependency-stated waits above five seconds instead of honoring them or terminating with an over-budget-wait outcome.",
+   "techniques": [
+    {
+     "technique": "backoff-design",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:906 A long Retry-After is truncated, allowing another request before the receiver's stated time."
+    },
+    {
+     "technique": "durable-retries",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:2629 The retry claim checks status but not the live retry budget; stale-pending reclamation can therefore permit dispatch beyond the cap after repeated interruptions."
+    },
+    {
+     "technique": "error-classification-for-retry",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:85 Unrecognized response statuses default to transient rather than a separately counted unknown class."
+    },
+    {
+     "technique": "retry-observability",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:2594 Permanent rejection writes the same dead status used for exhaustion, without distinct structured terminal outcomes."
+    },
+    {
+     "technique": "storm-control",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves."
+    }
+   ]
+  },
+  {
+   "context": "e2e-api-contract",
+   "subject": "retry-backoff",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/budget_terminal.rs:160 The contract requires governance-paused work to become terminally failed and consume an attempt instead of remaining suspended until its precondition changes.",
+   "techniques": [
+    {
+     "technique": "suspension-is-not-failure",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test explicitly charges one attempt and requires failure despite the temporary local hold."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "retry-backoff",
+   "context": "core-resilience",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-15T21:07:38.519134+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "retry-backoff"
+   ],
+   "techniques": [
+    "backoff-design",
+    "durable-retries",
+    "error-classification-for-retry",
+    "retry-observability",
+    "storm-control"
+   ],
+   "deviations": 1,
+   "context": "webhook-event-delivery",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-15T21:07:38.519134+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "retry-backoff"
+   ],
+   "techniques": [
+    "suspension-is-not-failure"
+   ],
+   "deviations": 1,
+   "context": "e2e-api-contract",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

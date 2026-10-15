@@ -3834,7 +3834,11 @@
           "revision": 13,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:160 The contract requires governance-paused work to become terminally failed and consume an attempt instead of remaining suspended until its precondition changes.",
+          "evaluatedAt": "2026-10-15",
+          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
+          "evaluatedRevision": 13
         }
       ],
       "governance": "governed"
@@ -5801,7 +5805,11 @@
           "revision": 13,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/webhook.rs:906 The sender shortens dependency-stated waits above five seconds instead of honoring them or terminating with an over-budget-wait outcome.",
+          "evaluatedAt": "2026-10-15",
+          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
+          "evaluatedRevision": 13
         },
         {
           "subject": "mcp-tools",

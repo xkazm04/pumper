@@ -3823,6 +3823,58 @@
         "at": "2026-10-15T00:53:13.544116+00:00",
         "reason": "reviewer (sonnet): The claim that expired entries are treated as full cache misses is contradicted by cache.rs: get_stale (line 130) returns expired entries with their ETag/Last-Modified validators for conditional-GET revalidation, and refresh (line 175) extends them on a 304; the in-flight dedup gap is also not shown"
       }
+    },
+    "571c7935-fe1d-4818-bced-5005f04ecf96/retry-backoff": {
+      "context": "webhook-event-delivery",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T21:07:38.519Z",
+      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "techniques": [
+        {
+          "technique": "backoff-design",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:906 A long Retry-After is truncated, allowing another request before the receiver's stated time."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:2629 The retry claim checks status but not the live retry budget; stale-pending reclamation can therefore permit dispatch beyond the cap after repeated interruptions."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:85 Unrecognized response statuses default to transient rather than a separately counted unknown class."
+        },
+        {
+          "technique": "retry-observability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:2594 Permanent rejection writes the same dead status used for exhaustion, without distinct structured terminal outcomes."
+        },
+        {
+          "technique": "storm-control",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves."
+        }
+      ]
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/retry-backoff": {
+      "context": "e2e-api-contract",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T21:07:38.519Z",
+      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "techniques": [
+        {
+          "technique": "suspension-is-not-failure",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test explicitly charges one attempt and requires failure despite the temporary local hold."
+        }
+      ]
     }
   }
 }
