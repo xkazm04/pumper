@@ -1884,7 +1884,11 @@
           "revision": 8,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/plugin/src/lib.rs:298 The plugin entry gate reports an installed module lacking the extraction ABI as not loaded, losing the distinction between absence and incompatibility needed to give the correct remedy.",
+          "evaluatedAt": "2026-10-15",
+          "evaluatedAgainst": "sha256-b2:25f000a9ae879947",
+          "evaluatedRevision": 8
         },
         {
           "subject": "node-boot-and-declarative-bootstrap",
@@ -2332,7 +2336,11 @@
           "revision": 8,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/app.rs:525 On a cache miss, the core research entry checks budget and invokes the researcher without consulting an availability or compatible-version verdict, leaving a missing CLI to surface as a spawn failure.",
+          "evaluatedAt": "2026-10-15",
+          "evaluatedAgainst": "sha256-b2:25f000a9ae879947",
+          "evaluatedRevision": 8
         }
       ],
       "governance": "governed"
@@ -5274,7 +5282,11 @@
           "revision": 8,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "plugins-src/title-extractor/Cargo.toml:3 Context and repository searches found no download or sidecar hits under plugins-src; these crates produce manually deployed WASM modules and do not acquire external runtime dependencies.",
+          "evaluatedAt": "2026-10-15",
+          "evaluatedAgainst": "sha256-b2:25f000a9ae879947",
+          "evaluatedRevision": 8
         },
         {
           "subject": "supply-chain",

@@ -3875,6 +3875,79 @@
           "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test explicitly charges one attempt and requires failure despite the temporary local hold."
         }
       ]
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/sidecar-provisioning": {
+      "context": "wasm-plugins",
+      "subject": "sidecar-provisioning",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T21:41:35.204Z",
+      "worker": "b4c2d178-1917-468f-85ca-4922ea91213d",
+      "techniques": [
+        {
+          "technique": "atomic-downloads",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/busyloop/Cargo.toml:4 The fixture is compiled and copied by the operator; this crate performs no artifact transfer."
+        },
+        {
+          "technique": "model-storage-lifecycle",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/delta-slim/Cargo.toml:4 The manifest delegates placement to a manual copy; the producer does not own a provisioned artifact store."
+        },
+        {
+          "technique": "plugin-lazy-load-and-reload",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/trigger-gate/Cargo.toml:21 This is a WASM module producer, not a host mounting out-of-process plugin runners."
+        },
+        {
+          "technique": "process-isolation",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/Cargo.toml:21 The artifact targets WASM rather than loading a native capability into the host's native-library namespace."
+        },
+        {
+          "technique": "resolution-ladders",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/delta-slim/Cargo.toml:3 This crate produces the file for manual deployment; dependency-file resolution belongs to its consumer."
+        },
+        {
+          "technique": "source-pinning",
+          "verdict": "not-applicable",
+          "evidence": "plugins-src/title-extractor/Cargo.toml:2 The runtime module is built from source here; no runtime artifact acquisition channel was found."
+        }
+      ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/sidecar-provisioning": {
+      "context": "content-monitoring",
+      "subject": "sidecar-provisioning",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T21:41:35.204Z",
+      "worker": "b4c2d178-1917-468f-85ca-4922ea91213d",
+      "techniques": [
+        {
+          "technique": "capability-detection",
+          "verdict": "deviation",
+          "evidence": "crates/apps/plugin/src/lib.rs:272 has() and list() exclude loaded describe-only modules, but this refusal labels them not loaded and can recommend installation instead of identifying the missing extraction ABI."
+        }
+      ]
+    },
+    "fc25f145-0e20-4ffc-801f-4c2dfb7780ee/sidecar-provisioning": {
+      "context": "core-engine-contract",
+      "subject": "sidecar-provisioning",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-15",
+      "evaluatedTs": "2026-10-15T21:41:35.204Z",
+      "worker": "b4c2d178-1917-468f-85ca-4922ea91213d",
+      "techniques": [
+        {
+          "technique": "capability-detection",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/app.rs:525 The complete wrapper handles replay, caching, and budget but has no dependency capability gate; the concrete Claude researcher proceeds directly to spawning the configured executable."
+        }
+      ]
     }
   }
 }

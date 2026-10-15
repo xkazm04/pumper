@@ -1,0 +1,131 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b4c2d178-1917-468f-85ca-4922ea91213d",
+ "subject": "sidecar-provisioning",
+ "evaluatedAt": "2026-10-15T21:41:35.204510+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "wasm-plugins",
+   "subject": "sidecar-provisioning",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "plugins-src/title-extractor/Cargo.toml:3 Context and repository searches found no download or sidecar hits under plugins-src; these crates produce manually deployed WASM modules and do not acquire external runtime dependencies.",
+   "techniques": [
+    {
+     "technique": "atomic-downloads",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/busyloop/Cargo.toml:4 The fixture is compiled and copied by the operator; this crate performs no artifact transfer."
+    },
+    {
+     "technique": "model-storage-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/delta-slim/Cargo.toml:4 The manifest delegates placement to a manual copy; the producer does not own a provisioned artifact store."
+    },
+    {
+     "technique": "plugin-lazy-load-and-reload",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/trigger-gate/Cargo.toml:21 This is a WASM module producer, not a host mounting out-of-process plugin runners."
+    },
+    {
+     "technique": "process-isolation",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/title-extractor/Cargo.toml:21 The artifact targets WASM rather than loading a native capability into the host's native-library namespace."
+    },
+    {
+     "technique": "resolution-ladders",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/delta-slim/Cargo.toml:3 This crate produces the file for manual deployment; dependency-file resolution belongs to its consumer."
+    },
+    {
+     "technique": "source-pinning",
+     "verdict": "not-applicable",
+     "evidence": "plugins-src/title-extractor/Cargo.toml:2 The runtime module is built from source here; no runtime artifact acquisition channel was found."
+    }
+   ],
+   "absenceTerms": [
+    "download",
+    "sidecar"
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "sidecar-provisioning",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/plugin/src/lib.rs:298 The plugin entry gate reports an installed module lacking the extraction ABI as not loaded, losing the distinction between absence and incompatibility needed to give the correct remedy.",
+   "techniques": [
+    {
+     "technique": "capability-detection",
+     "verdict": "deviation",
+     "evidence": "crates/apps/plugin/src/lib.rs:272 has() and list() exclude loaded describe-only modules, but this refusal labels them not loaded and can recommend installation instead of identifying the missing extraction ABI."
+    }
+   ]
+  },
+  {
+   "context": "core-engine-contract",
+   "subject": "sidecar-provisioning",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/app.rs:525 On a cache miss, the core research entry checks budget and invokes the researcher without consulting an availability or compatible-version verdict, leaving a missing CLI to surface as a spawn failure.",
+   "techniques": [
+    {
+     "technique": "capability-detection",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/app.rs:525 The complete wrapper handles replay, caching, and budget but has no dependency capability gate; the concrete Claude researcher proceeds directly to spawning the configured executable."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-15T21:41:35.204510+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "sidecar-provisioning"
+   ],
+   "techniques": [
+    "atomic-downloads",
+    "model-storage-lifecycle",
+    "plugin-lazy-load-and-reload",
+    "process-isolation",
+    "resolution-ladders",
+    "source-pinning"
+   ],
+   "deviations": 0,
+   "context": "wasm-plugins",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-15T21:41:35.204510+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "sidecar-provisioning"
+   ],
+   "techniques": [
+    "capability-detection"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-15T21:41:35.204510+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "sidecar-provisioning"
+   ],
+   "techniques": [
+    "capability-detection"
+   ],
+   "deviations": 1,
+   "context": "core-engine-contract",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
