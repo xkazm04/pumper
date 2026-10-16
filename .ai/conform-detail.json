@@ -4236,6 +4236,78 @@
         }
       ],
       "registryProposal": "atomic-claiming requires a holder id and a conditional completion write, while stuck-reaping allows an age threshold when the claim has only a timestamp. A one-process delivery row that stores updated_at and reaps at a written multiple of worst-case send time cannot satisfy both texts; state which obligation is waived for a single process."
+    },
+    "fc25f145-0e20-4ffc-801f-4c2dfb7780ee/guest-execution-bounding": {
+      "context": "core-engine-contract",
+      "subject": "guest-execution-bounding",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-16",
+      "evaluatedTs": "2026-10-16T22:44:06.687Z",
+      "worker": "1b78423a-7c5e-4992-b28d-18112163e1e7",
+      "techniques": [
+        {
+          "technique": "back-edge-iteration-counter",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/config.rs:1786 The supported instruction budget subsumes loop termination; this context does not implement an interpreter compiler."
+        },
+        {
+          "technique": "cost-budget-cooperative-yield",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/config.rs:1792 Plugin evaluation uses blocking-pool threads rather than sharing the host executor through a synchronous interpreter dispatch loop."
+        },
+        {
+          "technique": "nested-liveness-ceilings",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/config.rs:1547 Navigation and render ceilings are independently configurable, but Config::validate neither enforces their ordering nor orders the render ceiling below the worker timeout."
+        },
+        {
+          "technique": "terminate-from-outside-when-you-cannot-count",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/plugin.rs:77 The plugin contract uses enforced fuel counting; inspection of the implementation confirmed that Wasmtime fuel metering is enabled."
+        },
+        {
+          "technique": "uncatchable-limit-errors",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/error.rs:323 The standard requires ceiling-specific variants distinct from guest failures; this contract intentionally combines them into Trap."
+        }
+      ]
+    },
+    "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/guest-execution-bounding": {
+      "context": "web-scraping-engines",
+      "subject": "guest-execution-bounding",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-16",
+      "evaluatedTs": "2026-10-16T22:44:06.687Z",
+      "techniques": [
+        {
+          "technique": "back-edge-iteration-counter",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:46 This adapter delegates execution to Chrome through CDP and owns no guest compiler in which to emit iteration counters."
+        },
+        {
+          "technique": "cost-budget-cooperative-yield",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:526 JavaScript executes in the launched Chrome process, rather than in an interpreter dispatch loop on the Rust executor."
+        },
+        {
+          "technique": "terminate-from-outside-when-you-cannot-count",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:319 The adapter attempts tab closure, but a stalled close is abandoned after five seconds without terminating execution or killing the retained browser process."
+        },
+        {
+          "technique": "uncatchable-limit-errors",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:227 Render-budget exhaustion becomes the same Browser error class used for other browser failures; the host must parse text to identify the ceiling breach."
+        }
+      ],
+      "withdrawn": {
+        "worker": "1b78423a-7c5e-4992-b28d-18112163e1e7",
+        "state": "deviation",
+        "at": "2026-10-16T22:44:29.315333+00:00",
+        "reason": "reviewer (sonnet): Claiming 'no enforced termination backstop' is contradicted by the code: lib.rs:226-279 enforces a 180s render_budget_secs timeout over the whole render, lib.rs:153 and :397 recycle Chrome after N renders, and :643 kills it on drop (kill_on_drop). The cited line 324 only shows that a stalled close i"
+      }
     }
   }
 }

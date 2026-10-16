@@ -2254,7 +2254,11 @@
           "revision": 3,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/error.rs:344 The core error contract merges guest panics, fuel exhaustion and memory breaches into PluginFailure::Trap, preventing callers from distinguishing which ceiling stopped execution.",
+          "evaluatedAt": "2026-10-16",
+          "evaluatedAgainst": "sha256-b2:a59e479b7cea486b",
+          "evaluatedRevision": 3
         },
         {
           "subject": "agent-memory",

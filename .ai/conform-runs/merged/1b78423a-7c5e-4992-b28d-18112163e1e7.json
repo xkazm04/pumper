@@ -1,0 +1,88 @@
+{
+  "schema": "conform-run/1",
+  "worker": "1b78423a-7c5e-4992-b28d-18112163e1e7",
+  "subject": "guest-execution-bounding",
+  "evaluatedAt": "2026-10-16T22:44:06.687226+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [
+    {
+      "context": "core-engine-contract",
+      "subject": "guest-execution-bounding",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/error.rs:344 The core error contract merges guest panics, fuel exhaustion and memory breaches into PluginFailure::Trap, preventing callers from distinguishing which ceiling stopped execution.",
+      "techniques": [
+        {
+          "technique": "back-edge-iteration-counter",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/config.rs:1786 The supported instruction budget subsumes loop termination; this context does not implement an interpreter compiler."
+        },
+        {
+          "technique": "cost-budget-cooperative-yield",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/config.rs:1792 Plugin evaluation uses blocking-pool threads rather than sharing the host executor through a synchronous interpreter dispatch loop."
+        },
+        {
+          "technique": "nested-liveness-ceilings",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/config.rs:1547 Navigation and render ceilings are independently configurable, but Config::validate neither enforces their ordering nor orders the render ceiling below the worker timeout."
+        },
+        {
+          "technique": "terminate-from-outside-when-you-cannot-count",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/plugin.rs:77 The plugin contract uses enforced fuel counting; inspection of the implementation confirmed that Wasmtime fuel metering is enabled."
+        },
+        {
+          "technique": "uncatchable-limit-errors",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/error.rs:323 The standard requires ceiling-specific variants distinct from guest failures; this contract intentionally combines them into Trap."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "guest-execution-bounding",
+      "context": "web-scraping-engines",
+      "reason": "withdrawn after review: reviewer (sonnet): Claiming 'no enforced termination backstop' is contradicted by the code: lib.rs:226-279 enforces a 180s render_budget_secs timeout over the whole render, lib.rs:153 and :397 recycle Chrome after N renders, and :643 kills it on drop (kill_on_drop). The cited line 324 only shows that a stalled close i"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-16T22:44:06.687226+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "guest-execution-bounding"
+      ],
+      "techniques": [
+        "back-edge-iteration-counter",
+        "cost-budget-cooperative-yield",
+        "nested-liveness-ceilings",
+        "terminate-from-outside-when-you-cannot-count",
+        "uncatchable-limit-errors"
+      ],
+      "deviations": 1,
+      "context": "core-engine-contract",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "ts": "2026-10-16T22:44:06.687226+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "guest-execution-bounding"
+      ],
+      "techniques": [
+        "back-edge-iteration-counter",
+        "cost-budget-cooperative-yield",
+        "terminate-from-outside-when-you-cannot-count",
+        "uncatchable-limit-errors"
+      ],
+      "deviations": 1,
+      "context": "web-scraping-engines",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
