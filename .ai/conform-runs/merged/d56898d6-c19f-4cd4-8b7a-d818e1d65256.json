@@ -1,0 +1,43 @@
+{
+  "schema": "conform-run/1",
+  "worker": "d56898d6-c19f-4cd4-8b7a-d818e1d65256",
+  "subject": "admission-queue",
+  "evaluatedAt": "2026-10-16T21:08:11.560707+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "admission-queue",
+      "context": "job-worker",
+      "reason": "withdrawn after review: reviewer (sonnet): The deviation rests on the enqueue path (storage.rs:717 INSERT and routes/jobs.rs:174 handler), which sits outside the job-worker context's files, while the in-context code (worker.rs:24 semaphore, fanout.rs:126 and :137) only supports weaker claims about a different queue; the fanout check-then-inc"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-16T21:08:11.560707+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "admission-queue"
+      ],
+      "techniques": [
+        "admission-vocabulary",
+        "budget-includes-the-callers-own-cache",
+        "depth-bounds-and-shed",
+        "drain-and-shutdown",
+        "load-aware-admission",
+        "priority-and-fairness",
+        "queue-cardinality",
+        "refusal-without-release",
+        "self-paced-intake",
+        "speculative-work-admission",
+        "wait-telemetry",
+        "zero-depth-admission"
+      ],
+      "deviations": 1,
+      "context": "job-worker",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
