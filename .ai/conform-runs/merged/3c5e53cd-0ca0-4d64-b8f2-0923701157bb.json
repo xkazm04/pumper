@@ -1,0 +1,65 @@
+{
+ "schema": "conform-run/1",
+ "worker": "3c5e53cd-0ca0-4d64-b8f2-0923701157bb",
+ "subject": "bounded-enumeration",
+ "evaluatedAt": "2026-10-16T21:31:03.220377+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "bounded-enumeration",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/src/sync.ts:329 The incremental drain stops on a short page despite an available continuation, so a server-clamped page can end the run before the backlog is drained.",
+   "techniques": [
+    {
+     "technique": "after-plus-limit-not-cursor",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/types.ts:80 The SDK uses the feed's timestamp/rowid sort tuple rather than an offset; the standard permits tuple tokens for non-key ordering, and the inspected server constructs them from the last returned row."
+    },
+    {
+     "technique": "declare-the-inconsistency",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/src/client.ts:56 The paginated method's documentation describes positioning but does not state cross-page consistency or concurrent-write effects; searches of the SDK README, source, and linked SDK documentation found no such contract."
+    },
+    {
+     "technique": "deny-absorbs-and-lowest-limit-wins",
+     "verdict": "not-applicable",
+     "evidence": "clients/typescript/src/client.ts:1 This context consumes dataset reads without merging authorization policies or exposing recursive listing; searching the package found no implementation of those constructs."
+    },
+    {
+     "technique": "page-size-from-memory-budget",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/src/sync.ts:146 The configurable 500-revision default has no documented memory target, worst-case item size, overhead factor, or derivation; the low-level client's 1000-item default is likewise underived."
+    },
+    {
+     "technique": "required-limit-breaks-unaware-clients",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/src/sync.ts:326 Although the loop checks continuation absence here, line 329 also terminates on a short page; requesting batchSize above the server's 1000 ceiling therefore stops after one clamped page even when next_cursor is present."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-16T21:31:03.220377+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "bounded-enumeration"
+   ],
+   "techniques": [
+    "after-plus-limit-not-cursor",
+    "declare-the-inconsistency",
+    "deny-absorbs-and-lowest-limit-wins",
+    "page-size-from-memory-budget",
+    "required-limit-breaks-unaware-clients"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

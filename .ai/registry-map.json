@@ -5079,7 +5079,11 @@
           "revision": 3,
           "changedAt": "2026-09-26",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/src/sync.ts:329 The incremental drain stops on a short page despite an available continuation, so a server-clamped page can end the run before the backlog is drained.",
+          "evaluatedAt": "2026-10-16",
+          "evaluatedAgainst": "sha256-b2:4ec15f52e99e1903",
+          "evaluatedRevision": 3
         },
         {
           "subject": "prompt-assembly",
