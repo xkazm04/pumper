@@ -4092,6 +4092,93 @@
           "evidence": "clients/typescript/src/sync.ts:326 Although the loop checks continuation absence here, line 329 also terminates on a short page; requesting batchSize above the server's 1000 ceiling therefore stops after one clamped page even when next_cursor is present."
         }
       ]
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/conformance-checking": {
+      "context": "docs-and-ops-scripts",
+      "subject": "conformance-checking",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-16",
+      "evaluatedTs": "2026-10-16T21:59:31.515Z",
+      "techniques": [
+        {
+          "technique": "checker-false-positive-discipline",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:102 Differentiates tool results wearing user-role costume from genuine user prompts using three independent signals to prevent false passes."
+        },
+        {
+          "technique": "declared-deviation-register",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:18 Deviations are dismissed through unrecorded conversational replies rather than a published register with document version, clause, cost-stated motivation, and expiry."
+        },
+        {
+          "technique": "declared-then-proven",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:220 Checks only presence of the doc path in the edited set without inspecting doc shape or content, and emits findings without a declared proof rung."
+        },
+        {
+          "technique": "finding-severity-ladder",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:266 Explicitly reserves exit code 3 for unable-to-check outcomes so an unreadable transcript or empty map never radiates false confidence."
+        },
+        {
+          "technique": "fixture-repo-testing",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:41 Tests the checker end-to-end through its real CLI entry point against committed transcript fixtures, asserting exact exit codes."
+        },
+        {
+          "technique": "rule-registry-enumerated-fixtures",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/feature-doc-map.json:3 Does not enumerate the 19 entries in feature-doc-map.json to prove both pass and fail directions, allowing dead rules shadowed by SKIP_PATTERNS to remain in the registry."
+        }
+      ],
+      "withdrawn": {
+        "worker": "43c03f56-2235-4bfc-bea3-3ac9b17649d3",
+        "state": "deviation",
+        "at": "2026-10-16T21:59:51.331040+00:00",
+        "reason": "reviewer (sonnet): The evidence says the dead rules have no enumerated test fixtures, but fixtures/README.md has a table listing each fixture and what it pins. The dead rules are also declared in the map's own `_inert` note, which is the line right beside the cited anchor."
+      }
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/conformance-checking": {
+      "context": "e2e-data-integrity",
+      "subject": "conformance-checking",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-16",
+      "evaluatedTs": "2026-10-16T21:59:31.515Z",
+      "worker": "43c03f56-2235-4bfc-bea3-3ac9b17649d3",
+      "techniques": [
+        {
+          "technique": "checker-false-positive-discipline",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:258 Ensures intentionally disabled subsystems report clean without raising false positive warnings."
+        },
+        {
+          "technique": "declared-deviation-register",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:694 Implementor exemptions and refusals are declared as ad-hoc code arrays rather than an enumerable register with document version, clause, cost-stated motivation, and reconciliation state."
+        },
+        {
+          "technique": "declared-then-proven",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:62 Verifies client binary fetch capability by executing requests against a loopback origin rather than inspecting type names or error messages."
+        },
+        {
+          "technique": "derived-expectation-needs-an-evidence-floor",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:724 Asserts that every battery subject is present in the derived population, preventing an empty source scan from silently passing."
+        },
+        {
+          "technique": "finding-severity-ladder",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:149 Validates that when a sweep is skipped, the doctor report marks the check unverifiable and verdict incomplete rather than folding into clean."
+        },
+        {
+          "technique": "pass-ratio-comparability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:325 Refuses ratio-based checks across mismatched denominators and relies on discrete findings."
+        }
+      ]
     }
   }
 }

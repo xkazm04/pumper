@@ -1,0 +1,96 @@
+{
+  "schema": "conform-run/1",
+  "worker": "43c03f56-2235-4bfc-bea3-3ac9b17649d3",
+  "subject": "conformance-checking",
+  "evaluatedAt": "2026-10-16T21:59:31.515675+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [
+    {
+      "context": "e2e-data-integrity",
+      "subject": "conformance-checking",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/engine_conformance.rs:694 The engine conformance battery tracks implementor exemptions as hardcoded code tuples rather than in a published declared-deviation register with normative clause references and cost motivations.",
+      "techniques": [
+        {
+          "technique": "checker-false-positive-discipline",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:258 Ensures intentionally disabled subsystems report clean without raising false positive warnings."
+        },
+        {
+          "technique": "declared-deviation-register",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:694 Implementor exemptions and refusals are declared as ad-hoc code arrays rather than an enumerable register with document version, clause, cost-stated motivation, and reconciliation state."
+        },
+        {
+          "technique": "declared-then-proven",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:62 Verifies client binary fetch capability by executing requests against a loopback origin rather than inspecting type names or error messages."
+        },
+        {
+          "technique": "derived-expectation-needs-an-evidence-floor",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:724 Asserts that every battery subject is present in the derived population, preventing an empty source scan from silently passing."
+        },
+        {
+          "technique": "finding-severity-ladder",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:149 Validates that when a sweep is skipped, the doctor report marks the check unverifiable and verdict incomplete rather than folding into clean."
+        },
+        {
+          "technique": "pass-ratio-comparability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/store_reports.rs:325 Refuses ratio-based checks across mismatched denominators and relies on discrete findings."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "conformance-checking",
+      "context": "docs-and-ops-scripts",
+      "reason": "withdrawn after review: reviewer (sonnet): The evidence says the dead rules have no enumerated test fixtures, but fixtures/README.md has a table listing each fixture and what it pins. The dead rules are also declared in the map's own `_inert` note, which is the line right beside the cited anchor."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-16T21:59:31.515675+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "conformance-checking"
+      ],
+      "techniques": [
+        "checker-false-positive-discipline",
+        "declared-deviation-register",
+        "declared-then-proven",
+        "finding-severity-ladder",
+        "fixture-repo-testing",
+        "rule-registry-enumerated-fixtures"
+      ],
+      "deviations": 1,
+      "context": "docs-and-ops-scripts",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    },
+    {
+      "ts": "2026-10-16T21:59:31.515675+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "conformance-checking"
+      ],
+      "techniques": [
+        "checker-false-positive-discipline",
+        "declared-deviation-register",
+        "declared-then-proven",
+        "derived-expectation-needs-an-evidence-floor",
+        "finding-severity-ladder",
+        "pass-ratio-comparability"
+      ],
+      "deviations": 1,
+      "context": "e2e-data-integrity",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}
