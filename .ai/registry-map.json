@@ -5809,7 +5809,11 @@
           "revision": 8,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/events.rs:197 An empty SSE replay ring is reported as a successful empty catch-up, so a client that reconnects after a restart with Last-Event-ID is not told the gap is gone and then drops every new event because sequence ids start again at 1.",
+          "evaluatedAt": "2026-10-16",
+          "evaluatedAgainst": "sha256-b2:1023ff3ecf23d679",
+          "evaluatedRevision": 8
         },
         {
           "subject": "retry-backoff",

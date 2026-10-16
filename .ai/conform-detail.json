@@ -4179,6 +4179,63 @@
           "evidence": "crates/server/src/e2e/store_reports.rs:325 Refuses ratio-based checks across mismatched denominators and relies on discrete findings."
         }
       ]
+    },
+    "571c7935-fe1d-4818-bced-5005f04ecf96/delivery-guarantees": {
+      "context": "webhook-event-delivery",
+      "subject": "delivery-guarantees",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-16",
+      "evaluatedTs": "2026-10-16T22:28:15.583Z",
+      "worker": "19879839-80e4-4748-b88f-2d13d4a835d3",
+      "techniques": [
+        {
+          "technique": "atomic-claiming",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:2511 Outcome updates match only the delivery id. A sender whose pending row was reclaimed can overwrite the reaper, and the claim UPDATE records no holder id."
+        },
+        {
+          "technique": "co-transactional-consume",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:867 The handler effect is an HTTP POST outside the SQLite delivery row, so consume and effect cannot be one commit."
+        },
+        {
+          "technique": "dead-letter-design",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:2914 Aged dead rows are deleted with no non-delivery ledger write. The operator surface has replay and no discard or bulk verb."
+        },
+        {
+          "technique": "guarantee-selection",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/events.rs:196 The module promises reset when a gap has left the ring, but an empty ring after restart is treated as no loss. Webhook sends do keep a stable delivery id."
+        },
+        {
+          "technique": "marker-certifies-what-was-done",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/events.rs:197 Empty means caught up. A stale Last-Event-ID then stays above every post-restart sequence id, so those events are never offered."
+        },
+        {
+          "technique": "non-delivery-ledgers",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:471 A deliberate skip is a debug string. Governance audit rows cover executed actions, not this class of skip."
+        },
+        {
+          "technique": "ordered-lane-blocking",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:808 Each delivery is its own row. A dead row is left out of the due scan; there is no keyed stream whose head wedges successors."
+        },
+        {
+          "technique": "retry-escalation",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:2653 Manual replay increments the persisted counter instead of starting a new campaign, so an exhausted row that fails once is dead again. The drain ladder itself does move to status dead."
+        },
+        {
+          "technique": "stuck-reaping",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:2696 Pending rows older than the cutoff are returned to failed with a recorded reason. The next drain claim bumps retry_count, so a crash loop still reaches dead."
+        }
+      ],
+      "registryProposal": "atomic-claiming requires a holder id and a conditional completion write, while stuck-reaping allows an age threshold when the claim has only a timestamp. A one-process delivery row that stores updated_at and reaps at a written multiple of worst-case send time cannot satisfy both texts; state which obligation is waived for a single process."
     }
   }
 }
