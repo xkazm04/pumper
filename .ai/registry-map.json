@@ -3183,7 +3183,11 @@
           "revision": 6,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/resilience/store.rs:886 Context-directory and repository searches found no playhead, playout, crossfade or playlist constructs, while resilience evaluates extracted document values and reports, so the media-playback precondition does not hold.",
+          "evaluatedAt": "2026-10-16",
+          "evaluatedAgainst": "sha256-b2:122990080db4f70e",
+          "evaluatedRevision": 6
         },
         {
           "subject": "module-design",
@@ -5650,7 +5654,11 @@
           "revision": 6,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:931 Context-directory and repository searches found no playhead, playout, crossfade or playlist constructs, while the browser captures DOM content for scraping, so application-owned media playback is outside this context.",
+          "evaluatedAt": "2026-10-16",
+          "evaluatedAgainst": "sha256-b2:122990080db4f70e",
+          "evaluatedRevision": 6
         },
         {
           "subject": "browser-credential-boundary",

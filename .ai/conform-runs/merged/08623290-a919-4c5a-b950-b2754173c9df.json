@@ -1,0 +1,183 @@
+{
+ "schema": "conform-run/1",
+ "worker": "08623290-a919-4c5a-b950-b2754173c9df",
+ "subject": "media-playback",
+ "evaluatedAt": "2026-10-16T23:38:54.902396+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "media-playback",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-browser/src/lib.rs:931 Context-directory and repository searches found no playhead, playout, crossfade or playlist constructs, while the browser captures DOM content for scraping, so application-owned media playback is outside this context.",
+   "techniques": [
+    {
+     "technique": "committed-buffer-steering",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-archive/src/lib.rs:124 Queries existing archive captures; no generated media frontier accepts steering."
+    },
+    {
+     "technique": "engine-adapters",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:1069 The adapter contract exchanges HTTP requests and responses, rather than playback commands and engine state."
+    },
+    {
+     "technique": "media-resource-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-browser/src/lib.rs:685 The owned resource is a scraping tab; searches found no application-owned playback pipeline."
+    },
+    {
+     "technique": "playback-clock",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:560 Time bounds HTTP fetching, rather than advancing media position."
+    },
+    {
+     "technique": "self-conditioned-supply",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-archive/src/lib.rs:346 Retrieves an existing archived body, without generating continuations conditioned on committed media."
+    },
+    {
+     "technique": "sender-declared-playout-bound",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-remote/src/lib.rs:446 Remote fetching uses a JSON proxy envelope, without a live media receiver or negotiated playout bound."
+    },
+    {
+     "technique": "source-resilience",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-remote/src/lib.rs:618 Fallback retries an HTTP fetch locally; it does not recover continuous media playback."
+    },
+    {
+     "technique": "timeline-scheduling",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-archive/src/lib.rs:132 Selects stored web captures, without scheduling media clips against a shared clock."
+    },
+    {
+     "technique": "transport-contract",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-browser/src/lib.rs:656 The operation produces a rendered page; no application-owned play, pause or seek surface was found."
+    }
+   ],
+   "absenceTerms": [
+    "playhead",
+    "playout",
+    "crossfade",
+    "playlist"
+   ]
+  },
+  {
+   "context": "core-resilience",
+   "subject": "media-playback",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/resilience/store.rs:886 Context-directory and repository searches found no playhead, playout, crossfade or playlist constructs, while resilience evaluates extracted document values and reports, so the media-playback precondition does not hold.",
+   "techniques": [
+    {
+     "technique": "committed-buffer-steering",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/store.rs:505 Persists scraping-run evidence; there is no produced-but-unplayed media queue to steer."
+    },
+    {
+     "technique": "engine-adapters",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/store.rs:865 State is scoped to an app and dataset, rather than mirrored from a playback engine."
+    },
+    {
+     "technique": "generated-supply-margin",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/sketch.rs:3 Summarizes extracted fields; production is not consumed continuously by a media clock."
+    },
+    {
+     "technique": "media-resource-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/retention.rs:199 Retention protects fixture cassettes and archived bodies, without owning playback elements or decoded media buffers."
+    },
+    {
+     "technique": "playback-clock",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:3 Detection is a reproducible computation over stored evidence, without a playback clock."
+    },
+    {
+     "technique": "self-conditioned-supply",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/invariants.rs:113 Mines existing record fields; no media continuation is conditioned on its own committed output."
+    },
+    {
+     "technique": "sender-declared-playout-bound",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:181 Network evidence concerns web-fetch outcomes, without a foreign live-media receiver."
+    },
+    {
+     "technique": "source-resilience",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/mod.rs:99 A source is an extractor input whose schedule can stop, rather than a playable source requiring continuity recovery."
+    },
+    {
+     "technique": "timeline-scheduling",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:1095 Measures scraping-job cadence, without arranging media intervals on a composition clock."
+    },
+    {
+     "technique": "transport-contract",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/mod.rs:85 Health states govern dataset writes, rather than user transport intent and observed playback state."
+    }
+   ],
+   "absenceTerms": [
+    "playhead",
+    "playout",
+    "crossfade",
+    "playlist"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-16T23:38:54.902396+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "media-playback"
+   ],
+   "techniques": [
+    "committed-buffer-steering",
+    "engine-adapters",
+    "media-resource-lifecycle",
+    "playback-clock",
+    "self-conditioned-supply",
+    "sender-declared-playout-bound",
+    "source-resilience",
+    "timeline-scheduling",
+    "transport-contract"
+   ],
+   "deviations": 0,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-16T23:38:54.902396+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "media-playback"
+   ],
+   "techniques": [
+    "committed-buffer-steering",
+    "engine-adapters",
+    "generated-supply-margin",
+    "media-resource-lifecycle",
+    "playback-clock",
+    "self-conditioned-supply",
+    "sender-declared-playout-bound",
+    "source-resilience",
+    "timeline-scheduling",
+    "transport-contract"
+   ],
+   "deviations": 0,
+   "context": "core-resilience",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
