@@ -1,0 +1,37 @@
+{
+  "schema": "conform-run/1",
+  "worker": "2b5caa86-c1cd-4a1d-8e16-36125126d1d1",
+  "subject": "data-retention",
+  "evaluatedAt": "2026-10-17T21:26:07.712335+00:00",
+  "provider": "agy",
+  "model": "gemini-3.8-flash-high",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "data-retention",
+      "context": "core-resilience",
+      "reason": "withdrawn after review: reviewer (sonnet): Line 694 does clamp keep to 1 (`keep.max(1)`), but I found no caller anywhere in crates/ that passes 0 as a sentinel, and no non-test caller of HealthStore::prune at all, so the 'zero sentinel' and 'unattended janitor' claims are unconfirmed; the supporting anchors retention.rs:343 (delete_artifacts"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-17T21:26:07.712335+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-retention"
+      ],
+      "techniques": [
+        "confirm-by-echo",
+        "destructive-override-floor",
+        "dry-run-preview",
+        "erasure-requests",
+        "per-tenant-retention-policy",
+        "time-budgeted-batch-purge"
+      ],
+      "deviations": 1,
+      "context": "core-resilience",
+      "via": "curator-multi:agy",
+      "model": "gemini-3.8-flash-high"
+    }
+  ]
+}

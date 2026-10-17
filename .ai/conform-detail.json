@@ -5385,6 +5385,52 @@
         }
       ],
       "registryProposal": "entitlement-exhaustion-is-not-ill-health lists 'a rate limit keeps reopening the same target's breaker' in use_when, which matches a scrape fetch gate that files HTTP 429 as fetch failure; the procedure requires a purchased allowance on a benchmark target, so that bullet is wider than the subject."
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/data-retention": {
+      "context": "core-resilience",
+      "subject": "data-retention",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T21:26:07.712Z",
+      "techniques": [
+        {
+          "technique": "confirm-by-echo",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/retention.rs:343 Destructive cleanup in core-resilience runs as an unattended janitor pass without an interactive operator confirmation path."
+        },
+        {
+          "technique": "destructive-override-floor",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/store.rs:694 HealthStore::prune clamps below-floor values to 1 instead of refusing, which also floors the zero sentinel to 1 and prunes all but one run."
+        },
+        {
+          "technique": "dry-run-preview",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/retention.rs:207 Artifact retention implements a pure dry-run plan calculating the exact delete list and partitioned byte counts executed by delete_artifacts."
+        },
+        {
+          "technique": "erasure-requests",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/mod.rs:78 The resilience module manages health state, rolling sketch metrics, and scraped artifacts with no personal data or external erasure obligations."
+        },
+        {
+          "technique": "per-tenant-retention-policy",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/retention.rs:210 Retention planning applies a single global age cutoff across all apps rather than supporting stored per-tenant policies and resolution."
+        },
+        {
+          "technique": "time-budgeted-batch-purge",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/store.rs:703 HealthStore::prune executes an unbounded, unbatched SQL delete query without a wall-clock budget, chunking, or partial summary reporting."
+        }
+      ],
+      "withdrawn": {
+        "worker": "2b5caa86-c1cd-4a1d-8e16-36125126d1d1",
+        "state": "deviation",
+        "at": "2026-10-17T21:26:41.984706+00:00",
+        "reason": "reviewer (sonnet): Line 694 does clamp keep to 1 (`keep.max(1)`), but I found no caller anywhere in crates/ that passes 0 as a sentinel, and no non-test caller of HealthStore::prune at all, so the 'zero sentinel' and 'unattended janitor' claims are unconfirmed; the supporting anchors retention.rs:343 (delete_artifacts"
+      }
     }
   }
 }
