@@ -1,0 +1,59 @@
+{
+ "schema": "conform-run/1",
+ "worker": "f3afb305-4016-4ba1-a3e9-527792a5239b",
+ "subject": "agent-browser-control",
+ "evaluatedAt": "2026-10-17T02:53:08.696811+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "agent-browser-control",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/engine-browser/src/lib.rs:1185 Browser actions resolve caller-supplied CSS selectors instead of runtime references, allowing actions to target an unintended matching element.",
+   "techniques": [
+    {
+     "technique": "agent-actionable-errors",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:815 Navigation failures interpolate driver errors directly without stripping internals or supplying a literal recovery command."
+    },
+    {
+     "technique": "effect-classed-commands",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:1150 Actions use a common timeout path and direct variant dispatch; no read/write/meta classification distinguishes safe retries from potentially completed mutations."
+    },
+    {
+     "technique": "references-over-selectors",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:1199 Typing resolves a supplied selector directly; searches found no accessibility-derived reference table or reference invalidation mechanism."
+    },
+    {
+     "technique": "socket-scoped-surface",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-remote/src/lib.rs:456 The remote engine sends outbound HTTP fetch requests to peers; the context implements no tunneled browser-daemon listener or header-based local/remote classification."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T02:53:08.696811+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-browser-control"
+   ],
+   "techniques": [
+    "agent-actionable-errors",
+    "effect-classed-commands",
+    "references-over-selectors",
+    "socket-scoped-surface"
+   ],
+   "deviations": 1,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

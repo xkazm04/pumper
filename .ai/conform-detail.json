@@ -4968,6 +4968,37 @@
         "at": "2026-10-17T02:45:48.703978+00:00",
         "reason": "reviewer (sonnet): The anchor fetcher.rs:60 is the FetchStrategy enum, which does not show that the subject's precondition is absent. It is an escalation ladder (Http, Browser, Auto, AutoWithResearch) that degrades when content is thin or the budget is spent (app.rs:407). That is a close analogue of adaptive tiers, so"
       }
+    },
+    "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/agent-browser-control": {
+      "context": "web-scraping-engines",
+      "subject": "agent-browser-control",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T02:53:08.696Z",
+      "worker": "f3afb305-4016-4ba1-a3e9-527792a5239b",
+      "techniques": [
+        {
+          "technique": "agent-actionable-errors",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:815 Navigation failures interpolate driver errors directly without stripping internals or supplying a literal recovery command."
+        },
+        {
+          "technique": "effect-classed-commands",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:1150 Actions use a common timeout path and direct variant dispatch; no read/write/meta classification distinguishes safe retries from potentially completed mutations."
+        },
+        {
+          "technique": "references-over-selectors",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:1199 Typing resolves a supplied selector directly; searches found no accessibility-derived reference table or reference invalidation mechanism."
+        },
+        {
+          "technique": "socket-scoped-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-remote/src/lib.rs:456 The remote engine sends outbound HTTP fetch requests to peers; the context implements no tunneled browser-daemon listener or header-based local/remote classification."
+        }
+      ]
     }
   }
 }
