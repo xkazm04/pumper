@@ -1292,7 +1292,11 @@
           "revision": 3,
           "changedAt": "2026-09-26",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/main.rs:287 The listening announcement uses the configured address instead of the bound socket's address, so configuring port zero announces port zero rather than the assigned port.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:1c83f54ea0028875",
+          "evaluatedRevision": 3
         },
         {
           "subject": "embedded-preview",

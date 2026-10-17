@@ -1,0 +1,65 @@
+{
+ "schema": "conform-run/1",
+ "worker": "62dd8f1b-8129-4efa-9311-710ea557f2bf",
+ "subject": "node-boot-and-declarative-bootstrap",
+ "evaluatedAt": "2026-10-17T01:00:29.548236+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "node-boot-and-declarative-bootstrap",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/main.rs:287 The listening announcement uses the configured address instead of the bound socket's address, so configuring port zero announces port zero rather than the assigned port.",
+   "techniques": [
+    {
+     "technique": "once-only-bootstrap-with-marker",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/storage.rs:1583 The schedule seed called by main.rs:260 uses stable IDs and atomic create-if-absent inserts; every startup revisits missing seeds without overwriting existing rows, matching the standard's explicit exception."
+    },
+    {
+     "technique": "ordered-boot-dag",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/main.rs:287 Binding precedes this log, but the announcement still uses the configured address rather than listener.local_addr(), contrary to the bound-address requirement."
+    },
+    {
+     "technique": "request-chain-not-dsl",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/mod.rs:62 This processes client-supplied JSON-RPC batch entries; inspection and bootstrap searches found no declarative first-start request chain in this context."
+    },
+    {
+     "technique": "seal-before-storage-plugins",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:567 AppState opens SQLite directly before constructing the WASM host; the opened connection path and repository searches found no pluggable seal or unseal provider."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "node-boot-and-declarative-bootstrap",
+   "context": "content-monitoring",
+   "reason": "pair anchor refused: crates/apps/peer/src/lib.rs:101 does not contain the quoted text"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-17T01:00:29.548236+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "node-boot-and-declarative-bootstrap"
+   ],
+   "techniques": [
+    "once-only-bootstrap-with-marker",
+    "ordered-boot-dag",
+    "request-chain-not-dsl",
+    "seal-before-storage-plugins"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

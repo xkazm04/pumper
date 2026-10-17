@@ -4512,6 +4512,37 @@
         "at": "2026-10-17T00:36:29.633763+00:00",
         "reason": "reviewer (sonnet): The anchor fetcher.rs:1123 is not one of core-extraction's files (extract, markdown, induce, json_salvage and the listed tests), so the verdict is about the fetcher context; the code does discard the router error, but the source comment says this is deliberate, the two test anchors don't show the cl"
       }
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/node-boot-and-declarative-bootstrap": {
+      "context": "api-server-core",
+      "subject": "node-boot-and-declarative-bootstrap",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T01:00:29.548Z",
+      "worker": "62dd8f1b-8129-4efa-9311-710ea557f2bf",
+      "techniques": [
+        {
+          "technique": "once-only-bootstrap-with-marker",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:1583 The schedule seed called by main.rs:260 uses stable IDs and atomic create-if-absent inserts; every startup revisits missing seeds without overwriting existing rows, matching the standard's explicit exception."
+        },
+        {
+          "technique": "ordered-boot-dag",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/main.rs:287 Binding precedes this log, but the announcement still uses the configured address rather than listener.local_addr(), contrary to the bound-address requirement."
+        },
+        {
+          "technique": "request-chain-not-dsl",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/mod.rs:62 This processes client-supplied JSON-RPC batch entries; inspection and bootstrap searches found no declarative first-start request chain in this context."
+        },
+        {
+          "technique": "seal-before-storage-plugins",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:567 AppState opens SQLite directly before constructing the WASM host; the opened connection path and repository searches found no pluggable seal or unseal provider."
+        }
+      ]
     }
   }
 }
