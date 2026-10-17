@@ -1,0 +1,37 @@
+{
+  "schema": "conform-run/1",
+  "worker": "20b94e65-a163-48d2-874b-d5a82fc2534f",
+  "subject": "adaptive-fidelity-tiers",
+  "evaluatedAt": "2026-10-17T02:45:32.398865+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "adaptive-fidelity-tiers",
+      "context": "core-engine-contract",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor fetcher.rs:60 is the FetchStrategy enum, which does not show that the subject's precondition is absent. It is an escalation ladder (Http, Browser, Auto, AutoWithResearch) that degrades when content is thin or the budget is spent (app.rs:407). That is a close analogue of adaptive tiers, so"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-17T02:45:32.398865+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "adaptive-fidelity-tiers"
+      ],
+      "techniques": [
+        "asymmetric-tier-transitions",
+        "measured-not-declared-capability",
+        "measurement-settle-budget",
+        "per-tier-budget-tables",
+        "preference-short-circuits-measurement",
+        "probe-deferral-to-idle"
+      ],
+      "deviations": 0,
+      "context": "core-engine-contract",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
