@@ -1,0 +1,89 @@
+{
+ "schema": "conform-run/1",
+ "worker": "4bdf9ae9-ac42-46c8-ad2d-ad1e6673ca80",
+ "subject": "migrations",
+ "evaluatedAt": "2026-10-17T00:07:08.125929+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "core-schema-migrations",
+   "subject": "migrations",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/migrations/0004_simhash.sql:2 Existing records receive a zero sentinel without a chained backfill, leaving their derived fingerprints missing until a separate repair runs.",
+   "techniques": [
+    {
+     "technique": "data-migrations",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0004_simhash.sql:2 No migration backfills existing fingerprints; the later reindex_simhashes utility requires separate execution, and migration 0020 documents the historical impact."
+    },
+    {
+     "technique": "dynamic-table-set-migrations",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/migrations/0002_platform.sql:24 Datasets occupy rows in the fixed records table; searches of table creation and alteration statements found no operator-defined physical table set requiring migration discovery."
+    },
+    {
+     "technique": "error-propagation",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:607 allow_schema_ahead explicitly permits boot against newer ledger versions, violating mandatory downgrade refusal; ordinary migration errors otherwise propagate."
+    },
+    {
+     "technique": "expand-deploy-contract",
+     "verdict": "not-applicable",
+     "evidence": "docs/deployment.md:55 The documented deployment forbids sharing the SQLite store between processes, so concurrent old and new application versions are outside the supported model."
+    },
+    {
+     "technique": "idempotent-steps",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0006_watches.sql:4 The existence guard accepts any same-named table without verifying its intended shape, and the step has no live-schema postcondition."
+    },
+    {
+     "technique": "migrate-from-data-shape",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/backup.rs:166 SQLite provides an in-store ledger with atomic step-and-marker writes; this context does not require markerless record-shape classification."
+    },
+    {
+     "technique": "pre-migration-snapshots",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/backup.rs:231 After VACUUM INTO succeeds, backups are pruned and the path returned without opening or validating the new copy; readability is checked only in a test."
+    },
+    {
+     "technique": "schema-drift-detection",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:623 The boot assertion compares table names only, allowing column, type, index, and trigger drift to pass despite the standard's schema-fingerprint requirement."
+    },
+    {
+     "technique": "transactional-ddl",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0021_ingress.sql:43 The rebuild does not enumerate live dependents before dropping the table and recreates only idx_triggers_source, so operator-added indexes and SQL triggers would be lost."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T00:07:08.125929+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "migrations"
+   ],
+   "techniques": [
+    "data-migrations",
+    "dynamic-table-set-migrations",
+    "error-propagation",
+    "expand-deploy-contract",
+    "idempotent-steps",
+    "migrate-from-data-shape",
+    "pre-migration-snapshots",
+    "schema-drift-detection",
+    "transactional-ddl"
+   ],
+   "deviations": 1,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

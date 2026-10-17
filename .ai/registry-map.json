@@ -3289,7 +3289,11 @@
           "revision": 10,
           "changedAt": "2026-09-05",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/migrations/0004_simhash.sql:2 Existing records receive a zero sentinel without a chained backfill, leaving their derived fingerprints missing until a separate repair runs.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:b7d5afcb859dfff9",
+          "evaluatedRevision": 10
         },
         {
           "subject": "agent-memory",
