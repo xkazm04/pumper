@@ -1,0 +1,71 @@
+{
+ "schema": "conform-run/1",
+ "worker": "d1fb8a5f-c72d-4bba-a6a3-eedb2fd9565b",
+ "subject": "credential-vault",
+ "evaluatedAt": "2026-10-17T04:25:49.869057+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "api-platform-ops",
+   "subject": "credential-vault",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/watches.rs:350 Slack watches retain their capability-bearing incoming-webhook URLs as ordinary database values and expose them through serialized watch responses, violating sealed custody and secret-free responses.",
+   "techniques": [
+    {
+     "technique": "brokered-egress",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/watches.rs:266 Watch listings serialize the complete Watch; its url field is serialized, including Slack incoming-webhook credentials, although the separate HMAC secret is excluded."
+    },
+    {
+     "technique": "encryption-at-rest",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:1875 The watch creation path binds the supplied Slack incoming-webhook URL directly into SQLite without sealing; Storage::connect also configures an ordinary SQLite connection."
+    },
+    {
+     "technique": "renew-at-two-thirds-with-grace",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:867 The traced watch transport uses a retained webhook URL directly; its retry loop retries message delivery, with no issuer lease or lease-extension operation."
+    },
+    {
+     "technique": "revocation-interception-cache",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:171 The Slack branch formats and sends notifications directly to the stored endpoint; it does not proxy an issuer or cache leased secrets for consumers."
+    },
+    {
+     "technique": "token-refresh-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/watches.rs:297 The retained Slack capability is an incoming-webhook URL, without a refresh-grant/access-proof pair in the admission, storage, or delivery path."
+    },
+    {
+     "technique": "versioned-key-window",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/webhook.rs:874 Delivery uses the supplied shared signing secret directly; this path neither mints a vault-owned sealing-key family nor provides versioned encryption or rewrap operations."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T04:25:49.869057+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "credential-vault"
+   ],
+   "techniques": [
+    "brokered-egress",
+    "encryption-at-rest",
+    "renew-at-two-thirds-with-grace",
+    "revocation-interception-cache",
+    "token-refresh-lifecycle",
+    "versioned-key-window"
+   ],
+   "deviations": 1,
+   "context": "api-platform-ops",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

@@ -1133,7 +1133,11 @@
           "revision": 4,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/watches.rs:350 Slack watches retain their capability-bearing incoming-webhook URLs as ordinary database values and expose them through serialized watch responses, violating sealed custody and secret-free responses.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:1c57e44b947c96ef",
+          "evaluatedRevision": 4
         },
         {
           "subject": "test-harness",
