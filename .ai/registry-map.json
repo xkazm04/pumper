@@ -2526,7 +2526,11 @@
           "revision": 5,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:23 The only transcript-shaped data here is a recorded Claude CLI envelope used to score HTML-to-Markdown extraction, so there is no rendered conversation for turns, scroll, or a composer to govern.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:5b4e7d399a4d924e",
+          "evaluatedRevision": 5
         },
         {
           "subject": "release-pipeline",

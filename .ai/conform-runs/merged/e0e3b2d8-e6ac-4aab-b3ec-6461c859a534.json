@@ -1,0 +1,96 @@
+{
+ "schema": "conform-run/1",
+ "worker": "e0e3b2d8-e6ac-4aab-b3ec-6461c859a534",
+ "subject": "chat-transcript",
+ "evaluatedAt": "2026-10-17T04:02:13.565851+00:00",
+ "provider": "grok",
+ "model": "grok-4.7",
+ "pairs": [
+  {
+   "context": "core-extraction",
+   "subject": "chat-transcript",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/tests/eval_tier3_extraction.rs:23 The only transcript-shaped data here is a recorded Claude CLI envelope used to score HTML-to-Markdown extraction, so there is no rendered conversation for turns, scroll, or a composer to govern.",
+   "techniques": [
+    {
+     "technique": "composer-turn-queue",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/tests/llm_chokepoint.rs:2 The model write door is a metered library call. No send control exists to disable, queue, interject, or cancel."
+    },
+    {
+     "technique": "immutable-model-cached-layout",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/markdown.rs:61 The cost bound skips building a Markdown String per page. There is no frozen message, view, or width-keyed layout."
+    },
+    {
+     "technique": "inline-structured-rows",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/extract.rs:28 The closed vocabulary is CSS/field extraction. Nothing dispatches tool, approval, or artifact rows."
+    },
+    {
+     "technique": "markdown-and-code-rendering",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/json_salvage.rs:26 Fences are stripped so JSON can parse. Model text is not rendered through a sanitizing display door or held stable mid-stream."
+    },
+    {
+     "technique": "progress-narration",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/induce.rs:2 Induction is a DOM statistic and states it does not call a model. Nothing narrates a working turn or collapses a step trail."
+    },
+    {
+     "technique": "transcript-scroll",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/extract.rs:4 Work is a compiled ruleset over a document batch. There is no viewport, ready gate, or pin-to-tail."
+    },
+    {
+     "technique": "turn-metadata",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/tests/eval_tier3_extraction.rs:121 Cost is copied from the CLI envelope onto the research output for the fetch ledger, not chosen for a settled-turn strip."
+    },
+    {
+     "technique": "turn-model",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/tests/eval_tier3_extraction.rs:678 Replay identity is the page URL of one finished envelope, not a minted turn that stays one element from streaming to settled."
+    },
+    {
+     "technique": "virtual-filtered-channel",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/extract.rs:1112 A document slice maps to JSON values. There is no subscribed channel, ingest predicate, or per-pane buffer."
+    }
+   ],
+   "absenceTerms": [
+    "composer",
+    "ready_gate",
+    "metadata_strip",
+    "pin_to_tail"
+   ],
+   "registryProposal": "The bare noun transcript also names recorded model-call envelopes. Absence checks should use the render-contract identifiers (composer, ready_gate, virtual_channel, pin_to_tail), which do not appear in this context."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T04:02:13.565851+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "chat-transcript"
+   ],
+   "techniques": [
+    "composer-turn-queue",
+    "immutable-model-cached-layout",
+    "inline-structured-rows",
+    "markdown-and-code-rendering",
+    "progress-narration",
+    "transcript-scroll",
+    "turn-metadata",
+    "turn-model",
+    "virtual-filtered-channel"
+   ],
+   "deviations": 0,
+   "context": "core-extraction",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  }
+ ]
+}
