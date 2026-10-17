@@ -4371,7 +4371,11 @@
           "revision": 5,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:46 The scheduler derives one interval from configuration and sleeps that long after every pass, so how fast it notices due work never changes with whether anything is in flight.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:22ed2a99172ae050",
+          "evaluatedRevision": 5
         },
         {
           "subject": "scheduling",

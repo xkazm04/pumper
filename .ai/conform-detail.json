@@ -5071,6 +5071,53 @@
           "evidence": "crates/server/src/scheduler.rs:1346 This validates scrape application parameters, not authored alert metrics, comparators, thresholds, or evaluation windows."
         }
       ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/background-jobs": {
+      "context": "job-scheduler",
+      "subject": "background-jobs",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T03:30:33.838Z",
+      "worker": "d193bdfe-871c-4f91-afc6-7612111a8446",
+      "techniques": [
+        {
+          "technique": "loop-supervision",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1824 The pass pulse upserts only a timestamp. There is no owner identity, claim-before-run, or verify-before-fire, so a second process is not stood down. Stop itself is present: the loop watches the shared token and main joins the task for SCHEDULER_SHUTDOWN_GRACE."
+        },
+        {
+          "technique": "tick-isolation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/main.rs:79 Panic is caught around the tick and around each schedule, and the loop continues; the e2e test pins that. There is still no per-tick deadline in steady state and no consecutive-failure quarantine — the only bound is the shutdown grace."
+        },
+        {
+          "technique": "adaptive-cadence",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:110 Fixed-delay sleep of the same interval after every pass. No idle rate, no jitter, and no wake when a schedule is created; notify_one wakes the worker after enqueue, not this loop."
+        },
+        {
+          "technique": "loop-health-telemetry",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:246 Silence is real: pass_is_stale uses schedule_tick_secs × 4 (floor 60s), None is stale, and GET /schedules reads the heartbeat from outside the loop. An all-idle pass is not a recorded succeeded-empty outcome, and crash, timeout, and skipped are not tick-exit marks."
+        },
+        {
+          "technique": "startup-sweeps",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:574 The first pass shares decide() with steady state. last_pass None uses the grace floor; fire_once collapses to one run; skip enumeration stops at MAX_MISFIRE_SCAN; the ledger labels a collapsed catch-up."
+        },
+        {
+          "technique": "job-progress-and-cancellation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:3 This loop admits a queue job and returns. scheduler.rs has no progress, phase, or ETA writes. Cancel hits are the shutdown token and treating job status cancelled as slot-free, not a cancelling state."
+        },
+        {
+          "technique": "timeout-is-a-status-not-a-consumption",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:590 The step reports that it enqueued. It does not hold a job handle or give up a bounded wait, and there is no forever-budget sentinel in this file."
+        }
+      ],
+      "registryProposal": "The golden path sends missed-run policy to scheduling, but this loop's body is the recurrence engine. Say which host clauses still bind in that fusion — cadence, per-tick deadline, tick-outcome vocabulary, single-runner claim — so a scheduler file is not scored as pure policy and not as if it owned job progress."
     }
   }
 }
