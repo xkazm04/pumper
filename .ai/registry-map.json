@@ -3415,7 +3415,11 @@
           "revision": 13,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/migrations/0008_job_budget.sql:3 The nullable spend ceiling gives an unconfigured job unlimited spending authority, contrary to the standard’s fail-closed default.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:85c48ec5bdb5581f",
+          "evaluatedRevision": 13
         },
         {
           "subject": "data-access",
@@ -4500,7 +4504,11 @@
           "revision": 13,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:918 The scheduler forwards an absent spend ceiling unchanged into recurring jobs, preserving unlimited authority instead of the required fail-closed default.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:85c48ec5bdb5581f",
+          "evaluatedRevision": 13
         }
       ],
       "governance": "governed"

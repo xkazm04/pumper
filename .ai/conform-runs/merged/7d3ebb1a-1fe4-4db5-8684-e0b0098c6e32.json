@@ -1,0 +1,147 @@
+{
+ "schema": "conform-run/1",
+ "worker": "7d3ebb1a-1fe4-4db5-8684-e0b0098c6e32",
+ "subject": "settings",
+ "evaluatedAt": "2026-10-17T02:35:04.468392+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "core-schema-migrations",
+   "subject": "settings",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/migrations/0008_job_budget.sql:3 The nullable spend ceiling gives an unconfigured job unlimited spending authority, contrary to the standard\u2019s fail-closed default.",
+   "techniques": [
+    {
+     "technique": "applied-defaults-ledger",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/migrations/0021_ingress.sql:36 This rebuild copies existing rows to change their schema; it does not seed shipped collection entries."
+    },
+    {
+     "technique": "author-declared-include-graph",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:511 Migration inputs come from a fixed embedded directory, rather than parent files declared inside configuration artifacts."
+    },
+    {
+     "technique": "config-backup-and-restore",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:570 These migrations modify the server-held SQLite store; they do not overwrite an operator-owned settings document on save."
+    },
+    {
+     "technique": "in-place-document-patch",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/migrations/0021_ingress.sql:44 This is a relational schema transformation, which the technique distinguishes from patching a persistent settings document and runtime observers."
+    },
+    {
+     "technique": "key-registry",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/migrations/0014_triggers.sql:14 Per-trigger configuration occupies named columns in its owning entity table, the alternative explicitly permitted by this technique."
+    },
+    {
+     "technique": "typed-accessors",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0008_job_budget.sql:2 The declared absent-ceiling semantics fail open; the standard explicitly requires absent spend authority to be zero."
+    }
+   ]
+  },
+  {
+   "context": "job-scheduler",
+   "subject": "settings",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/scheduler.rs:918 The scheduler forwards an absent spend ceiling unchanged into recurring jobs, preserving unlimited authority instead of the required fail-closed default.",
+   "techniques": [
+    {
+     "technique": "applied-defaults-ledger",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:1583 Startup calls seed_schedule for code-declared schedules, while deletion removes the row without a tombstone; the next startup therefore recreates a deleted default."
+    },
+    {
+     "technique": "author-declared-include-graph",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/catalog.rs:330 The catalog loader parses the process-selected file directly; inspected catalog paths provide no artifact-declared parent graph."
+    },
+    {
+     "technique": "config-backup-and-restore",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:533 Mutable schedule decisions reside in the durable backend, rather than a standalone configuration file overwritten by the application."
+    },
+    {
+     "technique": "in-place-document-patch",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:3117 Reconciliation changes selected relational columns; it does not round-trip a monolithic settings document or replace an observed settings object."
+    },
+    {
+     "technique": "key-registry",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:1597 Schedule configuration uses named fields in the owning entity\u2019s storage rather than dynamically constructed settings keys."
+    },
+    {
+     "technique": "read-batching",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/scheduler.rs:266 Each pass bulk-loads current schedule configuration; settings values are not retained in a cross-tick cache, and firing re-reads the live ceiling."
+    },
+    {
+     "technique": "setting-kinds",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/schedule_budget.rs:152 The test requires an omitted safety ceiling to authorize uncapped recurring work, violating the taxonomy\u2019s mandatory fail-closed contract."
+    },
+    {
+     "technique": "settings-audit-and-history",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/storage.rs:1675 The complete budget setter updates the value without recording its old/new transition; inspected migrations contain no SQL audit trigger, and schedule_runs records execution decisions instead."
+    },
+    {
+     "technique": "typed-accessors",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:1075 A malformed stored timezone silently becomes UTC without the corruption diagnostic required by the typed-read contract."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T02:35:04.468392+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "settings"
+   ],
+   "techniques": [
+    "applied-defaults-ledger",
+    "author-declared-include-graph",
+    "config-backup-and-restore",
+    "in-place-document-patch",
+    "key-registry",
+    "typed-accessors"
+   ],
+   "deviations": 1,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-17T02:35:04.468392+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "settings"
+   ],
+   "techniques": [
+    "applied-defaults-ledger",
+    "author-declared-include-graph",
+    "config-backup-and-restore",
+    "in-place-document-patch",
+    "key-registry",
+    "read-batching",
+    "setting-kinds",
+    "settings-audit-and-history",
+    "typed-accessors"
+   ],
+   "deviations": 1,
+   "context": "job-scheduler",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
