@@ -4460,7 +4460,11 @@
           "revision": 4,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:851 The scheduler exposes heartbeat staleness on API reads, but no repository-defined independent receiver raises an alarm when passes stop, leaving scheduled work without the absence alarm the standard requires.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:90e16e9a2b80434b",
+          "evaluatedRevision": 4
         },
         {
           "subject": "mcp-tools",

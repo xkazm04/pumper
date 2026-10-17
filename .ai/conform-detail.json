@@ -5020,6 +5020,57 @@
           "evidence": "crates/engine-claude/src/lib.rs:285 The research tool published by /apps reaches this adapter, which accumulates stdout without a byte cap or termination on cap breach, allowing runaway output to exhaust host memory."
         }
       ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/alerting": {
+      "context": "job-scheduler",
+      "subject": "alerting",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T03:11:32.462Z",
+      "worker": "62287143-fd23-4ec1-b99d-ae3f272fde7f",
+      "techniques": [
+        {
+          "technique": "absence-as-a-condition",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:149 Completed passes stamp a durable heartbeat, but its consumers only expose API status; searches found no independent absence receiver or heartbeat through an alert delivery path."
+        },
+        {
+          "technique": "alert-lifecycle",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:580 This records a scheduled job enqueue in NewScheduleRun, not a human-action alert episode requiring acknowledgment and resolution."
+        },
+        {
+          "technique": "dedup-and-cooldown",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1096 These timestamps advance cron execution; they do not suppress alert notifications or track delivered fires."
+        },
+        {
+          "technique": "escalation-routing",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/quiet_window.rs:180 The escalation terminology here concerns database maintenance proceeding despite activity when storage harm exceeds a bound, not severity-based human interruption."
+        },
+        {
+          "technique": "evaluation-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:266 This loop evaluates cron schedules for scrape execution, not alert predicates over measured signals."
+        },
+        {
+          "technique": "flap-control",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1276 Firing depends on due cron times; there are no breach/recovery transitions requiring sustain or hysteresis."
+        },
+        {
+          "technique": "periodic-digest",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:566 The scheduled action enqueues scrape work rather than sending a periodic summary to recipients."
+        },
+        {
+          "technique": "rule-authoring-validation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1346 This validates scrape application parameters, not authored alert metrics, comparators, thresholds, or evaluation windows."
+        }
+      ]
     }
   }
 }
