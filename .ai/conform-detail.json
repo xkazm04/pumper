@@ -4999,6 +4999,27 @@
           "evidence": "crates/engine-remote/src/lib.rs:456 The remote engine sends outbound HTTP fetch requests to peers; the context implements no tunneled browser-daemon listener or header-based local/remote classification."
         }
       ]
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/agent-cli-transport": {
+      "context": "api-platform-ops",
+      "subject": "agent-cli-transport",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T03:04:13.748Z",
+      "worker": "92845e25-4438-41ff-97c3-62b93f1a2eaa",
+      "techniques": [
+        {
+          "technique": "availability-probe",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/meta.rs:1140 Research inherits the empty requires() default, making readiness true even when the CLI is missing or unauthorized; no version or authorization probe backs this published judgment."
+        },
+        {
+          "technique": "output-normalization",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/src/lib.rs:285 The research tool published by /apps reaches this adapter, which accumulates stdout without a byte cap or termination on cap breach, allowing runaway output to exhaust host memory."
+        }
+      ]
     }
   }
 }

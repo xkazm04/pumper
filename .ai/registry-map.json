@@ -1165,7 +1165,11 @@
           "revision": 9,
           "changedAt": "2026-10-02",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/meta.rs:1140 The app listing reports the Claude-backed research app ready through its empty default requirements without proving the CLI is installed or authorized.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:5791230ffb7d9fad",
+          "evaluatedRevision": 9
         }
       ],
       "governance": "governed"
