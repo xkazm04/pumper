@@ -1,0 +1,141 @@
+{
+ "schema": "conform-run/1",
+ "worker": "716958e2-a77e-4062-9e9a-32e260406b66",
+ "subject": "quorum-and-recovery-procedures",
+ "evaluatedAt": "2026-10-17T01:25:20.468451+00:00",
+ "provider": "grok",
+ "model": "grok-4.7",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "quorum-and-recovery-procedures",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/mcp/mod.rs:126 This context publishes a single-process scraping API, and a search of crates/server/src and crates/server/src/mcp for quorum, unseal, shamir, applied_index, and consensus found no threshold-share ritual, quorum loss, offline backend copy, or sealing-configuration restore.",
+   "techniques": [
+    {
+     "technique": "cancel-leaves-prior-state-valid",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/state.rs:126 The only cancel here fires the token of a running scrape job, not a root-rotation attempt."
+    },
+    {
+     "technique": "migration-lock-in-source",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/maintenance.rs:47 The only migration named is SQLite schema migration at connect, which this technique excludes from an offline store copy."
+    },
+    {
+     "technique": "nonce-progress-verify",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/progress.rs:32 Progress is one JSON snapshot per scrape job, not shares received of a threshold."
+    },
+    {
+     "technique": "pick-highest-applied-index",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/state.rs:332 Peers here are fetch-proxy nodes chosen by round-robin, not a sealed repair source chosen by applied index."
+    },
+    {
+     "technique": "single-node-recovery-resize",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/main.rs:236 Boot recovery requeues scrape jobs the last process left running; it never shrinks a consensus membership to one voter."
+    },
+    {
+     "technique": "unauthenticated-ritual-is-a-vulnerability",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/mod.rs:128 The published tools are dataset query, search, and job enqueue; there is no init, submit, cancel, or verify ritual endpoint."
+    }
+   ],
+   "absenceTerms": [
+    "quorum",
+    "unseal",
+    "shamir",
+    "consensus"
+   ]
+  },
+  {
+   "context": "e2e-integration",
+   "subject": "quorum-and-recovery-procedures",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/e2e/peer_mirror.rs:5 The nearest multi-node test runs two independent pumpers, each with its own SQLite file, mirroring a dataset feed over HTTP, and a search of crates/server/src/e2e for quorum, unseal, shamir, applied_index, and consensus found no quorum ritual or sealed snapshot restore.",
+   "techniques": [
+    {
+     "technique": "cancel-leaves-prior-state-valid",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/harness.rs:218 Cancel in this harness holds a scrape job open for drain tests, not a share-ritual attempt."
+    },
+    {
+     "technique": "migration-lock-in-source",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/peer_mirror.rs:6 The copy between the two stores is a live HTTP peer job, not an offline migrator with the server stopped."
+    },
+    {
+     "technique": "nonce-progress-verify",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/mcp_live.rs:3 The live tests wait for a job's terminal status; they never submit a share against an attempt nonce."
+    },
+    {
+     "technique": "pick-highest-applied-index",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/peer_mirror.rs:111 Snapshot here means a full dataset sync that tombstones missing keys, not a sealing-configuration snapshot installed into a peer set."
+    },
+    {
+     "technique": "single-node-recovery-resize",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/peer_mirror.rs:444 Recovery here is the origin dataset gaining a live record so deferred tombstones can apply, not reforming a peer set from one voter."
+    },
+    {
+     "technique": "unauthenticated-ritual-is-a-vulnerability",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/provisioner_lifecycle.rs:1 The provisioner under test validates and promotes extraction proposals; it does not mint or cancel root shares."
+    }
+   ],
+   "absenceTerms": [
+    "quorum",
+    "unseal",
+    "shamir",
+    "consensus"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T01:25:20.468451+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quorum-and-recovery-procedures"
+   ],
+   "techniques": [
+    "cancel-leaves-prior-state-valid",
+    "migration-lock-in-source",
+    "nonce-progress-verify",
+    "pick-highest-applied-index",
+    "single-node-recovery-resize",
+    "unauthenticated-ritual-is-a-vulnerability"
+   ],
+   "deviations": 0,
+   "context": "api-server-core",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  },
+  {
+   "ts": "2026-10-17T01:25:20.468451+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quorum-and-recovery-procedures"
+   ],
+   "techniques": [
+    "cancel-leaves-prior-state-valid",
+    "migration-lock-in-source",
+    "nonce-progress-verify",
+    "pick-highest-applied-index",
+    "single-node-recovery-resize",
+    "unauthenticated-ritual-is-a-vulnerability"
+   ],
+   "deviations": 0,
+   "context": "e2e-integration",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  }
+ ]
+}

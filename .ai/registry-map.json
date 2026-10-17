@@ -1328,7 +1328,11 @@
           "revision": 3,
           "changedAt": "2026-09-26",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/mcp/mod.rs:126 This context publishes a single-process scraping API, and a search of crates/server/src and crates/server/src/mcp for quorum, unseal, shamir, applied_index, and consensus found no threshold-share ritual, quorum loss, offline backend copy, or sealing-configuration restore.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:adce67260d401a6a",
+          "evaluatedRevision": 3
         },
         {
           "subject": "module-design",
@@ -4197,7 +4201,11 @@
           "revision": 3,
           "changedAt": "2026-09-26",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/peer_mirror.rs:5 The nearest multi-node test runs two independent pumpers, each with its own SQLite file, mirroring a dataset feed over HTTP, and a search of crates/server/src/e2e for quorum, unseal, shamir, applied_index, and consensus found no quorum ritual or sealed snapshot restore.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:adce67260d401a6a",
+          "evaluatedRevision": 3
         }
       ],
       "governance": "governed"
