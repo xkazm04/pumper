@@ -2803,7 +2803,11 @@
           "revision": 14,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/storage.rs:935 Recovery checks heartbeat staleness during selection but omits it from the subsequent update, allowing a refreshed live attempt to be requeued and its target exclusion released.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:ccc991958e998a93",
+          "evaluatedRevision": 16
         },
         {
           "subject": "read-serving-replicas",

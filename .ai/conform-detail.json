@@ -5191,6 +5191,82 @@
         }
       ],
       "registryProposal": "The bare noun transcript also names recorded model-call envelopes. Absence checks should use the render-contract identifiers (composer, ready_gate, virtual_channel, pin_to_tail), which do not appear in this context."
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/concurrency-guards": {
+      "context": "core-job-queue",
+      "subject": "concurrency-guards",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T04:06:41.153Z",
+      "worker": "a8a39e3d-5d66-4365-ba35-8998e74e80f8",
+      "techniques": [
+        {
+          "technique": "atomic-file-publish",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:570 Queue publication uses SQLite transactions and WAL rather than application-managed replacement of a shared document."
+        },
+        {
+          "technique": "attempt-attribution",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:840 Completion atomically compares the carried attempt against the incumbent running row; fail, heartbeat and checkpoint writes also carry attempt predicates."
+        },
+        {
+          "technique": "cache-value-not-handle",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/store_instrument.rs:632 The measured operation executes its own future; this queue path does not publish a shared in-flight completion handle."
+        },
+        {
+          "technique": "critical-section-across-a-suspension",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1553 The reaper selects stale rows separately from their later mutation; intervening awaits allow heartbeat changes that the mutation never revalidates."
+        },
+        {
+          "technique": "cross-process-exclusion",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1445 Although claims use shared atomic SQL, boot recovery selects every running job without process ownership or heartbeat freshness, so another process's live job can be reclaimed."
+        },
+        {
+          "technique": "fence-inside-write-transaction",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:1523 This is an individual job-attempt fence, not a cluster lease controlling the store's general right to write."
+        },
+        {
+          "technique": "guard-key-design",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:170 The guard uses an app-declared target identity separately from enqueue idempotency and attempt identity; NULL explicitly opts out."
+        },
+        {
+          "technique": "idempotency-by-design",
+          "verdict": "conformant",
+          "evidence": "crates/core/migrations/0011_idempotency.sql:5 The unique index atomically deduplicates supplied intent keys; enqueue_dedup returns the existing job with created=false, including after a concurrent insert race."
+        },
+        {
+          "technique": "leadership-is-the-lock",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:567 The queue uses SQLite rather than a replicated log whose leadership admits writes."
+        },
+        {
+          "technique": "preparation-is-the-staleness-window",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:935 reap_stale checks the heartbeat cutoff only in its SELECT; the later fail update can still succeed after a heartbeat refresh because status and attempt remain unchanged."
+        },
+        {
+          "technique": "renewal-deadline-two-thirds-ttl",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:1520 Renewal belongs to one job attempt; the standard explicitly reserves this technique for the cluster's right-to-write lease."
+        },
+        {
+          "technique": "shared-claims-by-announce-and-verify",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:805 Claims are exclusive transactional SQL updates, not shared-reader and exclusive-writer announcements over per-key conditional storage."
+        },
+        {
+          "technique": "single-flight-primitives",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:717 Target collisions use a centralized queue policy, but enqueue has no queue-depth bound and queued jobs have no maximum wait or expiry."
+        }
+      ]
     }
   }
 }
