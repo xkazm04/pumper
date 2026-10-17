@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "2334262f-6e10-4249-a9d5-dfff08769d82",
+ "subject": "delivery-analytics",
+ "evaluatedAt": "2026-10-17T22:13:36.592309+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "delivery-analytics",
+   "context": "core-change-detection",
+   "reason": "not-applicable without the 2+ search terms that prove the absence"
+  }
+ ],
+ "consults": []
+}
