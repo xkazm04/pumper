@@ -534,7 +534,11 @@
           "revision": 5,
           "changedAt": "2026-09-24",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-search/src/lib.rs:692 The engine parses raw text as Tantivy syntax and returns parsing errors instead of translating input into bounded literal terms with a literal fallback.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:395e660a5e607abe",
+          "evaluatedRevision": 6
         },
         {
           "subject": "test-harness",
@@ -823,7 +827,11 @@
           "revision": 5,
           "changedAt": "2026-09-24",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/search.rs:99 The request builder forwards query text unchanged, allowing engine syntax and malformed punctuation to reach the parser without the standard's literal-text translation.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:395e660a5e607abe",
+          "evaluatedRevision": 6
         },
         {
           "subject": "index-free-random-access",

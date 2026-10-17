@@ -1,0 +1,135 @@
+{
+ "schema": "conform-run/1",
+ "worker": "c0b1f2a3-ff96-48aa-a992-6ad8cbf78230",
+ "subject": "search",
+ "evaluatedAt": "2026-10-17T02:17:23.347033+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "ai-extraction-engines",
+   "subject": "search",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/engine-search/src/lib.rs:692 The engine parses raw text as Tantivy syntax and returns parsing errors instead of translating input into bounded literal terms with a literal fallback.",
+   "techniques": [
+    {
+     "technique": "command-surface",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-search/src/lib.rs:683 This searches indexed document fields; it does not implement a navigational command palette."
+    },
+    {
+     "technique": "faceting-and-filters",
+     "verdict": "deviation",
+     "evidence": "crates/engine-search/src/lib.rs:764 Facet counts cover a capped ranked prefix, whose size can change with pagination, but SearchResponse supplies no sample coverage or approximation indicator."
+    },
+    {
+     "technique": "full-text-indexing",
+     "verdict": "deviation",
+     "evidence": "crates/engine-search/src/lib.rs:849 Hit presentation reads stored index fields without rejoining the authoritative source or verifying current reachability, contrary to the source-authority requirement."
+    },
+    {
+     "technique": "query-parsing",
+     "verdict": "deviation",
+     "evidence": "crates/engine-search/src/lib.rs:693 Malformed engine syntax becomes a request error; the parser supplies neither tokenize-then-quote translation nor a literal-text fallback."
+    },
+    {
+     "technique": "ranking-and-excerpts",
+     "verdict": "deviation",
+     "evidence": "crates/engine-search/src/lib.rs:779 Relevance ordering has no explicit final key using the document's stable identity; hits are emitted in collector order."
+    },
+    {
+     "technique": "saved-views",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-search/src/lib.rs:536 This adapter supplies index operations to saved-search callers; it does not own saved predicates or their persistence."
+    },
+    {
+     "technique": "typed-filter-language",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-search/src/lib.rs:738 Search range predicates are constructed from fixed typed request fields, rather than an independently authored predicate program; WASM plugins are general executable modules."
+    }
+   ]
+  },
+  {
+   "context": "api-data-access",
+   "subject": "search",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/search.rs:99 The request builder forwards query text unchanged, allowing engine syntax and malformed punctuation to reach the parser without the standard's literal-text translation.",
+   "techniques": [
+    {
+     "technique": "command-surface",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/search.rs:209 The route serves corpus search rather than keyboard navigation through a command registry."
+    },
+    {
+     "technique": "faceting-and-filters",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/search.rs:204 The API publishes sampled facet counts without reporting their sampled window or approximation, although the adjacent total is the full match count."
+    },
+    {
+     "technique": "full-text-indexing",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/datasets.rs:450 After deleting source records, failed index cleanup only logs a warning and the route returns success, leaving searchable ghost documents without a retry queued here."
+    },
+    {
+     "technique": "query-parsing",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/search.rs:99 The shared builder validates emptiness and request options but forwards raw query text without literalization or term bounds."
+    },
+    {
+     "technique": "saved-views",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/search.rs:391 Saved-search creation persists trimmed raw query text rather than parsed typed state, making recall dependent on reparsing the engine grammar."
+    },
+    {
+     "technique": "typed-filter-language",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/datasets.rs:151 The exposed path/operator language validates path prefixes without checking identifiers or operand types against a declared schema; unknown fields pass validation and later become nonmatches."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T02:17:23.347033+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "search"
+   ],
+   "techniques": [
+    "command-surface",
+    "faceting-and-filters",
+    "full-text-indexing",
+    "query-parsing",
+    "ranking-and-excerpts",
+    "saved-views",
+    "typed-filter-language"
+   ],
+   "deviations": 1,
+   "context": "ai-extraction-engines",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-17T02:17:23.347033+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "search"
+   ],
+   "techniques": [
+    "command-surface",
+    "faceting-and-filters",
+    "full-text-indexing",
+    "query-parsing",
+    "saved-views",
+    "typed-filter-language"
+   ],
+   "deviations": 1,
+   "context": "api-data-access",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
