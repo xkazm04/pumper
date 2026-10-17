@@ -4625,6 +4625,47 @@
           "evidence": "crates/server/src/e2e/provisioner_lifecycle.rs:1 The provisioner under test validates and promotes extraction proposals; it does not mint or cancel root shares."
         }
       ]
+    },
+    "571c7935-fe1d-4818-bced-5005f04ecf96/realtime-events": {
+      "context": "webhook-event-delivery",
+      "subject": "realtime-events",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T01:40:14.951Z",
+      "worker": "fddd5d1d-e488-4b73-9d80-886bd24e7081",
+      "techniques": [
+        {
+          "technique": "capacity-packed-subscription-pool",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/events.rs:139 SSE uses internal broadcast receivers; this capacity bounds buffered messages, not provider topics or account connections, and searches found no provider subscription-cap mechanism."
+        },
+        {
+          "technique": "change-data-capture",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/worker.rs:1562 Watch capture reads committed revisions through one unpaged query capped at 1,000 rows per app; excess changes receive neither overflow accounting nor a coarse invalidation."
+        },
+        {
+          "technique": "coalescing-and-batching",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1938 Within the captured batch, watches receive revisions together per app/dataset without merging distinct occurrences; Slack summarizes the batch with its revision count."
+        },
+        {
+          "technique": "event-registry",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:263 The publication door accepts an arbitrary name and independently serializable payload rather than a registry-bound event variant; producers supply literal names."
+        },
+        {
+          "technique": "outbound-fan-out",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:592 When persistence fails, delivery proceeds with a generated ID and no durable retry row; initial deliveries are also scheduled before their rows are created, leaving a crash-loss window despite the implemented retry ladder and DLQ."
+        },
+        {
+          "technique": "subscription-lifecycle",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/events.rs:86 SSE streams own their broadcast receivers, subscribe before asynchronous snapshots, and terminate on shutdown; dropping the stream releases its receiver without an outstanding asynchronous subscription handshake."
+        }
+      ]
     }
   }
 }

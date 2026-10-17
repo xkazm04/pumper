@@ -5821,7 +5821,11 @@
           "revision": 6,
           "changedAt": "2026-09-03",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/webhook.rs:262 Webhook publication accepts arbitrary event names independently of payload types, allowing vocabulary and payload contracts to drift.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:a0685592373df03f",
+          "evaluatedRevision": 6
         },
         {
           "subject": "delivery-guarantees",

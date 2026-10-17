@@ -1,0 +1,71 @@
+{
+ "schema": "conform-run/1",
+ "worker": "fddd5d1d-e488-4b73-9d80-886bd24e7081",
+ "subject": "realtime-events",
+ "evaluatedAt": "2026-10-17T01:40:14.951932+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "webhook-event-delivery",
+   "subject": "realtime-events",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/webhook.rs:262 Webhook publication accepts arbitrary event names independently of payload types, allowing vocabulary and payload contracts to drift.",
+   "techniques": [
+    {
+     "technique": "capacity-packed-subscription-pool",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/events.rs:139 SSE uses internal broadcast receivers; this capacity bounds buffered messages, not provider topics or account connections, and searches found no provider subscription-cap mechanism."
+    },
+    {
+     "technique": "change-data-capture",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/worker.rs:1562 Watch capture reads committed revisions through one unpaged query capped at 1,000 rows per app; excess changes receive neither overflow accounting nor a coarse invalidation."
+    },
+    {
+     "technique": "coalescing-and-batching",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:1938 Within the captured batch, watches receive revisions together per app/dataset without merging distinct occurrences; Slack summarizes the batch with its revision count."
+    },
+    {
+     "technique": "event-registry",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:263 The publication door accepts an arbitrary name and independently serializable payload rather than a registry-bound event variant; producers supply literal names."
+    },
+    {
+     "technique": "outbound-fan-out",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:592 When persistence fails, delivery proceeds with a generated ID and no durable retry row; initial deliveries are also scheduled before their rows are created, leaving a crash-loss window despite the implemented retry ladder and DLQ."
+    },
+    {
+     "technique": "subscription-lifecycle",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/events.rs:86 SSE streams own their broadcast receivers, subscribe before asynchronous snapshots, and terminate on shutdown; dropping the stream releases its receiver without an outstanding asynchronous subscription handshake."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T01:40:14.951932+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "realtime-events"
+   ],
+   "techniques": [
+    "capacity-packed-subscription-pool",
+    "change-data-capture",
+    "coalescing-and-batching",
+    "event-registry",
+    "outbound-fan-out",
+    "subscription-lifecycle"
+   ],
+   "deviations": 1,
+   "context": "webhook-event-delivery",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
