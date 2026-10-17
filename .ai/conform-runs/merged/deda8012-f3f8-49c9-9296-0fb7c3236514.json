@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "deda8012-f3f8-49c9-9296-0fb7c3236514",
+ "subject": "convergence-loop-and-requeue",
+ "evaluatedAt": "2026-10-17T04:14:35.107073+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "convergence-loop-and-requeue",
+   "context": "core-job-queue",
+   "reason": "not-applicable without the 2+ search terms that prove the absence"
+  }
+ ],
+ "consults": []
+}
