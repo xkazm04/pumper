@@ -1,0 +1,41 @@
+{
+ "schema": "conform-run/1",
+ "worker": "df19266b-5410-47c5-92cc-74f7a9021b40",
+ "subject": "browser-credential-boundary",
+ "evaluatedAt": "2026-10-17T03:44:03.131100+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "browser-credential-boundary",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/engine-http/src/lib.rs:409 The HTTP engine automatically follows redirects without destination revalidation, so a permitted initial destination can redirect a server-side fetch into a private network.",
+   "techniques": [
+    {
+     "technique": "outbound-fetch-destination-validation",
+     "verdict": "deviation",
+     "evidence": "crates/engine-remote/src/lib.rs:187 The target guard checks hostname text rather than resolved addresses and does not pin validated addresses to connections; the HTTP transport also follows redirects automatically without rechecking destinations."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T03:44:03.131100+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "browser-credential-boundary"
+   ],
+   "techniques": [
+    "outbound-fetch-destination-validation"
+   ],
+   "deviations": 1,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

@@ -5730,7 +5730,11 @@
           "revision": 3,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-http/src/lib.rs:409 The HTTP engine automatically follows redirects without destination revalidation, so a permitted initial destination can redirect a server-side fetch into a private network.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:d3eef10e9ed8459f",
+          "evaluatedRevision": 3
         },
         {
           "subject": "supply-chain",

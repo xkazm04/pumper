@@ -5118,6 +5118,22 @@
         }
       ],
       "registryProposal": "The golden path sends missed-run policy to scheduling, but this loop's body is the recurrence engine. Say which host clauses still bind in that fusion — cadence, per-tick deadline, tick-outcome vocabulary, single-runner claim — so a scheduler file is not scored as pure policy and not as if it owned job progress."
+    },
+    "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/browser-credential-boundary": {
+      "context": "web-scraping-engines",
+      "subject": "browser-credential-boundary",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T03:44:03.131Z",
+      "worker": "df19266b-5410-47c5-92cc-74f7a9021b40",
+      "techniques": [
+        {
+          "technique": "outbound-fetch-destination-validation",
+          "verdict": "deviation",
+          "evidence": "crates/engine-remote/src/lib.rs:187 The target guard checks hostname text rather than resolved addresses and does not pin validated addresses to connections; the HTTP transport also follows redirects automatically without rechecking destinations."
+        }
+      ]
     }
   }
 }
