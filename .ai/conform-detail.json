@@ -4666,6 +4666,78 @@
           "evidence": "crates/server/src/routes/events.rs:86 SSE streams own their broadcast receivers, subscribe before asynchronous snapshots, and terminate on shutdown; dropping the stream releases its receiver without an outstanding asynchronous subscription handshake."
         }
       ]
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/scheduling": {
+      "context": "job-triggers-pipeline",
+      "subject": "scheduling",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T02:01:54.559Z",
+      "worker": "0c39a186-defb-468a-a182-b010b97fd7a9",
+      "techniques": [
+        {
+          "technique": "missed-run-semantics",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1087 These dispatchers react to source events rather than enumerate recurring due slots missed during downtime."
+        },
+        {
+          "technique": "next-run-computation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1140 Trigger occurrences are identified by source events; this pipeline does not compute recurrence deadlines."
+        },
+        {
+          "technique": "schedule-observability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:1030 Dataset-scope mismatches remove enabled candidates before decision recording, leaving no filtered outcome explaining those non-fires."
+        },
+        {
+          "technique": "trigger-matching",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:637 A missing path evaluates false, and the caller records only filter_miss at line 1200 rather than a broken-filter event."
+        }
+      ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/scheduling": {
+      "context": "job-scheduler",
+      "subject": "scheduling",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T02:01:54.559Z",
+      "worker": "0c39a186-defb-468a-a182-b010b97fd7a9",
+      "techniques": [
+        {
+          "technique": "cooldown-and-debounce",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:365 Cron dispatch classifies discrete clock occurrences; event-stream cooldown and debounce are not its suppression mechanism."
+        },
+        {
+          "technique": "missed-run-semantics",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:572 The reference advances after enqueue at line 566, outside an atomic decision-and-advance transition; catch-up work can survive without its reference advance."
+        },
+        {
+          "technique": "next-run-computation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:1112 Next-fire time is recomputed on demand; the inspected schedule columns and write paths persist no computed next_run_at, contrary to the standard's persistence requirement."
+        },
+        {
+          "technique": "overlap-and-reentrancy",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:732 Only the newest firing guards admission; schedule_truth.rs explicitly verifies that a manually retried older job remains queued while another firing is admitted, bypassing a shared manual/clock guard."
+        },
+        {
+          "technique": "schedule-observability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:373 SkipThenFire computes due_at from the earliest pending slot and reuses it for the fired record at line 582, attributing the current firing to an older skipped occurrence."
+        },
+        {
+          "technique": "trigger-matching",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1276 This dispatcher selects clock occurrences from cron rules rather than matching published events against subscriptions."
+        }
+      ]
     }
   }
 }

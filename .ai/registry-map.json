@@ -4371,7 +4371,11 @@
           "revision": 6,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:566 Dispatch precedes the separate schedule-reference update, so a crash can leave already-dispatched occurrences eligible to fire again.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:cd982b42588a2de5",
+          "evaluatedRevision": 6
         },
         {
           "subject": "proactive-nudges",
@@ -4663,7 +4667,11 @@
           "revision": 6,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:637 Missing payload fields become ordinary filter misses, preventing operators from distinguishing broken subscriptions from legitimate non-matches.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:cd982b42588a2de5",
+          "evaluatedRevision": 6
         },
         {
           "subject": "session-continuation",

@@ -1,0 +1,117 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0c39a186-defb-468a-a182-b010b97fd7a9",
+ "subject": "scheduling",
+ "evaluatedAt": "2026-10-17T02:01:54.559634+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "scheduling",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/triggers.rs:637 Missing payload fields become ordinary filter misses, preventing operators from distinguishing broken subscriptions from legitimate non-matches.",
+   "techniques": [
+    {
+     "technique": "missed-run-semantics",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:1087 These dispatchers react to source events rather than enumerate recurring due slots missed during downtime."
+    },
+    {
+     "technique": "next-run-computation",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:1140 Trigger occurrences are identified by source events; this pipeline does not compute recurrence deadlines."
+    },
+    {
+     "technique": "schedule-observability",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:1030 Dataset-scope mismatches remove enabled candidates before decision recording, leaving no filtered outcome explaining those non-fires."
+    },
+    {
+     "technique": "trigger-matching",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:637 A missing path evaluates false, and the caller records only filter_miss at line 1200 rather than a broken-filter event."
+    }
+   ]
+  },
+  {
+   "context": "job-scheduler",
+   "subject": "scheduling",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/scheduler.rs:566 Dispatch precedes the separate schedule-reference update, so a crash can leave already-dispatched occurrences eligible to fire again.",
+   "techniques": [
+    {
+     "technique": "cooldown-and-debounce",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:365 Cron dispatch classifies discrete clock occurrences; event-stream cooldown and debounce are not its suppression mechanism."
+    },
+    {
+     "technique": "missed-run-semantics",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:572 The reference advances after enqueue at line 566, outside an atomic decision-and-advance transition; catch-up work can survive without its reference advance."
+    },
+    {
+     "technique": "next-run-computation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:1112 Next-fire time is recomputed on demand; the inspected schedule columns and write paths persist no computed next_run_at, contrary to the standard's persistence requirement."
+    },
+    {
+     "technique": "overlap-and-reentrancy",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:732 Only the newest firing guards admission; schedule_truth.rs explicitly verifies that a manually retried older job remains queued while another firing is admitted, bypassing a shared manual/clock guard."
+    },
+    {
+     "technique": "schedule-observability",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:373 SkipThenFire computes due_at from the earliest pending slot and reuses it for the fired record at line 582, attributing the current firing to an older skipped occurrence."
+    },
+    {
+     "technique": "trigger-matching",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1276 This dispatcher selects clock occurrences from cron rules rather than matching published events against subscriptions."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T02:01:54.559634+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "scheduling"
+   ],
+   "techniques": [
+    "missed-run-semantics",
+    "next-run-computation",
+    "schedule-observability",
+    "trigger-matching"
+   ],
+   "deviations": 1,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "ts": "2026-10-17T02:01:54.559634+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "scheduling"
+   ],
+   "techniques": [
+    "cooldown-and-debounce",
+    "missed-run-semantics",
+    "next-run-computation",
+    "overlap-and-reentrancy",
+    "schedule-observability",
+    "trigger-matching"
+   ],
+   "deviations": 1,
+   "context": "job-scheduler",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
