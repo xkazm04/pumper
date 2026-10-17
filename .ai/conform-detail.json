@@ -4481,6 +4481,37 @@
           "evidence": "crates/core/migrations/0021_ingress.sql:43 The rebuild does not enumerate live dependents before dropping the table and recreates only idx_triggers_source, so operator-added indexes and SQL triggers would be lost."
         }
       ]
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/multi-provider-gateway-plane": {
+      "context": "core-extraction",
+      "subject": "multi-provider-gateway-plane",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T00:36:14.005Z",
+      "techniques": [
+        {
+          "technique": "exclusive-authorship-of-a-measured-decision",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:415 This evaluation injects a fixed recorded researcher to measure extraction, rather than comparing provider-selection policies."
+        },
+        {
+          "technique": "policy-verdict-in-the-status-space",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:412 The inspected research-budget boundary returns an in-process Result; its consumer is not an operator-configured list of status integers."
+        },
+        {
+          "technique": "router-versus-candidate-failure",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/fetcher.rs:1123 trace_tier_error returns Err for router failures at lines 1174–1175, but recipe replay ignores that result, records a failure strike, and returns None; the context's router tests cover HTTP/browser failures without exercising this branch."
+        }
+      ],
+      "withdrawn": {
+        "worker": "b42639b0-6ceb-4065-959d-b41f05935c82",
+        "state": "deviation",
+        "at": "2026-10-17T00:36:29.633763+00:00",
+        "reason": "reviewer (sonnet): The anchor fetcher.rs:1123 is not one of core-extraction's files (extract, markdown, induce, json_salvage and the listed tests), so the verdict is about the fetcher context; the code does discard the router error, but the source comment says this is deliberate, the two test anchors don't show the cl"
+      }
     }
   }
 }

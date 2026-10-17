@@ -1,0 +1,39 @@
+{
+  "schema": "conform-run/1",
+  "worker": "b42639b0-6ceb-4065-959d-b41f05935c82",
+  "subject": "multi-provider-gateway-plane",
+  "evaluatedAt": "2026-10-17T00:36:14.005686+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "multi-provider-gateway-plane",
+      "context": "e2e-api-contract",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "multi-provider-gateway-plane",
+      "context": "core-extraction",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor fetcher.rs:1123 is not one of core-extraction's files (extract, markdown, induce, json_salvage and the listed tests), so the verdict is about the fetcher context; the code does discard the router error, but the source comment says this is deliberate, the two test anchors don't show the cl"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-17T00:36:14.005686+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "multi-provider-gateway-plane"
+      ],
+      "techniques": [
+        "exclusive-authorship-of-a-measured-decision",
+        "policy-verdict-in-the-status-space",
+        "router-versus-candidate-failure"
+      ],
+      "deviations": 1,
+      "context": "core-extraction",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
