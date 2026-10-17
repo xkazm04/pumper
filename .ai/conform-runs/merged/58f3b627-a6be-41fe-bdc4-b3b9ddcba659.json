@@ -1,0 +1,121 @@
+{
+ "schema": "conform-run/1",
+ "worker": "58f3b627-a6be-41fe-bdc4-b3b9ddcba659",
+ "subject": "cross-provider-benchmark-operations",
+ "evaluatedAt": "2026-10-17T04:37:16.142289+00:00",
+ "provider": "grok",
+ "model": "grok-4.7",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "cross-provider-benchmark-operations",
+   "bundle": "llm-observability",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/resilience/detect.rs:5 Searches for scorecard, prompt_variant, thinking_budget, entitlement, and anonymize found nothing in this context or the repo, and the detector is a pure function over extractor sketches with no model in the decision, so it does not operate a cross-provider benchmark matrix.",
+   "techniques": [
+    {
+     "technique": "async-run-queue-with-cancel",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:13 The unit of work is an extraction verdict over documents already fetched, not a paid benchmark job that must enqueue, report progress, and cancel."
+    },
+    {
+     "technique": "axes-and-caveats-live-at-the-surface",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/preview.rs:3 The caller-facing surface is an enforce preview for source health, not a benchmark declaration that names target axes and the meaning of an omitted knob."
+    },
+    {
+     "technique": "budget-preflight-and-ceiling",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/mod.rs:46 Detection spends no paid model calls, so there is no matrix estimate or operator ceiling to enforce."
+    },
+    {
+     "technique": "cheapest-sufficient-configuration",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/preview.rs:15 Preview replays stored extraction-health states and does not pick a cheapest configuration against a best target."
+    },
+    {
+     "technique": "dataset-sampling-anonymize-freeze",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/retention.rs:24 Retention pins scrape artifact bodies by age and live readers; it does not sample, anonymize, or freeze an eval dataset."
+    },
+    {
+     "technique": "determinism-stamping",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:6 Reproducibility means replaying a stored source_runs row, not a sampled, best-effort, or exact stamp on generation and judging."
+    },
+    {
+     "technique": "entitlement-exhaustion-is-not-ill-health",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:182 A 429 is evidence the scrape fetch layer failed, not that a purchased model allowance ran out."
+    },
+    {
+     "technique": "failure-clustering-recommendations",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/doctor.rs:6 Doctor joins store-integrity promises and does not cluster low-scoring benchmark cases into prompt or routing actions."
+    },
+    {
+     "technique": "graded-case-difficulty",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/sketch.rs:3 Sketches summarize extracted field distributions, not an ordered difficulty ladder on eval cases."
+    },
+    {
+     "technique": "handicap-disclosure-in-the-result-row",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/store.rs:4 Persisted rows are source health and field sketches, with no per-cell handicap beside a comparative score."
+    },
+    {
+     "technique": "sampling-knobs-are-axes-not-strings",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/invariants.rs:12 Invariants are mined field regularities; there is no reasoning-effort or thinking-budget axis on a model spec."
+    },
+    {
+     "technique": "self-hosted-residency-is-part-of-the-target",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/mod.rs:407 The only residency in this context is peak HTML DOM memory, not accelerator placement of a self-hosted model."
+    },
+    {
+     "technique": "target-matrix-runs",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/mod.rs:21 Nothing here declares a provider, model, and prompt-variant matrix or scores the same cases across targets."
+    }
+   ],
+   "absenceTerms": [
+    "scorecard",
+    "prompt_variant",
+    "thinking_budget",
+    "entitlement",
+    "anonymize"
+   ],
+   "registryProposal": "entitlement-exhaustion-is-not-ill-health lists 'a rate limit keeps reopening the same target's breaker' in use_when, which matches a scrape fetch gate that files HTTP 429 as fetch failure; the procedure requires a purchased allowance on a benchmark target, so that bullet is wider than the subject."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-17T04:37:16.142289+00:00",
+   "bundle": "llm-observability",
+   "subjects": [
+    "cross-provider-benchmark-operations"
+   ],
+   "techniques": [
+    "async-run-queue-with-cancel",
+    "axes-and-caveats-live-at-the-surface",
+    "budget-preflight-and-ceiling",
+    "cheapest-sufficient-configuration",
+    "dataset-sampling-anonymize-freeze",
+    "determinism-stamping",
+    "entitlement-exhaustion-is-not-ill-health",
+    "failure-clustering-recommendations",
+    "graded-case-difficulty",
+    "handicap-disclosure-in-the-result-row",
+    "sampling-knobs-are-axes-not-strings",
+    "self-hosted-residency-is-part-of-the-target",
+    "target-matrix-runs"
+   ],
+   "deviations": 0,
+   "context": "core-resilience",
+   "via": "curator-multi:grok",
+   "model": "grok-4.7"
+  }
+ ]
+}

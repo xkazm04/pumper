@@ -5308,6 +5308,83 @@
           "evidence": "crates/server/src/webhook.rs:874 Delivery uses the supplied shared signing secret directly; this path neither mints a vault-owned sealing-key family nor provides versioned encryption or rewrap operations."
         }
       ]
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/cross-provider-benchmark-operations": {
+      "context": "core-resilience",
+      "subject": "cross-provider-benchmark-operations",
+      "bundle": "llm-observability",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-17",
+      "evaluatedTs": "2026-10-17T04:37:16.142Z",
+      "worker": "58f3b627-a6be-41fe-bdc4-b3b9ddcba659",
+      "techniques": [
+        {
+          "technique": "async-run-queue-with-cancel",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:13 The unit of work is an extraction verdict over documents already fetched, not a paid benchmark job that must enqueue, report progress, and cancel."
+        },
+        {
+          "technique": "axes-and-caveats-live-at-the-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/preview.rs:3 The caller-facing surface is an enforce preview for source health, not a benchmark declaration that names target axes and the meaning of an omitted knob."
+        },
+        {
+          "technique": "budget-preflight-and-ceiling",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/mod.rs:46 Detection spends no paid model calls, so there is no matrix estimate or operator ceiling to enforce."
+        },
+        {
+          "technique": "cheapest-sufficient-configuration",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/preview.rs:15 Preview replays stored extraction-health states and does not pick a cheapest configuration against a best target."
+        },
+        {
+          "technique": "dataset-sampling-anonymize-freeze",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/retention.rs:24 Retention pins scrape artifact bodies by age and live readers; it does not sample, anonymize, or freeze an eval dataset."
+        },
+        {
+          "technique": "determinism-stamping",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:6 Reproducibility means replaying a stored source_runs row, not a sampled, best-effort, or exact stamp on generation and judging."
+        },
+        {
+          "technique": "entitlement-exhaustion-is-not-ill-health",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:182 A 429 is evidence the scrape fetch layer failed, not that a purchased model allowance ran out."
+        },
+        {
+          "technique": "failure-clustering-recommendations",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/doctor.rs:6 Doctor joins store-integrity promises and does not cluster low-scoring benchmark cases into prompt or routing actions."
+        },
+        {
+          "technique": "graded-case-difficulty",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/sketch.rs:3 Sketches summarize extracted field distributions, not an ordered difficulty ladder on eval cases."
+        },
+        {
+          "technique": "handicap-disclosure-in-the-result-row",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/store.rs:4 Persisted rows are source health and field sketches, with no per-cell handicap beside a comparative score."
+        },
+        {
+          "technique": "sampling-knobs-are-axes-not-strings",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/invariants.rs:12 Invariants are mined field regularities; there is no reasoning-effort or thinking-budget axis on a model spec."
+        },
+        {
+          "technique": "self-hosted-residency-is-part-of-the-target",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/mod.rs:407 The only residency in this context is peak HTML DOM memory, not accelerator placement of a self-hosted model."
+        },
+        {
+          "technique": "target-matrix-runs",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/mod.rs:21 Nothing here declares a provider, model, and prompt-variant matrix or scores the same cases across targets."
+        }
+      ],
+      "registryProposal": "entitlement-exhaustion-is-not-ill-health lists 'a rate limit keeps reopening the same target's breaker' in use_when, which matches a scrape fetch gate that files HTTP 429 as fetch failure; the procedure requires a purchased allowance on a benchmark target, so that bullet is wider than the subject."
     }
   }
 }

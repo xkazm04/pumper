@@ -3267,7 +3267,11 @@
           "revision": 12,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:5 Searches for scorecard, prompt_variant, thinking_budget, entitlement, and anonymize found nothing in this context or the repo, and the detector is a pure function over extractor sketches with no model in the decision, so it does not operate a cross-provider benchmark matrix.",
+          "evaluatedAt": "2026-10-17",
+          "evaluatedAgainst": "sha256-b2:609da9e2f3c21869",
+          "evaluatedRevision": 12
         },
         {
           "subject": "data-access",
