@@ -104,6 +104,7 @@ async fn expired_research_answers_are_purged_not_kept_forever() {
         duration_ms: None,
         num_turns: None,
         session_id: None,
+        model: None,
     };
     research.put("k-old", &out).await.unwrap();
     research.put("k-fresh", &out).await.unwrap();

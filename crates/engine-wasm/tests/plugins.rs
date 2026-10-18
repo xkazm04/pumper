@@ -67,12 +67,39 @@ fn plugins_src() -> PathBuf {
 const EXPECTED_PLUGIN_ABI: &[(&str, &[&str])] = &[
     ("busyloop", &["alloc", "extract"]),
     ("delta-slim", &["alloc", "describe", "extract_v2"]),
+    // N11's reference index-time ENRICHER: the same core-module ABI, entered
+    // through `enrich` instead of `extract_v2` because an enricher is not an
+    // extractor. It belongs here for the same reason as the connector — a
+    // module that lost its entry point loads, answers `has() == false`, and
+    // silently strips the entities it exists to add.
+    ("enrich-money-date", &["alloc", "describe", "enrich"]),
+    // N10's reference SINK CONNECTOR: the same core-module ABI, plus a
+    // `capabilities` block in its manifest and one declared host import. It
+    // belongs on this list precisely because a connector that lost `extract_v2`
+    // would load, answer `has() == false`, and dead-letter every delivery.
+    ("sink-postgrest", &["alloc", "describe", "extract_v2"]),
     (
         "title-extractor",
         &["alloc", "describe", "extract", "extract_v2"],
     ),
     ("trigger-gate", &["alloc", "describe", "extract_v2"]),
 ];
+
+/// EXPECTED: the `plugins-src` crates that are **dynamic apps**, not plugins.
+///
+/// They are a different kind of guest — a component exporting the `pumper:app`
+/// world, with NO `#[no_mangle]` core-module ABI at all — so holding them to
+/// the plugin contract above would be nonsense, and letting them merely be
+/// absent from it would let a plugin that lost its ABI hide by growing a `wit/`
+/// directory. Both lists are closed; a crate must be in exactly one.
+const EXPECTED_APP_CRATES: &[&str] = &["wasm-app-template"];
+
+/// A `plugins-src` crate is an APP iff it carries the WIT world it is built
+/// against. Structural rather than name-based on purpose: the directory is what
+/// the build actually consumes.
+fn is_app_crate(dir: &std::path::Path) -> bool {
+    dir.join("wit").is_dir()
+}
 
 /// The `#[no_mangle] pub extern "C" fn <name>` exports declared in one source
 /// file, in sorted order. Deliberately textual: it must answer for a crate that
@@ -113,7 +140,7 @@ fn every_shipped_plugin_still_exports_the_host_abi() {
     let mut found: Vec<(String, BTreeSet<String>)> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.path().is_dir() && !is_app_crate(&e.path()))
         .map(|e| {
             let crate_name = e.file_name().to_string_lossy().into_owned();
             let lib = e.path().join("src/lib.rs");
@@ -148,6 +175,53 @@ fn every_shipped_plugin_still_exports_the_host_abi() {
              and silently fails its hop open"
         );
     }
+}
+
+/// N11's reference enricher, against the BUILT artifact: it must load, be
+/// executable, describe itself as an enricher, and answer the `{doc, params}`
+/// envelope with the entity contract the search host parses.
+///
+/// The source-level ABI test above cannot see any of that: a plugin that
+/// exports the right names and returns the wrong SHAPE still compiles, and the
+/// host then fails open per document — an index quietly missing entities, with
+/// no red build anywhere.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/enrich-money-date.wasm — `just plugins-verify` (CI runs this step)"]
+async fn the_reference_enricher_answers_the_entity_contract() {
+    let host = host();
+    assert!(
+        host.has("enrich-money-date"),
+        "data/plugins/enrich-money-date.wasm missing — {NEEDS_INSTALL}"
+    );
+    let manifest = host
+        .manifests()
+        .into_iter()
+        .find(|m| m["name"] == "enrich-money-date")
+        .expect("the enricher self-describes");
+    assert_eq!(manifest["kind"], json!("enricher"));
+
+    // 2026-01-01T00:00:00Z as the document's own clock.
+    let out = host
+        .run(
+            "enrich-money-date",
+            "Award up to $250,000; applications close 2026-03-01.",
+            &json!({ "now": 1_767_225_600i64 }),
+        )
+        .await
+        .expect("the enricher runs");
+    assert_eq!(out["entities"]["amount"], json!(250_000));
+    assert_eq!(out["entities"]["event_date"], json!(1_772_323_200i64));
+
+    // No match = no key: the contract the index stores verbatim.
+    let out = host
+        .run(
+            "enrich-money-date",
+            "a page about nothing in particular",
+            &json!({ "now": 1_767_225_600i64 }),
+        )
+        .await
+        .expect("the enricher runs");
+    assert_eq!(out["entities"], json!({}));
 }
 
 #[tokio::test]
@@ -195,4 +269,103 @@ async fn describe_manifest_surfaces_in_metadata() {
     assert_eq!(title["version"], json!("0.2.0"));
     assert!(title["description"].as_str().is_some());
     assert!(title["params_schema"].is_object());
+}
+
+/// The app half of the same inventory. A dynamic app's contract is its WIT
+/// world, so what must stay true is the mirror of the plugin rule: it declares
+/// no core-module ABI (a `#[no_mangle] extract` here would mean somebody built
+/// a plugin in the app lane), and it carries the world it is generated against
+/// — with the same package as the host's own copy, or the module links against
+/// nothing.
+#[test]
+fn every_shipped_app_crate_carries_the_world_and_no_plugin_abi() {
+    let dir = plugins_src();
+    let mut found: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && is_app_crate(&e.path()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    assert_eq!(
+        found, EXPECTED_APP_CRATES,
+        "plugins-src app crates changed — add the new one to EXPECTED_APP_CRATES (apps install into data/apps/ via `just plugin-app`, not data/plugins/)"
+    );
+
+    let host_world = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wit/pumper-app.wit"),
+    )
+    .expect("the host's own WIT world");
+    let package = host_world
+        .lines()
+        .find(|l| l.starts_with("package "))
+        .expect("the world declares a package");
+
+    for name in &found {
+        let crate_dir = dir.join(name);
+        let src = std::fs::read_to_string(crate_dir.join("src/lib.rs"))
+            .unwrap_or_else(|e| panic!("read {name}/src/lib.rs: {e}"));
+        assert!(
+            declared_exports(&src).is_empty(),
+            "plugins-src/{name} is an app but declares core-module plugin exports — one of the two lanes is wrong"
+        );
+        assert!(
+            src.contains("wit_bindgen::generate!"),
+            "plugins-src/{name} does not generate against a WIT world"
+        );
+        let wit = std::fs::read_to_string(crate_dir.join("wit/pumper-app.wit"))
+            .unwrap_or_else(|e| panic!("read {name}/wit/pumper-app.wit: {e}"));
+        assert!(
+            wit.contains(package),
+            "plugins-src/{name} is built against a different {package} than the host links — the module would fail to link, and the drift would only show up at load time on a deployed machine"
+        );
+    }
+}
+
+/// The N10 capability path against a **real rustc-built module**, not a `wat`
+/// fixture: `sink-postgrest` imports `pumper_http_request`, its manifest
+/// declares `capabilities.http`, and it must therefore load EXECUTABLE with the
+/// loader's parsed capabilities on its `GET /plugins` entry.
+///
+/// This is the half the unit tests cannot reach. They prove the linker refuses
+/// an undeclared import; only a real artifact proves the declared one actually
+/// resolves through a wasm32 codegen that puts the import where the host looks
+/// for it (module `env`, that exact symbol name). A mismatch there would leave
+/// every connector silently `executable: false`.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/sink-postgrest.wasm — `just plugins-verify` (CI runs this step)"]
+async fn the_reference_connector_loads_with_its_declared_capabilities() {
+    let host = host();
+    let manifest = host
+        .manifests()
+        .into_iter()
+        .find(|m| m["name"] == "sink-postgrest")
+        .unwrap_or_else(|| panic!("data/plugins/sink-postgrest.wasm missing — {NEEDS_INSTALL}"));
+
+    assert!(
+        manifest["capability_error"].is_null(),
+        "a declared import must resolve: {}",
+        manifest["capability_error"]
+    );
+    assert_eq!(
+        manifest["executable"],
+        json!(true),
+        "a connector that imports what it declared is runnable: {manifest}"
+    );
+    assert!(
+        host.has("sink-postgrest"),
+        "…and a `plugin:` sink pointed at it must resolve"
+    );
+    // The loader's own parse, not the manifest text — what a plugin asked for
+    // and what it was granted are the same answer or the surface is lying.
+    assert_eq!(
+        manifest["capabilities"]["http"]["methods"],
+        json!(["POST"]),
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["capabilities"]["kv"],
+        json!(false),
+        "this connector stores nothing and must be granted nothing"
+    );
 }

@@ -83,6 +83,28 @@
       "ciFixtureStep": "Harness gate fixtures",
       "blocksCi": false,
       "exits": [0, 2, 3]
+    },
+    {
+      "key": "commit-lint",
+      "script": "scripts/ci/commit-lint.mjs",
+      "test": "scripts/ci/commit-lint.test.mjs",
+      "recipe": "commit-lint",
+      "fixtureRecipes": ["inventory"],
+      "ciStep": "Conventional commits",
+      "ciFixtureStep": "Commit-message gate fixtures",
+      "blocksCi": false,
+      "exits": [0, 2, 3]
+    },
+    {
+      "key": "branch-protection",
+      "script": "scripts/ci/branch-protection.mjs",
+      "test": "scripts/ci/branch-protection.test.mjs",
+      "recipe": "inventory",
+      "fixtureRecipes": ["inventory"],
+      "ciStep": "Branch-protection declaration",
+      "ciFixtureStep": "Branch-protection declaration",
+      "blocksCi": true,
+      "exits": [0, 2, 3]
     }
   ],
   "_reportDoc": "`reportModes` is how a gate joins the posture table that `just quality` (scripts/ci/quality-report.mjs) prints. Keyed by gate key; a gate with NO entry, or an entry with no `command`, still gets a row -- NOT WIRED -- because an inexpressible condition must still enumerate. `command` is argv, spawned with the repo root as cwd, and MUST be the gate's non-mutating mode (disk-check therefore carries --no-prune: the posture is read-only by construction). `remedy` is the command a human runs when that row is red -- refusal-names-a-reachable-remedy, asserted by quality-report.test.mjs to start with `just` or `node` and to name only paths that resolve inside this repo. `self: true` marks the reporter's own entry, which is the one row it must never emit.",

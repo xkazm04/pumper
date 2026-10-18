@@ -14,6 +14,10 @@ for power: the API has no auth and permissive CORS (any local web app can call
 it), the Claude CLI runs with permission prompts disabled, and the browser
 profile keeps real login cookies on disk.
 
+Contributing? [CONTRIBUTING.md](CONTRIBUTING.md) is the whole path from a working
+tree to `master` — setup, the verify loop, the commit rule, the required checks,
+and how a change gets reviewed and merged.
+
 ## Architecture
 
 ```

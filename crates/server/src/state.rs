@@ -136,6 +136,11 @@ pub struct AppState {
     /// failure — that hid flapping), and the full-sync overlap flag. Surfaced on
     /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
     pub datahub_last: crate::datahub::StatusCell,
+    /// N24 OpenLineage emission history, kept APART from `datahub_last`. Two
+    /// writers double the failure surface, and one merged slot is exactly how a
+    /// healthy DataHub would hide a dead OpenLineage receiver. Surfaced on
+    /// `GET /datahub/status` → `lineage.writers[]`.
+    pub lineage_last: crate::datahub::StatusCell,
     /// M26 governance state: `cost:pause`d apps + last poll summary, surfaced on
     /// `GET /datahub/status`. In-memory only — re-derived from DataHub each poll.
     pub datahub_govern: crate::datahub::GovernCell,
@@ -216,15 +221,26 @@ impl AppState {
         let webhook_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
-        let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
+        // N05: the ring becomes a read-through cache over the `events` table
+        // when `[events] log_enabled` (default ON). Still no IO here — `emit`
+        // only QUEUES rows; the write happens at the head of the subscription
+        // outbox, and the counter is seeded from `MAX(seq)` by `init`.
+        let bus = EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY);
+        let events = Arc::new(if config.events.log_enabled {
+            bus.with_log(config.events.pending_capacity)
+        } else {
+            bus
+        });
         // Dynamic-app discovery (M28 v1). The one exception to "no IO" here,
         // and only when `[plugins] app_dir` is explicitly set (default: unset →
         // zero IO, so test states stay pure): scans the dir once and freezes the
         // read-only listing for the process lifetime.
-        let dynamic_apps = Arc::new(crate::registry::dynamic_app_entries(
-            &config.plugins,
-            &registry,
-        ));
+        // (N09) `&mut registry`: a component that links against the pumper:app
+        // world is REGISTERED here as an ordinary ScrapeApp, so the queue,
+        // scheduler and enqueue door need no dynamic-app special case. Modules
+        // that are only listed still produce a read-only entry.
+        let mut registry = registry;
+        let dynamic_apps = Arc::new(crate::registry::dynamic_app_entries(&config, &mut registry));
         let fanout_concurrency = config.worker.fanout_concurrency;
         let fanout_max_queued = config.worker.fanout_max_queued;
 
@@ -264,6 +280,7 @@ impl AppState {
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
             datahub_last: Arc::new(std::sync::Mutex::new(Default::default())),
+            lineage_last: Arc::new(std::sync::Mutex::new(Default::default())),
             datahub_govern: Default::default(),
             contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             plugin_missing_reported: Arc::new(tokio::sync::Mutex::new(
@@ -349,12 +366,31 @@ impl AppState {
         let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
-            Arc::new(WasmPluginHost::new(&config.plugins)?)
+            // N10: the host side of a plugin's DECLARED capabilities. Wired
+            // unconditionally — the gate is the manifest plus `[plugins]
+            // allow_http_hosts` (empty by default), not the presence of this
+            // bridge, and a host without one would make "no plugin declared a
+            // capability" and "the operator never wired the network" the same
+            // fact. The HTTP handle is the engine whose `send` holds the
+            // governor, so plugin traffic is spaced and cached like any other.
+            let bridge = Arc::new(crate::plugin_caps::ServerCapabilityHost::new(
+                engines.http.clone(),
+                storage.pool(),
+            ));
+            Arc::new(WasmPluginHost::new(&config.plugins)?.with_capabilities(bridge))
         } else {
             Arc::new(NoPlugins)
         };
         let search: Arc<dyn Search> = if config.search.enabled {
-            Arc::new(TantivyIndex::new(&config.search)?)
+            // N11: the index-time enrichment pipeline runs `plugin:<name>`
+            // enrichers on the SAME host every other hook uses, so they share
+            // its fuel budget, memory cap, admission gate and telemetry. Passed
+            // even when `[plugins] enabled = false` (a `NoPlugins`), so a
+            // `plugin:` enricher fails openly per document rather than at boot.
+            Arc::new(TantivyIndex::with_plugins(
+                &config.search,
+                Some(plugins.clone()),
+            )?)
         } else {
             Arc::new(NoSearch)
         };
@@ -363,7 +399,7 @@ impl AppState {
         // would silently overwrite the earlier app — it vanishes with no route, no
         // schedule, and a startup log that still claims success. A duplicate id is
         // a registration mistake, so fail loudly at boot.
-        let apps = crate::registry::apps();
+        let apps = crate::registry::apps(&config);
         let mut registry: HashMap<String, Arc<dyn ScrapeApp>> = HashMap::with_capacity(apps.len());
         for app in apps {
             let name = app.name().to_string();
@@ -387,6 +423,27 @@ impl AppState {
             search,
             registry,
         })?;
+
+        // N05: the sequence picks up where the last process left off, so a
+        // client's `Last-Event-ID` still names the event it named before the
+        // restart. Best-effort: a log that cannot be read starts at 0, which is
+        // the pre-N05 behaviour and is said out loud rather than assumed.
+        if state.events.logs() {
+            match state.storage.max_event_seq().await {
+                Ok(seq) => {
+                    state.events.seed_seq(seq as u64);
+                    tracing::info!(
+                        seq,
+                        retention_days = state.config.events.log_retention_days,
+                        "event log resumed"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "event log: could not read MAX(seq) ({e}); the sequence RESTARTS at 0 and \
+                     resuming clients will be told to reset"
+                ),
+            }
+        }
 
         if state.health.enabled() {
             tracing::info!(

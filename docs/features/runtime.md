@@ -14,7 +14,7 @@ Both fail in **both** directions — an app that newly declares and is not liste
 ## Jobs
 
 - Enqueue: `POST /apps/{name}/jobs` with optional `{params, max_attempts, delay_secs, priority, callback_url, callback_secret, budget_usd, idempotency_key}`. An `Idempotency-Key` header (or body field) makes retries safe: a duplicate key returns the original job with `200` instead of a new `202`.
-- Lifecycle: `queued → running → succeeded | failed | cancelled`. Failures retry with exponential backoff up to `max_attempts`; the boot recovery sweep (`recover_stuck`) issues the *same* verdict to jobs orphaned by a crash — see **Recovery verdicts** below. `POST /jobs/{id}/retry` resurrects a failed/cancelled job with one extra attempt.
+- Lifecycle: `queued → running → succeeded | failed | cancelled`, with one non-terminal detour: `running → waiting → queued` when a job parks on external input (see **Jobs that wait** below). Failures retry with exponential backoff up to `max_attempts`; the boot recovery sweep (`recover_stuck`) issues the *same* verdict to jobs orphaned by a crash — see **Recovery verdicts** below. `POST /jobs/{id}/retry` resurrects a failed/cancelled job with one extra attempt.
 - **Job control surface:**
   - `POST /jobs/retry` — bulk resurrect: re-queues every job in a terminal state (`failed` default, or `cancelled`), optionally scoped to one `app`, up to `limit` (≤500), each with one extra attempt. Returns `{retried, ids}`.
   - `POST /jobs/{id}/reset` — re-queues a **running** job (e.g. one stuck on a hung task) with a fresh attempt budget (409 if not running).
@@ -34,7 +34,7 @@ Both fail in **both** directions — an app that newly declares and is not liste
 | `[fetcher] host_memory_ttl_secs` | `604800` (`0` = no aging, no GC) | stale `tier_memory` rows with no pin/strikes/penalty |
 - **Graceful shutdown:** on Ctrl-C / SIGTERM (on Windows: Ctrl-Break, console-close, or system-shutdown) the process cancels a shared token — the worker stops claiming new jobs, the scheduler and cache janitor stop, and `axum::serve` stops accepting. In-flight jobs are given up to `worker.shutdown_drain_secs` (default 25) to finish; whatever is still `running` at the deadline goes through the recovery verdict below (reason `drain deadline reached (shutdown)`) so it resumes cleanly on the next boot instead of being stranded. The same window then drains in-flight **fan-out** (which no longer holds a permit, so re-acquiring the permits is no longer proof the queue is idle); anything unfinished at the deadline is logged, not silently dropped.
 - **A cancel during the drain is a cancel, not a deferral.** Drain phase 2 fires every in-flight job's cancel token to mean *suspend* (checkpoint + re-queue, resume next boot), and `DELETE /jobs/{id}` fires the **same** token to mean *stop*. The worker read both as suspend, so an operator's explicit cancel inside the drain window was silently converted into "run it again after the restart" while the door still answered `{cancelled: true, running: true}`. The door now claims the run for the operator — under the token-registry mutex the drain itself reads, immediately before firing — and `worker::cancel_kind` gives user intent priority over a concurrent drain: a suspend is a promise to run the work later, which is exactly what the operator asked us not to do. The one case a cancel cannot win is a run that already committed to a suspend microseconds earlier; that answers honestly with `{cancelled: false, running: true, suspended: true, note}` rather than a cancellation the queue contradicts. Jobs nobody cancelled suspend exactly as before.
-- Lineage columns: `schedule_id` (fired by a cron schedule), `trigger_id` (fired by a reactive trigger — see [triggers.md](triggers.md)).
+- Lineage columns: `schedule_id` (fired by a cron schedule), `trigger_id` (fired by a reactive trigger — see [triggers.md](triggers.md)), `source_job_id` (which run's outcome fired this one), `principal_id` (the caller that enqueued it — see [auth.md](auth.md)), and `workflow_run_id` / `workflow_step` / `root_id` (this job is a step of a declared plan — see [workflows.md](workflows.md)). All nullable; NULL is the honest answer for work nobody declared or authenticated.
 - **Querying the lineage (`Storage::JobQuery`).** The job list's predicates are one struct — `app`, `status`, `schedule_id`, `trigger_id`, `target_key`, `since`, `until` — and `Storage::list`, `list_page`, `status_counts_filtered` and `explain_job_list` all take it, so no two of them can disagree about what a filter means. Three facts worth knowing:
   - **The `WHERE` clause is assembled from only the predicates actually supplied** (`sqlx::QueryBuilder`, every value `push_bind`-ed, never interpolated — the same idiom `Datasets::list_filtered_trust` uses). This is not a style choice: the obvious alternative, one static statement with a `(?n IS NULL OR col = ?n)` clause per column, returns identical rows and **full-scans `jobs` every time**, because SQLite cannot use an index for a term it cannot prove is an equality while planning. Written that way the filter would work and the indexes 0012/0014/0041 paid for would stay exactly as unreachable as before. `explain_job_list` returns `EXPLAIN QUERY PLAN`'s `detail` rows so this is asserted, not asserted-in-prose: see `lineage_filters_ride_the_indexes_not_a_table_scan` in `crates/core/tests/jobs.rs`.
   - **The `created_at` window is half-open, `[since, until)`.** An inclusive upper bound returns the boundary row in two adjacent windows, which makes a day-at-a-time walk's counts wrong rather than merely off by one.
@@ -46,6 +46,7 @@ Both fail in **both** directions — an app that newly declares and is not liste
   - The order inside the unit is unchanged and still load-bearing: health gate → contract gate → watches → dataset triggers. It re-checks the `(status, attempts)` fence when it starts, so a job reset or reaped between the completion and the fan-out fires nothing.
   - `[worker] fanout_concurrency` (default 4) sizes the pool; `0` runs the fan-out inline on the job's permit (the historical behaviour). `[worker] fanout_max_queued` (default 64) is the backlog ceiling — at the ceiling a job runs its own fan-out inline (logged at `warn`). Backpressure is never a drop: an unsent webhook must not be a silent one.
   - Graceful shutdown drains the pool too, and logs `abandoned=N` if any unit is still running at the deadline.
+- **App-declared schedules.** A run that called `AppContext::request_schedule(body)` (a `POST /schedules`-shaped `{app, cron, params?}`) has its requests applied right after the run returns, **only when it finished OK** — a panicked, timed-out or cancelled attempt will be retried, and a flapping job must not mint a schedule per retry. Rows are written through `Storage::upsert_managed_schedule` tagged `managed_by = "app:<the requesting app>"`; the tag is set by the runtime and cannot be supplied in the body, so the SQL ownership fence keeps an app-declared row from ever overwriting a hand-made or catalog-managed schedule with the same id. The id is derived (content-addressed over requester, target app, cron and canonical params), so re-running the same job re-syncs one row instead of creating a schedule per run, and an unreadable cron is refused at the seam rather than stored as a schedule that never fires. `[worker] max_app_schedules_per_run` (default 20, `0` = refuse all) bounds one run; past it `request_schedule` answers `false` so the app can report the cut (`research` reports `watch_requests_truncated`). Refusals and fence misses are logged with counts, never swallowed — and so is the cap itself: `ScheduleRequestOutcome` reports `created`, `rejected`, `not_owned` **and `over_cap`**, so `created + rejected + not_owned + over_cap` always equals the number of requests the run made. The surplus the cap dropped used to be counted in none of those, which mattered most at `0`, where the worker's summary line (gated on `created > 0 || not_owned > 0`) did not fire either and a run that dropped every schedule it asked for left no trace at all. First consumer: `research`'s `watch_sources` ([apps.md §research](apps.md#watched-sources-app-declared-schedules)).
 - **Stage timings.** Each succeeded run stamps where its wall-clock went into `job_stages` (migration 0034): `run_ms` (the app's own `run()`), `index_ms`, `hooks_ms` (revisions + gates + watches + triggers), `alerts_ms` (saved searches, including the forced index flush and materialization) and `total_ms` (claim → end of fan-out). The same object rides the terminal SSE event as `stages`. Every field is nullable and a `null` means **unmeasured**, never zero — a job that failed before its fan-out has no stage row at all.
 - **Claim order / priority aging:** the worker claims the queued job with the highest *effective* priority = `priority + waited_secs / worker.priority_aging_coefficient_secs`. Aging is a starvation guard — a low-priority job stuck behind a continuous high-priority stream escalates as it waits (default coefficient `900`s → +1 level every 15 min) instead of never running. Set the coefficient to `0` to disable aging and fall back to strict `priority DESC, created_at`. Equal-(effective-)priority claims stay FIFO (oldest `created_at` first).
 
@@ -75,6 +76,43 @@ sweep being idempotent and the reaper continuing the work. It reports per class
 — `requeued` / `failed` / `skipped` — where `skipped` counts rows a live worker
 resolved between the scan and the verdict (the `(status, attempts)` fence), so a
 sweep that verdicted fewer rows than it scanned is legible rather than silent.
+
+## Jobs that wait (`waiting`)
+
+A running app can say *"I need something from outside before I can continue"* — a human approval, a 2FA code, an agent's answer to a clarifying question — and park itself **without holding a worker permit**.
+
+```rust
+// inside ScrapeApp::run
+let Some(answer) = ctx.restore_input().cloned() else {
+    // No answer yet: checkpoint the reversible work, then park.
+    return Err(ctx
+        .await_input(
+            json!({ "stage": "prepared", "amount": 42 }),   // the resume snapshot
+            json!({ "kind": "approval", "prompt": "submit $42?" }), // what you're asking for
+        )
+        .await);
+};
+// A later attempt lands here with `answer` in hand and the checkpoint restored.
+```
+
+- **`ctx.await_input(resume_state, request)`** forces a checkpoint of `resume_state` (`checkpoint_now`, so the 5s throttle cannot eat it) and returns `Error::AwaitingInput(request)`, which the app propagates. The forced checkpoint is the contract: a park is a promise to resume *from here*, and without a landed snapshot the resumed attempt would restart from the top and re-ask a question somebody already answered. Pass `Value::Null` if there is genuinely nothing to resume from.
+- **The worker's outcome arm** (above the terminal-failure arm — a park is not a failure, so `is_terminal_for_job` is never consulted) writes `status = 'waiting'` fenced on `(status='running', attempts)`, keeps the checkpoint, leaves `finished_at` NULL, **burns no attempt**, releases the permit, and publishes a **non-terminal `waiting` job event** carrying the request — so `GET /jobs/{id}/stream`, `/events` and the MCP live feed stay open.
+- **Columns** (migration `0050`): `input_request` (what the job is asking for), `waiting_since`, `waiting_expires_at`, `resumed_input`. The first three ride `GET /jobs/{id}`; `resumed_input` is **never serialized**, for the same reason as `callback_secret` — the payloads it exists to carry are approvals, one-time codes and credentials, and the read API is unauthenticated on a default install.
+- **`POST /jobs/{id}/resume {input}`** stores the answer and re-queues the job with `reset`'s attempt headroom (`max_attempts = MAX(max_attempts, attempts + 1)`), so a job that waited an hour for a human still has every retry it started with. `input` is optional (omitted = `null`, a fine answer to a pure "proceed?" gate). The write is guarded on `status = 'waiting'`, which makes the door **idempotent by refusal**: a second resume — a stale browser tab, an agent retry, a second approver — is `409`, never a second live lineage for one job. `404` if the job does not exist. The resumed attempt reads the answer through **`ctx.restore_input()`** and its checkpoint through `ctx.restore()`.
+- **`DELETE /jobs/{id}` reaches a parked job.** A `waiting` job has no in-flight future to interrupt, so it is cancelled synchronously through the same guarded write as a `queued` one (the guard is `status IN ('queued','waiting')`). Without that it would be uncancellable: the door finds no registered token, falls through, and tells the operator the job is *already terminal*. `POST /jobs/{id}/retry` deliberately does **not** reach it — resume is the door, and retry would drop the answer on the floor.
+- **The schedule slot is held.** `run_holds_slot` (the single predicate behind the cron overlap guard *and* `GET /schedules` health) counts `waiting` as active: a parked run is mid-work, so stacking the next firing on top of it would do the same work twice.
+- **The reaper does not touch it.** The lease reaper selects `status = 'running'` on a stale heartbeat; a parked job has no executor and no heartbeat, so it is naturally outside that scan. Its policy is a *deadline* instead: with `[waiting] expiry_secs > 0` a park stamps `waiting_expires_at`, and a sweep on the scheduler tick fails an unanswered wait permanently with `error: "awaited input not provided before waiting_expires_at"` — through `finalize`, so the result callback, the failure firehose and terminal triggers all fire like any other permanent failure.
+- **Metrics:** `pumper_jobs{status="waiting"}` — always emitted, `0` when nothing is parked (an absent series is indistinguishable from a scrape failure, and "how many jobs are blocked on a human right now" is the number this feature exists to make answerable).
+- **MCP:** `wait_job` settles on a terminal status **or** on `waiting`, returning `{status: "waiting", input_request, note}`; `resume_job` answers it (gated by `[mcp] allow_enqueue`, like every other tool that lets a job spend). `list_jobs`/`GET /jobs?status=waiting` is the inbox. See [mcp.md](mcp.md).
+
+| `[waiting]` key | default | meaning |
+| --- | --- | --- |
+| `expiry_secs` | `0` | How long a parked job may wait before the sweep fails it. **`0` = wait forever**, which is byte-for-byte the behaviour of a build without this feature. A deadline is opt-in on purpose: the alternative default is a timer that fails approvals nobody got to over a weekend. |
+| `expire_batch` | `100` | Rows one sweep pass will fail before stopping (the sweep piggybacks the scheduler tick). |
+
+**The first production consumer is `transact`** (N01): a flow enqueued with `submit: true` runs its dry run, stages a `pending` row in the transactions ledger, and parks with the evidence bundle as its `input_request`; `POST /transactions/{id}/approve` is what resumes it. Note the shape that door adds on top of the generic one — the resumed run does **not** treat its `input` as authority. It re-reads the ledger and refuses unless the row itself says `approved`, so a hand-posted `POST /jobs/{id}/resume` cannot release an irreversible action. An app whose resume grants real authority should copy that: the resume payload says *which* decision was made, the durable record says *that* it was. See [apps.md § transact](apps.md#transact-evidence-approval-submit). The other consumer is the `approval` test app in `crates/server/src/e2e/waiting_resume.rs`.
+
+**Not in this slice:** `research`'s clarification loop is not ported. A deadline is per-server, not per-park: an app cannot ask for its own expiry window — which is why `transact` carries its own `[transact] approval_ttl_secs` for the *approval*, separate from `[waiting] expiry_secs` for the *park*.
 
 ## Live progress
 
@@ -117,12 +155,13 @@ The block is **absent when every save landed** (no fabricated zeros — its pres
 
 DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`, `POST /schedules/{id}/budget`, plus the read-only decision ledger `GET /schedules/{id}/runs` (see [The decision ledger](#the-decision-ledger-get-schedulesidruns)). **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
 
-**What the tick actually is.** This loop is the process's only periodic timer, so four other jobs ride it rather than owning one of their own — in this order, after the cron reconcile:
+**What the tick actually is.** This loop is the process's only periodic timer, so five other jobs ride it rather than owning one of their own — in this order, after the cron reconcile:
 
 1. the **stuck-job reaper** (above), with the **trigger-decision-ledger prune** nested inside it (hourly, not per tick — see [triggers.md](triggers.md));
 2. the **webhook dead-letter drain** (`[webhooks] auto_retry`, see [events-webhooks.md](events-webhooks.md)) — runs in-line, so a slow receiver parks the tick;
 3. the **cache refresher** (`[refresher]`, default OFF, see [fetching.md](fetching.md)) — spawned, idle-slot only;
-4. the **DataHub governance poll** (`[datahub] govern`, default OFF, see [datahub.md](datahub.md)) — interval-gated and spawned.
+4. the **DataHub governance poll** (`[datahub] govern`, default OFF, see [datahub.md](datahub.md)) — interval-gated and spawned;
+5. the **scheduled-workflow pass** (see [workflows.md](workflows.md)) — a declared plan carrying a `cron` fires one run per firing, held while its newest run is still open. It reads the same `last_pass` the cron reconcile does, so the first tick after boot fires nothing.
 
 Before the first tick the loop runs one **boot catalog reconcile**: it always plans and logs drift between `catalog/data-sources.toml` and the `schedules` table, and applies it only under `[catalog] auto_reconcile = true` (default OFF). An unreadable catalog is a warning, never a reason not to serve the rows that already exist.
 
@@ -299,6 +338,8 @@ The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file a
 - **`full`** — everything else: the whole run comes off the cassette.
 - `record: true` on a non-`full` app still records what goes through the chokepoint, and warn-logs that the cassette cannot cover the whole run.
 
+**A self-hosted research run has a second bypass, and it is not in that list.** With `[claude] self_hosted_tools` on (see [mcp.md](mcp.md#the-self-hosted-agent-loop-claude-self_hosted_tools)) the Claude subprocess fetches through pumper's own `fetch` MCP tool. Those fetches ARE governed, cached and metered — that is the whole point of the item — but they run in a context this tool builds for the calling job, and that context has VCR `Off`: recording into a cassette the worker's task already owns would interleave two writers, and replay would have to resolve against a cassette the MCP call never opened. So the model's own fetches are **not recorded**, and a replay of such a run would let them go live. `REPLAY_BYPASS_APPS` grades an app by the code it runs, and cannot see this — it is a config-driven bypass, not an app-driven one. Do not treat `[vcr] replay` as an egress guarantee while `self_hosted_tools` is on.
+
 **Replay provenance on the stored result.** A replayed job's result carries `vcr_replay_of: "<job_id>"`, plus `vcr_replay_fidelity: "full" | "partial"` — written on **every** replay, including clean ones, so that a missing marker means "older pumper", not "nothing was wrong". A `partial` replay also carries `vcr_replay_bypass` with the reason. `vcr_cassette_unreadable_lines` appears when the cassette had torn lines.
 
 **Other limits.** A browser render replays as its final response equivalent — the recorded post-render HTML — not by re-running JS or page actions. The per-call inventory of raw-engine sites (which is what the grades above are derived from) lives in `crates/core/tests/fetch_chokepoint.rs`.
@@ -346,7 +387,7 @@ A write under the job's **own** app is never reported: an app owns its namespace
 
 ## AppContext (what a running app gets)
 
-`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `require_str`, `remaining_budget_usd`.
+`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `resumed_input` (the answer a `POST /jobs/{id}/resume` supplied — see [Jobs that wait](#jobs-that-wait-waiting)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `await_input`/`restore_input`, `require_str`, `remaining_budget_usd`.
 
 **Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives **in the store**: `Datasets::detect_removed` demands a `RemovalGuard`, and the only public way to mint one is `RemovalGuard::for_source_state(state)`, which yields `None` for a degrading source. So an app that hand-rolls `upsert_many` + removal detection cannot skip it either (it previously could, and one did). A caller that already knows which specific records disappeared uses `Datasets::tombstone_keys` instead — removal by name, nothing inferred. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert for a source nothing has armed, which is every source under the shipping default (`[resilience] enforce = false` with an empty `enforce_sources` — verdicts are computed and stored, nothing is gated, and nothing is even read on the write path).
 
@@ -354,7 +395,7 @@ A write under the job's **own** app is never reported: an app owns its namespace
 
 ## Config
 
-`config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
+`config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub, provisioner, waiting`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)). `[census]` holds the sub-state launch atlas's scope rail and its metered pricing driver — `atlas_states_k` (10), `atlas_top_n` (25), `atlas_metros` (5), `metro_pricing` (**false**), `metro_pricing_cron`, `metro_pricing_budget_usd`; the driver ships OFF, so with no `[census]` section the atlas is a pure read-model that plans metro pricing and buys none of it (see [apps.md](apps.md) "census/atlas"). `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) is the window `GET /provisioner/proposals` uses to lazily flag a still-`planned` proposal `expired` — see [apps.md](apps.md) "provisioner: proposal lifecycle" and [http-api.md](http-api.md#provisioner-proposal-lifecycle-provisionerproposals).
 
 ### `[recipes]` — learned API-recipe replay, and its two strike rungs
 
@@ -391,7 +432,7 @@ carries the policy. Full lifecycle: [fetching.md § The recipe lifecycle](fetchi
 
 ## Metrics
 
-`GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges, `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
+`GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges (including `status="waiting"` — jobs parked on external input, holding no permit), `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
 
 Webhook delivery health, all four read in one aggregate pass so they describe the same instant, and all DB-derived like `pumper_job_failures_total` (the retention sweep can lower the `_total` series): `pumper_webhook_deliveries{status="pending|delivered|failed|dead"}`, `pumper_webhook_oldest_undelivered_seconds` (oldest `pending`+`failed` row; `0` when none, `dead` excluded so the gauge can clear — **the series to alert on**), `pumper_webhook_delivery_attempts_total`, `pumper_webhook_deliveries_succeeded_total`. See [events-webhooks.md § Metrics](events-webhooks.md#metrics).
 
@@ -457,6 +498,87 @@ The pre-migration snapshot decision reads the same `classify`: a store that is
 `ahead` takes no snapshot (there is nothing this binary is about to change) but
 is logged as `SkipSchemaAhead`, not `SkipUpToDate` — the two used to be the same
 arm, which is how a downgrade rode in as a no-op.
+
+## Elastic executor plane (`[executors]`)
+
+**Default OFF.** With no `[executors]` section a node behaves exactly as it always has: one process owns the SQLite file and runs every job. Turning the plane on lets *additional* pumper processes — started as `pumper --executor --coordinator <url>` — dial in, claim whole jobs, run them with their own engines, and report the results back. Concurrency and geography then scale by starting a process, not by the coordinator's core count.
+
+**Only `execute` moves.** The queue, the attempt ladder, the heartbeat lease, the health/contract gates and the whole post-run fan-out stay on the coordinator. An executor's job ends with one call — *here is the result for `(job, attempt)`* — and the coordinator then indexes, gates, fires watches/triggers/saved searches, emits the terminal event and delivers the callback, through the identical `finalize_fanout` a local run uses.
+
+### What an executor may run: result-only apps
+
+An app is executor-eligible when it declares `ScrapeApp::executor() -> true` **and** is result-only: everything it produces comes back in the job result and the artifact tree. Today that is exactly one shipped app, `readable`.
+
+The reason is honest rather than temporary: an executor's `AppContext` carries a **refusing** `datasets` handle (an empty in-memory database with no schema), because there is no RPC dataset client in this slice. The alternative that "works" — pointing `datasets` at the executor's own scratch store — is the one that must never ship, since the app would report success while its records existed only on a machine nobody collects from. A server-side inventory test (`crate::executors::executor_eligible_apps_are_result_only`) reads each eligible app's own source and fails if it reaches `ctx.upsert*` / `ctx.sync_many` / `ctx.datasets` / `ctx.register_rules` / `ctx.observe_extraction`, so the declaration is a checked claim, not a comment.
+
+Everything else in the executor's context is real and local: engines (HTTP/browser/Claude/plugins), the cost ledger, the HTTP cache, learned host weather, the recipe store and the research cache all live in the executor's own `[storage] database_path`. They are process-local **derived** state — losing them costs a cache miss, never a record.
+
+### The doors (coordinator side)
+
+All six answer `404` unless `[executors] enabled` **and** a non-blank `secret`; there is no "configured but open" state. The secret arrives in `x-pumper-executor-secret` and is compared as SHA-256 digests, exactly like the remote fetch fabric's — a wrong secret is `401`. Under `[auth] mode = "keys"` they additionally require the `admin` scope, for free: `auth::required_scope` classifies any unknown mutating path as `Admin` and `GET /executors` as `Read`. Two credentials in two headers, so "wrong secret" and "wrong key" stay two distinguishable `401`s.
+
+| route | body | answer |
+| --- | --- | --- |
+| `POST /executors/claim` | `{executor_id, capabilities?}` | `200 {job_id, app, params, attempt, budget_usd, restored, resumed_input}` or `204` |
+| `POST /jobs/{id}/heartbeat` | `{executor_id, attempt}` | `{owned: true}` / `409` |
+| `POST /jobs/{id}/checkpoint` | `{executor_id, attempt, state}` | `{saved}` / `409` |
+| `POST /jobs/{id}/progress` | `{executor_id, attempt, state}` | `{reported}` / `409` |
+| `POST /jobs/{id}/finish` | `{executor_id, attempt, result \| error, run_ms?}` | `{outcome: "succeeded"\|"queued"\|"failed"\|"stale"}` / `409` |
+| `GET /executors` | — | `{executors: [...], eligible_apps: [...]}` |
+
+- **The claim is a long poll**, held up to `[executors] claim_wait_secs` (default 30) against an empty queue and woken instantly by an enqueue (the same `Notify` the local worker waits on). The poll is the clock *and* the backpressure boundary: an executor asks only when it has a free slot, so the coordinator never models remote capacity. Note the shared wake-up is `notify_one`, so one enqueue wakes one waiter — a local worker and a waiting executor race for it, and the loser falls back to its own timer. That costs latency on one job, never correctness: the claim itself is a single atomic `UPDATE … RETURNING`.
+- **`capabilities` can only narrow.** The coordinator intersects it with its own eligible set, so naming an app there never widens what an executor may claim. An empty list means "whatever you'll give me".
+- **Per-app caps go cluster-wide** for this path: the blocked set is computed from `SELECT app, COUNT(*) FROM jobs WHERE status='running' AND executor_id IS NOT NULL`, not from the worker's in-process `HashMap` — that map counts one process's jobs, so with N executors a cap of 2 admitted 2×N. The **local** claim path is unchanged and still uses the in-memory map.
+- **`GET /executors`** reports one of three states per executor — `busy` (polled recently, running something), `idle` (polled recently, running nothing: healthy on an empty queue), `offline` (no poll within `[executors] offline_after_secs`, default 120). It is a *report*: an executor going offline does nothing to any job by itself.
+
+### The fence, and why executor loss is cheap
+
+Every executor-driven write is refused unless the row still says `status='running' AND attempts = ? AND executor_id = ?`. The attempt half is the fence the local worker has always run under; the executor half makes a *reaped* process's late write refusable rather than merely unlucky.
+
+So the failure story needs no new machinery:
+
+1. an executor dies mid-run — its job stops being heartbeated;
+2. the coordinator's existing reaper re-queues the lease past `[worker] stale_after_secs`, with failure semantics (attempts, backoff, permanent failure when exhausted);
+3. the next claim advances `attempts` and hands the new attempt the checkpoint the dead executor pushed, through the same poisoned-checkpoint escape a local resume gets;
+4. if the corpse comes back and reports anyway, the fence answers `409` and the report is discarded.
+
+The heartbeat's answer is also the executor's **stop signal**: a `409` means "you no longer own this job", and the executor abandons the run rather than spending on a result that will be refused. A transport *failure* is deliberately not treated as loss of ownership — the lease is still live for `stale_after_secs`, and throwing away an almost-finished run over one dropped packet is worse than waiting.
+
+### Executor mode
+
+```bash
+pumper --executor --coordinator http://coordinator:8088
+```
+
+`--coordinator` overrides `[executors] coordinator_url`; with neither set the process refuses to start rather than polling nothing forever while looking healthy. `[executors] secret` is required in this mode — it is the credential the executor presents. `[executors] executor_id` names the process (unset = `<host>-<pid>`, which is honest but changes across restarts; set it for a fleet whose history you want to read). `[executors] capabilities` narrows what it offers to run; `poll_interval_secs` (default 2) is the pause after a `204` or a transport failure.
+
+An executor binds no port, serves no API, runs no scheduler, no janitors and no maintenance pass; `[search]`, `[mcp]` and the durable event log are forced off in this mode so a second index or MCP endpoint cannot appear beside the coordinator's. Progress is throttled executor-side (≥2s) and checkpoints (≥5s, `force` bypasses) exactly as the in-process seams are, so a chatty app cannot turn a tight loop into a DoS against the coordinator's event bus. A finish is retried three times with backoff, because the run is already paid for and losing its result to one dropped connection is the most expensive failure this process has; after that the lease simply goes stale and the reaper re-queues the job.
+
+### Where a job ran
+
+`jobs.executor_id` (migration 0056) is `NULL` for every locally-claimed job — the honest value, and every job on a single-process install. It rides `GET /jobs/{id}` and `receipt.job.executor_id`, and `/metrics` carries `pumper_executors{state="busy|idle|offline"}` whenever the plane is enabled (absent when it is not: a series that is always zero on the installs that never run an executor is noise).
+
+### Config
+
+| key | default | side | meaning |
+| --- | --- | --- | --- |
+| `enabled` | `false` | coordinator | serve the executor doors at all (paired with `secret` by `Config::validate`) |
+| `secret` | `""` | both | the shared plane secret, compared as digests |
+| `claim_wait_secs` | `30` | coordinator | long-poll ceiling; must be > 0 when enabled |
+| `offline_after_secs` | `120` | coordinator | when `GET /executors` calls an executor offline (report only) |
+| `coordinator_url` | `""` | executor | who to dial (`--coordinator` wins) |
+| `executor_id` | `""` | executor | stable identity (unset ⇒ `<host>-<pid>`) |
+| `capabilities` | `[]` | executor | apps offered; always intersected with the coordinator's eligible set |
+| `poll_interval_secs` | `2` | executor | pause after an empty claim or a failure |
+
+### Known gaps (deliberately out of the v1 slice)
+
+- **No RPC `Datasets` client**, so only result-only apps run remotely. This is the one change that unlocks every app.
+- **VCR is coordinator-side state** (cassettes live beside the recorded job's artifacts), so a remote run neither records nor replays; `record: true` on an executor-claimed job is silently a no-op run.
+- **`DELETE /jobs/{id}` cannot stop a running remote job.** The cancel-token registry is in-process, so a running executor job has no token and the door answers 409. The executor *does* stop on a lost fence (reset the job and it abandons), but a direct cancel arm on the heartbeat is not built.
+- **No TLS/mTLS of its own** — put the coordinator behind a reverse proxy if the plane crosses a network you do not control. The secret is a bearer credential in a header, exactly like the remote fabric's.
+- **No autoscaling and no executor-side VCR.** Capacity is "how many processes you started".
+- **Spend is metered on the executor's own ledger**, not folded back into the coordinator's `cost_events` — so `GET /jobs/{id}/costs` for a remotely-executed job is empty and its receipt says so through the existing "no ledger rows" note.
 
 ## Known gaps
 

@@ -18,7 +18,8 @@ use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
-                           target_key, result, error, requeue_reason, cause_kind, created_at, \
+                           target_key, result, error, requeue_reason, cause_kind, input_request, \
+                           waiting_since, waiting_expires_at, resumed_input, executor_id, created_at, \
                            available_at, started_at, finished_at";
 
 /// The queue list's predicate set, as a struct rather than a growing row of
@@ -404,6 +405,17 @@ pub struct EnqueueOptions {
     /// `None` (the default, and every app that has not overridden
     /// `target_key`) opts out completely: the job is neither held nor holding.
     pub target_key: Option<String>,
+    /// N03: the workflow run this job is a step of. `None` for every ordinary
+    /// job — a workflow is a *forward* declaration, so the absence of a run id
+    /// is the honest statement that nothing declared this work in advance.
+    pub workflow_run_id: Option<String>,
+    /// N03: the step name inside that run's spec. Always set together with
+    /// `workflow_run_id`; the pair is the cell in `workflow_steps`.
+    pub workflow_step: Option<String>,
+    /// N03: the chain's correlation id — the workflow run id for a step job.
+    /// Kept distinct from `workflow_run_id` so a future non-workflow chain can
+    /// share the same key without pretending to be a declared plan.
+    pub root_id: Option<String>,
 }
 
 /// A standing subscription: deliver a `dataset.changed` event whenever a job
@@ -419,9 +431,14 @@ pub struct Watch {
     /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
     #[serde(skip_serializing)]
     pub secret: Option<String>,
-    /// Delivery connector: `"webhook"` | `"file"` | `"slack"` (0031).
+    /// Delivery connector: `"webhook"` | `"file"` | `"slack"` (0031), or
+    /// `"plugin:<name>"` (N10).
     pub sink: String,
     pub enabled: bool,
+    /// N05: the highest `events.seq` this watch already has a delivery row for.
+    /// A watch is a subscription with a dataset selector, and the outbox drain
+    /// advances this exactly the way it advances a `subscriptions` cursor.
+    pub cursor_seq: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -688,6 +705,28 @@ impl Storage {
     /// Enqueues a job; when `opts.idempotency_key` matches an existing job, the
     /// original is returned instead. The bool reports whether a job was created.
     pub async fn enqueue_dedup(&self, app: &str, opts: EnqueueOptions) -> Result<(Job, bool)> {
+        self.enqueue_dedup_as(app, opts, None).await
+    }
+
+    /// [`Self::enqueue_dedup`] stamping the **calling principal** (N20) onto the
+    /// job row, so the cost ledger can answer "who spent this".
+    ///
+    /// A separate entry point rather than a field on [`EnqueueOptions`]: the
+    /// caller is a fact about the *request*, not about the work, and every
+    /// internal producer of jobs (the scheduler tick, a trigger hop, a retry)
+    /// genuinely has no principal. `None` is therefore the honest answer on
+    /// those paths, not a defaulted one, and the column stays NULL — which is
+    /// exactly what "unattributed" means everywhere it is read.
+    ///
+    /// An idempotency **replay does not re-stamp**: the returned job is the
+    /// original, and re-attributing it to whoever replayed the request would
+    /// rewrite the bill for work someone else already owns.
+    pub async fn enqueue_dedup_as(
+        &self,
+        app: &str,
+        opts: EnqueueOptions,
+        principal_id: Option<&str>,
+    ) -> Result<(Job, bool)> {
         if let Some(key) = &opts.idempotency_key {
             if let Some(existing) = self.get_by_idempotency_key(key).await? {
                 return Ok((existing, false));
@@ -708,13 +747,18 @@ impl Storage {
         let trig = opts.trigger_id.as_deref();
         let src = opts.source_job_id.as_deref();
         let target = opts.target_key.as_deref();
+        let wf_run = opts.workflow_run_id.as_deref();
+        let wf_step = opts.workflow_step.as_deref();
+        let root = opts.root_id.as_deref();
         let insert = self
             .metered(StoreOp::JobEnqueue, |mut conn| async move {
                 let r = sqlx::query(
                     "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
                      callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-                     trigger_id, source_job_id, target_key, created_at, available_at) \
-                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     trigger_id, source_job_id, target_key, created_at, available_at, principal_id, \
+                     workflow_run_id, workflow_step, root_id) \
+                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                     ?14, ?15, ?16, ?17, ?18, ?19)",
                 )
                 .bind(id.to_string())
                 .bind(app)
@@ -731,6 +775,10 @@ impl Storage {
                 .bind(target)
                 .bind(ts(created))
                 .bind(ts(available))
+                .bind(principal_id)
+                .bind(wf_run)
+                .bind(wf_step)
+                .bind(root)
                 .execute(&mut *conn)
                 .await?;
                 let rows = r.rows_affected();
@@ -823,6 +871,198 @@ impl Storage {
             })
             .await?;
         row.map(Job::try_from).transpose()
+    }
+
+    /// The executor-plane claim (N18): like [`Storage::claim_next`], but it
+    /// restricts the candidate set to `eligible` apps and **stamps the claiming
+    /// executor onto the row**.
+    ///
+    /// Two differences from the local claim, both load-bearing:
+    /// - `eligible` is an allow-list, not the local path's block-list. An
+    ///   executor may only ever run apps the *coordinator* decided are
+    ///   executor-eligible (`AppManifest::executor` + result-only), intersected
+    ///   with what the executor said it can do. An empty list claims nothing —
+    ///   the honest answer for a node with no eligible apps, and never "claim
+    ///   anything".
+    /// - `executor_id` is written in the SAME statement that flips the row to
+    ///   `running`, so there is no window in which a job is running under an
+    ///   executor the row does not name.
+    ///
+    /// `blocked` is the cluster-wide per-app cap, computed from the DB by the
+    /// coordinator rather than from an in-process map (which cannot see other
+    /// processes' work).
+    pub async fn claim_next_for_executor(
+        &self,
+        executor_id: &str,
+        eligible: &[String],
+        blocked: &[String],
+        aging_coeff: f64,
+    ) -> Result<Option<Job>> {
+        if eligible.is_empty() {
+            return Ok(None);
+        }
+        // Bind slots: ?1 = now, ?2 = executor id, then the eligible list, then
+        // the blocked list. Numbered by position so neither list can collide.
+        let mut next = 3usize;
+        let mut marks = Vec::with_capacity(eligible.len());
+        for _ in eligible {
+            marks.push(format!("?{next}"));
+            next += 1;
+        }
+        let inclusion = format!(" AND app IN ({})", marks.join(", "));
+        let exclusion = if blocked.is_empty() {
+            String::new()
+        } else {
+            let mut marks = Vec::with_capacity(blocked.len());
+            for _ in blocked {
+                marks.push(format!("?{next}"));
+                next += 1;
+            }
+            format!(" AND app NOT IN ({})", marks.join(", "))
+        };
+        let order = if aging_coeff > 0.0 {
+            format!(
+                "(priority + (julianday(?1) - julianday(created_at)) * 86400.0 / {aging_coeff}) \
+                 DESC, created_at"
+            )
+        } else {
+            "priority DESC, created_at".to_string()
+        };
+        let sql = format!(
+            "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1, \
+             heartbeat_at = ?1, executor_id = ?2 \
+             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1\
+             {inclusion}{exclusion}{TARGET_EXCLUSION} ORDER BY {order} LIMIT 1) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        let row = self
+            .metered(StoreOp::JobClaim, |mut conn| async move {
+                let mut query = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql))
+                    .bind(now())
+                    .bind(executor_id.to_string());
+                for app in eligible {
+                    query = query.bind(app);
+                }
+                for app in blocked {
+                    query = query.bind(app);
+                }
+                let row = query.fetch_optional(&mut *conn).await?;
+                let rows = row.is_some() as u64;
+                Ok((row, rows))
+            })
+            .await?;
+        row.map(Job::try_from).transpose()
+    }
+
+    /// Whether `executor_id` still holds this attempt's lease — the fence every
+    /// executor-facing route applies before it acts.
+    ///
+    /// The anti-pattern it closes: an executor that was reaped (its lease went
+    /// stale, the job re-queued and re-claimed elsewhere) reporting a result for
+    /// "its" job. The `(status='running', attempts)` fence on `complete`/`fail`
+    /// already discards that *write*; this makes the refusal explicit and early,
+    /// so the door answers `409` instead of silently accepting a report it is
+    /// about to throw away — and so a checkpoint or a progress snapshot cannot
+    /// be written by a process that no longer owns the job.
+    pub async fn job_claimed_by(&self, id: Uuid, attempt: i64, executor_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM jobs WHERE id = ?1 AND status = 'running' AND attempts = ?2 \
+             AND executor_id = ?3",
+        )
+        .bind(id.to_string())
+        .bind(attempt)
+        .bind(executor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// [`Storage::heartbeat`], additionally fenced on the executor that holds
+    /// the lease: a beat from a process the row does not name refreshes nothing,
+    /// so a partitioned executor cannot keep alive a job another executor has
+    /// already been handed.
+    pub async fn heartbeat_from(&self, id: Uuid, attempt: i64, executor_id: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE jobs SET heartbeat_at = ?2 \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3 AND executor_id = ?4",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .bind(attempt)
+        .bind(executor_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records that an executor polled, upserting its declared capabilities and
+    /// its last-poll instant. Called on every claim attempt — including the ones
+    /// that return no job, which is exactly what makes "idle but alive"
+    /// distinguishable from "gone".
+    pub async fn record_executor_poll(
+        &self,
+        id: &str,
+        capabilities: &[String],
+        claimed: bool,
+    ) -> Result<()> {
+        let caps = serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO executors (id, capabilities, first_seen_at, last_poll_at, claimed_total) \
+             VALUES (?1, ?2, ?3, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET capabilities = ?2, last_poll_at = ?3, \
+             claimed_total = claimed_total + ?4",
+        )
+        .bind(id)
+        .bind(caps)
+        .bind(now())
+        .bind(claimed as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every executor the coordinator has ever seen, newest poll first, with the
+    /// number of jobs each is currently running.
+    pub async fn list_executors(&self) -> Result<Vec<ExecutorRow>> {
+        let rows: Vec<(String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT e.id, e.capabilities, e.first_seen_at, e.last_poll_at, e.claimed_total, \
+             (SELECT COUNT(*) FROM jobs j WHERE j.executor_id = e.id AND j.status = 'running') \
+             FROM executors e ORDER BY e.last_poll_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, capabilities, first_seen_at, last_poll_at, claimed_total, running)| {
+                    ExecutorRow {
+                        id,
+                        capabilities: serde_json::from_str(&capabilities).unwrap_or_default(),
+                        first_seen_at,
+                        last_poll_at,
+                        claimed_total,
+                        running,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Per-app counts of jobs currently running **on executors**, cluster-wide.
+    ///
+    /// This is the number the in-process `HashMap` cannot produce: it lives in
+    /// one process and therefore counts one process's work. The coordinator's
+    /// per-app cap for the executor claim path is computed from this instead.
+    /// Locally-claimed jobs (`executor_id IS NULL`) are deliberately excluded —
+    /// the local path keeps its own in-memory accounting, unchanged.
+    pub async fn executor_running_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT app, COUNT(*) FROM jobs WHERE status = 'running' \
+             AND executor_id IS NOT NULL GROUP BY app",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Marks a running job succeeded. Guarded on `(status, attempts)`: only the
@@ -996,8 +1236,17 @@ impl Storage {
         Ok(rows > 0)
     }
 
-    /// Cancels a job that has not started yet, returning the cancelled job's
-    /// **app** (`None` = there was nothing queued to cancel).
+    /// Cancels a job that no worker task is currently executing — `queued`
+    /// (not started yet) or `waiting` (N02: parked on external input, its
+    /// executor long gone) — returning the cancelled job's **app**
+    /// (`None` = there was nothing cancellable).
+    ///
+    /// `waiting` belongs here rather than on the token path for the same
+    /// reason `queued` does: there is no in-flight future to interrupt, so
+    /// the cancel is a plain guarded write. Without it a parked job would be
+    /// uncancellable — the door would find no registered token, fall through
+    /// to the 409 branch, and tell the operator the job was *already
+    /// terminal*, which is the opposite of true.
     ///
     /// The app rides back with the outcome because the caller has to *announce*
     /// this transition, and a `JobEvent` with a blank app is invisible to every
@@ -1007,7 +1256,7 @@ impl Storage {
     pub async fn cancel(&self, id: Uuid) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?2 \
-             WHERE id = ?1 AND status = 'queued' RETURNING app",
+             WHERE id = ?1 AND status IN ('queued', 'waiting') RETURNING app",
         )
         .bind(id.to_string())
         .bind(now())
@@ -1052,6 +1301,110 @@ impl Storage {
             return Ok(None);
         }
         self.get(id).await
+    }
+
+    /// Parks a `running` job in [`JobStatus::Waiting`] with the request the app
+    /// wants answered (N02). Guarded on `(status, attempts)` exactly like
+    /// [`Storage::complete`]: a task whose job was reset or reaped mid-run must
+    /// not park the live attempt. Returns whether the write landed
+    /// (`false` = stale, discarded).
+    ///
+    /// **Nothing terminal is written**: `finished_at` stays NULL, `attempts` is
+    /// untouched (a park burns no attempt), and the checkpoint is deliberately
+    /// NOT cleared — it is the whole point of the park.
+    pub async fn await_input(
+        &self,
+        id: Uuid,
+        attempt: i64,
+        request: &Value,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let payload = request.to_string();
+        let expires = expires_at.map(ts);
+        let rows = self
+            .metered(StoreOp::JobVerdict, |mut conn| async move {
+                let r = sqlx::query(
+                    "UPDATE jobs SET status = 'waiting', input_request = ?2, waiting_since = ?3, \
+                     waiting_expires_at = ?4, resumed_input = NULL, error = NULL \
+                     WHERE id = ?1 AND status = 'running' AND attempts = ?5",
+                )
+                .bind(id.to_string())
+                .bind(payload)
+                .bind(now())
+                .bind(expires)
+                .bind(attempt)
+                .execute(&mut *conn)
+                .await?;
+                let rows = r.rows_affected();
+                Ok((rows, rows))
+            })
+            .await?;
+        Ok(rows > 0)
+    }
+
+    /// Answers a `waiting` job and re-queues it (`POST /jobs/{id}/resume`).
+    ///
+    /// Uses [`Storage::reset`]'s attempt semantics — `max_attempts = MAX(
+    /// max_attempts, attempts + 1)` — so a park costs no attempt: a job that
+    /// waited an hour for a human still has every retry it started with. The
+    /// guard is `status = 'waiting'`, which makes the door idempotent against a
+    /// double-submit: the second resume matches no row and answers 409 rather
+    /// than re-queueing a run that is already going.
+    ///
+    /// `waiting_since` is deliberately kept (how long the wait actually took is
+    /// the measurement this feature exists to produce); the deadline is cleared,
+    /// because the sweep must not expire a job that has already been answered.
+    /// Returns the refreshed job, or `None` when it was not waiting.
+    pub async fn resume(&self, id: Uuid, input: &Value) -> Result<Option<Job>> {
+        let payload = input.to_string();
+        let r = sqlx::query(
+            "UPDATE jobs SET status = 'queued', resumed_input = ?2, waiting_expires_at = NULL, \
+             error = NULL, finished_at = NULL, available_at = ?3, \
+             max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id = ?1 AND status = 'waiting'",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
+    /// Fails every `waiting` job whose `waiting_expires_at` has passed, up to
+    /// `cap`, returning the `(id, app)` pairs so the caller can route each
+    /// through `finalize` (callback + terminal triggers, like any other
+    /// permanent failure).
+    ///
+    /// The app travels with the id for the same reason it does on
+    /// [`Storage::cancel`] and [`Storage::retry_bulk`]: an announce with a blank
+    /// app never reaches an app-scoped watcher.
+    ///
+    /// A job with no deadline (`waiting_expires_at IS NULL`) is never swept —
+    /// "wait forever" is the default and it means what it says.
+    pub async fn expire_waiting(&self, reason: &str, cap: i64) -> Result<Vec<(Uuid, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE jobs SET status = 'failed', error = ?1, finished_at = ?2 \
+             WHERE id IN (SELECT id FROM jobs WHERE status = 'waiting' \
+                          AND waiting_expires_at IS NOT NULL AND waiting_expires_at <= ?2 \
+                          ORDER BY waiting_expires_at LIMIT ?3) \
+             RETURNING id, app",
+        )
+        .bind(reason)
+        .bind(now())
+        .bind(cap.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, app)| {
+                Uuid::parse_str(&id)
+                    .map(|id| (id, app))
+                    .map_err(|e| Error::parse_from(format!("job id: {e}"), e))
+            })
+            .collect()
     }
 
     /// Bulk re-queue: re-queues up to `cap` jobs in the given terminal state
@@ -1854,8 +2207,17 @@ impl Storage {
 
     // ---- Dataset watches ---------------------------------------------------
 
-    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"`);
-    /// callers validate the value — storage stores it verbatim.
+    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"` |
+    /// `"plugin:<name>"`); callers validate the value — storage stores it
+    /// verbatim.
+    ///
+    /// `from_seq` is where the watch's cursor starts (N05), and it is a REQUIRED
+    /// argument rather than a default because getting it wrong is silent and
+    /// wrong in an expensive direction. A watch created on a live server must
+    /// start at the log's head: with `0` it would replay every retained
+    /// `dataset.changed` event — including changes from before it existed — as
+    /// real deliveries at a real receiver, which is precisely what a watch has
+    /// never done. `0` is the deliberate "replay what you still have".
     pub async fn create_watch(
         &self,
         app: &str,
@@ -1863,11 +2225,12 @@ impl Storage {
         url: &str,
         secret: Option<&str>,
         sink: &str,
+        from_seq: i64,
     ) -> Result<Watch> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, cursor_seq, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
         )
         .bind(&id)
         .bind(app)
@@ -1875,6 +2238,7 @@ impl Storage {
         .bind(url)
         .bind(secret)
         .bind(sink)
+        .bind(from_seq.max(0))
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -1885,7 +2249,7 @@ impl Storage {
 
     pub async fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
         let row: Option<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches WHERE id = ?1",
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches WHERE id = ?1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -1896,7 +2260,7 @@ impl Storage {
     /// Watches for an app (all watches when `app` is None).
     pub async fn list_watches(&self, app: Option<&str>) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) ORDER BY app, dataset",
         )
         .bind(app)
@@ -1915,7 +2279,7 @@ impl Storage {
     ) -> Result<Vec<Watch>> {
         let (after_ts, after_id) = split_after(after);
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -1932,7 +2296,7 @@ impl Storage {
     /// Enabled watches for an app — the delivery set for change webhooks.
     pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at FROM watches \
              WHERE app = ?1 AND enabled = 1",
         )
         .bind(app)
@@ -1984,6 +2348,233 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    // ---- Durable event log (N05) -------------------------------------------
+
+    /// Appends a batch of already-sequenced events in ONE transaction.
+    ///
+    /// `seq` is supplied by the caller (the in-memory bus stamped it and put it
+    /// on the wire as the SSE id), so this is `INSERT OR IGNORE`: re-appending a
+    /// seq the log already holds is a no-op rather than a unique-violation that
+    /// would poison a whole batch. Returns the number of rows that landed.
+    ///
+    /// Batched because the alternative -- one round trip per emitted event --
+    /// puts the write amplification of the whole bus on the emit path. Under WAL
+    /// one transaction of N inserts is one fsync, so a burst costs what a single
+    /// event does.
+    pub async fn append_events(&self, events: &[NewEvent]) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let ts = now();
+        let mut tx = self.pool.begin().await?;
+        let mut landed = 0usize;
+        for ev in events {
+            let r = sqlx::query(
+                "INSERT OR IGNORE INTO events (seq, kind, app, subject_id, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(ev.seq)
+            .bind(&ev.kind)
+            .bind(&ev.app)
+            .bind(&ev.subject_id)
+            .bind(ev.payload.to_string())
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+            landed += r.rows_affected() as usize;
+        }
+        tx.commit().await?;
+        Ok(landed)
+    }
+
+    /// Highest sequence the log holds (0 when empty) -- what the bus seeds its
+    /// counter from at boot so `Last-Event-ID` survives a restart.
+    pub async fn max_event_seq(&self) -> Result<i64> {
+        let seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    /// Rows currently in the log -- the honest denominator for `GET /events/log`
+    /// and the retention report.
+    pub async fn count_events(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Keyset page of the log: events with `seq > after`, ascending, optionally
+    /// filtered by kind and/or app. Ascending because a cursor consumer reads
+    /// FORWARD -- a descending page could not express "the next N after my
+    /// cursor".
+    pub async fn events_after(
+        &self,
+        after: i64,
+        kind: Option<&str>,
+        app: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<EventRecord>> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT seq, kind, app, subject_id, payload, created_at FROM events \
+             WHERE seq > ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR app = ?3) \
+             ORDER BY seq ASC LIMIT ?4",
+        )
+        .bind(after)
+        .bind(kind)
+        .bind(app)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(EventRecord::try_from).collect()
+    }
+
+    /// Deletes log rows older than `days`. `days <= 0` deletes nothing -- a
+    /// retention knob turned off must never be read as "keep zero days".
+    pub async fn prune_events(&self, days: i64) -> Result<u64> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let r = sqlx::query("DELETE FROM events WHERE created_at < ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ---- Cursor subscriptions (N05) -----------------------------------------
+
+    /// Creates a subscription. `cursor_seq` starts at `from_seq`, so a consumer
+    /// can either start from now (`latest_seq`) or replay the retained log from
+    /// any earlier point -- the only two things a durable cursor is for.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_subscription(
+        &self,
+        name: Option<&str>,
+        selector: &Value,
+        sink: &str,
+        url: &str,
+        secret: Option<&str>,
+        from_seq: i64,
+        principal_id: Option<&str>,
+    ) -> Result<Subscription> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO subscriptions (id, name, selector, sink, url, secret, cursor_seq, \
+             enabled, principal_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(selector.to_string())
+        .bind(sink)
+        .bind(url)
+        .bind(secret)
+        .bind(from_seq)
+        .bind(principal_id)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_subscription(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_subscription(&self, id: &str) -> Result<Option<Subscription>> {
+        let row: Option<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, name, selector, sink, url, secret, cursor_seq, enabled, principal_id, \
+             created_at, last_delivered_at, last_error FROM subscriptions WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Subscription::try_from).transpose()
+    }
+
+    /// All subscriptions, newest first. `enabled_only` is the drain's view.
+    pub async fn list_subscriptions(&self, enabled_only: bool) -> Result<Vec<Subscription>> {
+        let rows: Vec<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, name, selector, sink, url, secret, cursor_seq, enabled, principal_id, \
+             created_at, last_delivered_at, last_error FROM subscriptions \
+             WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at DESC, id DESC",
+        )
+        .bind(enabled_only as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Subscription::try_from).collect()
+    }
+
+    pub async fn set_subscription_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let r = sqlx::query("UPDATE subscriptions SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn delete_subscription(&self, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM subscriptions WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Advances a subscription's cursor -- **monotonically**. The `cursor_seq <
+    /// ?2` fence is the whole at-least-once contract: two concurrent drains, or
+    /// a drain racing a restart, can only ever move the cursor forward, so an
+    /// event is never skipped by an out-of-order write.
+    pub async fn advance_subscription_cursor(&self, id: &str, seq: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE subscriptions SET cursor_seq = ?2, last_delivered_at = ?3, last_error = NULL \
+             WHERE id = ?1 AND cursor_seq < ?2",
+        )
+        .bind(id)
+        .bind(seq)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records why a drain could not advance this subscription. The cursor is
+    /// deliberately NOT moved: an event whose delivery row could not be written
+    /// has not been handed off, and the next tick must retry it.
+    pub async fn record_subscription_error(&self, id: &str, error: &str) -> Result<()> {
+        sqlx::query("UPDATE subscriptions SET last_error = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every enabled watch, across all apps -- the outbox drain's view of the
+    /// watch-derived half of the subscription set.
+    pub async fn enabled_watches_all(&self) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, sink, enabled, cursor_seq, created_at \
+             FROM watches WHERE enabled = 1 ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    /// [`Storage::advance_subscription_cursor`] for a watch -- same monotonic
+    /// fence, because a watch IS a subscription with a dataset selector.
+    pub async fn advance_watch_cursor(&self, id: &str, seq: i64) -> Result<bool> {
+        let r = sqlx::query("UPDATE watches SET cursor_seq = ?2 WHERE id = ?1 AND cursor_seq < ?2")
+            .bind(id)
+            .bind(seq)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     // ---- Reactive triggers ---------------------------------------------------
 
     /// Current version of the `triggers` table. Any change to the table (a
@@ -2020,13 +2611,20 @@ impl Storage {
         // NULL when neither hook is set — an all-empty hooks object is no hooks.
         let hooks_json = t
             .plugin_hooks
-            .filter(|h| h.predicate.is_some() || h.transform.is_some())
+            .filter(|h| h.predicate.is_some() || h.transform.is_some() || h.post_enqueue.is_some())
             .map(|h| serde_json::to_string(h).unwrap_or_else(|_| "{}".into()));
+        // NULL when the map is empty — an empty bind map is no binding at all,
+        // and storing `{}` would make "declared, binds nothing" indistinguishable
+        // from "never declared" in every read of this row.
+        let bind_json = t
+            .bind
+            .filter(|b| !b.is_empty())
+            .map(|b| serde_json::to_string(b).unwrap_or_else(|_| "{}".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
              on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
-             filters, plugin_hooks) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
+             filters, plugin_hooks, bind, each_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(&id)
         .bind(t.name)
@@ -2043,6 +2641,8 @@ impl Storage {
         .bind(now())
         .bind(filters_json)
         .bind(hooks_json)
+        .bind(bind_json)
+        .bind(t.each)
         .execute(&self.pool)
         .await?;
         self.bump_trigger_generation();
@@ -3005,6 +3605,139 @@ impl Storage {
         .await?)
     }
 
+    // ── principals & audit (N20) ─────────────────────────────
+    // Caller identities for the HTTP surface. Inert in `[auth] mode = "open"`:
+    // nothing here is consulted and the tables stay empty.
+
+    /// Creates a principal. `key_hash` is the SHA-256 hex digest of the key —
+    /// the key itself is never handed to this layer, so it cannot be stored by
+    /// accident and cannot be re-read out of the row later.
+    pub async fn create_principal(
+        &self,
+        name: &str,
+        key_hash: &str,
+        scopes: &[String],
+        budget_usd_per_day: Option<f64>,
+        rate_limit_per_min: Option<i64>,
+    ) -> Result<Principal> {
+        let id = Uuid::new_v4().to_string();
+        let scopes_json = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO principals (id, name, key_hash, scopes, budget_usd_per_day, \
+             rate_limit_per_min, enabled, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(key_hash)
+        .bind(scopes_json)
+        .bind(budget_usd_per_day)
+        .bind(rate_limit_per_min)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_principal(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_principal(&self, id: &str) -> Result<Option<Principal>> {
+        let row: Option<PrincipalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals WHERE id = ?1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Principal::try_from).transpose()
+    }
+
+    /// Resolves a presented key by its digest. The lookup is on the indexed
+    /// `key_hash` column, so no plaintext key is ever compared and the query
+    /// shape does not vary with how much of a wrong key matched.
+    pub async fn principal_by_key_hash(&self, key_hash: &str) -> Result<Option<Principal>> {
+        let row: Option<PrincipalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals WHERE key_hash = ?1"
+        )))
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Principal::try_from).transpose()
+    }
+
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        let rows: Vec<PrincipalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principals ORDER BY created_at"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Principal::try_from).collect()
+    }
+
+    pub async fn set_principal_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE principals SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Points a principal at a new key digest. The OLD digest is overwritten,
+    /// not kept alongside: a rotation that left the previous key working would
+    /// be a no-op dressed as a revocation.
+    pub async fn rotate_principal_key(&self, id: &str, key_hash: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE principals SET key_hash = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(key_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Appends one audit row. `principal_id` is NULL for a request refused
+    /// before any identity was established — never back-filled with a guess
+    /// about who it might have been.
+    pub async fn record_audit(
+        &self,
+        principal_id: Option<&str>,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO audit_log (principal_id, action, target, at, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(principal_id)
+        .bind(action)
+        .bind(target)
+        .bind(now())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One page of the audit ledger, newest first, keyset-paged on the
+    /// monotonic row id (`after_id` = the last id seen).
+    pub async fn list_audit(
+        &self,
+        principal_id: Option<&str>,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<AuditEntry>> {
+        let rows: Vec<AuditRow> = sqlx::query_as(
+            "SELECT id, principal_id, action, target, at, detail FROM audit_log \
+             WHERE (?1 IS NULL OR principal_id = ?1) AND (?2 IS NULL OR id < ?2) \
+             ORDER BY id DESC LIMIT ?3",
+        )
+        .bind(principal_id)
+        .bind(after_id)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(AuditEntry::try_from).collect()
+    }
+
     // ── ingress ──────────────────────────────────────────────────────────────
     // Inbound event ingress sources: per-caller credentials for POST /ingest/{id}.
 
@@ -3123,6 +3856,48 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Upserts a schedule OWNED by `tag` (`managed_by`) -- the storage-layer
+    /// writer every managed reconcile goes through.
+    ///
+    /// The anti-pattern it replaces: `scheduler.rs` reconciled `[[peer]]` rows
+    /// with a raw `sqlx::query` against the `schedules` table (N16), a second
+    /// hand-written INSERT..ON CONFLICT beside this module's -- one that had to
+    /// re-state the column list, the timestamp format and the ownership fence,
+    /// and that no storage-level test could see.
+    ///
+    /// The `WHERE schedules.managed_by = excluded.managed_by` clause is the
+    /// fence and is not optional: it is what stops a managed reconcile from
+    /// overwriting a hand-made schedule that happens to share an id. Returns
+    /// whether a row was written (`false` = an existing row owned by somebody
+    /// else, left untouched).
+    pub async fn upsert_managed_schedule(
+        &self,
+        id: &str,
+        app: &str,
+        cron: &str,
+        params: &Value,
+        enabled: bool,
+        tag: &str,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, params = excluded.params, \
+               enabled = excluded.enabled \
+             WHERE schedules.managed_by = excluded.managed_by",
+        )
+        .bind(id)
+        .bind(app)
+        .bind(cron)
+        .bind(params.to_string())
+        .bind(enabled as i64)
+        .bind(tag)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     /// Enables/disables a schedule owned by `tag`. Returns `false` when the row
@@ -3597,7 +4372,8 @@ pub struct RevisionCount {
 /// `total_ms` spans claim → end of fan-out and is **not** the sum of the named
 /// stages: the queue's own bookkeeping (completion write, checkpoint clear,
 /// yield record) sits between them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, sqlx::FromRow)]
+#[serde(default)]
 pub struct JobStages {
     /// The attempt these numbers describe.
     pub attempt: i64,
@@ -3705,6 +4481,29 @@ fn wal_sidecar_bytes(db: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// One row of `GET /executors` (N18): an outbound executor process the
+/// coordinator has seen, and what it is doing right now.
+///
+/// `last_poll_at` is kept as the stored string rather than a parsed instant for
+/// the same reason the keyset pages are: it is rendered, compared to a cutoff,
+/// and never arithmetic'd. The liveness *verdict* is computed by
+/// `crate::executors::executor_state` on the server side, from this and the
+/// configured window, so the store keeps facts and the policy stays in one
+/// tested function.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutorRow {
+    pub id: String,
+    /// The app names this executor declared. Advisory — the coordinator
+    /// intersects them with its own eligibility list on every claim.
+    pub capabilities: Vec<String>,
+    pub first_seen_at: String,
+    pub last_poll_at: String,
+    /// Jobs handed to this executor since it was first seen.
+    pub claimed_total: i64,
+    /// Jobs it is running right now (`status='running' AND executor_id = id`).
+    pub running: i64,
+}
+
 #[derive(sqlx::FromRow)]
 struct JobRow {
     id: String,
@@ -3724,6 +4523,11 @@ struct JobRow {
     error: Option<String>,
     requeue_reason: Option<String>,
     cause_kind: Option<String>,
+    input_request: Option<String>,
+    waiting_since: Option<String>,
+    waiting_expires_at: Option<String>,
+    resumed_input: Option<String>,
+    executor_id: Option<String>,
     created_at: String,
     available_at: String,
     started_at: Option<String>,
@@ -3756,6 +4560,11 @@ impl TryFrom<JobRow> for Job {
             error: r.error,
             requeue_reason: r.requeue_reason,
             cause_kind: r.cause_kind,
+            input_request: parse_json_column(r.input_request.as_deref()),
+            waiting_since: r.waiting_since.as_deref().map(parse_ts).transpose()?,
+            waiting_expires_at: r.waiting_expires_at.as_deref().map(parse_ts).transpose()?,
+            resumed_input: parse_json_column(r.resumed_input.as_deref()),
+            executor_id: r.executor_id,
             created_at: parse_ts(&r.created_at)?,
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
@@ -3766,7 +4575,7 @@ impl TryFrom<JobRow> for Job {
 
 const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
                                on_status, target_app, params, budget_usd, priority, \
-                               max_attempts, enabled, created_at, filters, plugin_hooks";
+                               max_attempts, enabled, created_at, filters, plugin_hooks,                                bind, each_path";
 
 /// One sandboxed WASM hook on a trigger: the plugin to run plus the `params`
 /// half of the `extract_v2` envelope it receives (so one module serves many
@@ -3801,6 +4610,15 @@ pub struct TriggerPluginHooks {
     /// Must return a JSON object; provenance keys are re-stamped by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<PluginHook>,
+    /// N10: runs AFTER the hop's job exists, with the job id in its envelope.
+    ///
+    /// The slot for side effects that must not gate the hop — notifying a
+    /// tracker, stamping an external system with the job id. Its output is
+    /// ignored entirely and its failures are ledgered, never acted on: by the
+    /// time it runs the job is already enqueued, so there is nothing left for a
+    /// verdict to decide. `on_error` is therefore meaningless here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_enqueue: Option<PluginHook>,
 }
 
 /// A reactive-pipeline edge: (source event) → (enqueue target app). The set of
@@ -3833,6 +4651,17 @@ pub struct Trigger {
     /// Sandboxed WASM predicate/transform hooks (M15 v1). All source kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_hooks: Option<TriggerPluginHooks>,
+    /// N04 param binding: `{target param name -> JSON pointer}` resolved
+    /// against the `{template, _trigger}` view before the target-schema door,
+    /// so an event can steer the target's OWN params instead of only riding
+    /// under `_trigger`. A pointer that resolves to nothing is `bind_miss`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<serde_json::Map<String, Value>>,
+    /// N04 per-record fan-out: a JSON pointer to an array in that same view.
+    /// One hop per element (`_trigger.item`, `_trigger.item_index`), capped by
+    /// `[triggers] fan_out_cap`.
+    #[serde(rename = "each", skip_serializing_if = "Option::is_none")]
+    pub each: Option<String>,
 }
 
 impl Trigger {
@@ -3860,6 +4689,10 @@ pub struct NewTrigger<'a> {
     pub filters: Option<&'a [String]>,
     /// Sandboxed WASM predicate/transform hooks (M15 v1).
     pub plugin_hooks: Option<&'a TriggerPluginHooks>,
+    /// N04: `{target param -> JSON pointer}` lifted out of the envelope.
+    pub bind: Option<&'a serde_json::Map<String, Value>>,
+    /// N04: JSON pointer to the array to fan out over.
+    pub each: Option<&'a str>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3880,6 +4713,8 @@ struct TriggerRow {
     created_at: String,
     filters: Option<String>,
     plugin_hooks: Option<String>,
+    bind: Option<String>,
+    each_path: Option<String>,
 }
 
 impl TryFrom<TriggerRow> for Trigger {
@@ -3909,6 +4744,8 @@ impl TryFrom<TriggerRow> for Trigger {
                 .plugin_hooks
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            bind: r.bind.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            each: r.each_path,
         })
     }
 }
@@ -3946,6 +4783,15 @@ pub struct TriggerRun {
 /// `GET /watches/{id}/deliveries` to answer anything at all — an e2e drives a
 /// real dispatch through both ends rather than trusting the string twice.
 pub const DELIVERY_KIND_WATCH: &str = "change";
+
+/// `webhook_deliveries.kind` for a delivery a **cursor subscription** produced
+/// (N05); the row's `ref_id` is then the subscription id.
+///
+/// Deliberately NOT `change`: a watch's deliveries and a subscription's are
+/// queried by different routes and resolve their signing secret from different
+/// tables, so one value could not serve both without
+/// `webhook::resolve_secret` guessing which.
+pub const DELIVERY_KIND_SUBSCRIPTION: &str = "subscription";
 
 /// The `trigger_id` a decision carries when it is about the evaluation SET, not
 /// about one trigger — the only such case is the set failing to load, which
@@ -4014,6 +4860,18 @@ pub const TRIGGER_OUTCOMES: &[&str] = &[
     // later with a message nobody connects back to the trigger template.
     // `detail` carries the pointer-path message the enqueue door would answer.
     "bad_params",
+    // N04: a `bind` pointer resolved to nothing, so the target param it was
+    // supposed to fill would have been absent (or, worse, silently left at the
+    // template's stale value). The hop is NOT enqueued: a binding that did not
+    // bind is a broken edge, and firing it anyway is what made "the event was
+    // supposed to steer this job" unfalsifiable. `detail` names the param and
+    // the pointer that missed.
+    "bind_miss",
+    // N04: a trigger declared `each` and the array it points at was EMPTY, so
+    // the event produced zero hops. Not an error and not a miss - but recorded,
+    // because "nothing fired" with no row at all is the exact silence this
+    // ledger exists to end.
+    "fan_out_empty",
     // A job already exists for this hop's idempotency key.
     "dedup",
     // The enqueue itself failed.
@@ -4449,6 +5307,7 @@ struct WatchRow {
     secret: Option<String>,
     sink: String,
     enabled: i64,
+    cursor_seq: i64,
     created_at: String,
 }
 
@@ -4464,6 +5323,7 @@ impl TryFrom<WatchRow> for Watch {
             secret: r.secret,
             sink: r.sink,
             enabled: r.enabled != 0,
+            cursor_seq: r.cursor_seq,
             created_at: parse_ts(&r.created_at)?,
         })
     }
@@ -4508,6 +5368,104 @@ impl TryFrom<ScheduleRow> for Schedule {
             last_skipped_at: r.last_skipped_at.as_deref().map(parse_ts).transpose()?,
             skipped_count: r.skipped_count,
             created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// The columns [`Principal`] is built from. One list, so a new column cannot be
+/// added to one query and forgotten in the other three.
+const PRINCIPAL_COLUMNS: &str =
+    "id, name, key_hash, scopes, budget_usd_per_day, rate_limit_per_min, enabled, created_at";
+
+/// A caller identity for the HTTP surface (N20): a scoped API key with an
+/// optional daily spend ceiling and an optional request throttle.
+///
+/// The key digest is `skip_serializing` for the same reason
+/// [`IngressSource::secret`] is: the plaintext key is shown exactly once, at
+/// creation or rotation, and nothing about it is ever listed again.
+#[derive(Debug, Clone, Serialize)]
+pub struct Principal {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub key_hash: String,
+    /// `"read"` | `"enqueue:<app>"` | `"enqueue:*"` | `"admin"`.
+    pub scopes: Vec<String>,
+    /// `None` = no ceiling, matching what an omitted `budget_usd` means at every
+    /// other door.
+    pub budget_usd_per_day: Option<f64>,
+    /// `None` = no per-principal throttle beyond the configured fallback.
+    pub rate_limit_per_min: Option<i64>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PrincipalRow {
+    id: String,
+    name: String,
+    key_hash: String,
+    scopes: String,
+    budget_usd_per_day: Option<f64>,
+    rate_limit_per_min: Option<i64>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<PrincipalRow> for Principal {
+    type Error = Error;
+
+    fn try_from(r: PrincipalRow) -> Result<Principal> {
+        Ok(Principal {
+            id: r.id,
+            name: r.name,
+            key_hash: r.key_hash,
+            // A row whose scopes JSON is unreadable grants NOTHING. Defaulting
+            // to a permissive set on a parse failure is how a corrupt row
+            // becomes an admin key.
+            scopes: serde_json::from_str(&r.scopes).unwrap_or_default(),
+            budget_usd_per_day: r.budget_usd_per_day,
+            rate_limit_per_min: r.rate_limit_per_min,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// One row of the durable audit ledger: which principal did what, to what, when.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    /// `None` when the request never resolved an identity.
+    pub principal_id: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub at: DateTime<Utc>,
+    /// Free-form JSON string as recorded; never parsed by this layer.
+    pub detail: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    id: i64,
+    principal_id: Option<String>,
+    action: String,
+    target: Option<String>,
+    at: String,
+    detail: Option<String>,
+}
+
+impl TryFrom<AuditRow> for AuditEntry {
+    type Error = Error;
+
+    fn try_from(r: AuditRow) -> Result<AuditEntry> {
+        Ok(AuditEntry {
+            id: r.id,
+            principal_id: r.principal_id,
+            action: r.action,
+            target: r.target,
+            at: parse_ts(&r.at)?,
+            detail: r.detail,
         })
     }
 }
@@ -4633,10 +5591,122 @@ fn cutoff(days: u64) -> DateTime<Utc> {
     Utc::now() - chrono::Duration::days(days as i64)
 }
 
+/// A nullable JSON column read back onto a [`Job`] (`input_request`,
+/// `resumed_input`).
+///
+/// Absent column → `None`. Present-but-unparsable → `Some(Value::String(raw))`,
+/// **not** `None`: these two columns are the evidence that a job parked and that
+/// somebody answered it, and the anti-pattern is a corrupt blob silently
+/// reading back as "this job never waited for anything" — a `waiting` row whose
+/// `input_request` decoded to `None` would show an operator a job parked on
+/// nothing at all. Keeping the raw text says what is actually there.
+fn parse_json_column(raw: Option<&str>) -> Option<Value> {
+    let raw = raw?;
+    Some(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())))
+}
+
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::parse_from(format!("bad timestamp '{s}': {e}"), e))
+}
+
+#[cfg(test)]
+mod cancel_reaches_parked_jobs_tests {
+    use crate::testing::TempStore;
+    use crate::{EnqueueOptions, JobStatus};
+    use serde_json::json;
+
+    /// A parked job has no executor and no registered cancel token, so the
+    /// cancel door's only route to it is this guarded write. When the guard
+    /// was `status = 'queued'` alone, `DELETE /jobs/{id}` on a job waiting on
+    /// a human found no token, fell through to the terminal branch, and
+    /// answered *already terminal* — leaving the only exit an expiry sweep
+    /// that is off by default.
+    #[tokio::test]
+    async fn cancel_reaches_a_parked_job_not_only_a_queued_one() {
+        let store = TempStore::new("cancel-parked").await;
+        let job = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        // Claim it, then park it exactly as the worker's outcome arm does.
+        let claimed = store
+            .storage
+            .claim_next(&[], 0.0)
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        assert!(store
+            .storage
+            .await_input(
+                claimed.id,
+                claimed.attempts,
+                &json!({"kind": "approval"}),
+                None
+            )
+            .await
+            .unwrap());
+
+        let app = store
+            .storage
+            .cancel(job.id)
+            .await
+            .unwrap()
+            .expect("a parked job is cancellable");
+        assert_eq!(app, "waiter", "the event needs the job's real app");
+        let row = store.storage.get(job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+        assert!(row.finished_at.is_some());
+
+        // And the guard still refuses what it always refused: a running job
+        // belongs to the token path, a terminal one to the 409.
+        let other = store
+            .storage
+            .enqueue("waiter", EnqueueOptions::default())
+            .await
+            .unwrap();
+        store.storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+        assert!(
+            store.storage.cancel(other.id).await.unwrap().is_none(),
+            "a running job is cancelled through its token, not this write"
+        );
+        assert!(
+            store.storage.cancel(job.id).await.unwrap().is_none(),
+            "an already-cancelled job is not cancelled twice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod json_column_tests {
+    use super::parse_json_column;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn absent_column_is_none() {
+        assert_eq!(parse_json_column(None), None);
+    }
+
+    #[test]
+    fn stored_request_round_trips() {
+        assert_eq!(
+            parse_json_column(Some(r#"{"kind":"approval","amount":12}"#)),
+            Some(json!({"kind": "approval", "amount": 12}))
+        );
+        // A JSON `null` really is a stored value; it is not an absent column.
+        assert_eq!(parse_json_column(Some("null")), Some(Value::Null));
+    }
+
+    /// The anti-pattern: a corrupt blob decoding to `None`, which reads exactly
+    /// like "this job never parked" on a row whose status says it did.
+    #[test]
+    fn unparsable_blob_survives_as_text_not_as_never_parked() {
+        let got = parse_json_column(Some("{not json"));
+        assert_eq!(got, Some(Value::String("{not json".to_string())));
+        assert!(got.is_some(), "a corrupt request must not read as absent");
+    }
 }
 
 #[cfg(test)]
@@ -4697,6 +5767,617 @@ mod latest_job_tiebreaker_tests {
             "a created_at tie must resolve to the greatest id (house keyset), not \
              an arbitrary row"
         );
+    }
+}
+
+// ---- workflow runs (N03, migration 0051) ------------------------------------
+
+/// A declared plan: a named DAG of steps, stored verbatim as its spec document.
+///
+/// The spec is kept as opaque JSON at this layer on purpose — the queue's job is
+/// durability, and the *meaning* of a spec (barriers, templates, budgets) lives
+/// in one place, `pumper-server`'s `workflow` module, which is also the only
+/// thing that validates it. A storage layer that half-understood the spec would
+/// be a second, silently diverging validator.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDef {
+    pub id: String,
+    pub name: String,
+    pub spec: Value,
+    /// `None` = on-demand only. `Some(cron)` = the scheduler owns this plan.
+    pub cron: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One execution of a [`WorkflowDef`].
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub def_id: String,
+    /// `running` | `succeeded` | `failed` | `cancelled`.
+    pub status: String,
+    pub budget_usd: Option<f64>,
+    /// Envelope spend, refreshed from `cost_events` as each step ends.
+    pub spent_usd: f64,
+    pub idempotency_key: Option<String>,
+    pub principal_id: Option<String>,
+    /// Correlation id every step job carries (equal to `id` in v1).
+    pub root_id: String,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// One `(run, step)` cell: the barrier's state and its job's outcome.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowStepRow {
+    pub run_id: String,
+    pub step: String,
+    pub job_id: Option<String>,
+    pub depends_on: Vec<String>,
+    /// `pending` | `queued` | `succeeded` | `failed` | `cancelled` | `skipped`.
+    pub status: String,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Create-time fields for a run (borrowed; storage assigns id/started_at).
+#[derive(Debug, Clone, Default)]
+pub struct NewWorkflowRun<'a> {
+    pub def_id: &'a str,
+    pub budget_usd: Option<f64>,
+    pub idempotency_key: Option<&'a str>,
+    pub principal_id: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowDefRow {
+    id: String,
+    name: String,
+    spec_json: String,
+    cron: Option<String>,
+    enabled: bool,
+    created_at: String,
+}
+
+impl TryFrom<WorkflowDefRow> for WorkflowDef {
+    type Error = Error;
+    fn try_from(r: WorkflowDefRow) -> Result<WorkflowDef> {
+        Ok(WorkflowDef {
+            id: r.id,
+            name: r.name,
+            spec: serde_json::from_str(&r.spec_json)
+                .map_err(|e| Error::parse_from(format!("workflow spec is not JSON: {e}"), e))?,
+            cron: r.cron,
+            enabled: r.enabled,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowRunRow {
+    id: String,
+    def_id: String,
+    status: String,
+    budget_usd: Option<f64>,
+    spent_usd: f64,
+    idempotency_key: Option<String>,
+    principal_id: Option<String>,
+    root_id: String,
+    error: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+}
+
+impl TryFrom<WorkflowRunRow> for WorkflowRun {
+    type Error = Error;
+    fn try_from(r: WorkflowRunRow) -> Result<WorkflowRun> {
+        Ok(WorkflowRun {
+            id: r.id,
+            def_id: r.def_id,
+            status: r.status,
+            budget_usd: r.budget_usd,
+            spent_usd: r.spent_usd,
+            idempotency_key: r.idempotency_key,
+            principal_id: r.principal_id,
+            root_id: r.root_id,
+            error: r.error,
+            started_at: parse_ts(&r.started_at)?,
+            finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowStepDbRow {
+    run_id: String,
+    step: String,
+    job_id: Option<String>,
+    depends_on: String,
+    status: String,
+    result: Option<String>,
+    error: Option<String>,
+    finished_at: Option<String>,
+}
+
+impl TryFrom<WorkflowStepDbRow> for WorkflowStepRow {
+    type Error = Error;
+    fn try_from(r: WorkflowStepDbRow) -> Result<WorkflowStepRow> {
+        Ok(WorkflowStepRow {
+            run_id: r.run_id,
+            step: r.step,
+            job_id: r.job_id,
+            // A `depends_on` that will not parse must NOT read as "no
+            // dependencies" — that would silently turn a join into a fan-out.
+            depends_on: serde_json::from_str(&r.depends_on).map_err(|e| {
+                Error::parse_from(format!("workflow depends_on is not a JSON array: {e}"), e)
+            })?,
+            status: r.status,
+            result: parse_json_column(r.result.as_deref()),
+            error: r.error,
+            finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+const WORKFLOW_DEF_COLUMNS: &str = "id, name, spec_json, cron, enabled, created_at";
+const WORKFLOW_RUN_COLUMNS: &str = "id, def_id, status, budget_usd, spent_usd, idempotency_key, \
+                                    principal_id, root_id, error, started_at, finished_at";
+const WORKFLOW_STEP_COLUMNS: &str =
+    "run_id, step, job_id, depends_on, status, result, error, finished_at";
+
+impl Storage {
+    /// Stores a plan. `spec` is written verbatim; the caller validated it.
+    pub async fn create_workflow(
+        &self,
+        name: &str,
+        spec: &Value,
+        cron: Option<&str>,
+    ) -> Result<WorkflowDef> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO workflow_defs (id, name, spec_json, cron, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(spec.to_string())
+        .bind(cron)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_workflow(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn list_workflows(&self) -> Result<Vec<WorkflowDef>> {
+        let sql = format!("SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs ORDER BY name");
+        let rows: Vec<WorkflowDefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowDef::try_from).collect()
+    }
+
+    /// Looks a plan up by **id or name** — the two ways a caller refers to one.
+    pub async fn get_workflow(&self, id_or_name: &str) -> Result<Option<WorkflowDef>> {
+        let sql =
+            format!("SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs WHERE id = ?1 OR name = ?1");
+        let row: Option<WorkflowDefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(id_or_name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowDef::try_from).transpose()
+    }
+
+    /// Plans the scheduler owns: enabled, with a cron.
+    pub async fn scheduled_workflows(&self) -> Result<Vec<WorkflowDef>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs \
+             WHERE enabled = 1 AND cron IS NOT NULL ORDER BY name"
+        );
+        let rows: Vec<WorkflowDefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowDef::try_from).collect()
+    }
+
+    pub async fn delete_workflow(&self, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM workflow_defs WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Opens a run. The bool reports whether one was created — an idempotency
+    /// replay returns the original, exactly like [`Self::enqueue_dedup`].
+    pub async fn create_workflow_run(
+        &self,
+        new: NewWorkflowRun<'_>,
+    ) -> Result<(WorkflowRun, bool)> {
+        if let Some(key) = new.idempotency_key {
+            if let Some(existing) = self.workflow_run_by_key(key).await? {
+                return Ok((existing, false));
+            }
+        }
+        let id = Uuid::new_v4().to_string();
+        let insert = sqlx::query(
+            "INSERT INTO workflow_runs (id, def_id, status, budget_usd, spent_usd, \
+             idempotency_key, principal_id, root_id, error, started_at, finished_at) \
+             VALUES (?1, ?2, 'running', ?3, 0, ?4, ?5, ?1, NULL, ?6, NULL)",
+        )
+        .bind(&id)
+        .bind(new.def_id)
+        .bind(new.budget_usd)
+        .bind(new.idempotency_key)
+        .bind(new.principal_id)
+        .bind(now())
+        .execute(&self.pool)
+        .await;
+        if insert.is_err() {
+            // Lost a concurrent race on the unique key — return the winner.
+            if let Some(key) = new.idempotency_key {
+                if let Some(existing) = self.workflow_run_by_key(key).await? {
+                    return Ok((existing, false));
+                }
+            }
+            insert?;
+        }
+        let run = self
+            .get_workflow_run(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))?;
+        Ok((run, true))
+    }
+
+    async fn workflow_run_by_key(&self, key: &str) -> Result<Option<WorkflowRun>> {
+        let sql =
+            format!("SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE idempotency_key = ?1");
+        let row: Option<WorkflowRunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowRun::try_from).transpose()
+    }
+
+    pub async fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowRun>> {
+        let sql = format!("SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE id = ?1");
+        let row: Option<WorkflowRunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowRun::try_from).transpose()
+    }
+
+    pub async fn list_workflow_runs(&self, def_id: &str, limit: i64) -> Result<Vec<WorkflowRun>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE def_id = ?1 \
+             ORDER BY started_at DESC, id DESC LIMIT ?2"
+        );
+        let rows: Vec<WorkflowRunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(def_id)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowRun::try_from).collect()
+    }
+
+    /// The newest run of a plan, as `(id, status)` — the scheduler's overlap
+    /// guard ("is the newest run still open?").
+    pub async fn latest_workflow_run(&self, def_id: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM workflow_runs WHERE def_id = ?1 \
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .bind(def_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Seeds every cell of a run in one transaction: all steps `pending`.
+    pub async fn insert_workflow_steps(
+        &self,
+        run_id: &str,
+        steps: &[(String, Vec<String>)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (step, deps) in steps {
+            sqlx::query(
+                "INSERT INTO workflow_steps (run_id, step, job_id, depends_on, status, result, \
+                 error, finished_at) VALUES (?1, ?2, NULL, ?3, 'pending', NULL, NULL, NULL)",
+            )
+            .bind(run_id)
+            .bind(step)
+            .bind(serde_json::to_string(deps).unwrap_or_else(|_| "[]".into()))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn workflow_steps(&self, run_id: &str) -> Result<Vec<WorkflowStepRow>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_STEP_COLUMNS} FROM workflow_steps WHERE run_id = ?1 ORDER BY step"
+        );
+        let rows: Vec<WorkflowStepDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowStepRow::try_from).collect()
+    }
+
+    /// Which `(run, step)` a job belongs to — the worker hook's only lookup,
+    /// one seek on `idx_workflow_steps_job`.
+    pub async fn workflow_step_for_job(&self, job_id: Uuid) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT run_id, step FROM workflow_steps WHERE job_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Claims a step for enqueue: `pending` → `queued`, atomically.
+    ///
+    /// This guarded UPDATE **is** the join barrier's exactly-once guarantee. Two
+    /// upstream jobs of a diamond can finish on different worker tasks at the
+    /// same instant and both compute the same ready step; only the one whose
+    /// UPDATE changes a row goes on to enqueue it.
+    pub async fn claim_workflow_step(&self, run_id: &str, step: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_steps SET status = 'queued' \
+             WHERE run_id = ?1 AND step = ?2 AND status = 'pending'",
+        )
+        .bind(run_id)
+        .bind(step)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records the job a claimed step was enqueued as.
+    pub async fn set_workflow_step_job(
+        &self,
+        run_id: &str,
+        step: &str,
+        job_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE workflow_steps SET job_id = ?3 WHERE run_id = ?1 AND step = ?2")
+            .bind(run_id)
+            .bind(step)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Lands a step's outcome, guarded on it still being open. `false` = another
+    /// task already finished this cell (a repeated terminal event, a boot
+    /// re-evaluation), which is what makes the worker hook idempotent per
+    /// `(run, step)`.
+    pub async fn finish_workflow_step(
+        &self,
+        run_id: &str,
+        step: &str,
+        status: &str,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_steps SET status = ?3, result = ?4, error = ?5, finished_at = ?6 \
+             WHERE run_id = ?1 AND step = ?2 AND status IN ('pending', 'queued')",
+        )
+        .bind(run_id)
+        .bind(step)
+        .bind(status)
+        .bind(result.map(Value::to_string))
+        .bind(error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Steps still open (`pending` or `queued`) — the cancel door's work list
+    /// and the "is this run finished?" test.
+    pub async fn open_workflow_steps(&self, run_id: &str) -> Result<Vec<(String, Option<String>)>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT step, job_id FROM workflow_steps \
+             WHERE run_id = ?1 AND status IN ('pending', 'queued') ORDER BY step",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Closes a run, guarded on it still being `running` so a concurrent cancel
+    /// and a concurrent completion cannot both stamp an ending.
+    pub async fn finish_workflow_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_runs SET status = ?2, error = ?3, finished_at = ?4 \
+             WHERE id = ?1 AND status = 'running'",
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Refreshes the envelope's running total from the ledger: the sum of
+    /// `cost_events.cost_usd` over this run's job set. Read back rather than
+    /// accumulated in memory, so a restart mid-run does not lose spend.
+    pub async fn refresh_workflow_spend(&self, run_id: &str) -> Result<f64> {
+        let spent: Option<f64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(c.cost_usd), 0) FROM cost_events c \
+             JOIN jobs j ON j.id = c.job_id WHERE j.workflow_run_id = ?1",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let spent = spent.unwrap_or(0.0);
+        sqlx::query("UPDATE workflow_runs SET spent_usd = ?2 WHERE id = ?1")
+            .bind(run_id)
+            .bind(spent)
+            .execute(&self.pool)
+            .await?;
+        Ok(spent)
+    }
+
+    /// Every job enqueued under this run — the receipt's job set.
+    pub async fn workflow_run_job_ids(&self, run_id: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM jobs WHERE workflow_run_id = ?1 ORDER BY created_at, id",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// `(workflow_run_id, root_id)` for one job — where it sits in a chain.
+    ///
+    /// Both columns are written at enqueue (N03) but neither is loaded into
+    /// [`Job`], because nothing on the hot path needs them. Lineage does: it is
+    /// what turns a workflow's twenty step jobs into one story in a downstream
+    /// catalog instead of twenty unrelated runs. A missing job answers
+    /// `(None, None)` rather than erroring — an emitter must never be able to
+    /// fail because a job row was reaped underneath it.
+    pub async fn job_chain_ids(&self, id: Uuid) -> Result<(Option<String>, Option<String>)> {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT workflow_run_id, root_id FROM jobs WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.unwrap_or((None, None)))
+    }
+}
+
+// ---- Durable event log + cursor subscriptions (N05) --------------------------
+
+/// One event on its way into the log: the bus already stamped `seq`, so this is
+/// the durable half of an emit, not a second identity.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    pub seq: i64,
+    pub kind: String,
+    pub app: String,
+    pub subject_id: String,
+    pub payload: Value,
+}
+
+/// One row of the append-only event log.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventRecord {
+    pub seq: i64,
+    pub kind: String,
+    pub app: String,
+    pub subject_id: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    seq: i64,
+    kind: String,
+    app: String,
+    subject_id: String,
+    payload: String,
+    created_at: String,
+}
+
+impl TryFrom<EventRow> for EventRecord {
+    type Error = Error;
+
+    fn try_from(r: EventRow) -> Result<EventRecord> {
+        Ok(EventRecord {
+            seq: r.seq,
+            kind: r.kind,
+            app: r.app,
+            subject_id: r.subject_id,
+            // A payload that no longer parses is rendered as the raw string
+            // rather than dropped: the log is the record of what happened, and
+            // "unreadable" is a fact a consumer must be able to see.
+            payload: serde_json::from_str(&r.payload).unwrap_or(Value::String(r.payload)),
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// A durable cursor subscription: an event selector, a sink, and the highest
+/// sequence already handed to that sink.
+#[derive(Debug, Clone, Serialize)]
+pub struct Subscription {
+    pub id: String,
+    pub name: Option<String>,
+    /// `{kinds: [..], app, dataset, filters: [{pointer, equals}]}` — parsed and
+    /// matched by the server's `subscriptions` module.
+    pub selector: Value,
+    /// `webhook` | `slack` | `file` | `plugin:<name>`.
+    pub sink: String,
+    pub url: String,
+    /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub cursor_seq: i64,
+    pub enabled: bool,
+    pub principal_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    /// Why the last drain could not advance the cursor. `null` once a drain
+    /// succeeds — a stale error string is worse than none.
+    pub last_error: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SubscriptionRow {
+    id: String,
+    name: Option<String>,
+    selector: String,
+    sink: String,
+    url: String,
+    secret: Option<String>,
+    cursor_seq: i64,
+    enabled: i64,
+    principal_id: Option<String>,
+    created_at: String,
+    last_delivered_at: Option<String>,
+    last_error: Option<String>,
+}
+
+impl TryFrom<SubscriptionRow> for Subscription {
+    type Error = Error;
+
+    fn try_from(r: SubscriptionRow) -> Result<Subscription> {
+        Ok(Subscription {
+            id: r.id,
+            name: r.name,
+            selector: serde_json::from_str(&r.selector).unwrap_or(Value::Null),
+            sink: r.sink,
+            url: r.url,
+            secret: r.secret,
+            cursor_seq: r.cursor_seq,
+            enabled: r.enabled != 0,
+            principal_id: r.principal_id,
+            created_at: parse_ts(&r.created_at)?,
+            last_delivered_at: r.last_delivered_at.as_deref().map(parse_ts).transpose()?,
+            last_error: r.last_error,
+        })
     }
 }
 

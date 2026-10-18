@@ -229,6 +229,7 @@ pub fn research_output(text: impl Into<String>) -> ResearchOutput {
         duration_ms: Some(0),
         num_turns: Some(1),
         session_id: None,
+        model: None,
     }
 }
 
@@ -348,6 +349,7 @@ pub fn engines_with(
 /// default-config `Resilience`, no budget, `NoPlugins`/`NoProgress`, artifacts
 /// under `<storage.artifacts_dir>/<app>/job`.
 pub struct TestContext<'a> {
+    max_schedule_requests: usize,
     storage: &'a Storage,
     app: String,
     params: Value,
@@ -357,6 +359,7 @@ pub struct TestContext<'a> {
     artifacts_dir: Option<std::path::PathBuf>,
     research_cache_ttl_secs: u64,
     restored: Option<Value>,
+    resumed_input: Option<Value>,
     checkpoints: Option<Arc<dyn CheckpointSink>>,
     vcr: crate::vcr::Vcr,
 }
@@ -373,8 +376,10 @@ impl<'a> TestContext<'a> {
             artifacts_dir: None,
             research_cache_ttl_secs: 0,
             restored: None,
+            resumed_input: None,
             checkpoints: None,
             vcr: crate::vcr::Vcr::Off,
+            max_schedule_requests: crate::config::WorkerConfig::default().max_app_schedules_per_run,
         }
     }
 
@@ -390,6 +395,13 @@ impl<'a> TestContext<'a> {
     /// Runs the context in a VCR mode (default: `Off`).
     pub fn vcr(mut self, vcr: crate::vcr::Vcr) -> Self {
         self.vcr = vcr;
+        self
+    }
+
+    /// Hands the context the input a `POST /jobs/{id}/resume` supplied, as the
+    /// worker does when it re-claims a job that had parked on `await_input`.
+    pub fn resumed_input(mut self, input: Value) -> Self {
+        self.resumed_input = Some(input);
         self
     }
 
@@ -415,6 +427,13 @@ impl<'a> TestContext<'a> {
 
     pub fn params(mut self, params: Value) -> Self {
         self.params = params;
+        self
+    }
+
+    /// Per-run ceiling on `AppContext::request_schedule`
+    /// (`[worker] max_app_schedules_per_run`). Defaults to the shipped 20.
+    pub fn max_schedule_requests(mut self, max: usize) -> Self {
+        self.max_schedule_requests = max;
         self
     }
 
@@ -458,7 +477,10 @@ impl<'a> TestContext<'a> {
             checkpoints: self
                 .checkpoints
                 .unwrap_or_else(|| Arc::new(NoCheckpoints) as Arc<dyn CheckpointSink>),
+            schedule_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            max_schedule_requests: self.max_schedule_requests,
             restored: self.restored,
+            resumed_input: self.resumed_input,
             vcr: self.vcr,
             artifacts_dir: self
                 .artifacts_dir

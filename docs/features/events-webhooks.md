@@ -1,15 +1,106 @@
 # Events & webhooks
 
+## The durable event log (N05)
+
+Every event this service emits — job transitions, `dataset.changed`, inbound ingress events, workflow transitions, `transaction.*`, `source.repair_*` — is appended to an `events` table with the **same monotonic `seq`** the SSE stream puts on the wire. Three things follow, and they are the whole point of the feature:
+
+1. **`Last-Event-ID` survives a restart.** The sequence is seeded from `MAX(seq)` at boot, so the id a client held before the restart still names the event it named. Before this the counter restarted at `0` and every resuming client was told `reset`.
+2. **`reset` is now rare.** A reconnecting client whose gap has fallen out of the 1024-event in-memory ring is served from the log instead. `reset` now means the log was pruned past that cursor (or the log is off, or unreadable) — not merely that 1024 events went by.
+3. **Every kind is subscribable.** Durable, retried, dead-letterable delivery used to exist for exactly four hand-wired kinds. It now exists for anything in the log, through one `subscriptions` model.
+
+The ring is a **read-through cache** over the log, not a separate mechanism. `EventBus::emit` stays synchronous and infallible (it is called from ~15 places, most of them not async): it assigns the id, buffers, broadcasts, and *queues* the durable row. The queue is written in one transaction at the head of the subscription outbox — on every scheduler tick and in every finished job's fan-out — so the log is at most one tick behind the ring. The queue is bounded by `[events] pending_capacity`; past it the oldest entries are dropped, **counted**, and reported in the next drain's warning, because a store that is down should cost bounded memory and a stated loss rather than unbounded RSS and a silent one.
+
+### `[events]` config
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `log_enabled` | `true` | Master switch. `false` restores the pre-N05 bus byte for byte: in-memory ring only, `reset` on an evicted gap, `GET /events/log` and `POST /subscriptions` answer **409**, and watches deliver through the old in-line path. |
+| `log_retention_days` | `7` | Rows older than this are pruned by the hourly **store janitor** (`main.rs`), alongside every other bounded delete and under the same activity gate — it used to run from the outbox drain, so its cadence depended on how often jobs finished. `0` = keep forever (never "keep zero days"). The log's job is *resume*, not archive — what a run produced durably lives in `records`/`record_revisions`. |
+| `outbox_batch` | `200` | Events handed to one subscription per drain pass. |
+| `pending_capacity` | `8192` | Ceiling on events queued in memory awaiting their log write. |
+
+This is the one section in this campaign that ships **on**, because it changes no behaviour an operator has to opt into: it makes an existing promise (`Last-Event-ID`) true.
+
+### `GET /events/log`
+
+The pull half, beside the SSE stream. `GET /events` is "tell me what happens next"; this is "what happened after seq N" — the question a consumer holding a cursor actually asks. It is a separate path because `GET /events` is the SSE stream and one path cannot be two content types.
+
+```
+GET /events/log?after=<seq>&kind=<kind>&app=<app>&limit=<1..500>
+→ { count, next_after, latest_seq, retained, pending, retention_days, events: [
+      { seq, kind, app, subject_id, payload, created_at }, … ] }
+```
+
+Ascending by `seq`, because a cursor reads forward. `next_after` is the cursor to send back and is **`null` when the page did not fill** — that is how a poller knows it is caught up and should back off rather than spin. `latest_seq` is the log's head, so `latest_seq - after` is your backlog.
+
+### Event kinds
+
+The `kind` vocabulary is derived from the bus event by one rule: a job status becomes `job.<status>`, anything already dotted passes through, and the pre-N05 `external` keeps its name.
+
+| `kind` | Emitted when | `subject_id` |
+| --- | --- | --- |
+| `job.queued` / `job.running` / `job.waiting` / `job.progress` / `job.succeeded` / `job.failed` / `job.cancelled` / `job.checkpoint_failed` | a job transitions | job id |
+| `dataset.changed` | a run left new/changed/removed revisions in `(app, dataset)` | dataset name |
+| `external` | `POST /ingest/{id}` accepted a verified inbound event | event id |
+| `workflow.*` | a workflow run transitions (N03) | run id |
+| `transaction.pending` | a `transact` run parked on an approval (N01) | transaction id |
+| `transaction.submitted` | a `transact` run committed a submission | transaction id |
+
+The last three rows close a wave-1/wave-2 gap: the apps *named* these events in their results and could not dispatch them, because `dispatch_event` lives in the server, above the app boundary. The worker's post-run fan-out (and, for `transaction.pending`, the park) is what turns a named event into a real one.
+
+## Cursor subscriptions (N05)
+
+A subscription is the general form of every push consumer: an **event selector**, a **sink**, and a **cursor**.
+
+```
+POST /subscriptions
+{
+  "name": "downstream-etl",
+  "selector": { "kinds": ["job.succeeded", "dataset.changed"], "app": "grants",
+                "dataset": "unified",
+                "filters": [{ "pointer": "/result/count", "equals": 2 }] },
+  "sink": "webhook", "url": "https://example.test/hook", "secret": "…",
+  "from_seq": 0
+}
+→ 201 { id, name, selector, sink, url, cursor_seq, enabled, principal_id, created_at, … }
+```
+
+- **Selector.** Every field *narrows*; `{}` (or an omitted selector) is the whole log. `kinds` is an exact-match list; `app` and `dataset` accept `*` as a wildcard, exactly as a watch's `dataset` does; `filters` are JSON-pointer equality tests into the stored event body. A malformed selector is a **400** at the door, never a stored row that sits `enabled` and silently never fires.
+- **`from_seq`.** Omitted = **now** (the subscription gets what happens next). `0` replays the whole retained log — the point of a durable cursor, and also a burst, so it is opt-in.
+- **Sink.** The same vocabulary, gate, transport, retry ladder and DLQ as a watch: `webhook` | `slack` | `file` | `plugin:<name>`. See [Sinks](#sinks).
+- **Body.** A subscription receives the event *envelope* — `{subscription_id, seq, kind, app, subject_id, created_at, payload}` — so the body itself carries the sequence the consumer should record.
+- **Routes.** `POST /subscriptions`, `GET /subscriptions[?enabled=true]` (which renders `latest_seq` beside the rows, because `cursor_seq: 41` means nothing without the head), `DELETE /subscriptions/{id}`, `GET /subscriptions/{id}/deliveries?status=&limit=&cursor=`.
+
+### The outbox, and what "advance the cursor" means
+
+One drain, on the scheduler tick and again at the end of every finished job's fan-out: flush the bus's pending rows into the log, then for each enabled subscription read the events past its `cursor_seq`, keep what the selector matches, and dispatch through the same `deliver` path a webhook takes.
+
+The cursor advances once every event in the page has a **durable delivery row** — not once the receiver has answered. That is a deliberate departure from "advance only on `delivered`": the delivery log already owns the answer (a 30s→2h ladder, then the DLQ, then manual replay), so blocking the cursor on the receiver would make one dead endpoint stop a subscription forever *and* duplicate the retry machinery. A delivery row that cannot be **written** does not advance the cursor — the event has not been handed off, `last_error` says why, and the next tick retries it. The cursor also advances past events the selector did *not* match, or a narrow selector would rescan the whole log every tick.
+
+Both cursor writes are fenced `cursor_seq < ?`, so two drains — or a drain racing a restart — can only ever move a cursor forward.
+
+### Watches are now an adapter
+
+**A watch IS a subscription with a `{kinds: ["dataset.changed"], app, dataset}` selector.** The `watches` table stays the source of truth for watch rows and every `/watches` route keeps working unchanged, but the fan-out runs through the shared outbox: `worker::notify_watches` emits one `dataset.changed` event per changed `(app, dataset)` instead of dispatching per watch, and the drain fans that event out to every matching watch and every matching subscription. Consequences:
+
+- A watch now has a **durable cursor** (`watches.cursor_seq`) and resumes after a restart or a disable instead of missing whatever happened while it was away.
+- A watch's delivered **body is unchanged** — the same `{event, watch_id, job_id, app, dataset, count, changes[]}` — so a receiver written against the old shape needs no change. Its delivery rows keep `kind = "change"`, so `GET /watches/{id}/deliveries` is unaffected.
+- `POST /watches` is **deprecated** in favour of `POST /subscriptions` and will be removed one release after N05.
+
+**Not migrated in v1, and still exactly as documented below:** a job's own `callback_url`, saved-search alerts, and the `[webhooks] failure_url` firehose. They keep their own dispatch sites and their own delivery kinds.
+
 ## SSE
 
-- `GET /events` — stream of all job status transitions (`queued/running/succeeded/failed/cancelled`).
+- `GET /events` — stream of all job status transitions (`queued/running/waiting/succeeded/failed/cancelled`).
 - `GET /jobs/{id}/stream` — one job's transitions; replays the current state on connect and closes at terminal.
 
-**Live progress events.** Besides the `queued/running/succeeded/failed/cancelled` status transitions, a long-running job also emits `status: "progress"` events carrying its latest snapshot in `result` (e.g. the crawler's `{crawled, kept, failed, frontier, hosts}`). These are throttled (≥ every 2s per job) and non-terminal, so the per-job stream stays open through them; the latest snapshot is also on `GET /jobs/{id}` (`progress` field). See [runtime.md § Live progress](runtime.md#live-progress).
+**`waiting` — a third non-terminal kind (N02).** A job that parks on external input (`ctx.await_input(..)`) emits `status: "waiting"` carrying its `input_request` in `result`. Non-terminal, so the per-job stream stays open across the whole park; the run resumes with a `queued` event when `POST /jobs/{id}/resume` answers it. An unanswered wait past `waiting_expires_at` reaches `finalize` like any permanent failure, so the result callback, the `failure_url` firehose and terminal triggers all fire. See [runtime.md § Jobs that wait](runtime.md#jobs-that-wait-waiting).
+
+**Live progress events.** Besides the `queued/running/waiting/succeeded/failed/cancelled` status transitions, a long-running job also emits `status: "progress"` events carrying its latest snapshot in `result` (e.g. the crawler's `{crawled, kept, failed, frontier, hosts}`). These are throttled (≥ every 2s per job) and non-terminal, so the per-job stream stays open through them; the latest snapshot is also on `GET /jobs/{id}` (`progress` field). See [runtime.md § Live progress](runtime.md#live-progress).
 
 **`checkpoint_failed` — the other non-terminal kind (2026-08-14).** A job whose durable checkpoint does not land also emits `status: "checkpoint_failed"`, carrying `{reason: "stale_lineage" | "storage_error", attempt}` in `result`. `stale_lineage` means the job was reset, reaped or re-claimed and another attempt now owns it, so this task's snapshot was fenced off; `storage_error` means the write itself failed (an oversized blob, a full disk, a locked DB). Only the **first** failure of each kind announces: a stale-lineage run fails *every* subsequent save, and one event per save would flood the bus with a single fact. A throttle-skipped save is not a failure and never announces. The running tally rides the stored result as `checkpoint_failures: {stale_lineage, storage_error, total}` — absent entirely when every save landed, never a fabricated zero. Like `progress`, this status is non-terminal, so the per-job stream stays open through it (only `succeeded`/`failed`/`cancelled` close a stream). **Known gap:** a run that never reaches a stored result — failed, timed out, or shutdown-suspended — carries its tally only on this event and in the log. See [runtime.md § Durable execution](runtime.md).
 
-**Resume with `Last-Event-ID`.** Every SSE event carries a process-global monotonic id (the `id:` field). Events are also kept in a bounded in-memory replay ring (last 1024, **and** a 32 MiB byte budget — whichever binds first — so a burst of large-result jobs can't pin ~1 GB of RSS; the oldest events are evicted to stay under both). Each buffered event is held behind an `Arc`, so the ring, the broadcast slot, and every subscriber share one allocation instead of deep-cloning a multi-MB `result` per copy. A client that reconnects with a `Last-Event-ID: <n>` header is replayed exactly the events it missed (`id > n`), filtered to the stream's scope. If the gap is older than the ring still holds, the server first emits a single `event: reset` (carrying the latest id as its `id:`) so the client knows to resync its view before live events resume. The same ring lets a live subscriber that falls behind the broadcast buffer recover the missed events instead of dropping them silently. The per-job stream's connect-time state snapshot has no id (it is a synthesized view, not a buffered transition); only real transitions are replayable.
+**Resume with `Last-Event-ID`.** Every SSE event carries a process-global monotonic id (the `id:` field). Events are also kept in a bounded in-memory replay ring (last 1024, **and** a 32 MiB byte budget — whichever binds first — so a burst of large-result jobs can't pin ~1 GB of RSS; the oldest events are evicted to stay under both). Each buffered event is held behind an `Arc`, so the ring, the broadcast slot, and every subscriber share one allocation instead of deep-cloning a multi-MB `result` per copy. A client that reconnects with a `Last-Event-ID: <n>` header is replayed exactly the events it missed (`id > n`), filtered to the stream's scope. If the gap is older than the ring still holds, the server serves it from the **durable event log** instead (N05); only when the log has been pruned past that cursor — or is disabled, or unreadable, or the gap exceeds 10 000 events, which is a backlog to page through `GET /events/log` rather than to push down one connection — does it emit a single `event: reset` (carrying the latest id as its `id:`) so the client knows to resync its view before live events resume. The same ring lets a live subscriber that falls behind the broadcast buffer recover the missed events instead of dropping them silently. The per-job stream's connect-time state snapshot has no id (it is a synthesized view, not a buffered transition); only real transitions are replayable.
 
 ## Outbound webhooks — one logged contract
 
@@ -28,10 +119,12 @@ Kinds (the `kind` column on a delivery row, and where its signing secret comes f
 | `search` | `search.matched` | saved-search id | the saved search's `secret` |
 | `failure` | `job.failed` | job id | `[webhooks] failure_secret` (config, not a row) |
 | `health` | `source.degraded` / `source.quarantined` / `source.retired` | source id (`<app>/<dataset>`) | `[webhooks] health_secret` (config, not a row) |
+| `subscription` | any event kind in the log | subscription id | the subscription's `secret` |
 
 - **`job.terminal`** — job set `callback_url` (+ optional `callback_secret`) at enqueue; the finished job JSON is delivered on terminal state.
 - **`dataset.changed`** — dataset **watches** (`watches` table): standing subscriptions `{app, dataset|'*', url, secret?, sink}`. After a successful run, revisions are grouped by dataset and each covering watch receives `{event, watch_id, job_id, app, dataset, count, changes[]}` (field-level diffs included). CRUD: `GET/POST /watches`, `DELETE /watches/{id}`, `POST /watches/{id}/enabled`, plus the per-watch delivery log `GET /watches/{id}/deliveries`. See [Watchable namespaces](#watch-namespaces) for what `app` may be, and [Sinks](#sinks) for the non-HTTP delivery targets.
 - **`search.matched`** — saved-search alerts (see [search.md](search.md)).
+- **the subscription envelope** — a cursor subscription's delivery, one row per (subscription, event). The `event` column is the event's own `kind`, so a delivery log filtered to `kind = subscription` reads as the log of what was pushed to whom.
 - **`job.failed`** — global permanent-failure firehose. When `[webhooks] failure_url` is configured, every job that fails **permanently** (attempts exhausted — app error, timeout, or a reaped stale lease) POSTs `{event, job_id, app, error, attempts, schedule_id}` there, HMAC-signed with `[webhooks] failure_secret` if set. This is distinct from `job.terminal`: a job's own `callback_url` already receives the full terminal JSON on failure, so `job.failed` is the cross-app subscription for "any job failed" (which has no natural per-resource key), not a per-job duplicate. Retryable requeues do **not** fire it — permanent failures only.
 - **`source.*`**: source health alerts. When `[webhooks] health_url` is configured, every run
   that moves a source **into** `degraded`, `quarantined` or `retired` POSTs
@@ -66,20 +159,32 @@ A watch's `app` is the **namespace the records land under**, which is not always
 <a id="sinks"></a>
 ## Sinks — where a `dataset.changed` event is delivered
 
-A watch's `sink` (a first-class `POST /watches` param, default `webhook`) selects the delivery *connector*. The body is shaped at dispatch time; only the transport branches. Every sink therefore rides the identical machinery: one delivery-log row, the same in-process retries, the same backed-off DLQ drain, the same manual replay.
+A watch's — or a subscription's — `sink` (a first-class `POST /watches` / `POST /subscriptions` param, default `webhook`) selects the delivery *connector*. Both doors validate it through the same gate, so a `plugin:` sink naming a module that was never installed is a **400** on either. The body is shaped at dispatch time; only the transport branches. Every sink therefore rides the identical machinery: one delivery-log row, the same in-process retries, the same backed-off DLQ drain, the same manual replay.
 
 | `sink` | Target | Body | Signed? |
 | --- | --- | --- | --- |
 | `webhook` (default) | the watch's `url` | the full `{event, watch_id, job_id, app, dataset, count, changes[]}` payload | yes, when `secret` is set |
 | `slack` | the watch's `url` (a Slack incoming-webhook URL) | a compact `{"text": "pumper: \`app/dataset\` changed — N revisions (job J)"}` summary — **never** the raw revision batch | yes, when `secret` is set; Slack ignores the `x-pumper-*` headers |
 | `file` | `data/sinks/<watch_id>.ndjson` (appended) | one NDJSON line `{delivery_id, event, delivered_at, payload}` | no — see below |
+| `plugin:<name>` | a WASM connector in `[plugins] dir` | the module receives `{delivery_id, event, body}`, where `body` is the **unshaped** `webhook` payload | no — see below |
 
 Two `file`-sink quirks worth knowing before you create one:
 
 - **`url` is ignored.** `POST /watches` with `sink: "file"` accepts a missing or arbitrary `url` and stores the empty string; the destination is derived from the watch id alone. The delivery row's `url` is the pseudo-URL `file://<watch_id>.ndjson`, which the transport re-validates on every send (bare filename characters only, no `..`, no separators) so nothing in the delivery log — including a tampered row — can write outside `data/sinks/`. On the `webhook`/`slack` sinks `url` is required and must be `http(s)`, or the create is a 400.
 - **`secret` is stored but never used.** A file append has no HTTP request to sign, so no signature is computed and the envelope carries none. The stable `delivery_id` in each line is the dedup key instead — a line re-appended by a drain retry or a manual replay repeats it.
 
-WASM (`plugin:<name>`) sinks are deliberately out of scope; the seam for them is the transport branch in `webhook.rs::deliver`.
+### `plugin:<name>` sinks (N10)
+
+A destination stops being a Rust change to `webhook.rs`: drop a `.wasm` into `data/plugins/`, `POST /plugins/reload`, and create a watch with `sink: "plugin:sink-postgrest"`. The module is handed `{delivery_id, event, body}` and answers `{delivered: bool, permanent?: bool, error?: string}`, which is mapped onto the same `(delivered, attempts, last_error, permanent)` tuple every built-in sink returns — so the delivery log, the retry ladder, the DLQ and manual replay are unchanged.
+
+- **`url` is the connector's target, and it is optional.** It reaches the module as `params.target`; a connector with its destination compiled in ignores it. When set it must be `http(s)`. The delivery row's `url` is the pseudo-URL `plugin://<name>` (plus `?target=<url>`), re-validated on every send — plugin-name characters only, no `..`, no separators — so nothing in the delivery log, including a tampered row, can resolve to a different module. Carrying the target on the URL rather than in the body is what keeps the body identical to a `webhook` sink's, so one connector module works against every event kind, and what makes a replayed row reach the destination the first attempt did.
+- **`secret` is stored but never used**, as with the `file` sink: there is no outbound HTTP request *the server* makes to sign. A connector that signs its own requests does so with what it was built with. The stable `delivery_id` is the idempotency key; `sink-postgrest` sends it as the row's primary key with `Prefer: resolution=merge-duplicates`.
+- **`permanent: true` dead-letters immediately**, exactly as a non-429 4xx does on the `webhook` sink, instead of burning the whole five-rung ladder to reach the same state.
+- **A trap, a missing module or malformed output is NOT a delivery**, and IS retryable. Trigger hooks fail *open* because a broken gate must not wedge a pipeline; a sink that failed open would silently drop the event it exists to deliver. Install the module and `POST /plugins/reload`, and the backed-off drain is what then succeeds.
+- **One in-process attempt**, like the `file` sink: a sandboxed module called three times with the same bytes and a fresh store answers the same three times. The DLQ ladder is where a *reloaded* module gets its second chance.
+- `POST /watches` refuses `plugin:<name>` when no executable module of that name is loaded — a watch pointed at a plugin that was never installed would look configured and dead-letter every event.
+
+What the connector may *do* — outbound HTTP through the metered chokepoint, a per-plugin key/value namespace — is its declared capability manifest, plus the operator's `[plugins] allow_http_hosts`. Both are in [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10), including the threat model.
 
 ## Delivery lifecycle, log & dead-letter queue
 
@@ -144,6 +249,16 @@ Two opt-in knobs under `[storage]`, both `0` (off) by default:
 
 ## Known gaps
 
+- **Job `callback_url`, saved-search alerts and `[webhooks] failure_url` are not subscriptions yet.** They still have their own dispatch sites and delivery kinds; migrating them is deliberately out of the N05 v1 slice.
+- **Push federation to peers (`sink: "pumper:<url>/ingest/<source>"`) is not implemented.** The ingress verify path it would reuse exists; the sink branch does not. Peering stays pull-only.
+- **The log's write is asynchronous within the process.** `emit` queues; the transaction happens at the next outbox pass (a scheduler tick, or the end of a finished job's fan-out). A hard kill between the two loses whatever was queued — bounded by `[events] pending_capacity` and counted, never silent. The alternative (a synchronous SQLite write inside `emit`) would put a store round trip on ~15 call sites that are not async, including the progress announcer's hot loop.
+- **No `POST /subscriptions/{id}/enabled`.** A subscription is created or deleted in v1; the `enabled` column exists and the drain honours it, but nothing over the API flips it.
+- ** events are logged like any other kind.** A long-running job emits one every ~2s, so a busy server writes them at that rate per in-flight job. They are the highest-volume kind by far and the least valuable to retain; nothing filters them out today, and  is the only thing bounding them.
+- **`job.progress` events are logged like any other kind.** A long-running job emits one every ~2s, so a busy server writes them at that rate per in-flight job. They are the highest-volume kind by far and the least valuable to retain; nothing filters them out today, and `[events] log_retention_days` (enforced by the store janitor) is the only thing bounding them.
+- **Write amplification was not measured.** One row per emitted event, batched per drain pass under WAL, is the design's claim; no benchmark has been run at volume.
+
 - No per-endpoint success-rate breakdown: the metrics are whole-log aggregates, so "which receiver is failing" still means reading `GET /webhooks/deliveries?status=dead` and looking at `url`.
 - The delivery log is unauthenticated like the rest of the API, and `GET /webhooks/deliveries/{id}` returns the full body — which for `dataset.changed` is the revision batch. See [../deployment.md](../deployment.md) for the auth posture.
 - Delivery-pool sizing (16 concurrent / 1024 queued) is a constant, not a config key.
+- A `plugin:` sink's only per-watch configuration is `params.target` (the watch's `url`). There is no per-watch params object, and no secret injection into a connector — a connector needing a token has it compiled in or stores it through the `kv` capability.
+- A `plugin:` sink holds a `[plugins] max_concurrent` admission slot for the whole call, network included. A slow connector therefore competes with trigger hooks and extraction plugins for the same gate; the two ceilings that bound it are documented in [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10), and no latency benchmark has been run.

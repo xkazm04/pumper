@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -99,11 +99,26 @@ pub struct AppContext {
     /// `None` on a fresh first attempt or after the poisoned-checkpoint escape.
     /// Advisory: apps must tolerate any stored shape and start fresh on doubt.
     pub restored: Option<Value>,
+    /// The input `POST /jobs/{id}/resume` supplied to a previously parked run,
+    /// handed back through [`restore_input`](Self::restore_input). `None` on
+    /// every attempt that was not resumed from a wait.
+    pub resumed_input: Option<Value>,
     /// VCR mode (M24): `Off` (default), `Record` (persist every fetch/research
     /// through this context into the job's cassette artifact), or `Replay`
     /// (serve every fetch/research from a prior job's cassette — a MISS is a
     /// typed error, never a silent live fetch; replay spends $0).
     pub vcr: crate::vcr::Vcr,
+    /// Schedules this run has ASKED the runtime to create
+    /// ([`request_schedule`](Self::request_schedule)), drained by the worker's
+    /// post-run fan-out. An app has no schedule-writing seam of its own on
+    /// purpose: a schedule is a standing commitment, and the runtime owns the
+    /// ownership tag, the cap and the fence.
+    pub schedule_requests: Arc<Mutex<Vec<Value>>>,
+    /// Per-run ceiling on [`request_schedule`](Self::request_schedule)
+    /// (`[worker] max_app_schedules_per_run`). A run that asks for more is
+    /// told `false` at the seam rather than having the surplus dropped
+    /// silently after it finished.
+    pub max_schedule_requests: usize,
     pub artifacts_dir: PathBuf,
 }
 
@@ -123,26 +138,99 @@ impl AppContext {
         self.checkpoints.save(state, true).await
     }
 
+    /// Asks the runtime to create a schedule after this run
+    /// (a `POST /schedules`-shaped body: `{app, cron, params?}`).
+    ///
+    /// Apps do not write schedules themselves: the runtime owns the ownership
+    /// tag (`app:<name>`), the per-run cap and the fence, and it applies the
+    /// requests only once the run has finished. Returns `false` when the run
+    /// has already used its `[worker] max_app_schedules_per_run` budget — a
+    /// caller that cares reports the cut (`*_truncated`) rather than letting
+    /// the surplus vanish.
+    pub fn request_schedule(&self, body: Value) -> bool {
+        let Ok(mut pending) = self.schedule_requests.lock() else {
+            return false;
+        };
+        if pending.len() >= self.max_schedule_requests {
+            return false;
+        }
+        pending.push(body);
+        true
+    }
+
+    /// Takes the schedules this run asked for, leaving the list empty.
+    ///
+    /// The worker does not go through here: the context has moved into `run()`
+    /// by the time its fan-out drains, so it holds a clone of
+    /// [`schedule_requests`](Self::schedule_requests) instead. This is the
+    /// equivalent for an embedder that drives an `AppContext` itself and owns
+    /// the post-run step.
+    pub fn take_schedule_requests(&self) -> Vec<Value> {
+        self.schedule_requests
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
+    }
+
     /// The last checkpoint persisted by a prior attempt of this job, if any.
     /// Advisory: treat unexpected shapes as "start fresh", never as an error.
     pub fn restore(&self) -> Option<&Value> {
         self.restored.as_ref()
     }
 
+    /// Parks this job until somebody supplies the input it is asking for
+    /// (N02): forces a checkpoint of `resume_state`, then returns the typed
+    /// [`Error::AwaitingInput`] the app must propagate — `return Err(ctx
+    /// .await_input(state, request).await)`.
+    ///
+    /// The worker's outcome arm recognises that error and moves the job to
+    /// [`crate::JobStatus::Waiting`] instead of failing it: the permit is
+    /// released (a parked job costs no worker slot), the checkpoint stays live,
+    /// no attempt is burned, and `request` rides `GET /jobs/{id}`, the
+    /// non-terminal `waiting` SSE event and MCP `wait_job`. The answer arrives
+    /// on the next attempt through [`restore_input`](Self::restore_input).
+    ///
+    /// **The checkpoint is forced, not optional, and that is the whole
+    /// contract.** A park is a promise to resume from *here*; without a landed
+    /// snapshot the resumed attempt restarts from the top and re-asks the
+    /// question the human already answered. It uses
+    /// [`checkpoint_now`](Self::checkpoint_now) rather than
+    /// [`checkpoint`](Self::checkpoint) for exactly the reason that method
+    /// exists — a snapshot whose loss costs real work must not be eaten by the
+    /// 5s throttle. Pass [`Value::Null`] only if the app genuinely has nothing
+    /// to resume from.
+    ///
+    /// A save that does not land (stale lineage, storage error) is reported by
+    /// the sink and counted there; the park still happens, because refusing to
+    /// park would fail a job whose external question is already outstanding.
+    pub async fn await_input(&self, resume_state: Value, request: Value) -> Error {
+        self.checkpoint_now(resume_state).await;
+        Error::AwaitingInput(request)
+    }
+
+    /// The input a `POST /jobs/{id}/resume` supplied for this job, when this
+    /// attempt is the resume of an [`await_input`](Self::await_input) park.
+    ///
+    /// Advisory in the same way as [`restore`](Self::restore): the value is
+    /// whatever the resumer sent, so treat an unexpected shape as a refusal to
+    /// proceed, never as a panic.
+    pub fn restore_input(&self) -> Option<&Value> {
+        self.resumed_input.as_ref()
+    }
+
     /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.
     pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         // `name` may be composed from job params (e.g. census `cbp-{naics}.json`),
         // so reject anything that isn't a single safe segment — otherwise a `..`
-        // or absolute name escapes the per-job artifact dir.
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\\')
-            || std::path::Path::new(name).is_absolute()
-        {
-            return Err(Error::App(format!("unsafe artifact name: {name:?}")));
-        }
+        // or absolute name escapes the per-job artifact dir. Through the SHARED
+        // `safe_path_segment`, not a second copy of its predicate: this method
+        // used to re-type the same six clauses inline, so the repo had one rule
+        // with two implementations and a test on only one of them. Hardening the
+        // guard for the read path would silently have left the write path on the
+        // old rule.
+        // `safe_path_segment` already renders `unsafe artifact name: "..."`, so
+        // the operator-visible message is byte-identical to the inline guard's.
+        safe_path_segment(name, "artifact name").map_err(Error::App)?;
         tokio::fs::create_dir_all(&self.artifacts_dir).await?;
         let path = self.artifacts_dir.join(name);
         tokio::fs::write(&path, bytes).await?;
@@ -366,27 +454,32 @@ impl AppContext {
             .and_then(|u| u.host_str().map(str::to_lowercase));
 
         // Learned tier routing: hosts where the HTTP tier persistently loses
-        // start straight at the browser (escalating strategies only).
+        // start straight at the browser; hosts a validated API recipe already
+        // serves consult recipes ahead of the live ladder. Both pins are read
+        // by one pure function so this seam and `GET /hosts` cannot disagree
+        // about what a pin means.
         let mut tier_note = None;
+        let mut recipe_note = None;
         if let Some(host) = &host {
-            if !req.skip_http
-                && matches!(
+            match self.tiers.preferred(host).await {
+                Ok(pref) => match router_pin(
+                    pref.as_deref(),
                     req.strategy,
-                    crate::fetcher::FetchStrategy::Auto
-                        | crate::fetcher::FetchStrategy::AutoWithResearch
-                )
-            {
-                match self.tiers.preferred(host).await {
-                    Ok(Some(pref)) if pref == "browser" => {
+                    req.skip_http,
+                    req.use_recipes,
+                ) {
+                    RouterPin::StartAtBrowser => {
                         req.skip_http = true;
-                        tier_note = Some(
-                            "http tier skipped: learned host preference (persistent http losses)"
-                                .to_string(),
-                        );
+                        tier_note = Some(format!("http tier skipped: {BROWSER_PIN_REASON}"));
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(job = %self.job_id, "tier memory read failed: {e}"),
-                }
+                    RouterPin::ConsultRecipes => {
+                        req.use_recipes = true;
+                        recipe_note =
+                            Some(format!("api_recipe tier consulted: {RECIPE_PIN_REASON}"));
+                    }
+                    RouterPin::None => {}
+                },
+                Err(e) => tracing::warn!(job = %self.job_id, "tier memory read failed: {e}"),
             }
         }
 
@@ -432,8 +525,14 @@ impl AppContext {
                 cache_hit: None,
                 latency_ms: 0,
                 cost_usd: None,
-                detail: Some("learned host preference (persistent http losses)".to_string()),
+                detail: Some(BROWSER_PIN_REASON.to_string()),
             });
+            outcome.escalations.push(note);
+        }
+        // The recipe pin leaves a trail line only — the recipe tier writes its
+        // own `TierTrace` when it actually runs, and a second synthetic entry
+        // here would report a tier that may never have been reached.
+        if let Some(note) = recipe_note {
             outcome.escalations.push(note);
         }
         if let Some(note) = budget_note {
@@ -502,6 +601,10 @@ impl AppContext {
             self.meter("claude", None, 0.0, Some("vcr_replay")).await;
             return Ok(out);
         }
+        // The engine mints this run's MCP job token from here (N15), so the
+        // fetches the model makes are attributed to the job that paid for the
+        // model. Stamped at the chokepoint, never accepted from a request body.
+        req.job_id = Some(self.job_id);
         let cacheable = req.resume_session.is_none() && self.research_cache.enabled();
         let key = cacheable.then(|| {
             ResearchCache::key_with(&req, &self.engines.researcher().answer_fingerprint(&req))
@@ -524,6 +627,7 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
+        let started = std::time::Instant::now();
         let out = match self.engines.researcher().research(req.clone()).await {
             Ok(out) => out,
             // **A failed call still spent money.** The CLI reports
@@ -533,12 +637,36 @@ impl AppContext {
             // Meter first, then propagate unchanged.
             Err(e) => {
                 self.meter_failed_spend(&e, None).await;
+                // External sink, same spend the internal write just landed —
+                // AFTER it, never instead of it, and never able to change what
+                // gets returned below. `ledger_event` is also the "did the
+                // internal write happen at all" check (a bare `Spawn` failure
+                // writes nothing, so this sends nothing either).
+                if let Some((cost, _, _)) = e.claude_spend().and_then(|s| s.ledger_event()) {
+                    crate::lighttrack::emit_research(crate::lighttrack::ResearchEvent {
+                        use_case: req.use_case.as_deref(),
+                        model: req.model.as_deref(),
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        cost_usd: Some(cost),
+                        error: Some(&e.to_string()),
+                    });
+                }
                 return Err(e);
             }
         };
+        let latency_ms = started.elapsed().as_millis() as u64;
         let (cost, certainty, detail) = success_spend_event(out.cost_usd);
         self.meter_with_certainty("claude", None, cost, certainty, detail)
             .await;
+        // External sink, same call the internal write above just recorded —
+        // fire-and-forget, cannot fail this call or change `out`.
+        crate::lighttrack::emit_research(crate::lighttrack::ResearchEvent {
+            use_case: req.use_case.as_deref(),
+            model: out.model.as_deref(),
+            latency_ms,
+            cost_usd: out.cost_usd,
+            error: None,
+        });
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
@@ -576,9 +704,12 @@ impl AppContext {
         if page.network.is_empty() {
             return Ok((0, 0));
         }
-        // Raw captures land beside the job's other artifacts for inspection.
+        // Raw captures land beside the job's other artifacts for inspection —
+        // one file per captured page, because this method is called once per
+        // page (see `network_capture_name`).
         let bytes = serde_json::to_vec_pretty(&page.network)?;
-        self.save_artifact("network-capture.json", &bytes).await?;
+        self.save_artifact(&network_capture_name(&bytes), &bytes)
+            .await?;
 
         let candidates = crate::recipes::discover_recipes(&page.network, extracted);
         let mut stored = 0usize;
@@ -802,6 +933,234 @@ impl AppContext {
     }
 }
 
+// ── app-declared schedules (N25 / P.4) ──────────────────────────────────────
+
+/// One schedule an app asked the runtime to create, already validated.
+///
+/// `managed_by` is `app:<name>` and is set HERE, never by the app: it is the
+/// ownership fence every managed write is made under
+/// (`Storage::upsert_managed_schedule`), which is what stops an app-declared
+/// row from overwriting a hand-made schedule that happens to share an id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRequest {
+    pub id: String,
+    pub app: String,
+    pub cron: String,
+    pub params: Value,
+    pub managed_by: String,
+}
+
+/// The `managed_by` tag for schedules an app declared.
+pub fn app_managed_by(requested_by: &str) -> String {
+    format!("app:{requested_by}")
+}
+
+/// Validates one app-declared `POST /schedules`-shaped body and derives the row
+/// the runtime will write.
+///
+/// THE ANTI-PATTERN THIS CLOSES: an app with no schedule-writing seam
+/// (N25 `research`) emitted `watch_requests[]` — ready-to-POST bodies a human
+/// was supposed to notice and replay by hand. Nothing created them, so
+/// `watch_sources: true` produced a list and no watches.
+///
+/// The id is DERIVED, content-addressed over `(requesting app, target app,
+/// cron, params)`, so re-running the same job re-syncs the same row instead of
+/// minting a duplicate schedule every night. `enabled` is not taken from the
+/// body: an app-declared schedule is created running, and an operator disables
+/// it through the ordinary `/schedules` surface.
+pub fn schedule_request(
+    requested_by: &str,
+    body: &Value,
+) -> std::result::Result<ScheduleRequest, String> {
+    let app = body
+        .get("app")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| "a schedule request needs a non-empty 'app'".to_string())?;
+    let cron = body
+        .get("cron")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| format!("the schedule request for '{app}' has no 'cron'"))?;
+    // Parsed, not shape-checked: a cron the scheduler cannot read would be
+    // stored as a schedule that never fires — indistinguishable from one that
+    // fires and finds nothing.
+    <cron::Schedule as std::str::FromStr>::from_str(cron)
+        .map_err(|e| format!("the schedule request for '{app}' has an invalid cron: {e}"))?;
+    let params = match body.get("params") {
+        None | Some(Value::Null) => Value::Object(Default::default()),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => {
+            return Err(format!(
+                "the schedule request for '{app}' has non-object params"
+            ))
+        }
+    };
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(requested_by.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(app.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(cron.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(crate::mesh::canonical_json(&params).as_bytes());
+        hex::encode(&h.finalize()[..8])
+    };
+    Ok(ScheduleRequest {
+        id: format!("app-{requested_by}-{digest}"),
+        app: app.to_string(),
+        cron: cron.to_string(),
+        params,
+        managed_by: app_managed_by(requested_by),
+    })
+}
+
+/// What the post-run fan-out did with a run's schedule requests. Every number
+/// is reported rather than logged: a request that was refused is the operator's
+/// business, not a warn line on a box nobody reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleRequestOutcome {
+    /// Rows written or re-synced.
+    pub created: usize,
+    /// Requests refused because the body was unusable, with the reason.
+    pub rejected: Vec<String>,
+    /// Requests dropped because an existing row with that id is owned by
+    /// somebody else — the ownership fence held.
+    pub not_owned: usize,
+    /// Requests never looked at because the per-run cap was already spent.
+    ///
+    /// THE GAP THIS CLOSES: the surplus left through `.take(cap)` and was
+    /// counted nowhere — not `created`, not `rejected`, not `not_owned` — so
+    /// this struct's own promise above ("every number is reported") did not hold
+    /// for the one disposition an operator can actually act on by raising
+    /// `[worker] max_app_schedules_per_run`. With a cap of zero the run dropped
+    /// every request and `created + not_owned == 0` also suppressed the worker's
+    /// summary line, leaving no trace of any kind.
+    pub over_cap: usize,
+}
+
+/// Applies a run's schedule requests, fenced on `managed_by = "app:<name>"`.
+///
+/// Cap is applied here as well as at the seam so a caller that reaches this
+/// function another way cannot write an unbounded number of standing
+/// commitments out of one job.
+pub async fn apply_schedule_requests(
+    storage: &crate::storage::Storage,
+    requested_by: &str,
+    requests: &[Value],
+    cap: usize,
+) -> ScheduleRequestOutcome {
+    let mut out = ScheduleRequestOutcome {
+        over_cap: requests.len().saturating_sub(cap),
+        ..Default::default()
+    };
+    for body in requests.iter().take(cap) {
+        match schedule_request(requested_by, body) {
+            Err(why) => out.rejected.push(why),
+            Ok(req) => {
+                match storage
+                    .upsert_managed_schedule(
+                        &req.id,
+                        &req.app,
+                        &req.cron,
+                        &req.params,
+                        true,
+                        &req.managed_by,
+                    )
+                    .await
+                {
+                    Ok(true) => out.created += 1,
+                    Ok(false) => out.not_owned += 1,
+                    Err(e) => out.rejected.push(format!("schedule write failed: {e}")),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What the learned tier pin for a host does to one fetch request.
+///
+/// The router used to branch on `browser` and nothing else, so the third
+/// learned state N14 introduced — `api_recipe`, earned the moment a validated
+/// recipe actually served a host — was memory the routing decision never read.
+/// A host could be pinned to the cheapest tier in the ladder while every fetch
+/// of it still walked http → browser, because recipes are consulted only when
+/// `[recipes] enabled`, `[fetcher] xray` or the per-request `use_recipes` say
+/// so, and a pin said none of those things. The anti-pattern the tests name:
+/// `api_recipe_pin_not_left_as_decoration`.
+/// Why a `browser` pin re-routed a fetch, in the words the operator reads.
+///
+/// One literal for two surfaces: the structured `TierTrace.detail` and the
+/// human trail line `AppContext::fetch` pushes onto `escalations` (which
+/// `fetch_cost_detail` then writes into the job's receipt). They were two
+/// copies of one sentence, so a reworded trail line would silently have stopped
+/// matching the trace beside it.
+pub(crate) const BROWSER_PIN_REASON: &str = "learned host preference (persistent http losses)";
+
+/// Why an `api_recipe` pin consulted recipes ahead of the live ladder.
+///
+/// This one shipped with a thirty-space run inside it — a wrapped source line
+/// whose indentation landed *in the string* rather than between two of them.
+/// It reached the job's receipt verbatim through `escalations` ->
+/// `fetch_cost_detail`, where nothing collapses whitespace. Hoisted to a const
+/// so it is one line of source with no wrap to mangle, and pinned by
+/// `a_pin_note_reads_as_one_sentence_on_the_receipt`.
+pub(crate) const RECIPE_PIN_REASON: &str =
+    "learned host preference (a validated recipe last served this host)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouterPin {
+    /// No pin, or a pin this request already satisfies / must not honour.
+    None,
+    /// `browser`: skip the http tier, it persistently loses here.
+    StartAtBrowser,
+    /// `api_recipe`: consult learned recipes ahead of the live ladder.
+    ConsultRecipes,
+}
+
+/// Reads one host's learned pin against the request that is about to run.
+///
+/// Deliberately total and side-effect free: both pins are *hints* the explicit
+/// strategies override. `Browser` strategy never takes the recipe pin (an API
+/// payload is not the JS render the caller asked for — the same exclusion
+/// [`crate::fetcher::recipes_consulted`] makes), and `Http` never takes the
+/// browser pin (the caller asked for the cheap tier only). A request that has
+/// already opted into the effect gets `None`, so the trail records the pin once
+/// or not at all.
+pub(crate) fn router_pin(
+    preferred: Option<&str>,
+    strategy: crate::fetcher::FetchStrategy,
+    skip_http: bool,
+    use_recipes: bool,
+) -> RouterPin {
+    use crate::fetcher::FetchStrategy as S;
+    match preferred {
+        Some(crate::tiers::PREFERRED_BROWSER)
+            if !skip_http && matches!(strategy, S::Auto | S::AutoWithResearch) =>
+        {
+            RouterPin::StartAtBrowser
+        }
+        Some(crate::tiers::PREFERRED_API_RECIPE) if !use_recipes && strategy != S::Browser => {
+            RouterPin::ConsultRecipes
+        }
+        _ => RouterPin::None,
+    }
+}
+
 /// This build's identity, stamped on every run row so a fleet-wide break
 /// correlates with a deploy in one query instead of looking like thirty sites
 /// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
@@ -941,7 +1300,8 @@ fn safe_path_segment(s: &str, what: &str) -> std::result::Result<(), String> {
 /// over `GET /apps`, and only surfaces its gap via a failed job).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// An environment variable that must be set (typically an API key/credential).
+    /// An environment variable that must be set to a **non-blank** value
+    /// (typically an API key/credential).
     Env(&'static str),
 }
 
@@ -949,7 +1309,7 @@ impl Requirement {
     /// Whether this precondition is satisfied in the current environment.
     pub fn is_satisfied(&self) -> bool {
         match self {
-            Requirement::Env(name) => std::env::var(name).is_ok(),
+            Requirement::Env(name) => env_value_satisfies(std::env::var(name).ok().as_deref()),
         }
     }
 
@@ -959,6 +1319,49 @@ impl Requirement {
             Requirement::Env(name) => format!("env:{name}"),
         }
     }
+}
+
+/// The artifact name one X-ray capture is written under.
+///
+/// THE ANTI-PATTERN THIS CLOSES: a fixed `network-capture.json`.
+/// [`AppContext::xray`] is called once per captured *page* — the only caller,
+/// `extractor::xray_captures`, loops over every document in the run — so under
+/// one name the Nth call overwrote the previous N−1. A forty-page run left a
+/// single file while the return value counted every capture and the feature doc
+/// promised all of them were on disk; the raw payloads the recipe heuristic
+/// scored were exactly what an operator could no longer inspect.
+///
+/// Content-addressed over the serialized captures rather than over the page
+/// URL, because the caller that exists rebuilds a bare `RenderedPage` carrying
+/// only `network` — there is no URL to key on. Two consequences, both wanted:
+/// identical captures collapse onto one file (a re-run rewrites instead of
+/// accumulating), and distinct ones cannot collide.
+fn network_capture_name(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "network-capture-{}.json",
+        hex::encode(&Sha256::digest(bytes)[..8])
+    )
+}
+
+/// Whether an environment variable's value actually satisfies a
+/// [`Requirement::Env`] — present **and** not blank.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `std::env::var(name).is_ok()`, under which a
+/// variable set to the empty string reads as satisfied. A `.env` line left as a
+/// bare `CENSUS_API_KEY=` is exactly what a human writes when they have not got
+/// the key yet, and `load_dotenv` sets it verbatim — so the app reported
+/// `ready: true` on `GET /apps`, was offered to an agent in the MCP tool list
+/// (`routes/meta.rs` filters on this very predicate), and announced its missing
+/// credential as an upstream 403 on the first job instead of as a gap before
+/// the first job. A credential that is present and blank is a credential that
+/// is missing, and readiness is the one field whose whole purpose is to say so
+/// in advance.
+///
+/// Whitespace counts as blank for the same reason: a quoted `"   "` is a
+/// placeholder, never a key.
+fn env_value_satisfies(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.trim().is_empty())
 }
 
 // ── App manifest (agent-ready registry) ─────────────────────────────────────
@@ -1091,6 +1494,32 @@ pub trait ScrapeApp: Send + Sync {
         None
     }
 
+    /// N18: may this app's jobs run on an **outbound executor** — a separate
+    /// process that long-polls the coordinator, executes the whole job with its
+    /// own engines, and reports the result back?
+    ///
+    /// Default `false`, and that default is the safe one: an executor's
+    /// [`AppContext`] carries a **refusing** `datasets` handle (there is no RPC
+    /// dataset client in v1), so an app that upserts would run to completion out
+    /// there and lose every write it thinks it made. Declaring `true` is
+    /// therefore a claim about the app — *this app is result-only: it fetches,
+    /// researches, saves artifacts, reports progress and checkpoints, and
+    /// returns everything it produced in its result JSON* — and the server pins
+    /// that claim with an inventory test that reads the app's own source
+    /// (`crate::executors::executor_eligible_apps_are_result_only`), not with
+    /// this flag alone.
+    ///
+    /// It sits on the trait beside [`schedule`](Self::schedule) and
+    /// [`requires`](Self::requires) rather than inside [`AppManifest`] for the
+    /// same reason those do — it is a fact about *where and when this app may
+    /// run*, not part of the agent-facing params contract — and because a new
+    /// `AppManifest` field is not additive: every app that builds one as a
+    /// struct literal (35 files today) would stop compiling, which is a lot of
+    /// churn to buy nothing.
+    fn executor(&self) -> bool {
+        false
+    }
+
     /// Executes one job. The returned JSON is stored as the job result.
     async fn run(&self, ctx: AppContext) -> Result<Value>;
 }
@@ -1098,9 +1527,95 @@ pub trait ScrapeApp: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, safe_path_segment,
-        success_spend_event, FetchOutcome, SpendCertainty,
+        app_managed_by, budget_exhausted_error, budget_is_exhausted, env_value_satisfies,
+        fetch_cost_detail, network_capture_name, router_pin, safe_path_segment, schedule_request,
+        success_spend_event, FetchOutcome, RouterPin, SpendCertainty,
     };
+    use serde_json::json;
+
+    /// THE ANTI-PATTERN: a wrapped source line whose indentation landed INSIDE
+    /// the string. The `api_recipe` pin's trail line carried thirty consecutive
+    /// spaces mid-sentence, and it is not an internal log: `fetch` pushes it
+    /// onto `FetchOutcome.escalations`, `fetch_cost_detail` joins those into the
+    /// cost event's `detail`, and that is the row a job's receipt keeps about
+    /// the fetch. Nothing between here and the operator collapses whitespace.
+    #[test]
+    fn a_pin_note_reads_as_one_sentence_on_the_receipt() {
+        for reason in [super::BROWSER_PIN_REASON, super::RECIPE_PIN_REASON] {
+            assert!(
+                !reason.contains("  "),
+                "a receipt line must not carry a run of spaces: {reason:?}"
+            );
+            assert_eq!(
+                reason.trim(),
+                reason,
+                "nor lead or trail with whitespace: {reason:?}"
+            );
+            assert!(
+                !reason.contains('\n'),
+                "nor a newline, which would split the joined detail: {reason:?}"
+            );
+            assert!(
+                reason.starts_with("learned host preference"),
+                "both pins say WHY in the same words, so the two trail lines \
+                 read as one vocabulary: {reason:?}"
+            );
+        }
+        // The browser pin's reason is the single source for both the structured
+        // `TierTrace.detail` and the human trail line; the recipe pin has no
+        // trace entry of its own, by design.
+        assert_ne!(super::BROWSER_PIN_REASON, super::RECIPE_PIN_REASON);
+    }
+
+    /// THE ANTI-PATTERN: one fixed `network-capture.json`. `xray` runs once per
+    /// captured page, so the second page's captures silently replaced the
+    /// first's — a forty-page run left one file while the return value counted
+    /// forty and the feature doc said all of them had landed.
+    #[test]
+    fn a_second_captured_page_does_not_overwrite_the_first() {
+        let a = network_capture_name(br#"[{"url":"https://a.test/api"}]"#);
+        let b = network_capture_name(br#"[{"url":"https://b.test/api"}]"#);
+        assert_ne!(a, b, "two pages' captures must land in two files");
+        assert_eq!(
+            a,
+            network_capture_name(br#"[{"url":"https://a.test/api"}]"#),
+            "the same capture keeps the same name: a re-run rewrites one file \
+             instead of accumulating a copy per attempt"
+        );
+        assert!(
+            a.starts_with("network-capture-") && a.ends_with(".json"),
+            "{a}"
+        );
+        // The generated name goes straight into `save_artifact`, so it must
+        // clear the very guard that method applies to it.
+        assert!(safe_path_segment(&a, "artifact name").is_ok(), "{a}");
+    }
+
+    /// THE ANTI-PATTERN: `std::env::var(name).is_ok()`, under which a variable
+    /// set to the empty string reports the app READY. `.env` carries a bare
+    /// `CENSUS_API_KEY=` whenever a human has not got the key yet, so the
+    /// registry advertised a credential-gated app as ready, the MCP tool list
+    /// offered it, and the gap surfaced as an upstream 403 on the first job —
+    /// which is precisely the outcome `requires()` exists to prevent.
+    #[test]
+    fn a_blank_credential_is_missing_not_ready() {
+        assert!(
+            env_value_satisfies(Some("sk-live-abc")),
+            "a real key satisfies"
+        );
+        assert!(!env_value_satisfies(None), "unset is not satisfied");
+        assert!(
+            !env_value_satisfies(Some("")),
+            "set-but-empty is the whole bug: a blank credential is a missing one"
+        );
+        assert!(
+            !env_value_satisfies(Some("   \t ")),
+            "a whitespace placeholder is not a key either"
+        );
+        // Leading/trailing whitespace around a REAL value is a typo, not an
+        // absence — the variable is still satisfied.
+        assert!(env_value_satisfies(Some(" sk-live-abc ")));
+    }
 
     fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
         FetchOutcome {
@@ -1117,6 +1632,7 @@ mod tests {
                 via: via.into(),
                 captured_at: captured_at.map(str::to_string),
             }),
+            network: Vec::new(),
         }
     }
 
@@ -1212,6 +1728,104 @@ mod tests {
         );
     }
 
+    /// The carry-forward N14 named as its own first known gap: a host the
+    /// router pinned to `api_recipe` — the cheapest tier in the ladder, earned
+    /// by a validated recipe actually serving that host — was routed exactly
+    /// like an unpinned one, because this seam branched on `browser` alone. The
+    /// pin was learned, exported on `GET /hosts`, and read by nothing.
+    #[test]
+    fn api_recipe_pin_not_left_as_decoration() {
+        use crate::fetcher::FetchStrategy as S;
+        for strategy in [S::Auto, S::AutoWithResearch, S::Http] {
+            assert_eq!(
+                router_pin(
+                    Some(crate::tiers::PREFERRED_API_RECIPE),
+                    strategy,
+                    false,
+                    false
+                ),
+                RouterPin::ConsultRecipes,
+                "{strategy:?} must honour the recipe pin"
+            );
+        }
+    }
+
+    /// An explicit `browser` strategy asked for a JS render; an API payload is
+    /// not one. Same exclusion `recipes_consulted` makes, decided once.
+    #[test]
+    fn api_recipe_pin_not_applied_to_an_explicit_browser_render() {
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_API_RECIPE),
+                crate::fetcher::FetchStrategy::Browser,
+                false,
+                false,
+            ),
+            RouterPin::None
+        );
+    }
+
+    /// A request that already set `use_recipes` gets no pin effect, so the
+    /// trail cannot claim the router did something the caller had done.
+    #[test]
+    fn a_pin_already_satisfied_is_not_reported_twice() {
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_API_RECIPE),
+                crate::fetcher::FetchStrategy::Auto,
+                false,
+                true,
+            ),
+            RouterPin::None
+        );
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_BROWSER),
+                crate::fetcher::FetchStrategy::Auto,
+                true,
+                false,
+            ),
+            RouterPin::None
+        );
+    }
+
+    /// The browser pin's pre-existing rules are unchanged: escalating
+    /// strategies only, and an unknown/absent pin routes normally.
+    #[test]
+    fn browser_pin_still_only_binds_the_escalating_strategies() {
+        use crate::fetcher::FetchStrategy as S;
+        assert_eq!(
+            router_pin(Some(crate::tiers::PREFERRED_BROWSER), S::Auto, false, false),
+            RouterPin::StartAtBrowser
+        );
+        assert_eq!(
+            router_pin(
+                Some(crate::tiers::PREFERRED_BROWSER),
+                S::AutoWithResearch,
+                false,
+                false
+            ),
+            RouterPin::StartAtBrowser
+        );
+        for strategy in [S::Http, S::Browser] {
+            assert_eq!(
+                router_pin(
+                    Some(crate::tiers::PREFERRED_BROWSER),
+                    strategy,
+                    false,
+                    false
+                ),
+                RouterPin::None,
+                "{strategy:?} is explicit and overrides the pin"
+            );
+        }
+        assert_eq!(router_pin(None, S::Auto, false, false), RouterPin::None);
+        assert_eq!(
+            router_pin(Some("something-else"), S::Auto, false, false),
+            RouterPin::None
+        );
+    }
+
     /// The ONE artifact path-traversal guard shared by extractor + plugin
     /// (`read_source_artifact`). Gutting it to `Ok(())` must turn this red —
     /// it is the only thing between untrusted record/param data and a
@@ -1241,5 +1855,88 @@ mod tests {
         for ok in ["page-0001.html", "grants-gov", "a.b_c-d", "café", ".hidden"] {
             assert!(safe_path_segment(ok, "test").is_ok(), "must accept {ok:?}");
         }
+    }
+
+    // ── app-declared schedules (P.4) ────────────────────────────────────────
+
+    #[test]
+    fn an_app_declared_schedule_is_owned_by_the_app_that_asked_for_it() {
+        let req = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://a/"}}),
+        )
+        .expect("a well-formed body");
+        assert_eq!(req.app, "watch", "the TARGET app, not the requester");
+        assert_eq!(req.managed_by, app_managed_by("research"));
+        assert_eq!(
+            req.managed_by, "app:research",
+            "the fence tag is set by the runtime, never taken from the body"
+        );
+        assert_eq!(req.params["url"], "https://a/");
+        // The body cannot smuggle its own ownership or id past the fence.
+        let forged = schedule_request(
+            "research",
+            &json!({
+                "app": "watch", "cron": "0 0 6 * * *",
+                "managed_by": "catalog", "id": "catalog-watch"
+            }),
+        )
+        .expect("opens");
+        assert_eq!(forged.managed_by, "app:research");
+        assert_ne!(forged.id, "catalog-watch");
+    }
+
+    #[test]
+    fn the_same_request_twice_is_one_row_not_a_schedule_per_night() {
+        // THE REFUTED BEHAVIOR a random id would have: a nightly research run
+        // asking to watch the same URL would mint a new schedule every night.
+        let body = json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://a/"}});
+        let a = schedule_request("research", &body).expect("ok");
+        let b = schedule_request("research", &body).expect("ok");
+        assert_eq!(a.id, b.id);
+        // …and a DIFFERENT target is a different row.
+        let other = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://b/"}}),
+        )
+        .expect("ok");
+        assert_ne!(a.id, other.id);
+        // Params compare canonically: key order is not a new schedule.
+        let reordered = schedule_request(
+            "research",
+            &json!({"params": {"url": "https://a/"}, "cron": "0 0 6 * * *", "app": "watch"}),
+        )
+        .expect("ok");
+        assert_eq!(a.id, reordered.id);
+        // The requester is part of the identity: two apps asking for the same
+        // watch own their own rows rather than fighting over one.
+        assert_ne!(a.id, schedule_request("watch", &body).expect("ok").id);
+    }
+
+    #[test]
+    fn an_unreadable_cron_is_refused_not_stored_as_a_schedule_that_never_fires() {
+        let err = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "every tuesday"}),
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("invalid cron"), "{err}");
+        assert!(schedule_request("research", &json!({"app": "watch"})).is_err());
+        assert!(schedule_request("research", &json!({"cron": "0 0 6 * * *"})).is_err());
+        assert!(
+            schedule_request("research", &json!({"app": "  ", "cron": "0 0 6 * * *"})).is_err()
+        );
+        assert!(schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": "not an object"})
+        )
+        .is_err());
+        // Absent params is not an error — it is the empty object.
+        assert_eq!(
+            schedule_request("research", &json!({"app": "watch", "cron": "0 0 6 * * *"}))
+                .expect("ok")
+                .params,
+            json!({})
+        );
     }
 }

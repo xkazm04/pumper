@@ -254,6 +254,8 @@ async fn trigger_with_a_bad_template_records_bad_params_instead_of_firing() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger");

@@ -25,9 +25,21 @@ pub(crate) use datasets::parse_filters;
 // (`crate::mcp::live`): both SSE surfaces have to end on the shutdown token, and
 // one implementation means neither can silently regain the unbounded `recv()`.
 pub(crate) use events::next_or_shutdown;
+// The ring-then-log replay, re-exported for the MCP live stream: N05 made a
+// resume able to fall back to the durable event log, and both SSE surfaces must
+// fall back the same way or an agent and a browser reconnecting at the same
+// sequence get different answers.
+pub(crate) use events::replay_or_log;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;
+// The job cancel door, re-exported for the workflow engine (`crate::workflow`),
+// which sits outside `routes`. Cancelling a workflow run must stop its open
+// steps EXACTLY the way `DELETE /jobs/{id}` stops any other job — queued rows
+// through the guarded write, running ones through their cancellation token —
+// so the engine calls that handler rather than growing a second, subtly
+// different cancel path.
+pub(crate) use jobs::cancel_job;
 // The poison-recovering lock helper, re-exported for the BACKGROUND loops
 // (`crate::worker`, `crate::datahub`) — they hold the same class of advisory
 // in-memory caches the request path does, but sit outside `routes` and so
@@ -35,6 +47,14 @@ pub(crate) use jobs::merge_params;
 // surfaces: a poisoned advisory cache must not be able to kill the scheduler
 // tick any more than it may permanently 500 an endpoint.
 pub(crate) use error::lock_advisory;
+// The error envelope's code map and its 500 body, re-exported for the identity
+// layer (`crate::auth`): a refusal raised in the middleware must be shaped
+// exactly like one raised in a handler, or clients get two error contracts.
+pub(crate) use error::{error_code, INTERNAL_MESSAGE};
+// The pure token-bucket step, re-exported for the identity layer's
+// per-principal throttle. One implementation, two rails: the ingress
+// per-source limit and the per-principal one cannot drift apart.
+pub(crate) use ingress::bucket_step;
 // The retention plan builder, re-exported for `main.rs`'s janitor: the dry-run
 // endpoint and the loop that actually deletes MUST compute the same plan, so
 // there is exactly one implementation and both call it.
@@ -47,29 +67,53 @@ pub(crate) use retention::artifact_retention_plan;
 // on a wiped index while the other tells the truth.
 pub(crate) use search::{build_search_request, run_search, SearchInput, SEARCH_MAX_OFFSET};
 
+// N04: the MCP trigger/watch/ingress AUTHORING tools call these HTTP handlers
+// (and their request bodies) directly rather than re-implementing the door, so
+// an agent and an operator cannot get different answers about the same body —
+// the same reason `approve_transaction` shares the HTTP door's decision
+// function. Handlers only; nothing here is a second validation path.
+pub(crate) use error::ApiError;
+pub(crate) use ingress::{create_ingress_source, CreateIngressSourceBody};
+pub(crate) use triggers::{
+    create_trigger, test_trigger, trigger_runs, CreateTriggerBody, RunsQuery, TestTriggerQuery,
+};
+pub(crate) use watches::{create_watch, CreateWatchBody};
+
 mod datasets;
 mod derived;
 mod doctor;
+// N23: the typed response envelopes every route's `responses(...)` block
+// points at. Schema-only — nothing here runs at request time.
+mod dto;
 mod economics;
 mod error;
 mod events;
+mod executors;
 mod health;
 mod host_weather;
 mod ingress;
 pub(crate) mod jobs;
+pub(crate) mod mesh;
 mod meta;
+mod principals;
 mod provenance;
 mod provisioner;
-mod query;
-mod receipt;
+// `pub(crate)` (N33): the MCP `market_profile` tool answers through this
+// module's `find_market_profile`, the same function the HTTP door uses, so the
+// two surfaces cannot disagree about which row exists or what a miss means.
+pub(crate) mod query;
+pub(crate) mod receipt;
 mod recipes;
 mod remote;
 mod retention;
 mod runtime;
 mod schedules;
 mod search;
+mod subscriptions;
+pub(crate) mod transactions;
 mod triggers;
-mod watches;
+pub(crate) mod watches;
+mod workflows;
 
 // Bring every handler (and its utoipa-generated `__path_*` companion) into this
 // module so the `routes!(...)` registrations below resolve. Each submodule
@@ -79,11 +123,14 @@ use derived::*;
 use doctor::*;
 use economics::*;
 use events::*;
+use executors::*;
 use health::*;
 use host_weather::*;
 use ingress::*;
 use jobs::*;
+use mesh::*;
 use meta::*;
+use principals::*;
 use provenance::*;
 use provisioner::*;
 use query::*;
@@ -94,8 +141,11 @@ use retention::*;
 use runtime::*;
 use schedules::*;
 use search::*;
+use subscriptions::*;
+use transactions::*;
 use triggers::*;
 use watches::*;
+use workflows::*;
 
 /// Top-level metadata for the generated OpenAPI document. Route operations are
 /// collected from each `#[utoipa::path]` handler by `OpenApiRouter` (see
@@ -116,9 +166,11 @@ use watches::*;
         (name = "schedules", description = "Cron schedules"),
         (name = "datasets", description = "Change-detected dataset records, export, history"),
         (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
+        (name = "market", description = "State x trade market profile: trades economics joined to census density"),
         (name = "derived", description = "Derived datasets: filter/project/lookup specs recomputed on upstream deltas"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
+        (name = "transactions", description = "Approval ledger for live (irreversible) browser actions"),
         (name = "ingress", description = "Inbound event ingress: signed external webhooks as trigger inputs"),
         (name = "webhooks", description = "Outbound delivery log"),
         (name = "search", description = "Full-text search and saved searches"),
@@ -132,9 +184,13 @@ use watches::*;
         (name = "remote", description = "Distributed fetch fabric: peer nodes proxy fetches through this node's local stack"),
         (name = "retention", description = "Read-only retention dry run: reclaimable artifact bytes per app and ledger sizes"),
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
+        (name = "principals", description = "Identity and tenancy: scoped API keys, their spend, and the audit ledger"),
+        (name = "mesh", description = "Pumper mesh: signed node identity and scheduled peer sync of datasets, host weather and recipes"),
+        (name = "executors", description = "Elastic executor plane: outbound worker processes that long-poll for whole jobs, run them with their own engines, and report results back to the coordinator"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
+        (name = "workflows", description = "Declared multi-step DAGs: fan-in join barriers, param templating, one budget envelope and one rolled-up receipt per run"),
     )
 )]
 struct ApiDoc;
@@ -195,6 +251,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(retry_job))
         .routes(routes!(bulk_retry_jobs))
         .routes(routes!(reset_job))
+        .routes(routes!(resume_job))
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
         .routes(routes!(job_receipt))
@@ -223,6 +280,12 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_watch))
         .routes(routes!(set_watch_enabled))
         .routes(routes!(watch_deliveries))
+        // N05: the durable event log's pull page, and the cursor subscriptions
+        // that generalize watches.
+        .routes(routes!(event_log))
+        .routes(routes!(list_subscriptions, create_subscription))
+        .routes(routes!(delete_subscription))
+        .routes(routes!(subscription_deliveries))
         .routes(routes!(list_triggers, create_trigger))
         .routes(routes!(delete_trigger))
         .routes(routes!(set_trigger_enabled))
@@ -245,6 +308,11 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_recipes))
         .routes(routes!(retire_recipe))
         .routes(routes!(revive_recipe))
+        .routes(routes!(export_recipes))
+        .routes(routes!(import_recipes))
+        .routes(routes!(dataset_manifest))
+        .routes(routes!(get_node))
+        .routes(routes!(get_mesh))
         .routes(routes!(fetch_proxy))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
@@ -257,6 +325,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(search_status))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
+        .routes(routes!(list_programs))
+        // N31: the applicant fit surface over the same virtual namespace.
+        .routes(routes!(list_grant_profiles, create_grant_profile))
+        .routes(routes!(list_fits))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
         .routes(routes!(catalog_reconcile, catalog_reconcile_apply))
@@ -276,6 +348,30 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(datahub_governance_preview))
+        // N33: the cross-family market product, one keyed row per state x trade.
+        .routes(routes!(market_profile))
+        .routes(routes!(list_principals, create_principal))
+        .routes(routes!(principal_costs))
+        .routes(routes!(disable_principal))
+        .routes(routes!(rotate_principal))
+        .routes(routes!(list_audit))
+        .routes(routes!(list_workflows, create_workflow))
+        .routes(routes!(get_workflow, delete_workflow))
+        .routes(routes!(list_workflow_runs, start_workflow_run))
+        .routes(routes!(get_workflow_run, cancel_workflow_run))
+        .routes(routes!(list_transactions))
+        .routes(routes!(get_transaction))
+        .routes(routes!(approve_transaction))
+        .routes(routes!(reject_transaction))
+        // N18: the executor plane's doors. All six answer 404 unless
+        // `[executors] enabled` + a secret, so registering them changes nothing
+        // for a node that never configures the plane.
+        .routes(routes!(claim_job))
+        .routes(routes!(list_executors))
+        .routes(routes!(executor_heartbeat))
+        .routes(routes!(executor_checkpoint))
+        .routes(routes!(executor_progress))
+        .routes(routes!(executor_finish))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -309,6 +405,12 @@ pub fn router(state: AppState) -> Router {
     // rather than in `with_middleware` because it needs the state's gauge, and
     // that function is deliberately state-agnostic so a test can drive the
     // exact stack over a synthetic router.
+    // N20 identity layer. In the default `[auth] mode = "open"` it resolves the
+    // synthetic operator and does nothing else, so this is inert until an
+    // operator flips the key. Applied here rather than in `with_middleware`
+    // because it needs the state, and that function is state-agnostic on
+    // purpose.
+    let router = crate::auth::with_auth(router, state.clone());
     let router = crate::activity::with_activity(router, state.activity.clone());
     with_middleware(router, origins).with_state(state)
 }
@@ -419,7 +521,7 @@ mod catalog_tests {
     }
 
     fn registered() -> Vec<std::sync::Arc<dyn pumper_core::ScrapeApp>> {
-        crate::registry::apps()
+        crate::registry::apps(&pumper_core::Config::default())
     }
 
     #[test]
@@ -538,6 +640,7 @@ mod api_spec_tests {
         "POST /jobs/{id}/retry",
         "POST /jobs/retry",
         "POST /jobs/{id}/reset",
+        "POST /jobs/{id}/resume",
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
         "GET /jobs/{id}/receipt",
@@ -560,6 +663,7 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /datasets/{app}/{dataset}/manifest",
         "GET /datasets/doctor",
         "GET /provenance/{app}/{dataset}/{key}",
         "POST /provenance/{app}/{dataset}/{key}/rederive",
@@ -575,6 +679,12 @@ mod api_spec_tests {
         "DELETE /watches/{id}",
         "POST /watches/{id}/enabled",
         "GET /watches/{id}/deliveries",
+        // N05 durable event log + cursor subscriptions.
+        "GET /events/log",
+        "GET /subscriptions",
+        "POST /subscriptions",
+        "DELETE /subscriptions/{id}",
+        "GET /subscriptions/{id}/deliveries",
         "GET /triggers",
         "POST /triggers",
         "DELETE /triggers/{id}",
@@ -604,6 +714,10 @@ mod api_spec_tests {
         // it is a new irreversible door and wants its own review.
         "POST /recipes/{id}/retire",
         "POST /recipes/{id}/revive",
+        "GET /recipes/export",
+        "POST /recipes/import",
+        "GET /node",
+        "GET /mesh",
         "POST /fetch-proxy",
         "GET /plugins",
         "POST /plugins/reload",
@@ -618,6 +732,10 @@ mod api_spec_tests {
         "POST /extract/preview",
         "GET /grants",
         "GET /grants/closing-soon",
+        "GET /grants/programs",
+        "GET /grants/profiles",
+        "POST /grants/profiles",
+        "GET /grants/fits",
         "GET /catalog/sources",
         "GET /catalog/health",
         "GET /catalog/reconcile",
@@ -639,6 +757,32 @@ mod api_spec_tests {
         "GET /datahub/status",
         "POST /datahub/sync",
         "GET /datahub/governance/preview",
+        "GET /principals",
+        "POST /principals",
+        "GET /principals/costs",
+        "POST /principals/{id}/disable",
+        "POST /principals/{id}/rotate",
+        "GET /audit",
+        "GET /workflows",
+        "POST /workflows",
+        "GET /workflows/{id}",
+        "DELETE /workflows/{id}",
+        "GET /workflows/{id}/runs",
+        "POST /workflows/{id}/runs",
+        "GET /workflow-runs/{run_id}",
+        "DELETE /workflow-runs/{run_id}",
+        "GET /transactions",
+        "GET /transactions/{id}",
+        "POST /transactions/{id}/approve",
+        "POST /transactions/{id}/reject",
+        "GET /market/profile/{state}/{trade}",
+        // N18 elastic executor plane.
+        "POST /executors/claim",
+        "GET /executors",
+        "POST /jobs/{id}/heartbeat",
+        "POST /jobs/{id}/checkpoint",
+        "POST /jobs/{id}/progress",
+        "POST /jobs/{id}/finish",
         "GET /openapi.json",
     ];
 
@@ -819,5 +963,244 @@ mod filter_tests {
     #[test]
     fn empty_specs_yield_no_filters() {
         assert!(parse_filters(&[]).expect("ok").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod spec_snapshot_tests {
+    use std::path::PathBuf;
+
+    /// The committed OpenAPI document, the artifact every generated client is
+    /// built from.
+    ///
+    /// The spec is generated from the router, so it exists only inside a running
+    /// `pumper` process — and the client generators are Node scripts that must
+    /// run in a job with no Rust toolchain. Committing the document is what lets
+    /// those two live in different CI jobs: this test is the ONLY thing keeping
+    /// the committed copy honest, so a route or DTO change that is not
+    /// regenerated fails `cargo test` here rather than silently shipping clients
+    /// generated from last week's contract.
+    ///
+    /// Regenerate with `just openapi` (or `UPDATE_OPENAPI=1 cargo test -p
+    /// pumper-server spec_snapshot`).
+    pub(crate) fn snapshot_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../clients/openapi.json")
+    }
+
+    /// The document as the router generates it, pretty-printed with a trailing
+    /// newline so the committed file is a normal text file and its diffs are
+    /// readable.
+    pub(crate) fn generated_spec() -> String {
+        let api = super::openapi_router().split_for_parts().1;
+        let value = serde_json::to_value(&api).expect("spec serializes");
+        let mut out = serde_json::to_string_pretty(&value).expect("spec pretty-prints");
+        out.push('\n');
+        out
+    }
+
+    #[test]
+    fn committed_spec_matches_the_router() {
+        let path = snapshot_path();
+        let generated = generated_spec();
+        if std::env::var("UPDATE_OPENAPI").is_ok() {
+            std::fs::create_dir_all(path.parent().expect("clients dir")).expect("mkdir");
+            std::fs::write(&path, &generated).expect("write spec");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "clients/openapi.json is missing or unreadable ({e}) — every generated client is \
+                 built from it. Regenerate with `just openapi`."
+            )
+        });
+        // Deliberately NOT `assert_eq!` on the two documents: the spec is a
+        // quarter-megabyte of JSON, and dumping both copies into the test output
+        // buries the one line that actually differs under 700 kB of identical
+        // context. Report the first divergence and its line number instead.
+        let committed = committed.replace("\r\n", "\n");
+        if committed != generated {
+            let at = committed
+                .lines()
+                .zip(generated.lines())
+                .position(|(a, b)| a != b);
+            let detail = match at {
+                Some(i) => format!(
+                    "first difference at line {}:\n  committed: {}\n  generated: {}",
+                    i + 1,
+                    committed.lines().nth(i).unwrap_or(""),
+                    generated.lines().nth(i).unwrap_or("")
+                ),
+                None => format!(
+                    "same prefix, different length ({} committed vs {} generated lines)",
+                    committed.lines().count(),
+                    generated.lines().count()
+                ),
+            };
+            panic!(
+                "clients/openapi.json is stale — the router's spec changed and the committed \
+                 document (and every client generated from it) did not. Run `just clients`.\n\
+                 {detail}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spec_schema_tests {
+    use std::collections::BTreeSet;
+
+    /// Every 2xx response in the document that does NOT reference a
+    /// `#/components/schemas/…` entry — the EXPECTED-diff idiom this repo uses
+    /// for route and body-limit inventories, pointed at response *bodies*.
+    ///
+    /// # Why an allowlist rather than a bare "all responses are typed"
+    ///
+    /// N23 found 135 of 136 success responses describing their payload in a
+    /// backtick sentence and declaring `body = Object` (or no body at all). A
+    /// test that simply demanded zero would have been red for the whole item
+    /// and would have had to be committed red; an allowlist that starts at 135
+    /// and shrinks makes each route file's typing a green, revertible step, and
+    /// — the part that matters after N23 is done — makes the fence work in the
+    /// direction that will actually be exercised:
+    ///
+    /// - a NEW route with an untyped 2xx appears here and fails, naming itself.
+    ///   It cannot join the surface untyped and silent, which is the whole
+    ///   point of typing the surface in the first place;
+    /// - a route that GAINS a schema must be struck from this list, so nobody
+    ///   can quietly re-untype a response and hide behind a stale entry.
+    ///
+    /// Both directions are asserted. Entries left below are responses that are
+    /// not a JSON document at all, and each says why.
+    const SCHEMALESS_RESPONSES: &[&str] = &[
+        // Prometheus text exposition, not JSON.
+        "GET /metrics 200",
+        // Server-sent events. The FRAMES carry JSON, but the response body is a
+        // stream, and OpenAPI has no way to say "one `JobEvent` per `data:`
+        // line" — pretending otherwise would generate a client that tries to
+        // parse the whole stream as one document.
+        "GET /events 200",
+        "GET /jobs/{id}/stream 200",
+        // A streamed export whose media type is chosen by `?format=`
+        // (`application/json`, `application/x-ndjson`, `text/csv`) and whose
+        // JSON arm deliberately omits its closing bracket on a mid-stream abort
+        // — the truncation signal. That is not a document a schema describes.
+        "GET /datasets/{app}/{dataset}/export 200",
+        // The OpenAPI document itself. Its schema is the OpenAPI meta-schema,
+        // which this document does not (and should not) embed.
+        "GET /openapi.json 200",
+        // 204: no body at all. The executor plane's long poll came back empty.
+        "POST /executors/claim 204",
+    ];
+
+    /// `(METHOD, path, status)` for every 2xx response whose media type carries
+    /// no reference to a component schema.
+    ///
+    /// The `$ref` is looked for ANYWHERE inside the media type's schema, not
+    /// just at its root, because the interesting shapes are wrappers: an array
+    /// of records is `{type: array, items: {$ref}}` and a dual-mode response is
+    /// a `oneOf` of two refs. A response is typed when a generator can reach a
+    /// named component from it — that is exactly what "anywhere" tests.
+    fn success_responses_without_a_schema() -> BTreeSet<String> {
+        fn has_ref(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Object(map) => map.iter().any(|(k, val)| {
+                    (k == "$ref"
+                        && val
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("#/components/schemas/")))
+                        || has_ref(val)
+                }),
+                serde_json::Value::Array(items) => items.iter().any(has_ref),
+                _ => false,
+            }
+        }
+
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "trace",
+        ];
+        let mut out = BTreeSet::new();
+        for (path, item) in json["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                if !methods.contains(&method.as_str()) {
+                    continue;
+                }
+                let Some(responses) = op["responses"].as_object() else {
+                    continue;
+                };
+                for (status, response) in responses {
+                    if !status.starts_with('2') {
+                        continue;
+                    }
+                    if !has_ref(&response["content"]) {
+                        out.insert(format!("{} {} {}", method.to_uppercase(), path, status));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_success_response_references_a_component_schema() {
+        let untyped = success_responses_without_a_schema();
+        let allowed: BTreeSet<String> =
+            SCHEMALESS_RESPONSES.iter().map(|s| s.to_string()).collect();
+        let unexpected: Vec<_> = untyped.difference(&allowed).collect();
+        let stale: Vec<_> = allowed.difference(&untyped).collect();
+        assert!(
+            unexpected.is_empty(),
+            "these 2xx responses describe their body in prose instead of referencing a component \
+             schema, so no client can be generated for them. Add a DTO in `routes::dto` and point \
+             the handler's `responses(...)` at it with `body = <Dto>`: {unexpected:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "these responses now DO reference a schema — strike them from \
+             SCHEMALESS_RESPONSES so the fence keeps binding: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn every_schema_reference_resolves_to_a_component() {
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let components: BTreeSet<String> = json["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas")
+            .keys()
+            .cloned()
+            .collect();
+
+        fn collect(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        if k == "$ref" {
+                            if let Some(name) = val
+                                .as_str()
+                                .and_then(|s| s.strip_prefix("#/components/schemas/"))
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                        collect(val, out);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|i| collect(i, out)),
+                _ => {}
+            }
+        }
+
+        let mut referenced = BTreeSet::new();
+        collect(&json["paths"], &mut referenced);
+        collect(&json["components"], &mut referenced);
+        let dangling: Vec<_> = referenced.difference(&components).collect();
+        assert!(
+            dangling.is_empty(),
+            "the document references component schemas it does not define — a generated client \
+             would emit `any` (or fail to compile) for each: {dangling:?}"
+        );
     }
 }

@@ -175,7 +175,7 @@ Naming the binary is required — see [§8](#8-verification-loop--do-this-before
   job JSON here; if a secret is set, the body is HMAC-SHA256 signed and sent as
   `X-Pumper-Signature: sha256=<hex>`. So you can push results instead of polling.
 
-**Job lifecycle:** `queued → running → succeeded | failed | cancelled`. Poll
+**Job lifecycle:** `queued → running → succeeded | failed | cancelled`, plus the non-terminal `running → waiting → queued` detour when an app parks on external input (`ctx.await_input`; answered by `POST /jobs/{id}/resume`). Poll
 `GET /jobs/{id}` until `status` is terminal, then read `result` (or `error`).
 Structured output for each app is under `result`; raw dumps are on disk at
 `data/artifacts/<app>/<job_id>/`.
@@ -230,6 +230,7 @@ pub trait ScrapeApp: Send + Sync {
     fn default_params(&self) -> Value { Value::Object(Default::default()) } // scheduled + body-less runs
     fn manifest(&self) -> AppManifest { AppManifest::default() }            // agent-facing contract
     fn target_key(&self, params: &Value) -> Option<String> { None }         // what this job acts on
+    fn executor(&self) -> bool { false }          // N18: may run on an outbound executor (result-only)
     async fn run(&self, ctx: AppContext) -> Result<Value>;// returns JSON stored as the job result
 }
 ```
@@ -255,6 +256,14 @@ worth overriding on purpose:
   granularity in both directions — and an over-broad key silently serialises a
   legitimately parallel shape, so return `None` rather than a key you are not
   sure about.
+
+- **`executor()`** — declare `true` only if your app is **result-only**: it
+  returns everything it produces in the job result and the artifact tree, and
+  never touches `ctx.upsert*` / `ctx.sync_many` / `ctx.datasets`. Executors
+  (N18) run jobs in a separate process whose dataset handle *refuses*, so this
+  is a checked claim, not a capability advertisement — a server-side inventory
+  test reads your app's source and fails the build if it writes datasets. See
+  [docs/features/runtime.md § Elastic executor plane](docs/features/runtime.md#elastic-executor-plane-executors).
 
 Minimal implementation:
 

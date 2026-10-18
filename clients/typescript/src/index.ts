@@ -16,6 +16,8 @@ export { PumperHttpError, type HttpOptions } from "./http.js";
 export type {
   DatasetRef,
   FeedOrder,
+  PumperEvent,
+  PumperEventPage,
   PumperRecord,
   PumperRevision,
   RevisionChange,

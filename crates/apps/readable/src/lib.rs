@@ -91,6 +91,15 @@ impl ScrapeApp for Readable {
         }
     }
 
+    /// N18: result-only, so this app may run on an outbound executor. Every byte
+    /// it produces goes into the `page.md` artifact and the result JSON; it
+    /// never reaches the dataset store, which is what makes it safe on a process
+    /// whose `datasets` handle refuses. Pinned by the server's eligibility
+    /// inventory test, not by this declaration alone.
+    fn executor(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let url = ctx.require_str("url")?.to_string();
         let strategy = match ctx.params.get("strategy").and_then(Value::as_str) {

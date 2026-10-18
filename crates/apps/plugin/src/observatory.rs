@@ -59,6 +59,31 @@ pub(crate) const MAX_SAMPLE_PER_SITE: usize = 500;
 /// Sites with fewer stored pages than this are flagged `low_confidence`.
 pub(crate) const LOW_CONFIDENCE_FLOOR: usize = 5;
 
+/// The crawl's whole-corpus ranking (written by `crawl` `mode: "graph"`, N27) —
+/// read by name, never by a dependency: apps depend only on core.
+pub(crate) const PAGE_RANK_DATASET: &str = "page_rank";
+
+/// Which pages a site's sample is drawn from FIRST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleBy {
+    /// Newest first (the default, and what the sampler has always done):
+    /// drift reflects the current site.
+    Recency,
+    /// Highest whole-corpus PageRank first: drift on the pages the corpus
+    /// actually points at surfaces before drift on a leaf nobody links to.
+    Rank,
+}
+
+/// Parses `observatory.sample_by`. Anything unrecognized — including a missing
+/// key — is [`SampleBy::Recency`], so the sampler's behaviour is unchanged
+/// unless a caller asked for something else by name.
+pub(crate) fn parse_sample_by(requested: Option<&Value>) -> SampleBy {
+    match requested.and_then(Value::as_str) {
+        Some("rank") => SampleBy::Rank,
+        _ => SampleBy::Recency,
+    }
+}
+
 /// An empty-rate increase of at least this much vs the previous run flags
 /// `empty_rate_rising` — the canary for a site that quietly changed markup.
 pub(crate) const EMPTY_RISE_THRESHOLD: f64 = 0.10;
@@ -368,11 +393,36 @@ pub(crate) fn sample_indices(total: usize, k: usize, seed: u64) -> Vec<usize> {
 }
 
 /// One stored-page candidate: its RFC3339 observation timestamp (for
-/// newest-first ordering) and the record whose `artifact_path` resolves the
-/// body. Site bucketing happens at insertion, so the URL itself isn't kept.
+/// newest-first ordering), the page URL (for the rank join), and the record
+/// whose `artifact_path` resolves the body.
 struct Candidate {
     observed_at: String,
+    url: String,
     record: Record,
+}
+
+/// Orders one site's candidates into the list [`sample_indices`] draws from.
+///
+/// `Recency` is the original ordering, newest first. `Rank` puts the pages the
+/// rest of the corpus points at first — the sampler always takes the head of
+/// the list, so the site's most important pages are the ones that are always
+/// audited, and drift on a nav hub surfaces before drift on a leaf. A page with
+/// no `page_rank` record ranks 0 (honest absence) and falls back to its
+/// recency position, which is what keeps `Rank` a *reordering* rather than a
+/// filter: nothing is dropped.
+fn order_candidates(cands: &mut [Candidate], ranks: &BTreeMap<String, f64>, by: SampleBy) {
+    match by {
+        // RFC3339 strings compare chronologically enough for same-corpus
+        // ordering; unparseable stamps just sort low.
+        SampleBy::Recency => cands.sort_by(|a, b| b.observed_at.cmp(&a.observed_at)),
+        SampleBy::Rank => cands.sort_by(|a, b| {
+            let ra = ranks.get(&a.url).copied().unwrap_or(0.0);
+            let rb = ranks.get(&b.url).copied().unwrap_or(0.0);
+            rb.partial_cmp(&ra)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.observed_at.cmp(&a.observed_at))
+        }),
+    }
 }
 
 /// One audited plugin **and the configuration it is replayed with**.
@@ -396,6 +446,7 @@ pub(crate) struct AuditedPlugin {
 struct ObsConfig {
     plugins: Vec<AuditedPlugin>,
     sample_per_site: usize,
+    sample_by: SampleBy,
     src_app: String,
     src_dataset: String,
     out_dataset: String,
@@ -494,6 +545,7 @@ fn parse_config(ctx: &AppContext) -> Result<ObsConfig> {
     Ok(ObsConfig {
         plugins,
         sample_per_site,
+        sample_by: parse_sample_by(obs_obj.and_then(|m| m.get("sample_by"))),
         src_app,
         src_dataset,
         out_dataset,
@@ -525,6 +577,7 @@ async fn gather_candidates(
         let observed_at = r.updated_at.to_rfc3339();
         by_site.entry(site_of(&url)).or_default().push(Candidate {
             observed_at,
+            url,
             record: r,
         });
     }
@@ -547,13 +600,32 @@ async fn gather_candidates(
         };
         by_site.entry(site_of(&url)).or_default().push(Candidate {
             observed_at: ts,
+            url,
             record: v,
         });
     }
-    // Newest-first per site (RFC3339 strings compare chronologically enough for
-    // same-corpus ordering; unparseable stamps just sort low).
+    // The whole-corpus ranking is read ONLY when it is asked for, so a corpus
+    // that has never had a `crawl` `mode: "graph"` run pays nothing and behaves
+    // exactly as before.
+    let ranks: BTreeMap<String, f64> = match cfg.sample_by {
+        SampleBy::Recency => BTreeMap::new(),
+        SampleBy::Rank => ctx
+            .datasets
+            .list(&cfg.src_app, PAGE_RANK_DATASET, SOURCE_LIST_LIMIT)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.removed_at.is_none())
+            .filter_map(|r| {
+                r.data
+                    .get("rank")
+                    .and_then(Value::as_f64)
+                    .map(|rank| (r.key, rank))
+            })
+            .collect(),
+    };
     for cands in by_site.values_mut() {
-        cands.sort_by(|a, b| b.observed_at.cmp(&a.observed_at));
+        order_candidates(cands, &ranks, cfg.sample_by);
     }
     Ok(by_site)
 }
@@ -770,6 +842,12 @@ pub(crate) async fn run_observatory(ctx: &AppContext) -> Result<Value> {
         "pages_unreadable": pages_unreadable,
         "pages_empty": pages_empty,
         "sample_per_site": cfg.sample_per_site,
+        // Which end of each site's page list the sample was drawn from, so a
+        // drift row can be read against the population it actually covered.
+        "sample_by": match cfg.sample_by {
+            SampleBy::Recency => "recency",
+            SampleBy::Rank => "rank",
+        },
         "low_confidence_sites": low_confidence_sites,
         "flagged_empty_rising": flagged,
         "new": summary.new.len(),
@@ -913,6 +991,87 @@ mod tests {
         assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         assert_eq!(r[0], 0.5);
         assert_eq!(rates(&[0, 0, 0, 0]), [0.0; 4]);
+    }
+
+    // --- what the sample is drawn from (N27) --------------------------------
+
+    fn candidate(url: &str, observed_at: &str) -> Candidate {
+        Candidate {
+            observed_at: observed_at.to_string(),
+            url: url.to_string(),
+            record: Record {
+                key: url.to_string(),
+                data: json!({}),
+                first_seen: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                removed_at: None,
+                trust: "stable".into(),
+            },
+        }
+    }
+
+    fn urls(cands: &[Candidate]) -> Vec<&str> {
+        cands.iter().map(|c| c.url.as_str()).collect()
+    }
+
+    #[test]
+    fn sample_by_defaults_to_recency_for_anything_it_does_not_recognize() {
+        assert_eq!(parse_sample_by(None), SampleBy::Recency);
+        assert_eq!(parse_sample_by(Some(&json!("recency"))), SampleBy::Recency);
+        assert_eq!(parse_sample_by(Some(&json!("rank"))), SampleBy::Rank);
+        // A typo, a wrong type, or a future value must not silently change what
+        // the corpus is sampled from.
+        assert_eq!(parse_sample_by(Some(&json!("Rank"))), SampleBy::Recency);
+        assert_eq!(parse_sample_by(Some(&json!(true))), SampleBy::Recency);
+    }
+
+    #[test]
+    fn rank_ordering_puts_the_hub_where_the_sampler_always_looks() {
+        // THE POINT: `sample_indices` always takes the HEAD of the list, so
+        // whatever is first is audited every run. Under recency that is
+        // whatever was crawled last — which on a big site is a leaf nobody
+        // links to, while the nav hub every rule depends on may never be
+        // sampled at all.
+        let mut cands = vec![
+            candidate("https://x/leaf", "2026-09-02T00:00:00Z"),
+            candidate("https://x/hub", "2026-08-01T00:00:00Z"),
+        ];
+        let ranks: BTreeMap<String, f64> = [
+            ("https://x/hub".to_string(), 0.9),
+            ("https://x/leaf".to_string(), 0.01),
+        ]
+        .into_iter()
+        .collect();
+
+        order_candidates(&mut cands, &ranks, SampleBy::Recency);
+        assert_eq!(urls(&cands), vec!["https://x/leaf", "https://x/hub"]);
+
+        order_candidates(&mut cands, &ranks, SampleBy::Rank);
+        assert_eq!(urls(&cands), vec!["https://x/hub", "https://x/leaf"]);
+        assert!(
+            sample_indices(cands.len(), 1, 7).contains(&0),
+            "the head of the list is always sampled — that is why order is the lever"
+        );
+    }
+
+    #[test]
+    fn an_unranked_page_keeps_its_recency_position_instead_of_disappearing() {
+        // Honest absence: `rank` is a REORDERING, not a filter. A page with no
+        // `page_rank` record (never crawled into the graph, or no graph run at
+        // all) ranks 0 and sorts by recency among its peers — it is still in
+        // the population the sample is drawn from.
+        let mut cands = vec![
+            candidate("https://x/old", "2026-01-01T00:00:00Z"),
+            candidate("https://x/new", "2026-09-01T00:00:00Z"),
+        ];
+        order_candidates(&mut cands, &BTreeMap::new(), SampleBy::Rank);
+        assert_eq!(
+            urls(&cands),
+            vec!["https://x/new", "https://x/old"],
+            "with no ranking at all, rank ordering IS recency ordering"
+        );
+        assert_eq!(cands.len(), 2, "nothing was dropped");
     }
 
     // --- sampling honesty --------------------------------------------------

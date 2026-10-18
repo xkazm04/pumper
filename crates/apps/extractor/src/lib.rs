@@ -9,6 +9,7 @@ use app_crawl::reliability;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::config::ArchiveConfig;
+use pumper_core::engine::{CapturedCall, RenderedPage};
 use pumper_core::extract::extract_batch_with_report_at;
 use pumper_core::{
     extract_and_fingerprint_batch, signals_batch, AppContext, AppManifest, CompiledRuleSet,
@@ -238,6 +239,12 @@ struct SourceDoc {
     /// histories compose under one convention.
     fetched_via: Option<&'static str>,
     body: String,
+    /// Same-origin JSON calls the browser tier observed while rendering this
+    /// document, when the render was an escalation and `[fetcher] xray` is on.
+    /// Empty for every other document — including every stored/archived body,
+    /// which by definition has no live render behind it. The raw material of
+    /// the API X-ray discovery pass (`AppContext::xray`).
+    network: Vec<CapturedCall>,
 }
 
 impl SourceDoc {
@@ -249,7 +256,15 @@ impl SourceDoc {
             observed_at: None,
             fetched_via: None,
             body,
+            network: Vec::new(),
         }
+    }
+
+    /// Attaches the captures the fetch that produced this body brought back.
+    #[must_use]
+    fn with_network(mut self, network: Vec<CapturedCall>) -> Self {
+        self.network = network;
+        self
     }
 }
 
@@ -782,10 +797,12 @@ async fn extract_and_upsert(
     let mut metas: Vec<(String, Option<String>, Option<&'static str>)> =
         Vec::with_capacity(keyed.len());
     let mut docs: Vec<String> = Vec::with_capacity(keyed.len());
+    let mut captures: Vec<Vec<CapturedCall>> = Vec::with_capacity(keyed.len());
     for d in keyed {
         keys.push(d.key);
         metas.push((d.url, d.observed_at, d.fetched_via));
         docs.push(d.body);
+        captures.push(d.network);
     }
     // Each document's own URL travels with it into extraction, so `url_absolute`
     // resolves an item's `/item/123` href against the page it was scraped from.
@@ -856,6 +873,12 @@ async fn extract_and_upsert(
     // inside the map above: a full deep copy of every record on the write path
     // of every mode, kept alive purely so the job result could restate data the
     // dataset already holds.
+    // API X-ray discovery (N14): the records this page yielded are exactly the
+    // `extracted` argument the discovery heuristic wants, and this is the first
+    // point at which both they and the page's captured JSON calls exist. Runs
+    // before the write so a failing upsert cannot swallow it; entirely a no-op
+    // unless `[fetcher] xray` put captures on the fetch in the first place.
+    xray_captures(ctx, &items, &captures).await;
     let records_total = items.len();
     let records: Vec<Value> = items.iter().take(echo).map(|(_, v)| v.clone()).collect();
     // Where this batch is ABOUT to land, read at the same point the write path
@@ -893,6 +916,48 @@ async fn extract_and_upsert(
         dataset: written,
         indexable: !state.skips_search_index(),
     })
+}
+
+/// Runs the API X-ray discovery pass for every document whose fetch brought
+/// back captured JSON calls, scoring each capture against **that document's own
+/// record** — the values the extractor just read off the page.
+///
+/// This is the caller the X-ray shipped without: `AppContext::xray` has existed
+/// (with the store, the heuristic, `GET /recipes` and the fetcher's
+/// `api_recipe` tier) since M05 with zero call sites, so the `api_recipes`
+/// table was empty on every deployment by construction.
+///
+/// Best-effort by design, like every other telemetry seam here: a discovery or
+/// write failure is warn-logged and never fails the extraction that produced
+/// the records. `captures` is positionally aligned with `items` (both are built
+/// from the same `keyed` vector, in order); a length mismatch skips rather than
+/// mis-attributing a capture to the wrong page.
+async fn xray_captures(
+    ctx: &AppContext,
+    items: &[(String, Value)],
+    captures: &[Vec<CapturedCall>],
+) {
+    for (i, network) in captures.iter().enumerate() {
+        if network.is_empty() {
+            continue;
+        }
+        let Some((key, record)) = items.get(i) else {
+            continue;
+        };
+        // `xray` takes the rendered page it captured on; only `network` is read
+        // by the discovery heuristic, so the rest of the page is not restated.
+        let page = RenderedPage {
+            network: network.clone(),
+            ..RenderedPage::default()
+        };
+        match ctx.xray(&page, std::slice::from_ref(record)).await {
+            Ok((calls, stored)) if stored > 0 => {
+                tracing::info!(key, calls, stored, "api x-ray: recipes discovered")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(key, "api x-ray discovery failed: {e}"),
+        }
+    }
 }
 
 /// The outcome of registering this run's rule set in the content-addressed
@@ -1679,6 +1744,11 @@ impl ScrapeApp for Extractor {
     }
 }
 
+/// One URL-mode fetch: the URL, its body (if any), whether the fetch was
+/// healthy, whether the page is permanently gone, and the JSON calls an
+/// escalated render observed (the API X-ray's raw material, N14).
+type FetchedUrl = (String, Option<String>, bool, bool, Vec<CapturedCall>);
+
 impl Extractor {
     /// URLs mode: fetch each URL (tiered) and extract. Failed/empty fetches are
     /// attributed in `failed` and skipped — never upserted as all-null records.
@@ -1738,25 +1808,30 @@ impl Extractor {
                     // healthy, which is the winning tier's structured verdict — not
                     // whether a body came back non-empty. A bot wall returns plenty
                     // of bytes.
-                    Ok(out) => {
+                    Ok(mut out) => {
                         let healthy = tier_won(&out);
                         let gone = permanently_gone(&out);
+                        // The API X-ray's raw material. Taken before the body is
+                        // moved out: these are the JSON calls the *escalated*
+                        // render observed, and they are only ever non-empty with
+                        // `[fetcher] xray` on.
+                        let network = std::mem::take(&mut out.network);
                         (
                             url,
                             out.html.or(out.text).filter(|d| !d.is_empty()),
                             healthy,
                             gone,
+                            network,
                         )
                     }
-                    Err(_) => (url, None, false, false),
+                    Err(_) => (url, None, false, false, Vec::new()),
                 }
             }
         });
-        let fetched_pairs: Vec<(String, Option<String>, bool, bool)> =
-            futures::stream::iter(fetches)
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
+        let fetched_pairs: Vec<FetchedUrl> = futures::stream::iter(fetches)
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -1767,7 +1842,7 @@ impl Extractor {
             permanent: 0,
             roster: Some(urls.len() as u32),
         };
-        for (url, doc, healthy, gone) in fetched_pairs {
+        for (url, doc, healthy, gone, network) in fetched_pairs {
             if healthy {
                 fetch.ok += 1;
             }
@@ -1775,7 +1850,7 @@ impl Extractor {
                 fetch.permanent += 1;
             }
             match doc {
-                Some(d) => keyed.push(SourceDoc::live(url, d)),
+                Some(d) => keyed.push(SourceDoc::live(url, d).with_network(network)),
                 None => failed.push(url),
             }
         }
@@ -2021,6 +2096,8 @@ impl Extractor {
                         observed_at: Some(ts.clone()),
                         fetched_via: None,
                         body,
+                        // A stored artifact has no live render behind it.
+                        network: Vec::new(),
                     }),
                     Err(reason) => {
                         missing.push(json!({"key": record.key, "reason": reason}));
@@ -2170,6 +2247,8 @@ impl Extractor {
                         observed_at: Some(ts.to_string()),
                         fetched_via: None,
                         body,
+                        // A stored artifact has no live render behind it.
+                        network: Vec::new(),
                     }),
                     Err(reason) => missing.push(json!({"key": v.key, "reason": reason})),
                 }
@@ -2351,6 +2430,7 @@ impl Extractor {
                         url: snap.original,
                         observed_at: Some(observed),
                         fetched_via: Some("wayback"),
+                        network: Vec::new(),
                         body,
                     });
                 }
@@ -2604,6 +2684,7 @@ mod permanence_tests {
             trace,
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         }
     }
 

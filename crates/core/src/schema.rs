@@ -36,6 +36,8 @@ use serde::Serialize;
 pub const EXPECTED_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "api_recipes",
+    // N20 identity & tenancy (0048): who called, and what they did.
+    "audit_log",
     "body_pins",
     "checkpoints",
     "cost_events",
@@ -43,6 +45,10 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "datahub_govern_levels",
     "derived",
     "doc_fingerprints",
+    // N05: the durable event log (0055).
+    "events",
+    // N18: the outbound executors that have polled this coordinator (0056).
+    "executors",
     "field_invariants",
     "field_sketches",
     "golden_docs",
@@ -51,6 +57,9 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "http_cache",
     "ingress_sources",
     "jobs",
+    // N10: the per-plugin kv namespace behind `pumper_kv_get`/`pumper_kv_put` (0053).
+    "plugin_kv",
+    "principals",
     "record_revisions",
     "records",
     "research_cache",
@@ -63,11 +72,20 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "source_rulesets",
     "source_runs",
     "sources",
+    // N05: cursor subscriptions over the event log (0055).
+    "subscriptions",
     "tier_memory",
+    // N01: the approval ledger behind live browser submissions (0052).
+    "transactions",
     "trigger_runs",
     "triggers",
     "watches",
     "webhook_deliveries",
+    // N03 workflow runs (0051): the declared plan, its executions, and the
+    // per-(run, step) cells that ARE the join barrier's state.
+    "workflow_defs",
+    "workflow_runs",
+    "workflow_steps",
 ];
 
 /// How a store's applied-migration ledger stands against the chain this binary

@@ -36,6 +36,34 @@ pub struct Config {
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
+    pub auth: AuthConfig,
+    pub waiting: WaitingConfig,
+    pub wasm_apps: WasmAppsConfig,
+    /// Mesh peers (N16). `[[peer]]` is an array of tables, so this is a Vec and
+    /// not a section struct: a node has zero or more peers, and an EMPTY list
+    /// (the default) is exactly today's behaviour — nothing is pulled, nothing
+    /// is scheduled, and unsigned bundle imports keep working as they always
+    /// have. See [`PeerConfig`].
+    pub peer: Vec<PeerConfig>,
+    /// N01 Transact v2: the live-submission gate. Default OFF.
+    pub transact: TransactConfig,
+    /// N25 Research as a living knowledge base: the fan-out rails on the
+    /// research app's per-source side effects. See [`ResearchConfig`].
+    pub research: ResearchConfig,
+    /// N24 vendor-neutral lineage: the OpenLineage writer plus the quality and
+    /// external-source aspects both writers can carry. Every key defaults to
+    /// off, so a build without this section emits exactly what it emits today.
+    pub lineage: LineageConfig,
+    /// N05: the durable event log and its cursor subscriptions. On by default.
+    pub events: EventsConfig,
+    /// N18 elastic executor plane: the coordinator's executor-facing doors and
+    /// the outbound executor's own dial-out settings. Default OFF on both
+    /// sides — `/executors/*` answers 404 until `enabled`, and no process runs
+    /// in executor mode unless it is started with `--executor`.
+    pub executors: ExecutorsConfig,
+    /// N35 sub-state launch atlas: the county fan-out rail and the metro
+    /// pricing driver. The driver is OFF by default. See [`CensusConfig`].
+    pub census: CensusConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -290,6 +318,17 @@ pub struct McpConfig {
     /// is clamped, an absent one defaults to this. Bounds how long one MCP
     /// tool call may hold its HTTP response open awaiting a terminal status.
     pub wait_job_max_secs: u64,
+    /// Whether the `approve_transaction` tool is offered (N01). `false`
+    /// (default) = an agent can LIST pending transactions but can never
+    /// release an irreversible action.
+    ///
+    /// A third switch rather than a reuse of `allow_enqueue`, because the two
+    /// authorities are not the same size: enqueueing a job spends money that
+    /// `max_job_budget_usd` bounds, while approving a transaction submits a
+    /// form on a live site under an operator's logged-in identity and cannot
+    /// be undone by anything this process controls. `[transact] allow_live`
+    /// still gates the action itself, so this tool is inert unless BOTH are on.
+    pub allow_approve: bool,
 }
 
 impl Default for McpConfig {
@@ -299,6 +338,7 @@ impl Default for McpConfig {
             allow_enqueue: false,
             max_job_budget_usd: 1.0,
             wait_job_max_secs: 60,
+            allow_approve: false,
         }
     }
 }
@@ -812,6 +852,11 @@ pub struct TriggersConfig {
     pub max_depth: u32,
     /// Max keys inlined into `params._trigger.keys` (`count` stays exact).
     pub key_cap: usize,
+    /// N04: max hops ONE source event may fan out into via a trigger's `each`
+    /// pointer. Elements past the cap are not enqueued and the hops that were
+    /// say so (`_trigger.fan_out_truncated`), the `keys_truncated` precedent —
+    /// a partial fan-out nobody declares is a silent partial run.
+    pub fan_out_cap: usize,
 }
 
 impl Default for TriggersConfig {
@@ -819,6 +864,7 @@ impl Default for TriggersConfig {
         Self {
             max_depth: 8,
             key_cap: 200,
+            fan_out_cap: 50,
         }
     }
 }
@@ -1032,6 +1078,25 @@ impl Config {
             }
         }
 
+        // N18 executor plane. Same pairing as `[remote]` above and for a
+        // stronger reason: an unauthenticated `/executors/claim` does not merely
+        // fetch on a caller's behalf, it HANDS OUT this node's queued work and
+        // then accepts whatever result comes back for it.
+        let ex = &self.executors;
+        if ex.enabled && ex.secret.trim().is_empty() {
+            return Err(Error::config(
+                "[executors] secret must be set when the executor plane is enabled — \
+                 an unauthenticated /executors/claim hands out this node's jobs and \
+                 accepts their results from anyone",
+            ));
+        }
+        if ex.enabled && ex.claim_wait_secs == 0 {
+            return Err(Error::config(
+                "[executors] claim_wait_secs must be > 0 — a zero-length long poll turns \
+                 every executor into a hot loop against the claim door",
+            ));
+        }
+
         // Retention. Every knob is off by default, so these rules only bind on a
         // deployment that deliberately turned deletion on — and each one catches
         // a value that parses fine and then deletes more, or less, than the
@@ -1191,6 +1256,13 @@ impl Config {
             }
         }
 
+        // Mesh peers (N16). Every rule here guards a row that parses fine and
+        // then produces a peer that is never pulled, or one that is pulled and
+        // then trusted for the wrong reason.
+        for (i, peer) in self.peer.iter().enumerate() {
+            peer.validate(i)?;
+        }
+
         Ok(())
     }
 }
@@ -1273,6 +1345,13 @@ pub struct WorkerConfig {
     /// runs inline on its worker permit instead — slower, but never dropped: a
     /// dropped fan-out is a webhook that silently never arrives.
     pub fanout_max_queued: usize,
+    /// Ceiling on the schedules ONE run may ask the runtime to create
+    /// (`AppContext::request_schedule`, applied by the post-run fan-out as
+    /// `managed_by = "app:<name>"` rows). A schedule is a standing commitment,
+    /// so a single job must not be able to mint an unbounded number of them;
+    /// a run that asks for more is told `false` at the seam and reports the
+    /// cut. `0` refuses every app-declared schedule.
+    pub max_app_schedules_per_run: usize,
 }
 
 impl Default for WorkerConfig {
@@ -1284,6 +1363,7 @@ impl Default for WorkerConfig {
             default_app_concurrency: 0,
             app_concurrency: HashMap::new(),
             schedule_tick_secs: 15,
+            max_app_schedules_per_run: 20,
             shutdown_drain_secs: 25,
             // Heartbeat every 30s; reap after 120s (4 missed beats) so a slow but
             // alive job is never mistaken for a hung one, while a wedged task is
@@ -1609,6 +1689,44 @@ pub struct ClaudeConfig {
     /// the engine's own tests construct.
     #[serde(skip)]
     pub isolation_dir: Option<PathBuf>,
+
+    // ── N15 self-hosted agent loop (appended; nothing above changed) ─────────
+    /// Point the CLI subprocess at **pumper's own MCP surface** instead of the
+    /// CLI's built-in network tools. Default **OFF**: with it off the engine
+    /// writes no MCP config, passes no `--mcp-config`, and `allowed_tools`
+    /// reaches `--allowedTools` exactly as before.
+    ///
+    /// With it on, each run gets a scratch `.mcp.json` naming
+    /// [`Self::self_hosted_url`] plus a single-job token, and the allow-list
+    /// becomes [`Self::self_hosted_allowed_tools`] — so the model fetches
+    /// through the job's own metered `AppContext::fetch` (governor, cache,
+    /// profile, archive, cost ledger) instead of from an ungoverned IP.
+    ///
+    /// Requires `[mcp] enabled = true`: the tool the subprocess is being sent
+    /// to only exists when the MCP surface is mounted.
+    pub self_hosted_tools: bool,
+    /// Where the subprocess reaches this server's `/mcp`. Loopback by default;
+    /// **must match `[server] port`** — nothing derives it, because the engine
+    /// is constructed from `[claude]` alone and a second source of truth for
+    /// the port could only disagree with the listener.
+    pub self_hosted_url: String,
+    /// The API key the subprocess presents when `[auth] mode = "keys"`.
+    /// `POST /mcp` is a mutating route, so the identity layer demands `admin`
+    /// there like any other mutation — a job token authorizes *attribution*,
+    /// not access. `None` (the default) is correct in `open` mode and is a
+    /// guaranteed 401 in `keys` mode.
+    pub self_hosted_key: Option<String>,
+    /// The `--allowedTools` list used **instead of** `allowed_tools` while the
+    /// loop is on. The shipped default replaces `WebFetch`/`WebSearch` with
+    /// pumper's own `fetch`; add `WebSearch` back if you want the CLI's search
+    /// (pumper has no live-web search equivalent) or
+    /// `mcp__pumper__search` / `mcp__pumper__query_dataset` to let the agent
+    /// read what this node already scraped.
+    pub self_hosted_allowed_tools: Vec<String>,
+    /// How long one run's job token stays valid. A backstop only — the token is
+    /// revoked when the run's guard drops, whether it succeeded, failed, timed
+    /// out or was cancelled. `0` mints tokens that are already expired.
+    pub self_hosted_token_ttl_secs: u64,
 }
 
 impl ClaudeConfig {
@@ -1666,6 +1784,11 @@ impl Default for ClaudeConfig {
             roles,
             research_cache_ttl_secs: 24 * 3600,
             isolation_dir: None,
+            self_hosted_tools: false,
+            self_hosted_url: "http://127.0.0.1:8088/mcp".into(),
+            self_hosted_key: None,
+            self_hosted_allowed_tools: vec!["mcp__pumper__fetch".into()],
+            self_hosted_token_ttl_secs: 3600,
         }
     }
 }
@@ -1693,6 +1816,14 @@ pub struct FetcherConfig {
     /// cookie jar) and `browser/` (that profile's Chrome user-data-dir). Created
     /// on first use. Default: `data/profiles`.
     pub profiles_dir: PathBuf,
+    /// API X-ray loop (N14), default OFF. When ON the fetcher captures the
+    /// network calls of every *escalated* browser render (the render that
+    /// happened because the http tier lost or was skipped), consults learned
+    /// API recipes ahead of the live ladder, and lets an unvalidated candidate
+    /// prove itself on one replay. OFF — the default — leaves the ladder
+    /// byte-for-byte as it was: no capture, no discovery, no recipe tier
+    /// beyond the explicit `[recipes] enabled` / `use_recipes` opt-ins.
+    pub xray: bool,
 }
 
 impl Default for FetcherConfig {
@@ -1702,6 +1833,7 @@ impl Default for FetcherConfig {
             host_memory_ttl_secs: 7 * 24 * 3600,
             host_penalty_persist_secs: 60,
             profiles_dir: "data/profiles".into(),
+            xray: false,
         }
     }
 }
@@ -1799,6 +1931,21 @@ pub struct PluginConfig {
     /// only; executing dynamic apps needs the component-model host (next
     /// slice). `None` (the default) disables discovery entirely.
     pub app_dir: Option<PathBuf>,
+    /// **The operator half of the N10 capability gate.** Hosts a plugin's
+    /// `pumper_http_request` import may reach, on top of what the plugin's own
+    /// `describe().capabilities.http.hosts` declares — BOTH lists must pass.
+    ///
+    /// Default: empty, which means **no plugin reaches the network**, so a
+    /// deployment behaves byte-for-byte as it did before N10 until an operator
+    /// opts in. An entry starting with `.` covers a domain and its subdomains
+    /// (`.notion.com`); `"*"` delegates the whole decision to the plugins'
+    /// manifests and is honored only from here — a manifest may not write it.
+    ///
+    /// This is the sandbox's first outbound authority, so treat it like the
+    /// `[ingress]` allow-lists: name the hosts, and remember that a host you
+    /// allow is a host every capability-declaring plugin in `dir` may reach
+    /// (loopback and link-local addresses included, if you list them).
+    pub allow_http_hosts: Vec<String>,
 }
 
 impl Default for PluginConfig {
@@ -1810,6 +1957,9 @@ impl Default for PluginConfig {
             max_memory_mb: 64,
             max_concurrent: 0,
             app_dir: None,
+            // Empty = no plugin has network. The capability model is opt-in on
+            // both sides, and this is the side the operator owns.
+            allow_http_hosts: Vec::new(),
         }
     }
 }
@@ -1825,6 +1975,17 @@ pub struct SearchConfig {
     /// detection over the view — a broad query stays a bounded view, not an
     /// unbounded dataset copy.
     pub max_materialize_results: usize,
+    /// Index-time entity enrichment passes, IN ORDER (N11). `"builtin"` is the
+    /// shipped regex pass (`amount` + `event_date`); `"plugin:<name>"` runs a
+    /// core-module WASM plugin's `enrich` export under the same fuel/memory
+    /// caps as every other plugin call, fail-open per document.
+    ///
+    /// The default is `["builtin"]` -- byte-for-byte today's behaviour. An
+    /// earlier entry wins a colliding entity kind, so appending a plugin can
+    /// only ADD kinds; putting it first is how an operator deliberately lets it
+    /// override `amount`. An unparseable or unknown entry is refused by name at
+    /// startup rather than silently skipped.
+    pub enrichers: Vec<String>,
 }
 
 impl Default for SearchConfig {
@@ -1833,6 +1994,111 @@ impl Default for SearchConfig {
             enabled: true,
             dir: "data/search-index".into(),
             max_materialize_results: 500,
+            enrichers: vec![crate::search::ENRICHER_BUILTIN.to_string()],
+        }
+    }
+}
+
+/// N20 identity & tenancy: caller principals (scoped API keys) in front of the
+/// HTTP surface.
+///
+/// **Default `open` is byte-for-byte today's behaviour** — the same posture
+/// `[ingress]`, `[remote]` and `[mcp]` already take. In `open` every request
+/// resolves a synthetic `operator` principal with every scope and no ceiling,
+/// nothing is looked up, nothing is throttled, and the `principals`/`audit_log`
+/// tables stay empty. Auth exists only once an operator flips this key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// `"open"` (default) or `"keys"`. An unrecognised value is treated as
+    /// `open` by [`Self::keys_required`] — see the note there for why a typo
+    /// must not fail *open* silently at the parse layer instead.
+    pub mode: String,
+    /// Audit every mutating request (non-GET/HEAD/OPTIONS) into `audit_log`.
+    /// Default ON, and it applies in `open` mode too: "who deleted the dataset"
+    /// is a question a single-operator node also wants answered, and the write
+    /// is one INSERT on a verb that already did real work.
+    pub audit: bool,
+    /// Fallback per-principal throttle (requests/minute, also the burst) used
+    /// when a principal row carries no `rate_limit_per_min` of its own.
+    /// `0` = no fallback throttle.
+    pub default_rate_limit_per_min: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AUTH_MODE_OPEN.to_string(),
+            audit: true,
+            default_rate_limit_per_min: 0,
+        }
+    }
+}
+
+/// The unauthenticated mode: today's behaviour, and the default.
+pub const AUTH_MODE_OPEN: &str = "open";
+/// The authenticated mode: every non-public route resolves a principal.
+pub const AUTH_MODE_KEYS: &str = "keys";
+
+impl AuthConfig {
+    /// Whether a key is required on the non-public surface.
+    ///
+    /// The anti-pattern this defends: `mode != "open"` as the predicate. A typo
+    /// (`mode = "key"`, `mode = "Keys "`) would then have switched the server
+    /// into an enforcing mode nobody asked for and locked the operator out of
+    /// their own node — the mirror-image failure of failing open. Enforcement is
+    /// opt-in by an EXACT match on the one string that means it, case- and
+    /// whitespace-insensitive; anything else is `open`, which is also what an
+    /// absent `[auth]` section means.
+    pub fn keys_required(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case(AUTH_MODE_KEYS)
+    }
+
+    /// The mode as it is reported on the wire (`/health`, audit rows): the
+    /// canonical spelling of what is actually enforced, never the raw string —
+    /// echoing `"Keys "` back would suggest a mode this server does not have.
+    pub fn effective_mode(&self) -> &'static str {
+        if self.keys_required() {
+            AUTH_MODE_KEYS
+        } else {
+            AUTH_MODE_OPEN
+        }
+    }
+}
+
+/// `[waiting]` — the deadline policy for jobs parked on external input (N02).
+///
+/// A job enters [`crate::JobStatus::Waiting`] when its app calls
+/// `ctx.await_input(..)`, and leaves it through `POST /jobs/{id}/resume`. That
+/// is a wait on a *human or agent*, so the only question this section answers is
+/// how long the runtime is willing to hold the row before declaring the answer
+/// never came.
+///
+/// **Default is `0` = wait forever**, which is the byte-for-byte behaviour of a
+/// build without this feature: nothing sweeps, nothing expires, and a parked job
+/// stays parked until somebody answers it or cancels it. An operator opts into a
+/// deadline deliberately, because the alternative default — a timer that fails
+/// approvals nobody got to over a weekend — is the kind of silent data-losing
+/// policy this repo makes opt-in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WaitingConfig {
+    /// How long a parked job may wait before the expiry sweep fails it
+    /// permanently (`error: "awaited input not provided ..."`, through
+    /// `finalize`, so callbacks and terminal triggers fire like any other
+    /// permanent failure). `0` = no deadline.
+    pub expiry_secs: u64,
+    /// Rows one expiry sweep will fail before stopping. The sweep piggybacks the
+    /// scheduler tick, so it is bounded per pass rather than proportional to how
+    /// long the deadline was ignored; the remainder is taken by the next tick.
+    pub expire_batch: i64,
+}
+
+impl Default for WaitingConfig {
+    fn default() -> Self {
+        Self {
+            expiry_secs: 0,
+            expire_batch: 100,
         }
     }
 }
@@ -2542,5 +2808,1026 @@ budget_imputation = \"of\"
         .unwrap();
         cfg.normalize();
         assert_eq!(cfg.browser.proxy.as_deref(), Some("http://browser-gw:9090"));
+    }
+}
+
+#[cfg(test)]
+mod auth_config_tests {
+    use super::{AuthConfig, Config, AUTH_MODE_KEYS, AUTH_MODE_OPEN};
+
+    #[test]
+    fn absent_section_is_open() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.auth.mode, AUTH_MODE_OPEN);
+        assert!(
+            !cfg.auth.keys_required(),
+            "the default must not authenticate"
+        );
+        assert!(cfg.auth.audit);
+        assert_eq!(cfg.auth.default_rate_limit_per_min, 0);
+    }
+
+    #[test]
+    fn keys_mode_is_enforced_case_and_space_insensitively() {
+        for spelling in ["keys", "Keys", " KEYS "] {
+            let cfg = AuthConfig {
+                mode: spelling.to_string(),
+                ..Default::default()
+            };
+            assert!(cfg.keys_required(), "{spelling:?} must enforce");
+            assert_eq!(cfg.effective_mode(), AUTH_MODE_KEYS);
+        }
+    }
+
+    /// A typo must fail OPEN, not into an enforcing mode nobody configured:
+    /// `mode != "open"` as the predicate would have locked the operator out of
+    /// their own node over a one-letter slip.
+    #[test]
+    fn typo_stays_open_not_locked_out() {
+        for typo in ["key", "kesy", "on", "true", ""] {
+            let cfg = AuthConfig {
+                mode: typo.to_string(),
+                ..Default::default()
+            };
+            assert!(!cfg.keys_required(), "{typo:?} must not enforce");
+            assert_eq!(cfg.effective_mode(), AUTH_MODE_OPEN);
+        }
+    }
+
+    #[test]
+    fn section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [auth]
+            mode = "keys"
+            audit = false
+            default_rate_limit_per_min = 120
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.auth.keys_required());
+        assert!(!cfg.auth.audit);
+        assert_eq!(cfg.auth.default_rate_limit_per_min, 120);
+    }
+}
+
+/// `[wasm_apps]` — running the `.wasm` **dynamic apps** discovered in
+/// `[plugins] app_dir` (N09).
+///
+/// Discovery itself is older and unchanged: any module in `app_dir` that
+/// exports a `describe()` manifest is LISTED by `GET /apps`. What this section
+/// governs is whether a discovered **component** (component-model binary, not a
+/// core module) may also be *registered as a runnable app* — enqueued,
+/// scheduled, budgeted, and given host imports onto the metered `AppContext`
+/// seams.
+///
+/// `enabled = false` is the default and means the build behaves exactly as it
+/// did before this section existed: every dynamic app stays `runnable: false`
+/// and every enqueue of one is refused. Running third-party code with fetch and
+/// dataset-write authority is an operator decision, so it is opt-in even when
+/// modules are already present on disk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WasmAppsConfig {
+    /// Master switch. `false` (default) = discovered components are listed but
+    /// never registered as runnable apps.
+    pub enabled: bool,
+    /// Whole-job CPU instruction budget (fuel) for ONE dynamic-app run. The
+    /// guest traps when it is exhausted — the deterministic half of the bound,
+    /// paired with `max_wall_secs` for the wall-clock half.
+    pub fuel_per_job: u64,
+    /// How much fuel the guest may burn between yields back to the async
+    /// runtime. Bounds how long one `poll` can sit in wasm, which is what keeps
+    /// a busy guest from pinning a tokio worker and what makes the run
+    /// cancellable at all. Must be > 0.
+    pub yield_interval: u64,
+    /// Hard cap on one instance's linear memory. Live instances are bounded by
+    /// `max_concurrent`, so the aggregate ceiling is `max_concurrent ×
+    /// max_memory_mb`.
+    pub max_memory_mb: usize,
+    /// Wall-clock ceiling for one run, enforced around the whole call (the
+    /// guest yields, so the timeout can actually fire) and re-checked at every
+    /// host import.
+    pub max_wall_secs: u64,
+    /// Max dynamic-app runs executing at once. Each holds an instance (and its
+    /// memory cap) across every host call it awaits, so this bounds live wasm
+    /// memory, not call rate. `0` → `available_parallelism()` (fallback 4).
+    pub max_concurrent: usize,
+    /// Cap on host imports one run may make. A guest that loops over `fetch`
+    /// burns fuel slowly (the work happens in the host), so fuel alone does not
+    /// bound it; this does.
+    pub max_host_calls: u64,
+    /// Cap on the bytes one host call may hand across the boundary in either
+    /// direction (a fetched body, an upsert batch, an artifact). Refused as a
+    /// typed host error, never truncated silently.
+    pub max_payload_bytes: usize,
+}
+
+impl Default for WasmAppsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fuel_per_job: 2_000_000_000,
+            yield_interval: 10_000_000,
+            max_memory_mb: 128,
+            max_wall_secs: 900,
+            max_concurrent: 0,
+            max_host_calls: 10_000,
+            max_payload_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl WasmAppsConfig {
+    /// Linear-memory cap in bytes.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// The yield interval actually usable by wasmtime: `Some(n)` only for a
+    /// non-zero `n`, since `fuel_async_yield_interval(Some(0))` is an error and
+    /// a zero here means "not configured", not "yield constantly".
+    pub fn yield_interval_or_none(&self) -> Option<u64> {
+        (self.yield_interval > 0).then_some(self.yield_interval)
+    }
+}
+
+// ── [[peer]] — the mesh (N16) ───────────────────────────────────────────────
+
+/// One mesh peer: a pumper node this node pulls from on a schedule.
+///
+/// `[[peer]]` is the whole federation surface. There is no push, no discovery
+/// and no gossip: an operator names the nodes this one trusts, the streams it
+/// wants from each, and how often. Everything below is **default OFF by
+/// omission** — a config with no `[[peer]]` block behaves exactly as it did
+/// before the mesh existed.
+///
+/// ```toml
+/// [[peer]]
+/// name = "vps"
+/// url = "https://vps.example:8088"
+/// public_key = "9f3c…"            # 64 hex chars, from the peer's GET /node
+/// pull = ["datasets:grants-gov/opportunities", "weather", "recipes"]
+/// every = "15m"
+/// allow_unsigned = false           # accept pre-N16 bundles from this peer
+/// max_penalty_secs = 60            # ceiling on imported politeness penalties
+/// api_key = "pk_…"                 # presented to the peer when IT runs [auth] keys
+/// ```
+///
+/// ## Trust
+///
+/// `public_key` is the only thing that makes a bundle believable. Without it a
+/// bundle can only be accepted as UNVERIFIED, and only when `allow_unsigned` is
+/// explicitly on — a signature nobody can check is worth exactly as much as no
+/// signature. `max_penalty_secs` bounds the blast radius of a peer whose key
+/// leaked: the worst it can do to this node's politeness is slow it down by
+/// that much (and the import merge is raise-only regardless, so it can never
+/// make this node *ruder*).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PeerConfig {
+    /// Operator-facing label. Defaults to the URL's host when blank; used as
+    /// the schedule id suffix, so changing it re-creates the schedule row.
+    pub name: String,
+    /// Base URL of the peer node (`http`/`https`, no trailing path).
+    pub url: String,
+    /// The peer's ed25519 public key, 64 hex chars, from its `GET /node`.
+    /// Empty = not pinned (see the type docs).
+    pub public_key: String,
+    /// Streams to pull: `"weather"`, `"recipes"`, `"datasets:<app>/<dataset>"`.
+    /// Empty = nothing is scheduled for this peer.
+    pub pull: Vec<String>,
+    /// Pull interval, e.g. `"15m"`, `"1h"`, `"900s"`. Must divide an hour (or a
+    /// day, at or above an hour) — see [`peer_cron`].
+    pub every: String,
+    /// Accept unsigned (`pumper.host-weather/1`) or unverifiable bundles from
+    /// this peer. Default false.
+    pub allow_unsigned: bool,
+    /// Ceiling (seconds) on a politeness penalty imported from this peer.
+    /// Applied ON TOP of the core import cap, never above it.
+    pub max_penalty_secs: u64,
+    /// API key presented to the peer (`x-pumper-key`) when the PEER runs
+    /// `[auth] mode = "keys"`. Mint it on the peer with a `read`-only scope:
+    /// a pull only ever GETs export/manifest/changes routes.
+    pub api_key: Option<String>,
+    /// Local app namespace mirrored dataset records land under. Default
+    /// `peer_{remote app}`, as the puller has always done.
+    pub namespace: Option<String>,
+    /// Set false to keep the row but stop scheduling it. The reconcile pass
+    /// disables the schedule rather than deleting it, so its history survives.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Serde default for `[[peer]] enabled`, which defaults ON.
+fn default_true() -> bool {
+    true
+}
+
+/// Default pull interval when `every` is blank: 15 minutes, the value the
+/// design card names.
+pub const PEER_DEFAULT_EVERY_SECS: u64 = 900;
+
+/// One stream a peer row asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullStream {
+    /// `datasets:<app>/<dataset>` — the revision feed, mirrored by the `peer` app.
+    Dataset { app: String, dataset: String },
+    /// `weather` — the host-weather bundle.
+    Weather,
+    /// `recipes` — the discovered API-recipe bundle.
+    Recipes,
+}
+
+impl PullStream {
+    /// The `stream` param the `peer` app is run with for this entry.
+    pub fn param(&self) -> &'static str {
+        match self {
+            PullStream::Dataset { .. } => "datasets",
+            PullStream::Weather => "weather",
+            PullStream::Recipes => "recipes",
+        }
+    }
+
+    /// Stable slug used in the schedule id, so one peer's three streams are
+    /// three schedule rows that never collide.
+    pub fn slug(&self) -> String {
+        match self {
+            PullStream::Dataset { app, dataset } => format!("datasets-{app}-{dataset}"),
+            PullStream::Weather => "weather".into(),
+            PullStream::Recipes => "recipes".into(),
+        }
+    }
+}
+
+/// Parses one `pull = [...]` entry.
+///
+/// Strict on purpose: a typo'd stream name is a peer that silently never syncs,
+/// which is the single hardest mesh failure to notice. `None` here becomes a
+/// config error, not a skipped row.
+pub fn parse_pull(entry: &str) -> Option<PullStream> {
+    let entry = entry.trim();
+    match entry {
+        "weather" => Some(PullStream::Weather),
+        "recipes" => Some(PullStream::Recipes),
+        _ => {
+            let spec = entry.strip_prefix("datasets:")?;
+            let (app, dataset) = spec.split_once('/')?;
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            };
+            (ok(app) && ok(dataset)).then(|| PullStream::Dataset {
+                app: app.to_string(),
+                dataset: dataset.to_string(),
+            })
+        }
+    }
+}
+
+/// Parses `every = "15m"` into seconds. Accepts a bare number (seconds) and the
+/// `s`/`m`/`h` suffixes. `None` on anything else — including `0`.
+pub fn parse_every(every: &str) -> Option<u64> {
+    let every = every.trim();
+    if every.is_empty() {
+        return Some(PEER_DEFAULT_EVERY_SECS);
+    }
+    let (digits, mult) = match every.chars().last()? {
+        's' => (&every[..every.len() - 1], 1),
+        'm' => (&every[..every.len() - 1], 60),
+        'h' => (&every[..every.len() - 1], 3600),
+        c if c.is_ascii_digit() => (every, 1),
+        _ => return None,
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    (n > 0).then_some(n * mult)
+}
+
+/// The 6-field cron a pull interval becomes.
+///
+/// The scheduler's unit of work is a cron row, not an interval, and an arbitrary
+/// interval does not map onto one: "every 7 minutes" has no cron expression that
+/// keeps its period across an hour boundary. So the accepted set is exactly the
+/// intervals that divide an hour (below an hour) or a day (at or above one), and
+/// anything else is a **config error** rather than a schedule that quietly drifts
+/// — a peer that pulls at 07, 14, 21, … 56, 00 is not what "every 7m" promised.
+pub fn peer_cron(every_secs: u64) -> Option<String> {
+    if every_secs < 60 {
+        return None;
+    }
+    if every_secs < 3600 {
+        let minutes = every_secs / 60;
+        if !every_secs.is_multiple_of(60) || !60u64.is_multiple_of(minutes) {
+            return None;
+        }
+        return Some(format!("0 */{minutes} * * * *"));
+    }
+    if every_secs <= 86_400 {
+        let hours = every_secs / 3600;
+        if !every_secs.is_multiple_of(3600) || !24u64.is_multiple_of(hours) {
+            return None;
+        }
+        return Some(format!("0 0 */{hours} * * *"));
+    }
+    None
+}
+
+impl PeerConfig {
+    /// Operator-facing label: `name`, else the URL's host, else the index.
+    pub fn label(&self, index: usize) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        self.url
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .filter(|h| !h.is_empty())
+            .map(|h| h.replace(':', "-"))
+            .unwrap_or_else(|| format!("peer{index}"))
+    }
+
+    /// Pull interval in seconds.
+    pub fn every_secs(&self) -> Option<u64> {
+        parse_every(&self.every)
+    }
+
+    /// The streams this row asks for, in config order. `Err` names the first
+    /// unparseable entry.
+    pub fn streams(&self) -> std::result::Result<Vec<PullStream>, String> {
+        self.pull
+            .iter()
+            .map(|e| parse_pull(e).ok_or_else(|| e.clone()))
+            .collect()
+    }
+
+    /// Rejects rows that parse but cannot work.
+    pub fn validate(&self, index: usize) -> Result<()> {
+        let label = self.label(index);
+        if self.url.trim().is_empty() {
+            return Err(Error::config(format!("[[peer]] {label}: url is required")));
+        }
+        if !(self.url.starts_with("http://") || self.url.starts_with("https://")) {
+            return Err(Error::config(format!(
+                "[[peer]] {label}: url {:?} must start with http:// or https://",
+                self.url
+            )));
+        }
+        if !self.public_key.trim().is_empty() {
+            // Shape-checked here rather than decoded: `core` has no hex
+            // dependency and does not need one to say "that is not a key".
+            // The actual decode happens where the key is used to verify.
+            let key = self.public_key.trim();
+            if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::config(format!(
+                    "[[peer]] {label}: public_key is not hex"
+                )));
+            }
+            if key.len() != 64 {
+                return Err(Error::config(format!(
+                    "[[peer]] {label}: public_key must be a 32-byte (64 hex char) ed25519 key, \
+                     got {} hex chars",
+                    key.len()
+                )));
+            }
+        } else if !self.allow_unsigned && !self.pull.is_empty() {
+            return Err(Error::config(format!(
+                "[[peer]] {label}: no public_key pinned and allow_unsigned = false — every \
+                 bundle from this peer would be refused. Pin the key from its GET /node, or \
+                 set allow_unsigned = true to accept it unverified."
+            )));
+        }
+        if let Err(bad) = self.streams() {
+            return Err(Error::config(format!(
+                "[[peer]] {label}: unknown pull entry {bad:?} — expected \"weather\", \
+                 \"recipes\" or \"datasets:<app>/<dataset>\""
+            )));
+        }
+        let secs = self.every_secs().ok_or_else(|| {
+            Error::config(format!(
+                "[[peer]] {label}: every {:?} is not a duration (try \"15m\", \"1h\", \"900s\")",
+                self.every
+            ))
+        })?;
+        if peer_cron(secs).is_none() {
+            return Err(Error::config(format!(
+                "[[peer]] {label}: every {:?} ({secs}s) has no cron expression that keeps its \
+                 period — use an interval of at least 60s that divides an hour (5m, 15m, 30m) \
+                 or, at or above an hour, divides a day (1h, 2h, 6h, 12h, 24h)",
+                self.every
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod peer_config_tests {
+    use super::*;
+
+    fn peer(url: &str, pull: &[&str], every: &str) -> PeerConfig {
+        PeerConfig {
+            url: url.into(),
+            public_key: "77".repeat(32),
+            pull: pull.iter().map(|s| s.to_string()).collect(),
+            every: every.into(),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_config_with_no_peer_block_has_no_peers() {
+        assert!(Config::default().peer.is_empty());
+    }
+
+    #[test]
+    fn peer_rows_parse_from_an_array_of_tables() {
+        let toml_src = concat!(
+            "[[peer]]\n",
+            "url = \"https://a.example\"\n",
+            "pull = [\"weather\", \"datasets:grants-gov/opportunities\"]\n",
+            "every = \"15m\"\n",
+            "allow_unsigned = true\n",
+            "\n",
+            "[[peer]]\n",
+            "name = \"b\"\n",
+            "url = \"http://b.example:8088\"\n",
+            "pull = [\"recipes\"]\n",
+            "every = \"1h\"\n",
+            "allow_unsigned = true\n",
+        );
+        let cfg: Config = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.peer.len(), 2);
+        assert_eq!(cfg.peer[0].label(0), "a.example");
+        assert_eq!(cfg.peer[1].label(1), "b");
+        assert!(
+            cfg.peer[0].enabled,
+            "a peer row is enabled unless told not to"
+        );
+        assert_eq!(
+            cfg.peer[0].streams().expect("streams"),
+            vec![
+                PullStream::Weather,
+                PullStream::Dataset {
+                    app: "grants-gov".into(),
+                    dataset: "opportunities".into()
+                }
+            ]
+        );
+        cfg.validate().expect("both rows are valid");
+    }
+
+    #[test]
+    fn pull_entries_parse_the_three_streams_and_refuse_lookalikes() {
+        assert_eq!(parse_pull("weather"), Some(PullStream::Weather));
+        assert_eq!(parse_pull(" recipes "), Some(PullStream::Recipes));
+        assert_eq!(
+            parse_pull("datasets:hn/stories"),
+            Some(PullStream::Dataset {
+                app: "hn".into(),
+                dataset: "stories".into()
+            })
+        );
+        // The lookalikes: a typo, the wrong separator, a missing dataset, a
+        // wildcard the v1 slice does not implement, and a path traversal.
+        assert_eq!(parse_pull("wether"), None);
+        assert_eq!(parse_pull("dataset:hn/stories"), None);
+        assert_eq!(parse_pull("datasets:hn"), None);
+        assert_eq!(parse_pull("datasets:grants/*"), None);
+        assert_eq!(parse_pull("datasets:../etc/passwd"), None);
+    }
+
+    #[test]
+    fn every_parses_suffixes_and_refuses_zero() {
+        assert_eq!(parse_every("15m"), Some(900));
+        assert_eq!(parse_every("1h"), Some(3600));
+        assert_eq!(parse_every("90s"), Some(90));
+        assert_eq!(parse_every("300"), Some(300));
+        assert_eq!(parse_every(""), Some(PEER_DEFAULT_EVERY_SECS));
+        assert_eq!(parse_every("0m"), None);
+        assert_eq!(parse_every("soon"), None);
+        assert_eq!(parse_every("15 minutes"), None);
+    }
+
+    #[test]
+    fn a_cron_is_only_produced_for_intervals_that_keep_their_period() {
+        assert_eq!(peer_cron(900).as_deref(), Some("0 */15 * * * *"));
+        assert_eq!(peer_cron(3600).as_deref(), Some("0 0 */1 * * *"));
+        assert_eq!(peer_cron(6 * 3600).as_deref(), Some("0 0 */6 * * *"));
+        // 7 minutes divides neither an hour nor anything else useful: refused
+        // rather than silently drifting at the hour boundary.
+        assert_eq!(peer_cron(7 * 60), None);
+        assert_eq!(peer_cron(45 * 60), None);
+        assert_eq!(peer_cron(30), None, "sub-minute pulls are not a mesh");
+        assert_eq!(peer_cron(5 * 3600), None);
+        assert_eq!(peer_cron(2 * 86_400), None);
+    }
+
+    #[test]
+    fn an_unpinned_peer_that_refuses_unsigned_bundles_is_a_config_error_not_a_dead_peer() {
+        let mut p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = String::new();
+        p.allow_unsigned = false;
+        let err = p.validate(0).expect_err("must refuse");
+        assert!(
+            err.to_string()
+                .contains("every bundle from this peer would be refused"),
+            "{err}"
+        );
+        // Explicitly opting into unverified bundles is allowed — loudly.
+        p.allow_unsigned = true;
+        p.validate(0).expect("allow_unsigned makes it coherent");
+    }
+
+    #[test]
+    fn a_bad_url_key_stream_or_interval_is_refused_at_load() {
+        let mut p = peer("ftp://a.example", &["weather"], "15m");
+        assert!(p.validate(0).is_err(), "scheme");
+        p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = "nothex".into();
+        assert!(p.validate(0).is_err(), "key hex");
+        p = peer("https://a.example", &["weather"], "15m");
+        p.public_key = "11".repeat(16);
+        assert!(p.validate(0).is_err(), "key length");
+        p = peer("https://a.example", &["wether"], "15m");
+        assert!(p.validate(0).is_err(), "stream typo");
+        p = peer("https://a.example", &["weather"], "7m");
+        assert!(p.validate(0).is_err(), "interval");
+        p = peer("", &["weather"], "15m");
+        assert!(p.validate(0).is_err(), "url required");
+    }
+
+    #[test]
+    fn stream_slugs_are_distinct_per_stream_so_schedules_cannot_collide() {
+        let a = PullStream::Dataset {
+            app: "hn".into(),
+            dataset: "stories".into(),
+        };
+        let b = PullStream::Dataset {
+            app: "hn".into(),
+            dataset: "comments".into(),
+        };
+        assert_ne!(a.slug(), b.slug());
+        assert_ne!(PullStream::Weather.slug(), PullStream::Recipes.slug());
+        assert_eq!(a.param(), "datasets");
+    }
+}
+
+/// Live (irreversible) browser submissions — N01 Transact v2.
+///
+/// `allow_live = false` is the default and means the node behaves like a build
+/// without this section: a `transact` job with `submit: true` still runs the
+/// dry run and still writes its `pending` ledger row (so an operator can see
+/// exactly what would be queued for approval), but
+/// `POST /transactions/{id}/approve` answers 409 and no code path can reach a
+/// real submit button. Turning it on is an operator decision about an action
+/// that no part of this process can undo, which is why it is a switch and not
+/// a parameter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TransactConfig {
+    /// Master switch. `false` (default) = every approval is refused (409) and
+    /// nothing can ever move a ledger row to `submitted`.
+    pub allow_live: bool,
+    /// How long a `pending` transaction may wait for a decision before the
+    /// sweep expires it. `0` = never expires.
+    ///
+    /// Non-zero by default, unlike `[waiting] expiry_secs`: the two deadlines
+    /// guard different things. A parked job waiting forever costs nothing; an
+    /// approval waiting forever is a *stale mandate* — evidence describing a
+    /// page as it was days ago, still one click from acting. 24h is long
+    /// enough for a human working day and short enough that a forgotten
+    /// request dies instead of lurking.
+    pub approval_ttl_secs: u64,
+    /// Max transactions ONE profile may submit per rolling 24 hours. `0` = no
+    /// cap. The blast radius of a compromised approval path is bounded per
+    /// identity, because a profile is what a submission acts as.
+    pub max_submits_per_profile_per_day: i64,
+    /// Rows `GET /transactions` returns at most.
+    pub list_limit: i64,
+    /// If set, every ledger transition (`transaction.approved`,
+    /// `transaction.rejected`, `transaction.submitted`) POSTs here. Absent =
+    /// no delivery at all, which is the honest default: there is no global
+    /// event subscriber to borrow, and inventing one would send approvals
+    /// somewhere the operator never named.
+    pub webhook_url: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `webhook_url` deliveries.
+    pub webhook_secret: Option<String>,
+}
+
+impl Default for TransactConfig {
+    fn default() -> Self {
+        Self {
+            allow_live: false,
+            approval_ttl_secs: 24 * 60 * 60,
+            max_submits_per_profile_per_day: 10,
+            list_limit: 100,
+            webhook_url: None,
+            webhook_secret: None,
+        }
+    }
+}
+
+impl TransactConfig {
+    /// The approval deadline of a transaction created at `created_at`, or
+    /// `None` when `approval_ttl_secs = 0` (never expires).
+    ///
+    /// Derived rather than stored, so the TTL is a live operator control: the
+    /// door, the sweep and the API response all compute the same deadline from
+    /// the same key.
+    pub fn approval_deadline(
+        &self,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        (self.approval_ttl_secs > 0)
+            .then(|| created_at + chrono::Duration::seconds(self.approval_ttl_secs as i64))
+    }
+
+    /// The per-profile daily cap as the ledger's decision function wants it:
+    /// `None` for "no cap".
+    pub fn daily_cap(&self) -> Option<i64> {
+        (self.max_submits_per_profile_per_day > 0).then_some(self.max_submits_per_profile_per_day)
+    }
+}
+
+/// Rails on the research app's **per-source** side effects — N25.
+///
+/// A research run cites an arbitrary number of URLs, and two of the app's
+/// params act once per cited URL: `snapshot_sources` fetches each one through
+/// the metered tiered fetcher, and `watch_sources` proposes a standing monitor
+/// for each. Both are therefore unbounded fan-out driven by model output, which
+/// is exactly the shape that needs an operator ceiling rather than a caller
+/// one. This section holds that ceiling; nothing here turns a behaviour ON (both
+/// params default to `false`), so a node without a `[research]` block behaves
+/// byte-for-byte as it did before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ResearchConfig {
+    /// Max cited sources ONE run may act on — snapshot fetches and proposed
+    /// watches alike. A run that cites more says so (`sources_truncated: true`)
+    /// rather than silently acting on a prefix.
+    ///
+    /// 20 is the default because a source list past that is a survey, not a
+    /// citation set, and every entry past it costs a real metered fetch.
+    pub max_watched_sources: usize,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        Self {
+            max_watched_sources: 20,
+        }
+    }
+}
+
+/// N24 — vendor-neutral lineage.
+///
+/// Pumper's metadata push has been DataHub-shaped from the start: entities are
+/// built straight into DataHub's v1 ingestion envelope, so a second catalog
+/// meant a second emitter. This section turns on the other half — a writer that
+/// speaks [OpenLineage](https://openlineage.io) `RunEvent`s, which Marquez,
+/// Dagster, Airflow, Atlan and OpenMetadata all consume — and the two classes of
+/// fact Pumper already knows but never pushed: its own quality verdicts, and the
+/// external `[[source]]` rows its data actually comes from.
+///
+/// **Everything here is off by default and the defaults are load-bearing.** With
+/// no `[lineage]` section the DataHub emitter produces byte-for-byte the entity
+/// set it produced before N24: `openlineage_url` unset means no second writer,
+/// `emit_quality` off means no assertion/tag aspects, `emit_sources` off means
+/// column lineage keeps its honest `upstreamType: NONE`. Turning a key on is an
+/// operator saying "yes, push more".
+///
+/// The writers share the emitter's **no-retry** posture (see
+/// `docs/features/datahub.md`): a failed post is recorded per writer on
+/// `GET /datahub/status` (`lineage.writers[]`) and healed by the next run, never
+/// queued. Two writers double the failure surface, so they are reported apart —
+/// a green DataHub must not hide a dead Marquez.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LineageConfig {
+    /// Base URL of an OpenLineage HTTP receiver (Marquez: `http://localhost:5000`).
+    /// Empty/unset = the OpenLineage writer is off and posts nothing.
+    ///
+    /// The standard OpenLineage HTTP transport path `/api/v1/lineage` is
+    /// appended unless the URL already ends in `/lineage`, so both a bare host
+    /// and a fully-qualified endpoint work.
+    pub openlineage_url: Option<String>,
+    /// OpenLineage job/dataset namespace for this node. One namespace per
+    /// Pumper deployment is the intended granularity.
+    pub namespace: String,
+    /// Bearer token for the receiver. Falls back to the `OPENLINEAGE_API_KEY`
+    /// env var so the secret can live in `.env`.
+    pub api_key: Option<String>,
+    /// Model each catalog `[[source]]` as an external upstream entity: an
+    /// OpenLineage input dataset in the `web` namespace, a DataHub dataset URN
+    /// on platform `web`, and — the point — the fine-grained column lineage
+    /// stops claiming `upstreamType: NONE` and names the source it came from.
+    ///
+    /// Off by default because it adds entities to whatever catalog is
+    /// connected; nothing about it is irreversible.
+    pub emit_sources: bool,
+    /// Push what Pumper already judged: the latest data-contract verdict for a
+    /// dataset becomes an OpenLineage `dataQualityAssertions` entry and a
+    /// DataHub `assertionRunEvent`, and extraction-health state + trust tier
+    /// become `globalTags` / an OpenLineage `tags` facet.
+    ///
+    /// Off by default for the same reason as `emit_sources`: it is additional
+    /// writes to someone else's catalog.
+    pub emit_quality: bool,
+}
+
+impl Default for LineageConfig {
+    fn default() -> Self {
+        Self {
+            openlineage_url: None,
+            namespace: "pumper".into(),
+            api_key: None,
+            emit_sources: false,
+            emit_quality: false,
+        }
+    }
+}
+
+impl LineageConfig {
+    /// The OpenLineage receiver endpoint, or `None` when the writer is off.
+    ///
+    /// Extracted (rather than inlined at the post site) because "is the writer
+    /// on?" and "where does it post?" are the same question, and a status route
+    /// that answers it differently from the writer is how a bridge reports
+    /// healthy while posting nowhere.
+    pub fn endpoint(&self) -> Option<String> {
+        let base = self
+            .openlineage_url
+            .as_deref()?
+            .trim()
+            .trim_end_matches('/');
+        if base.is_empty() {
+            return None;
+        }
+        if base.ends_with("/lineage") {
+            Some(base.to_string())
+        } else {
+            Some(format!("{base}/api/v1/lineage"))
+        }
+    }
+
+    /// Config key, else `OPENLINEAGE_API_KEY` from the environment.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        self.api_key.clone().filter(|t| !t.is_empty()).or_else(|| {
+            std::env::var("OPENLINEAGE_API_KEY")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+    }
+}
+
+#[cfg(test)]
+mod lineage_config_tests {
+    use super::LineageConfig;
+
+    #[test]
+    fn an_unset_url_is_a_writer_that_is_off_not_a_post_to_nowhere() {
+        let mut cfg = LineageConfig::default();
+        assert_eq!(cfg.endpoint(), None);
+        cfg.openlineage_url = Some(String::new());
+        assert_eq!(cfg.endpoint(), None);
+        cfg.openlineage_url = Some("   ".into());
+        assert_eq!(cfg.endpoint(), None);
+    }
+
+    #[test]
+    fn endpoint_appends_the_transport_path_once_not_twice() {
+        let ep = |u: &str| {
+            LineageConfig {
+                openlineage_url: Some(u.into()),
+                ..Default::default()
+            }
+            .endpoint()
+        };
+        assert_eq!(
+            ep("http://localhost:5000"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+        assert_eq!(
+            ep("http://localhost:5000/"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+        // Already a full endpoint: appending again would 404 silently.
+        assert_eq!(
+            ep("http://localhost:5000/api/v1/lineage"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+    }
+
+    #[test]
+    fn defaults_are_off_so_master_emits_what_it_emitted_before() {
+        let cfg = LineageConfig::default();
+        assert_eq!(cfg.endpoint(), None);
+        assert!(!cfg.emit_sources);
+        assert!(!cfg.emit_quality);
+        assert_eq!(cfg.namespace, "pumper");
+    }
+}
+
+/// N05: the durable event log and its cursor subscriptions.
+///
+/// The log is **on by default** and that is deliberate — unlike every other
+/// section added in this campaign, it changes no behaviour an operator has to
+/// opt into. Writing the bus to SQLite makes `Last-Event-ID` survive a restart
+/// and makes every event kind subscribable; turning it off restores exactly the
+/// old in-memory ring, `reset` events and all.
+///
+/// It lives in its own section rather than as `[storage]` keys because the log
+/// is a *feature* with a retention policy, a batch size and an outbox, not a
+/// property of the store — and because `[storage]` is a shared surface this
+/// campaign's parallel builders were told not to edit.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Master switch. `false` = the pre-N05 behaviour byte for byte: the bus
+    /// stays an in-memory ring, nothing is persisted, `GET /events/log` answers
+    /// an empty page and the outbox drain does nothing (so watches deliver
+    /// through the legacy in-line path).
+    pub log_enabled: bool,
+    /// How long a log row is kept. `0` = keep forever (the log then grows
+    /// without bound, which is a choice an operator may make deliberately).
+    ///
+    /// Seven days is the default because the log's job is *resume*, not
+    /// archive: a consumer that has been away a week has to resync anyway, and
+    /// the durable record of what a run produced lives in `records` /
+    /// `record_revisions`, not here.
+    pub log_retention_days: i64,
+    /// Events one outbox drain hands to one subscription per tick. A small
+    /// batch so a subscription that has been disabled for a week cannot
+    /// stampede its receiver (or the delivery pool) when it is re-enabled.
+    pub outbox_batch: i64,
+    /// Ceiling on events buffered in memory awaiting their log write. Reached
+    /// only when the store is unavailable or wedged; past it the OLDEST pending
+    /// events are dropped and counted, and the drop is logged — a bounded,
+    /// stated loss rather than unbounded RSS growth on a failing store.
+    pub pending_capacity: usize,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            log_enabled: true,
+            log_retention_days: 7,
+            outbox_batch: 200,
+            pending_capacity: 8192,
+        }
+    }
+}
+
+/// N18: the elastic executor plane.
+///
+/// One section serves **both ends** of the same relationship, which is
+/// deliberate: a node is a coordinator, an executor, or (in a test) both, and
+/// splitting the keys into `[executors]` and `[executor]` would have made the
+/// two secrets two config surfaces that must be kept equal by hand — exactly
+/// the mistake `[remote]`'s single `secret` avoids for the fetch fabric.
+///
+/// Coordinator keys: `enabled`, `secret`, `claim_wait_secs`, `offline_after_secs`.
+/// Executor keys: `coordinator_url`, `executor_id`, `capabilities`,
+/// `poll_interval_secs`.
+///
+/// **Everything is off by default.** `enabled = false` makes every
+/// `/executors/*` and `/jobs/{id}/(heartbeat|checkpoint|progress|finish)` route
+/// answer 404 (they do not exist as far as a caller is concerned), so a node
+/// that never sets this key behaves byte-for-byte as it did before N18.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExecutorsConfig {
+    /// Coordinator side: serve the executor-facing doors at all.
+    ///
+    /// Paired with `secret` by [`Config::validate`] exactly as `[remote]` is:
+    /// an enabled plane with a blank secret would be an unauthenticated door
+    /// that hands out jobs and accepts their results, which is strictly worse
+    /// than a disabled one.
+    pub enabled: bool,
+    /// The shared secret both ends present in [`EXECUTOR_SECRET_HEADER`].
+    /// Compared as SHA-256 digests, like the remote fabric's, so the comparison
+    /// does not leak a prefix through its timing.
+    pub secret: String,
+    /// Coordinator side: how long `POST /executors/claim` holds an empty queue
+    /// open before answering `204`. The long poll IS the clock and the
+    /// backpressure boundary — an executor asks for work only when it has a
+    /// free slot — so this is a latency/idle-request trade, not a rate limit.
+    pub claim_wait_secs: u64,
+    /// Coordinator side: how long since an executor's last poll before
+    /// `GET /executors` calls it `offline`. Purely a *report*: reclaiming a dead
+    /// executor's jobs is the reaper's business, and it is driven by the job's
+    /// heartbeat, not by this.
+    pub offline_after_secs: u64,
+    /// Executor side: the coordinator to dial (`--coordinator <url>` overrides
+    /// it). Empty = no coordinator configured; `--executor` then refuses to
+    /// start rather than looping against nothing.
+    pub coordinator_url: String,
+    /// Executor side: this executor's stable identity. Empty = derive one from
+    /// the hostname plus the process id, which is honest but changes across
+    /// restarts; set it for a fleet you want to read a history for.
+    pub executor_id: String,
+    /// Executor side: the apps this process offers to run. Empty = "everything
+    /// the coordinator considers executor-eligible". The coordinator always
+    /// intersects this with its own eligibility list, so naming an app here can
+    /// never widen what this executor is allowed to claim.
+    pub capabilities: Vec<String>,
+    /// Executor side: how long to wait after an empty claim (a `204`) or a
+    /// transport failure before asking again.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ExecutorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: String::new(),
+            claim_wait_secs: 30,
+            offline_after_secs: 120,
+            coordinator_url: String::new(),
+            executor_id: String::new(),
+            capabilities: Vec::new(),
+            poll_interval_secs: 2,
+        }
+    }
+}
+
+impl ExecutorsConfig {
+    /// Whether the coordinator's executor doors are actually servable: enabled
+    /// AND holding a secret.
+    ///
+    /// The anti-pattern this is named for: `enabled` alone read as "serve it".
+    /// `Config::validate` refuses that pairing at boot for a real config, but a
+    /// hand-assembled state (a test, an embedder) can still carry it, and the
+    /// failure mode of getting it wrong is an open door that hands out jobs.
+    pub fn servable(&self) -> bool {
+        self.enabled && !self.secret.trim().is_empty()
+    }
+}
+
+/// The header both ends of the executor plane carry the shared secret in.
+///
+/// Deliberately NOT `Authorization`: `[auth] mode = "keys"` already owns that
+/// header for principal resolution, and an executor presents *two* credentials
+/// (the plane secret and, in keys mode, an `admin` key). One header per
+/// credential keeps "wrong secret" and "wrong key" two distinguishable 401s.
+pub const EXECUTOR_SECRET_HEADER: &str = "x-pumper-executor-secret";
+
+/// N35 — the sub-state launch atlas.
+///
+/// The census family publishes state-grain products; the atlas is the county
+/// and metro grain on top of them. Two things here need to be an OPERATOR
+/// setting rather than a job param: how many states a county run is allowed to
+/// fan out over (the cost rail — a nationwide county run is ~3,000 counties x
+/// N trades of CBP requests), and whether the atlas may create metered pricing
+/// schedules for the metros it ranks.
+///
+/// **The pricing driver is OFF by default.** Everything else here shapes a
+/// derived dataset and is safe to compute on every run; `metro_pricing` asks
+/// the runtime to create schedules that spend real money through the Claude
+/// engine, so it ships disabled and the plan is reported instead. With no
+/// `[census]` section the atlas behaves as a pure read-model: ranked, written,
+/// and buying nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CensusConfig {
+    /// How many states the county atlas is scoped to — the top K by the state
+    /// ranking the atlas publishes. The atlas never contains a county outside
+    /// them, so this is the one number that bounds both the dataset and the
+    /// CBP request fan-out a county run implies.
+    pub atlas_states_k: usize,
+    /// How many counties per trade each of the atlas's two rankings keeps.
+    pub atlas_top_n: usize,
+    /// How many distinct metros the pricing plan may name. Each one is a
+    /// metered ~20-turn research run when the driver is enabled.
+    pub atlas_metros: usize,
+    /// Ask the runtime to create the `homewyse-pricing` schedules the atlas
+    /// plans. **Default false**: the plan is always computed and reported, and
+    /// only an operator turning this on turns it into standing spend.
+    pub metro_pricing: bool,
+    /// Cron for each metro pricing schedule. Quarterly by default — the
+    /// pricing app's own freshness gate is 90 days, so a tighter cron buys
+    /// nothing but skipped runs.
+    pub metro_pricing_cron: String,
+    /// Per-run spend ceiling replayed into every job the metro schedules
+    /// enqueue, through the same `budget_usd` rail `POST /schedules` validates.
+    /// `0` = no ceiling requested (the runtime's own defaults apply).
+    pub metro_pricing_budget_usd: f64,
+}
+
+impl Default for CensusConfig {
+    fn default() -> Self {
+        Self {
+            atlas_states_k: 10,
+            atlas_top_n: 25,
+            atlas_metros: 5,
+            metro_pricing: false,
+            metro_pricing_cron: "0 0 7 1 1,4,7,10 *".to_string(),
+            metro_pricing_budget_usd: 2.0,
+        }
     }
 }

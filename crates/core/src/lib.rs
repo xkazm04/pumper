@@ -3,6 +3,7 @@
 // Datasets store. Embedders that only need the engines + Fetcher build with
 // `default-features = false` and get everything below the `storage` line.
 #[cfg(feature = "storage")]
+pub mod agent_tools;
 pub mod app;
 #[cfg(feature = "storage")]
 pub mod backup;
@@ -39,9 +40,15 @@ pub mod induce;
 pub mod jitter;
 pub mod job;
 pub mod json_salvage;
+mod lighttrack;
 pub mod lru;
 pub mod markdown;
 pub mod materiality;
+// N16 mesh wire format: signed bundle envelopes + the dataset live-set digest,
+// shared verbatim by the serving routes and the `peer` app. Under `storage`
+// because the weather bundle shape is typed by `tiers::WeatherEntry`.
+#[cfg(feature = "storage")]
+pub mod mesh;
 pub mod plugin;
 pub mod process_env;
 pub mod recipes;
@@ -51,6 +58,9 @@ pub mod retention;
 pub mod schema;
 pub mod search;
 pub mod simhash;
+// N01 Transact v2: the approval ledger behind live browser submissions.
+#[cfg(feature = "storage")]
+pub mod transactions;
 
 #[cfg(feature = "storage")]
 pub use app::{
@@ -60,7 +70,10 @@ pub use app::{
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, KeyFreshness, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
-pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
+pub use costs::{
+    extract_yields, CostEvent, CostLedger, CostSummary, PrincipalCostSummary, SpentTotal,
+    YieldEntry, UNATTRIBUTED_PRINCIPAL,
+};
 #[cfg(feature = "storage")]
 pub use datasets::{
     backfill_cursor, derived_spec_fingerprint, derived_would_cycle, diff_values, filters_match,
@@ -91,10 +104,12 @@ pub use retention::{
 };
 #[cfg(feature = "storage")]
 pub use storage::{
-    CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, IngressSource, JobStages,
-    JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule,
-    NewTrigger, PluginHook, QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize,
-    Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    AuditEntry, CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, EventRecord,
+    IngressSource, JobStages, JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat,
+    NewDerivedSpec, NewEvent, NewSchedule, NewTrigger, NewWorkflowRun, PluginHook, Principal,
+    QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize, Storage, Subscription,
+    Trigger, TriggerPluginHooks, Watch, WorkflowDef, WorkflowRun, WorkflowStepRow, YieldSummary,
+    LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use store_instrument::{
@@ -121,16 +136,16 @@ pub use crawl::{
     RevisitPlan, RevisitSeed, ScoredSeed,
 };
 pub use engine::{
-    filled_fields_js, interaction_outcome, is_sensitive_input, parse_filled_fields,
-    parse_transact_probe, pass_fully_succeeded, profile_browser_dir, profile_cookies_path,
-    profile_dir, redact_field, require_existing_profile, require_safe_profile_name,
-    submit_target_js, summarize_steps, transact_probe_js, unknown_transact_fields,
-    validate_profile_name, Browser, CapturedCall, EngineSet, FilledField, HttpClient, HttpMethod,
-    HttpRequest, HttpResponse, PageAction, RenderRequest, RenderedPage, ResearchOutput,
-    ResearchRequest, Researcher, StepOutcome, StepSummary, SubmitTarget, TransactEvidence,
-    TransactRequest, FETCHED_VIA_HEADER, FILLED_VALUE_MAX_CHARS, PROFILE_BROWSER_DIR,
-    PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SENSITIVE_AUTOCOMPLETE_TOKENS, SNAPSHOT_TS_HEADER,
-    TRANSACT_FIELDS,
+    commit_guard, evidence_digest, filled_fields_js, interaction_outcome, is_sensitive_input,
+    parse_filled_fields, parse_transact_probe, pass_fully_succeeded, profile_browser_dir,
+    profile_cookies_path, profile_dir, redact_field, require_existing_profile,
+    require_safe_profile_name, submit_target_js, summarize_steps, transact_probe_js,
+    unknown_transact_fields, validate_profile_name, ApprovedTransaction, Browser, CapturedCall,
+    CommitRefusal, EngineSet, FilledField, HttpClient, HttpMethod, HttpRequest, HttpResponse,
+    PageAction, RenderRequest, RenderedPage, ResearchOutput, ResearchRequest, Researcher,
+    StepOutcome, StepSummary, SubmitTarget, TransactEvidence, TransactReceipt, TransactRequest,
+    FETCHED_VIA_HEADER, FILLED_VALUE_MAX_CHARS, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE,
+    PROFILE_NAME_MAX_LEN, SENSITIVE_AUTOCOMPLETE_TOKENS, SNAPSHOT_TS_HEADER, TRANSACT_FIELDS,
 };
 pub use error::{Error, Result};
 pub use extract::{
@@ -161,7 +176,14 @@ pub use schema::{
     TableDrift, EXPECTED_TABLES,
 };
 pub use search::{
+    merge_entities, parse_enricher_spec, EnrichInput, Enricher, EnricherSpec, EnricherStat, Entity,
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
-    SearchRequest, SearchResponse, SearchSort,
+    SearchRequest, SearchResponse, SearchSort, ENRICHER_BUILTIN, ENRICHER_PLUGIN_PREFIX,
+    ENTITY_AMOUNT, ENTITY_EVENT_DATE,
 };
 pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
+#[cfg(feature = "storage")]
+pub use transactions::{
+    approve_decision, reject_decision, ApprovalRefusal, NewTransaction, Transaction,
+    TransactionState,
+};

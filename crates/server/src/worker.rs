@@ -481,7 +481,7 @@ fn forget_cancel_intent(id: Uuid) {
 /// failed to complete, the checkpoint is discarded (fresh start) instead of
 /// being retried forever. Fail-open — an unreadable checkpoint store never
 /// blocks the run, it just means no restore.
-async fn load_restore(state: &AppState, job: &Job) -> Option<Value> {
+pub(crate) async fn load_restore(state: &AppState, job: &Job) -> Option<Value> {
     let max = state.config.worker.max_resume_failures;
     if max <= 0 {
         return None;
@@ -531,7 +531,7 @@ async fn blocked_apps(
         .collect()
 }
 
-fn app_limit(state: &AppState, app: &str) -> usize {
+pub(crate) fn app_limit(state: &AppState, app: &str) -> usize {
     state
         .config
         .worker
@@ -806,6 +806,8 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             spent_seed,
             state.config.costs.budget_imputation,
         )),
+        schedule_requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        max_schedule_requests: state.config.worker.max_app_schedules_per_run,
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
@@ -821,6 +823,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             .reporter(job.id, job.app.clone(), state.events.clone()),
         checkpoints: checkpointer.clone(),
         restored,
+        // N02: the answer `POST /jobs/{id}/resume` stored for a job that had
+        // parked on `await_input`. Read straight off the claimed row, so it
+        // travels with the same lineage the checkpoint does.
+        resumed_input: job.resumed_input.clone(),
         vcr,
         artifacts_dir,
     };
@@ -842,6 +848,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // heartbeat branch above is ever reached and no unwind happens at all. The
     // heartbeat goes stale and the reaper (`reap_once`) remains the backstop for
     // that class — as it does for a hard abort (`process::exit`, OOM, SIGKILL).
+    // P.4: the handle to whatever schedules the run asks for
+    // (`AppContext::request_schedule`), cloned before the context moves into
+    // the app.
+    let schedule_requests = ctx.schedule_requests.clone();
     let run = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(app.run(ctx)));
     install_panic_location_hook();
     tokio::pin!(run);
@@ -903,6 +913,40 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // a cancellation; every other outcome leaves the registry untouched.
     let cancelled_by = matches!(outcome, Outcome::Cancelled)
         .then(|| resolve_cancel(job.id, state.shutdown.is_cancelled()));
+
+    // P.4 post-run fan-out: turn the run's schedule REQUESTS into real
+    // `managed_by = "app:<name>"` rows. Only for a run that finished OK — a
+    // panicked, timed-out or cancelled attempt will be retried, and minting
+    // standing commitments out of an attempt that did not conclude is how one
+    // flapping job creates a schedule per retry.
+    if matches!(outcome, Outcome::Finished(Ok(_))) {
+        let requests = schedule_requests
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default();
+        if !requests.is_empty() {
+            let applied = pumper_core::app::apply_schedule_requests(
+                &state.storage,
+                &job.app,
+                &requests,
+                state.config.worker.max_app_schedules_per_run,
+            )
+            .await;
+            for why in &applied.rejected {
+                warn!(job = %job.id, app = %job.app, "app-declared schedule refused: {why}");
+            }
+            if applied.created > 0 || applied.not_owned > 0 {
+                info!(
+                    job = %job.id,
+                    app = %job.app,
+                    created = applied.created,
+                    not_owned = applied.not_owned,
+                    requested = requests.len(),
+                    "applied app-declared schedules"
+                );
+            }
+        }
+    }
 
     match outcome {
         // A shutdown does NOT by itself mean suspend: an operator's `DELETE
@@ -1032,6 +1076,51 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     finalize_fanout(st, jb, stages).await;
                 })
                 .await;
+            return;
+        }
+        // N02: NOT a failure. The app called `ctx.await_input(..)`, which forced
+        // a checkpoint and handed back this typed signal; the job parks on the
+        // outside world instead of failing. This arm is deliberately ABOVE the
+        // terminal-failure arm — `is_terminal_for_job` answers "skip the retry
+        // ladder for this failure", a question that must never be asked about a
+        // park.
+        Outcome::Finished(Err(ref e)) if e.awaited_request().is_some() => {
+            let request = e
+                .awaited_request()
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let expires = waiting_deadline(chrono::Utc::now(), state.config.waiting.expiry_secs);
+            match state
+                .storage
+                .await_input(job.id, job.attempts, &request, expires)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        job = %job.id,
+                        expires = ?expires,
+                        "job parked awaiting external input; permit released"
+                    );
+                    // Non-terminal, like `progress` — `GET /jobs/{id}/stream`
+                    // and MCP's live feed stay open, and the request rides the
+                    // event so a watcher learns WHAT is being asked without a
+                    // follow-up read.
+                    let mut event = JobEvent::new(job.id, job.app.clone(), "waiting");
+                    event.result = Some(request.clone());
+                    publish(&state, event);
+                    // N05 carry-forward: a park that stages a transaction is
+                    // `transaction.pending` — an approval waiting for a human is
+                    // exactly the kind of thing a subscriber wants pushed.
+                    for event in park_domain_events(&job.app, &request) {
+                        publish(&state, event);
+                    }
+                }
+                // Stale (job reset/reaped mid-run): the live attempt owns it.
+                Ok(false) => {}
+                Err(e) => error!(job = %job.id, "failed to persist waiting state: {e}"),
+            }
+            // The permit is released by the caller as this task ends — which is
+            // the whole economic claim of N02: a parked job costs no slot.
             return;
         }
         Outcome::Finished(Err(e)) if e.is_terminal_for_job() => {
@@ -1311,6 +1400,11 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
                 &by_dataset,
             )
             .await;
+            // N05 carry-forward: the domain events this run DECLARED in its
+            // result become real events here, beside the dataset changes above.
+            for event in result_domain_events(&job.app, &result) {
+                publish(&state, event);
+            }
         })
         .await;
 
@@ -1346,6 +1440,134 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
         warn!(job = %job.id, "stage-timing record failed: {e}");
     }
     finalize_with_stages(&state, job.id, Some(stages)).await;
+    // N05: push this run's events to their subscribers HERE, *after* the
+    // terminal event — which is deliberate and was a bug the first time it
+    // wasn't. `job.succeeded` is the single most subscribed kind there is, and
+    // it is published by `finalize_with_stages`; draining before that left it
+    // sitting in the queue until the next scheduler tick.
+    //
+    // The outbox is what makes delivery durable; this call is what keeps it
+    // prompt. A watch used to be delivered inside this same fan-out unit, so
+    // `worker::run_one` returning meant "every delivery this job produced has
+    // finished" — a guarantee the sink tests are built on and a latency an
+    // operator can feel. The scheduler tick's drain is the safety net for
+    // whatever this pass could not hand off.
+    crate::subscriptions::drain(&state).await;
+}
+
+/// Announces that a job has started, for a run this process is not executing.
+///
+/// The local claim publishes this event inline in `run`'s spawn arm; an
+/// executor's claim comes in over HTTP and must publish the identical event, or
+/// `GET /jobs/{id}/stream` would go quiet for the whole remote run and an
+/// operator would see a job sitting in `queued` while it is in fact running on
+/// another host.
+pub(crate) fn publish_running(state: &AppState, job: &Job) {
+    publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
+}
+
+/// The remote-report finish path (N18): an executor has run a job to an outcome
+/// and reported it; this is everything the local `execute` does **after** the
+/// app future resolves.
+///
+/// It is deliberately the same code path, not a parallel one:
+/// - success writes through the attempt-fenced [`Storage::complete`], records
+///   the run's yield, clears the spent checkpoint, and hands the whole post-run
+///   fan-out to [`finalize_fanout`] on the bounded pool — search indexing, the
+///   health and contract gates, watches, dataset triggers, saved searches, the
+///   terminal event and the result webhook, in the same load-bearing order;
+/// - failure goes through [`Storage::fail`], so the retry ladder, the jittered
+///   backoff and the attempts-exhausted permanent failure are byte-identical to
+///   a local failure — and a re-queued job wakes the local worker, which is
+///   correct: the next attempt may legitimately run *here*.
+///
+/// The returned word is what the door reports back: `succeeded`, `queued` (a
+/// retry is pending), `failed`, or `stale` when the fence discarded the write
+/// between the door's ownership check and this write.
+///
+/// `run_ms` is the only span the coordinator cannot measure, so the executor
+/// reports it and the stage clock is started that far in the past — making
+/// `total_ms` mean the same thing it means locally (the app's own run plus the
+/// fan-out) rather than silently shrinking to "how long the fan-out took".
+/// Absent, the stage row says `run_ms: null` = unmeasured, never `0`.
+pub(crate) async fn finish_from_executor(
+    state: &AppState,
+    job: Job,
+    outcome: std::result::Result<Value, String>,
+    run_ms: Option<i64>,
+) -> &'static str {
+    let executor = job.executor_id.clone().unwrap_or_default();
+    match outcome {
+        Ok(result) => {
+            let yields = pumper_core::extract_yields(&result);
+            match state.storage.complete(job.id, job.attempts, result).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        job = %job.id, executor = %executor,
+                        "executor completion discarded: the job was reset or reaped mid-run"
+                    );
+                    return "stale";
+                }
+                Err(e) => {
+                    error!(job = %job.id, "failed to persist executor result: {e}; skipping fan-out");
+                    return "stale";
+                }
+            }
+            info!(job = %job.id, executor = %executor, "job succeeded on executor");
+            if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+                warn!(job = %job.id, "checkpoint clear failed: {e}");
+            }
+            if !yields.is_empty() {
+                if let Err(e) = state
+                    .storage
+                    .record_job_yield(job.id, &job.app, &yields)
+                    .await
+                {
+                    warn!(job = %job.id, "job-yield record failed: {e}");
+                }
+            }
+            let reported = run_ms.unwrap_or(0).max(0) as u64;
+            let started = std::time::Instant::now()
+                .checked_sub(Duration::from_millis(reported))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut stages = StageWatch::new(job.attempts, 0, started);
+            // Honest absence: a run the executor did not time reports `null`,
+            // not a zero that would read as "it was instantaneous".
+            stages.stages.run_ms = run_ms;
+            let (st, jb) = (state.clone(), job.clone());
+            state
+                .fanout
+                .run("finalize", job.id, async move {
+                    finalize_fanout(st, jb, stages).await;
+                })
+                .await;
+            "succeeded"
+        }
+        Err(error) => {
+            warn!(job = %job.id, executor = %executor, %error, "job failed on executor");
+            match state
+                .storage
+                .fail(job.id, job.attempts, FailReason::Text(&error))
+                .await
+            {
+                Ok(Some(JobStatus::Queued)) => {
+                    // The next attempt may run anywhere — including here.
+                    state.notify.notify_one();
+                    "queued"
+                }
+                Ok(None) => "stale",
+                Ok(Some(_)) => {
+                    finalize(state, job.id).await;
+                    "failed"
+                }
+                Err(e) => {
+                    error!(job = %job.id, "failed to persist executor failure: {e}");
+                    "stale"
+                }
+            }
+        }
+    }
 }
 
 /// Parses the VCR enqueue params out of a job's params object:
@@ -1406,6 +1628,13 @@ pub async fn reap_once(state: &AppState) {
     // — before the `stale_after_secs == 0` early return, because a deployment
     // with the reaper disabled still writes decisions.
     prune_decision_ledgers(state).await;
+    // So does the waiting-expiry sweep (N02), for the same reason and one more:
+    // the reaper and the sweep are *different policies over different states*.
+    // The reaper selects `status='running'` on a stale heartbeat — a parked job
+    // has no executor and no heartbeat, so it is naturally outside that scan and
+    // must never be dragged into it. Turning the reaper off is a statement about
+    // leases, not about approvals.
+    expire_waiting_once(state).await;
     let stale = state.config.worker.stale_after_secs;
     if stale == 0 {
         return;
@@ -1429,6 +1658,55 @@ pub async fn reap_once(state: &AppState) {
                 finalize(state, id).await;
             }
         }
+    }
+}
+
+/// The error a parked job is failed with when its deadline passes. Distinct
+/// prose (not "job failed", not the reaper's "lease expired") because the
+/// remedy is different: nobody answered, so the fix is a person, not a restart.
+pub(crate) const WAITING_EXPIRED_REASON: &str =
+    "awaited input not provided before waiting_expires_at";
+
+/// Pure: the instant a park expires, given when it started and the configured
+/// window.
+///
+/// The anti-pattern this exists to make untestable-by-construction: reading
+/// `expiry_secs = 0` as "expires now". Zero is the DEFAULT, and it means *wait
+/// forever* — a fresh install must behave exactly as it did before N02 existed,
+/// and a park that expires the instant it is made would fail every approval the
+/// feature was built to enable.
+pub(crate) fn waiting_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    expiry_secs: u64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    (expiry_secs > 0).then(|| now + chrono::Duration::seconds(expiry_secs as i64))
+}
+
+/// One expiry-sweep pass: permanently fails every `waiting` job whose deadline
+/// has passed, routing each through [`finalize`] so its callback and terminal
+/// triggers fire exactly like any other permanent failure. Bounded per pass by
+/// `[waiting] expire_batch`; with `[waiting] expiry_secs = 0` (the default) no
+/// row ever carries a deadline, so this is one indexed query that matches
+/// nothing.
+pub(crate) async fn expire_waiting_once(state: &AppState) {
+    let cap = state.config.waiting.expire_batch;
+    if cap <= 0 {
+        return;
+    }
+    let expired = match state
+        .storage
+        .expire_waiting(WAITING_EXPIRED_REASON, cap)
+        .await
+    {
+        Ok(expired) => expired,
+        Err(e) => {
+            error!("waiting-expiry sweep failed: {e}");
+            return;
+        }
+    };
+    for (id, app) in expired {
+        warn!(job = %id, %app, "waiting job expired: {WAITING_EXPIRED_REASON}");
+        finalize(state, id).await;
     }
 }
 
@@ -1883,63 +2161,150 @@ fn enforce_contracts(
     }
 }
 
-/// Fires `dataset.changed` webhooks at every enabled watch whose `(app, dataset)`
-/// pair saw new/changed/removed revisions during this job run. Best-effort:
-/// delivery failures never affect the job outcome.
+/// Emits one `dataset.changed` event per `(app, dataset)` pair that saw
+/// new/changed/removed revisions during this job run.
 ///
-/// Watches are loaded per APP of the batch, not once for `job.app`, because a run
-/// can write under several namespaces (see [`load_run_changes`]). Each watch is
-/// then offered only the entries of its own app — that scoping is what makes one
-/// dispatch per (watch, app, dataset) and no more. Without it, a watch on the
-/// virtual app with `dataset = "*"` would also match the job app's own datasets
-/// and fire twice for one run.
+/// **N05 changed what this function is.** It used to load the watch table and
+/// dispatch a webhook per matching watch — the fan-out and the delivery decision
+/// in one place, reachable only by watches. It now emits the *fact* onto the
+/// durable event bus; [`crate::subscriptions::drain`] (called at the end of this
+/// job's fan-out, and again on every scheduler tick) is what turns that fact
+/// into deliveries, for watches and for cursor subscriptions alike. So a
+/// `dataset.changed` now survives a restart, is replayable from a cursor, and is
+/// visible on `GET /events/log` whether or not anything was subscribed to it.
+///
+/// One event per `(app, dataset)` — not per watch — because a run can write
+/// under several namespaces (see [`load_run_changes`]) and the *event* is about
+/// the data, not about who asked for it. The per-watch scoping that used to live
+/// here (a watch belongs to exactly one app, so a `dataset = "*"` watch must not
+/// fire twice for a two-namespace run) is now the selector's job, and is tested
+/// there as `a_watch_is_a_dataset_changed_selector`.
+///
+/// With `[events] log_enabled = false` there is no log to drain, so this falls
+/// back to the pre-N05 in-line dispatch — the config key means what it says.
 async fn notify_watches(
     state: &AppState,
     job: &Job,
     by_dataset: &HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
-    let mut apps: Vec<&str> = by_dataset.keys().map(|(app, _)| *app).collect();
-    apps.sort_unstable();
-    apps.dedup();
-    for app in apps {
-        let watches = match state.storage.enabled_watches(app).await {
-            Ok(w) if !w.is_empty() => w,
-            Ok(_) => continue,
-            Err(e) => {
-                warn!(job = %job.id, %app, "failed to load watches: {e}");
+    // Sorted so a multi-dataset run emits in a stable sequence rather than in
+    // `HashMap` (RandomState) order — matching `fire_dataset_triggers`, and now
+    // also fixing the LOG's order, which is a cursor's order.
+    let mut pairs: Vec<(&str, &str)> = by_dataset.keys().copied().collect();
+    pairs.sort_unstable();
+    let legacy = !state.events.logs();
+    for pair in pairs {
+        let (app, dataset) = pair;
+        let revs = &by_dataset[&pair];
+        let payload = serde_json::json!({
+            "event": "dataset.changed",
+            "job_id": job.id,
+            // The app the records actually live under — which for a virtual-app
+            // write is NOT the job's app, and is the only namespace the consumer
+            // can read them back from.
+            "app": app,
+            "dataset": dataset,
+            "count": revs.len(),
+            "changes": revs,
+        });
+        if legacy {
+            legacy_notify_watches(state, job, app, dataset, &payload).await;
+            continue;
+        }
+        publish(
+            state,
+            JobEvent::domain(crate::subscriptions::DATASET_CHANGED, app, dataset, payload),
+        );
+    }
+}
+
+/// The pre-N05 dispatch: load the app's watches, offer each only the entries of
+/// its own app, POST. Reached only with `[events] log_enabled = false`.
+async fn legacy_notify_watches(
+    state: &AppState,
+    job: &Job,
+    app: &str,
+    dataset: &str,
+    payload: &Value,
+) {
+    let watches = match state.storage.enabled_watches(app).await {
+        Ok(w) if !w.is_empty() => w,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, %app, "failed to load watches: {e}");
+            return;
+        }
+    };
+    for watch in watches
+        .iter()
+        .filter(|w| watch_covers_entry(w, app, dataset))
+    {
+        let mut body = payload.clone();
+        if let Value::Object(map) = &mut body {
+            map.insert("watch_id".into(), serde_json::json!(watch.id));
+        }
+        webhook::dispatch_change(state, watch.clone(), body).await;
+    }
+}
+
+/// Domain events a finished run DECLARES in its result (N05 carry-forward).
+///
+/// Two wave-2 seams closed here, both the same shape: an app knows something
+/// happened, names it in its result, and cannot dispatch it — `dispatch_event`
+/// lives in the server, above the app boundary. The worker's post-run fan-out is
+/// where a named event becomes a real one.
+///
+/// - `result.events: ["source.repair_promoted", …]` — the `repair` app (N12)
+///   already writes this array; its subject is the source it repaired.
+/// - `result.submitted == true` with a `transaction_id` — the `transact` app
+///   (N01) commits inside `Browser::commit`, so `transaction.submitted` could
+///   not be dispatched from there.
+///
+/// Pure so the vocabulary is testable without a worker: a kind that drifts from
+/// what a selector can name is a subscription that silently never fires.
+pub(crate) fn result_domain_events(app: &str, result: &Value) -> Vec<JobEvent> {
+    let mut out = Vec::new();
+    let subject = |result: &Value| {
+        result
+            .get("source")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("transaction_id").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(kinds) = result.get("events").and_then(Value::as_array) {
+        for kind in kinds.iter().filter_map(Value::as_str) {
+            if kind.is_empty() {
                 continue;
             }
-        };
-        // Sorted so a multi-dataset run dispatches in a stable sequence rather
-        // than in `HashMap` (RandomState) order — matching `fire_dataset_triggers`.
-        let mut datasets: Vec<(&str, &str)> = by_dataset
-            .keys()
-            .copied()
-            .filter(|(entry_app, _)| *entry_app == app)
-            .collect();
-        datasets.sort_unstable();
-        for pair in datasets {
-            let (_, dataset) = pair;
-            let revs = &by_dataset[&pair];
-            for watch in watches
-                .iter()
-                .filter(|w| watch_covers_entry(w, app, dataset))
-            {
-                let payload = serde_json::json!({
-                    "event": "dataset.changed",
-                    "watch_id": watch.id,
-                    "job_id": job.id,
-                    // The app the records actually live under — which for a
-                    // virtual-app write is NOT the job's app, and is the only
-                    // namespace the consumer can read them back from.
-                    "app": app,
-                    "dataset": dataset,
-                    "count": revs.len(),
-                    "changes": revs,
-                });
-                webhook::dispatch_change(state, watch.clone(), payload).await;
-            }
+            out.push(JobEvent::domain(kind, app, subject(result), result.clone()));
         }
+    }
+    if result.get("submitted").and_then(Value::as_bool) == Some(true) {
+        if let Some(tx) = result.get("transaction_id").and_then(Value::as_str) {
+            out.push(JobEvent::domain(
+                "transaction.submitted",
+                app,
+                tx,
+                result.clone(),
+            ));
+        }
+    }
+    out
+}
+
+/// `transaction.pending` for a job that PARKED on an approval (N05
+/// carry-forward). The staging happens inside the app, so the park is the only
+/// server-side moment that knows a transaction is waiting for a human.
+pub(crate) fn park_domain_events(app: &str, request: &Value) -> Vec<JobEvent> {
+    match request.get("transaction_id").and_then(Value::as_str) {
+        Some(tx) => vec![JobEvent::domain(
+            "transaction.pending",
+            app,
+            tx,
+            request.clone(),
+        )],
+        None => Vec::new(),
     }
 }
 
@@ -2369,6 +2734,10 @@ async fn finalize_with_stages(
     // the global `[webhooks] failure_url` subscriber, if configured. Retryable
     // requeues never reach `finalize`, so this is permanent failures only.
     if job.status == JobStatus::Failed {
+        // N24: the other terminal outcome a lineage consumer needs. DataHub is
+        // deliberately not written here — a failed run refreshed no dataset —
+        // so this is the OpenLineage writer only, and a no-op without it.
+        crate::datahub::on_job_failure(state, &job).await;
         if let Some(url) = &state.config.webhooks.failure_url {
             webhook::dispatch_failure(
                 state,
@@ -2387,6 +2756,12 @@ async fn finalize_with_stages(
     // Terminal-job triggers: the job's final status is an event other apps can
     // chain on (e.g. "when crawl succeeds, run extract").
     crate::triggers::fire_terminal_triggers(state, &job).await;
+    // Workflow barriers (N03): if this job is a step of a declared run, land its
+    // outcome and enqueue whatever its completion unblocked. Same seam, same
+    // fail-open discipline as the trigger fan-out above — `finalize` is the one
+    // point EVERY terminal path reaches, which is why the barrier lives here and
+    // nowhere else.
+    crate::workflow::on_step_terminal(state, &job).await;
 }
 
 fn publish(state: &AppState, event: JobEvent) {
@@ -3095,6 +3470,11 @@ mod fanout_fence_tests {
             cause_kind: None,
             result: None,
             error: None,
+            input_request: None,
+            waiting_since: None,
+            waiting_expires_at: None,
+            resumed_input: None,
+            executor_id: None,
             created_at: chrono::Utc::now(),
             available_at: chrono::Utc::now(),
             started_at: None,
@@ -3195,6 +3575,7 @@ mod hook_scope_tests {
             secret: None,
             sink: "webhook".into(),
             enabled: true,
+            cursor_seq: 0,
             created_at: chrono::Utc::now(),
         }
     }
@@ -3543,6 +3924,28 @@ mod write_coverage_tests {
             pairs(&[("f", "t"), ("g", "u")]),
             "deduplicated, and sorted so the receipt is stable between reads"
         );
+    }
+}
+
+#[cfg(test)]
+mod waiting_deadline_tests {
+    use super::waiting_deadline;
+    use chrono::{Duration, Utc};
+
+    /// The anti-pattern: `expiry_secs = 0` read as "expires now". Zero is the
+    /// DEFAULT, and a park that expired the instant it was made would fail
+    /// every approval the feature exists to enable, on a fresh install, with
+    /// nobody having configured anything.
+    #[test]
+    fn zero_expiry_waits_forever_it_does_not_expire_immediately() {
+        let now = Utc::now();
+        assert_eq!(waiting_deadline(now, 0), None);
+        // Any positive window is a real deadline, in the future.
+        let deadline = waiting_deadline(now, 3600).expect("a configured window stamps a deadline");
+        assert_eq!(deadline, now + Duration::seconds(3600));
+        assert!(deadline > now, "a deadline must be ahead of the park");
+        // And the smallest configurable window is still a future instant.
+        assert!(waiting_deadline(now, 1).expect("1s window") > now);
     }
 }
 

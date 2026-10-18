@@ -223,6 +223,9 @@ impl ScrapeApp for Cordis {
         // truncates mid-page must leave the tail for the next run, not step over
         // it (which skipped those projects for a whole ~46-week corpus cycle).
         let mut consumed: u64 = 0;
+        // Hits served by the page the walk ENDED on — what a warning reports,
+        // not the run-wide consumed count.
+        let mut last_got: u64;
         let end: SweepEnd;
 
         loop {
@@ -267,6 +270,7 @@ impl ScrapeApp for Cordis {
             })?;
             total = page_total;
             let got = hits.len() as u64;
+            last_got = got;
             if pages_fetched == 0 && empty_page_is_drift(page, page_size, total, got) {
                 // `SourceDrift`, not `App`: terminal for the job.
                 return Err(Error::SourceDrift(format!(
@@ -517,15 +521,8 @@ impl ScrapeApp for Cordis {
             "sweep": end.as_str(),
             "corpus_swept": end == SweepEnd::Complete,
         });
-        if end == SweepEnd::ShortPage {
-            // Loud, because the silent version of this cost ~46 weeks of walk.
-            warnings.push(format!(
-                "listing page {page} returned {} of {page_size} results while the API reports \
-                 {total} total — treated as a TRUNCATED page, not the end of the corpus: the \
-                 resume cursor keeps its place ({}) and `corpus_swept` is false",
-                consumed.min(page_size),
-                start_offset + consumed
-            ));
+        if let Some(w) = sweep_warning(end, page, page_size, total, last_got, next_offset) {
+            warnings.push(w);
         }
         if !warnings.is_empty() {
             if let Value::Object(map) = &mut out {
@@ -844,6 +841,43 @@ impl Coverage {
             "corpus_total": self.listing_total,
             "corpus_swept": self.swept,
         })
+    }
+}
+
+/// The `warnings[]` line an UNPROVEN ending owes the result, or `None`.
+///
+/// Every arm whose coverage is unproven reaches `warnings[]` — the rule the
+/// sibling grants apps enforce through `grants_common::sweep_warning`, and the
+/// one cordis applied to `short_page` alone: an `unknown_total` walk was
+/// reported in `sweep` and nowhere else, so a drifted total field looked like
+/// a quiet run. `capped` is deliberately silent: stopping at `maxProjects` is
+/// the designed steady state of a ~46-week corpus walk, and `corpus_swept:
+/// false` plus the advancing cursor already say it.
+///
+/// `got` is the hit count of the page the walk ended on, `cursor` the resume
+/// position the run persisted.
+fn sweep_warning(
+    end: SweepEnd,
+    page: u64,
+    page_size: u64,
+    total: u64,
+    got: u64,
+    cursor: u64,
+) -> Option<String> {
+    match end {
+        SweepEnd::Complete | SweepEnd::Capped => None,
+        // Loud, because the silent version of this cost ~46 weeks of walk.
+        SweepEnd::ShortPage => Some(format!(
+            "listing page {page} returned {got} of {page_size} results while the API reports \
+             {total} total — treated as a TRUNCATED page, not the end of the corpus: the \
+             resume cursor keeps its place ({cursor}) and `corpus_swept` is false"
+        )),
+        SweepEnd::UnknownTotal => Some(format!(
+            "listing page {page} returned {got} of {page_size} results under a reported total \
+             of 0 — the total field is absent, renamed, or the query grammar drifted, so the \
+             end of the corpus cannot be proven: coverage is UNPROVEN, the resume cursor keeps \
+             its place ({cursor}) and `corpus_swept` is false"
+        )),
     }
 }
 
@@ -1692,6 +1726,31 @@ mod walk_tests {
         assert_eq!(second["cursor_next_offset"], 0);
     }
 
+    /// THE REFUTED BEHAVIOR: `unknown_total` was written to `sweep` and
+    /// nowhere else — an unproven walk with no `warnings[]` line, while the
+    /// sibling apps land one for every non-complete arm.
+    #[test]
+    fn every_unproven_ending_warns_and_the_count_is_the_ending_pages_own() {
+        assert_eq!(sweep_warning(SweepEnd::Complete, 20, 10, 200, 10, 0), None);
+        assert_eq!(sweep_warning(SweepEnd::Capped, 5, 10, 200, 10, 50), None);
+        let short = sweep_warning(SweepEnd::ShortPage, 3, 10, 200, 4, 24).expect("warns");
+        assert!(short.contains("page 3 returned 4 of 10"), "{short}");
+        assert!(short.contains("(24)"), "{short}");
+        let unknown = sweep_warning(SweepEnd::UnknownTotal, 2, 10, 0, 7, 17).expect("warns");
+        assert!(unknown.contains("UNPROVEN"), "{unknown}");
+        assert!(unknown.contains("page 2 returned 7 of 10"), "{unknown}");
+    }
+
+    /// The result keys agents read are declared: `sweep` can say
+    /// `unknown_total`, so `output_shape` must say so too.
+    #[test]
+    fn output_shape_declares_every_sweep_ending_it_can_report() {
+        let shape = Cordis.manifest().output_shape.expect("shape");
+        for key in ["sweep", "complete", "capped", "short_page", "unknown_total"] {
+            assert!(shape.contains(key), "output_shape omits `{key}`: {shape}");
+        }
+    }
+
     /// The wipe: one truncated page used to claim `corpus_swept: true` AND
     /// reset the cursor to page 1, throwing away every week of walk so far.
     #[tokio::test]
@@ -1716,6 +1775,10 @@ mod walk_tests {
                 .contains("TRUNCATED"),
             "{out}"
         );
+        // The page that ended the walk served 4 hits; the line says 4, not the
+        // run-wide consumed count it used to print ("returned 10 of 10").
+        let warning = out["warnings"][0].as_str().unwrap_or_default();
+        assert!(warning.contains("page 3 returned 4 of 10"), "{warning}");
         // The persisted row agrees with the reported cursor.
         let ds = store.datasets();
         let state = ds.get("cordis", "state", "cursor").await.unwrap().unwrap();

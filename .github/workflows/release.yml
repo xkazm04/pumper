@@ -1,0 +1,129 @@
+name: Release
+
+# What ships from this repo is a NATIVE BINARY, not an image and not a package —
+# `docs/deployment.md` is explicit that containerization is refused on purpose
+# (a real Chrome you can log in through, a `claude` CLI on the host, one SQLite
+# file in WAL mode). So the supply-chain question a consumer actually has is not
+# "which image digest" but "did this `pumper.exe` come out of xkazm04/pumper's
+# pipeline, from the commit it claims, with the dependency set it claims".
+#
+# Three artifacts answer that, and this workflow is the only place they are made:
+#
+#   pumper-<target>[.exe]        the binary
+#   pumper-<target>.cdx.json     a CycloneDX SBOM of everything linked into it,
+#                                generated from the committed Cargo.lock
+#   SHA256SUMS-<target>          the digests, so a download can be checked at all
+#
+# plus two Sigstore attestations per binary, signed keyless with this run's OIDC
+# identity — no secret to leak, no key to rotate:
+#
+#   build provenance (SLSA v1)   which workflow, which commit, which runner
+#   SBOM attestation             binds the SBOM above TO that exact binary, so a
+#                                consumer cannot be handed one artifact's SBOM
+#                                alongside another artifact's bytes
+#
+# Verify a download with the GitHub CLI, no local trust setup required:
+#
+#   gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper
+#   gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper \
+#       --predicate-type https://cyclonedx.org/bom
+#
+# The SBOM generator itself is NOT release-only: `node scripts/ci/sbom.mjs` runs
+# from Cargo.lock with no network and no cargo, and its fixture suite runs on
+# every CI change (the `Ship inventory` job). A release-only instrument is one
+# that is first exercised on the day it matters.
+
+on:
+  push:
+    tags: ["v*"]
+  # So the whole chain can be exercised without cutting a release. Nothing is
+  # uploaded on this path (there is no release to upload to); the artifacts and
+  # both attestations are still produced, which is the part worth rehearsing.
+  workflow_dispatch:
+
+# Read-only by default; the one job that needs to write says so, and says why.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: "Signed binary + SBOM (${{ matrix.target }})"
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # Upload the artifacts onto the GitHub Release for the pushed tag.
+      contents: write
+      # The keyless-signing pair: `id-token` mints the run's OIDC token that
+      # Sigstore signs against, `attestations` records the result in this repo's
+      # attestation store, which is what `gh attestation verify` reads.
+      id-token: write
+      attestations: write
+    strategy:
+      # A Windows-only packaging break must not hide behind a green Linux leg —
+      # the same reason the CI test matrix sets it.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      # `--locked` is load-bearing for everything below: the SBOM is generated
+      # FROM Cargo.lock, so a build allowed to resolve a different version than
+      # the lockfile records would produce a signed SBOM that describes a binary
+      # nobody built. It also makes the release build reproducible in the only
+      # sense this repo claims (docs/deployment.md: "reproducibility comes from
+      # the pinned Cargo.lock").
+      - name: Build the release binary
+        run: cargo build --release --locked -p pumper-server --bin pumper
+
+      - name: Stage the artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/release/pumper${{ matrix.ext }}" "dist/pumper-${{ matrix.target }}${{ matrix.ext }}"
+          node scripts/ci/sbom.mjs --out "dist/pumper-${{ matrix.target }}.cdx.json"
+          cd dist
+          sha256sum "pumper-${{ matrix.target }}${{ matrix.ext }}" "pumper-${{ matrix.target }}.cdx.json" \
+            > "SHA256SUMS-${{ matrix.target }}"
+          cat "SHA256SUMS-${{ matrix.target }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/pumper-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Attest the SBOM against that exact binary
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: dist/pumper-${{ matrix.target }}${{ matrix.ext }}
+          sbom-path: dist/pumper-${{ matrix.target }}.cdx.json
+
+      - name: Upload the artifacts to the run
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      # Tag pushes only: on workflow_dispatch there is no release to attach to,
+      # and inventing one would turn a rehearsal into a publication.
+      - name: Attach to the GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

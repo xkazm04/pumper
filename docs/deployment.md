@@ -25,6 +25,49 @@ index, a WASM host, and a lazily-launched Chrome. It is not a request-scoped
 service and does not scale horizontally — two processes over one `data/` directory
 would fight over the SQLite writer and the Tantivy exclusive writer lock.
 
+### Released artifacts, and how to verify one
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
+which is the only place release artifacts are made. Per target
+(`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`) it publishes:
+
+| artifact | what it is |
+| --- | --- |
+| `pumper-<target>[.exe]` | the binary, built with `cargo build --release --locked` |
+| `pumper-<target>.cdx.json` | a CycloneDX 1.6 SBOM of every crate linked into it, generated from the committed `Cargo.lock` |
+| `SHA256SUMS-<target>` | digests for both of the above |
+
+`--locked` is load-bearing: the SBOM is generated *from* `Cargo.lock`, so a build
+allowed to resolve anything else would ship an SBOM describing a binary nobody
+built. It is also the only sense in which this repo claims reproducibility.
+
+Two Sigstore attestations are signed per binary with the workflow's OIDC
+identity — keyless, so there is no signing key to leak or rotate. Build
+provenance says *which workflow, which commit, which runner*; the SBOM
+attestation binds the SBOM above to that exact binary, so a consumer cannot be
+handed one build's SBOM alongside another build's bytes:
+
+```bash
+gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper
+gh attestation verify ./pumper-x86_64-unknown-linux-gnu --repo xkazm04/pumper \
+    --predicate-type https://cyclonedx.org/bom
+```
+
+The SBOM covers the **cargo dependency graph only**. It says nothing about the
+host Chrome `engine-browser` drives or the `claude` CLI `engine-claude` shells
+out to — see [Not containerized](#not-containerized--on-purpose) for why those
+are the operator's, and `SECURITY.md` for the rest of the supply-chain posture.
+
+Generate the same document locally, offline, with no cargo:
+
+```bash
+just sbom --out /tmp/pumper.cdx.json   # or `just sbom-summary` for the counts
+```
+
+`workflow_dispatch` runs the whole chain — build, SBOM, both attestations —
+without uploading anything, so the release path can be rehearsed without cutting
+a release.
+
 ## Local-first run story
 
 ```
@@ -100,11 +143,29 @@ environment is never overwritten. Only the `pumper` binary loads it.
 
 ## Auth posture
 
-**There is no inbound authentication on any route.** No API key, no bearer token,
-no session — the HTTP surface is entirely unauthenticated, and this is a recorded
-design decision (`ONBOARDING.md` §2, `docs/features/runtime.md` "Known gaps").
+**By default there is no inbound authentication on any route** — no API key, no
+bearer token, no session. That default is unchanged and deliberate for a
+local-first node, but it is now a *setting* rather than a fact about the server:
 
-The surface is also **fully mutating**, not read-only. Unauthenticated callers can:
+```toml
+[auth]
+mode = "keys"   # default: "open"
+```
+
+flips on scoped API keys (**principals**) with per-principal spend ceilings,
+request throttles and a durable audit ledger in front of every route except
+`/health`, `/metrics` and `/openapi.json`. `mode = "open"` — the default, and
+what an absent `[auth]` section means — consults no table, reads no header and
+throttles nothing, so a node that never edits its config behaves byte for byte
+as it did before. Full surface, scope vocabulary, refusal codes and
+bootstrapping: **[features/auth.md](features/auth.md)**.
+
+Create the first principal while `mode = "open"`, then flip the key and restart:
+minting a principal requires the `admin` scope, and there is deliberately no
+bootstrap escape hatch.
+
+**Everything below describes `mode = "open"`.** In `open` mode the surface is
+**fully mutating**, not read-only, and unauthenticated callers can:
 
 - enqueue and cancel/reset/retry jobs (`POST /apps/{name}/jobs`, `DELETE /jobs/{id}`,
   `POST /jobs/{id}/reset`, `POST /jobs/retry`) — which means driving the browser
@@ -121,12 +182,14 @@ The surface is also **fully mutating**, not read-only. Unauthenticated callers c
 
 The plugin sandbox (wasmtime fuel budget + memory cap, no ambient authority) bounds
 what a *module* can do; it does not authenticate the *caller* who triggers the
-reload.
+reload — `[auth] mode = "keys"` is what does, and under it `POST /plugins/reload`
+requires the `admin` scope like every other mutation.
 
 Inbound bodies are bounded — **1 MiB on every route, 8 MiB on `POST /extract/preview`**,
 over-limit ⇒ `413` before the handler runs (`docs/features/http-api.md` →
 "Request body limits"). That caps how much memory one unauthenticated request can
-make the process buffer; it is not a substitute for auth or rate limiting.
+make the process buffer; it is not a substitute for auth or rate limiting — for
+those, see [features/auth.md](features/auth.md).
 
 **This is defensible only while the bind stays on loopback.** The entire safety
 argument is `[server] host = "127.0.0.1"` — the network, not the application, is
@@ -183,6 +246,51 @@ Two guardrails ship *inside* the app; neither replaces the network control:
   empty jar and returning the logged-out page with a `200`. The `422` costs the
   coordinator a fallback fetch — the right trade against silently storing a login
   wall as a dataset revision.
+
+### Elastic executor plane (`[executors]`) — the same precondition, one direction further
+
+N18 lets extra pumper processes drain the coordinator's queue: `pumper --executor
+--coordinator <url>`. It inherits the `[remote]` warning above **and sharpens it**,
+because an executor claims whole jobs rather than proxying one fetch.
+
+What changes, and what does not:
+
+- **Direction.** Executors dial *out*. They need no ingress, no port and no
+  address of their own — which is the point: an executor can live behind NAT, on
+  a laptop, or in a cheap VPS with a different IP and a real Chrome. Only the
+  **coordinator** has to be reachable, so this adds exactly one exposed node, not
+  N.
+- **The exposure is the same one `[remote]` documents.** The coordinator must
+  bind off loopback for executors to reach it, and `[executors] secret`
+  authenticates the six executor routes **and nothing else**. Every control in
+  the table above applies unchanged — host firewall, private overlay, or an
+  authenticating reverse proxy. Prefer this one over `[remote]`'s network shape
+  where you can: with `[auth] mode = "keys"` the executor routes additionally
+  require an `admin` principal, so the plane is the one cross-host surface that
+  can be put behind real authentication today.
+- **What crosses the wire.** Job params and results in both directions, plus
+  checkpoints and progress snapshots. Whatever an app puts in its params
+  (credentials in a `params` object, say) reaches every executor allowed to claim
+  that app. There is no TLS of pumper's own — put the coordinator behind a
+  proxy that terminates it if the link is not already private.
+- **What does not cross.** Session profiles (cookie jars are per-node disk, same
+  as the fabric), the dataset store (an executor's `datasets` handle refuses —
+  only result-only apps are eligible), and the queue itself.
+
+**Executor state.** An executor keeps its own `[storage] database_path` — give it
+one, do not point two processes at the same SQLite file. What lives there is
+process-local derived state only (cost ledger, HTTP cache, host weather, recipes,
+research cache) plus the artifact tree of the jobs it ran. Losing it costs cache
+misses and the artifacts of past runs, never a record; it is **not** part of the
+"must survive a machine move" set above.
+
+**Operating it.** `GET /executors` on the coordinator is the fleet view (`busy` /
+`idle` / `offline` per executor); `/metrics` carries `pumper_executors{state}`
+while the plane is enabled. An executor that dies needs no intervention: its lease
+goes stale, the existing reaper re-queues the job with its checkpoint, and the
+dead process's late report is refused by the `(status, attempts, executor_id)`
+fence. Full surface and the v1 boundaries:
+[docs/features/runtime.md § Elastic executor plane](features/runtime.md#elastic-executor-plane-executors).
 
 ### CORS
 

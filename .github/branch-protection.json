@@ -1,0 +1,90 @@
+{
+  "$comment": [
+    "The branch-protection rule for `master`, declared in the repo and reconciled",
+    "against the workflows by scripts/ci/branch-protection.mjs (`just protection-check`).",
+    "",
+    "WHY THIS FILE EXISTS. Every other guardrail here is versioned: the hooks are in",
+    ".githooks/, the pinning register is .github/unpinned-actions.json, the quarantine",
+    "register is .flake/register.json. Branch protection was the one control that lived",
+    "ONLY in GitHub's settings UI — invisible in review, unversioned, and impossible to",
+    "check out. CODEOWNERS says in its own header that its routing does not bind until",
+    "protection is on, and until this file there was nowhere to read what 'on' should mean.",
+    "",
+    "WHAT THE GATE VERIFIES (on every PR, in the `Ship inventory` job). Not that GitHub",
+    "has the rule — a worktree cannot see that — but that this declaration still DESCRIBES",
+    "the workflows, in both directions:",
+    "  - every required check names a job that exists, with the exact context string",
+    "    GitHub will report (matrix legs expanded: `test (ubuntu-latest)`, not `test`);",
+    "  - every job in a gated workflow is classified here, so a NEW job cannot arrive",
+    "    un-required by omission;",
+    "  - the settings below are not weakened (force pushes, deletions, admin bypass).",
+    "That is the half that rots. A required-check name that no job produces is the worst",
+    "failure mode available: GitHub waits for a check nobody will ever report, or ignores",
+    "a name that no longer exists, and either way the rung stops binding silently.",
+    "",
+    "TO APPLY IT (needs a token with admin rights on the repo; one command):",
+    "  node scripts/ci/branch-protection.mjs --json |",
+    "    gh api -X PUT repos/xkazm04/pumper/branches/master/protection --input -",
+    "  # then confirm:",
+    "  gh api repos/xkazm04/pumper/branches/master/protection --jq '.required_status_checks.contexts'",
+    "",
+    "REVIEWS ARE DELIBERATELY NOT REQUIRED YET. This repo has one maintainer, and GitHub",
+    "does not let an author approve their own pull request: requiring one approval today",
+    "means nothing merges, which ends with protection switched back off. So the binding",
+    "rung today is the CHECKS, and `require_code_owner_reviews` flips to true the day a",
+    "second handle appears in .github/CODEOWNERS — see CONTRIBUTING.md, 'Adding a second",
+    "maintainer', which names this file and that field."
+  ],
+  "branch": "master",
+  "gated_workflows": [".github/workflows/ci.yml"],
+  "required_checks": [
+    {
+      "job": "format",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["Format"]
+    },
+    {
+      "job": "test",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["test (ubuntu-latest)", "test (windows-latest)"]
+    },
+    {
+      "job": "sdk",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["Consumer clients (TS SDK, CLI, Python)"]
+    },
+    {
+      "job": "inventory",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["Ship inventory + doc-sync hook + supply chain"]
+    },
+    {
+      "job": "harness",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["Test harness gates"]
+    },
+    {
+      "job": "audit",
+      "workflow": ".github/workflows/ci.yml",
+      "contexts": ["Dependency audit"]
+    }
+  ],
+  "not_required": [
+    {
+      "job": "long-lanes",
+      "workflow": ".github/workflows/ci.yml",
+      "reason": "certification on the nightly clock, not a per-change gate: it does not run on pull_request at all, and blocking a merge on a 90-minute lane would destroy the merge cadence without improving the certification (the property it certifies is not a property of any single change)"
+    }
+  ],
+  "settings": {
+    "strict": true,
+    "enforce_admins": true,
+    "required_approving_review_count": 0,
+    "require_code_owner_reviews": false,
+    "dismiss_stale_reviews": true,
+    "required_linear_history": true,
+    "required_conversation_resolution": true,
+    "allow_force_pushes": false,
+    "allow_deletions": false
+  }
+}

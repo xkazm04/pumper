@@ -38,7 +38,7 @@ fn parse_cursor_i64_arg(cursor: &str) -> Result<Option<(String, i64)>, ApiError>
     path = "/apps/{name}/datasets",
     tag = "apps",
     params(("name" = String, Path, description = "App name")),
-    responses((status = 200, description = "`{app, datasets: [name]}`"))
+    responses((status = 200, description = "`{app, datasets: [name]}`", body = crate::routes::dto::AppDatasetsResponse))
 )]
 pub(crate) async fn list_datasets(
     State(state): State<AppState>,
@@ -229,8 +229,8 @@ pub(crate) fn parse_filters(
         ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (e.g. `$.state:eq:CA`, `$.amount:numgte:1000`). ops: eq | contains | gte | lte | numgte. Pushed into SQL."),
     ),
     responses(
-        (status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present. Every shape honors `trust=` and `removed=` identically — default, cursor-paged, and `filter=`-narrowed."),
-        (status = 400, description = "Malformed `filter` or `removed` value", body = Object),
+        (status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present. Every shape honors `trust=` and `removed=` identically — default, cursor-paged, and `filter=`-narrowed.", body = crate::routes::dto::RecordsResponse),
+        (status = 400, description = "Malformed `filter` or `removed` value", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_records(
@@ -312,11 +312,11 @@ const DELETED_EXPORT_DIR: &str = "deleted-datasets";
         DeleteDatasetQuery,
     ),
     responses(
-        (status = 200, description = "`{preview: false, app, dataset, deleted, records, revisions, export, as_of}` — the receipt: what was ACTUALLY destroyed, and the NDJSON export written before it was. Search docs are dropped too."),
-        (status = 400, description = "`confirm` did not match `<app>/<dataset>`", body = Object),
-        (status = 409, description = "The record count moved since the preview — nothing was deleted; re-preview and retry", body = Object),
+        (status = 200, description = "`{preview: false, app, dataset, deleted, records, revisions, export, as_of}` — the receipt: what was ACTUALLY destroyed, and the NDJSON export written before it was. Search docs are dropped too.", body = crate::routes::dto::DatasetDeletion),
+        (status = 400, description = "`confirm` did not match `<app>/<dataset>`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "The record count moved since the preview — nothing was deleted; re-preview and retry", body = crate::routes::dto::ErrorEnvelope),
         (status = 428, description = "Two-step gate: no `confirm`/`expect_records`, so this call PREVIEWED and deleted nothing. Body is `{preview: true, records, revisions, confirm, expect_records, as_of}` — the exact parameters to retry with.", body = Object),
-        (status = 500, description = "The pre-delete export could not be written; nothing was deleted", body = Object),
+        (status = 500, description = "The pre-delete export could not be written; nothing was deleted", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 /// Hard-deletes a whole dataset behind a two-step gate.
@@ -634,8 +634,8 @@ fn export_content_disposition(dataset: &str, extension: &str) -> String {
         ("key" = String, Path, description = "Record key"),
     ),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`) — the record and its full revision history."),
-        (status = 404, description = "Record not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`) — the record and its full revision history.", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Record not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_record_route(
@@ -712,7 +712,7 @@ impl ExportFormat {
     ),
     responses(
         (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`. A mid-stream store error aborts the connection without a clean end (no closing `]` for json) rather than emitting a truncated-but-valid-looking body; per-row serialization failures are counted and logged, not silently dropped."),
-        (status = 400, description = "Unknown format, malformed `filter`, or bad `trust`/`removed` value", body = Object),
+        (status = 400, description = "Unknown format, malformed `filter`, or bad `trust`/`removed` value", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn export_records(
@@ -954,8 +954,8 @@ const DUP_SCAN_MAX: i64 = 10_000;
         DupQuery,
     ),
     responses(
-        (status = 200, description = "`{app, dataset, max_distance, pairs}`"),
-        (status = 413, description = "Dataset over the 10k O(n^2) scan cap", body = Object),
+        (status = 200, description = "`{app, dataset, max_distance, pairs}`", body = crate::routes::dto::DuplicatesResponse),
+        (status = 413, description = "Dataset over the 10k O(n^2) scan cap", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn dataset_duplicates(
@@ -1043,8 +1043,8 @@ pub(crate) fn parse_feed_order(raw: &str) -> Result<pumper_core::datasets::FeedO
         ChangesQuery,
     ),
     responses(
-        (status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed). `order=asc` drains oldest-first and always carries a `next_cursor` while the page is non-empty, so a mirror can checkpoint each page."),
-        (status = 400, description = "Malformed `since` (not RFC 3339), `cursor` (not the `<created_at>|<rowid>` token from `next_cursor`), or `order` (not `asc`/`desc`); also `order=asc` without `cursor`. A blank `cursor=` is valid and starts at the first page.", body = Object),
+        (status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed). `order=asc` drains oldest-first and always carries a `next_cursor` while the page is non-empty, so a mirror can checkpoint each page.", body = crate::routes::dto::ChangesResponse),
+        (status = 400, description = "Malformed `since` (not RFC 3339), `cursor` (not the `<created_at>|<rowid>` token from `next_cursor`), or `order` (not `asc`/`desc`); also `order=asc` without `cursor`. A blank `cursor=` is valid and starts at the first page.", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn dataset_changes(
@@ -1121,8 +1121,8 @@ pub(crate) struct HistoryQuery {
         HistoryQuery,
     ),
     responses(
-        (status = 200, description = "Dual-mode: `{app, dataset, key, count, revisions}` (clamped 500), or `{items, next_cursor}` when `cursor` is present."),
-        (status = 400, description = "Malformed `cursor` (not the `<created_at>|<revision>` token from `next_cursor`). A blank `cursor=` is valid and starts at the first page.", body = Object),
+        (status = 200, description = "Dual-mode: `{app, dataset, key, count, revisions}` (clamped 500), or `{items, next_cursor}` when `cursor` is present.", body = crate::routes::dto::HistoryResponse),
+        (status = 400, description = "Malformed `cursor` (not the `<created_at>|<revision>` token from `next_cursor`). A blank `cursor=` is valid and starts at the first page.", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn record_history(
@@ -1151,6 +1151,81 @@ pub(crate) async fn record_history(
     Ok(Json(
         json!({ "items": page.items, "next_cursor": page.next_cursor }),
     ))
+}
+
+// ── live-set manifest (N16, mesh reconcile) ─────────────────────────────────
+
+/// Ceiling on keys one manifest call walks. Past it the manifest is honest
+/// about being partial (`complete: false`) and a mirror REFUSES to reconcile
+/// from it — tombstoning against a truncated origin view would delete live
+/// records, which is a worse bug than the ghosts reconcile exists to remove.
+const MANIFEST_KEYS_CAP: i64 = 50_000;
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub(crate) struct ManifestQuery {
+    /// Include the key list itself. Default false: the digest alone answers
+    /// "are we in sync", and the keys are only needed on the mismatch path.
+    #[serde(default)]
+    keys: bool,
+}
+
+/// Live-set manifest: the key count and a rolling hash over the live keys.
+///
+/// This is the reconcile primitive. A hard delete on an origin (`DELETE
+/// /datasets/{app}/{ds}/records/{key}`) removes the row outright, so no
+/// `removed` revision ever enters the change feed and no puller can learn of
+/// it — the mirror keeps serving a record the origin does not have. A mirror
+/// compares this digest against its own; on a mismatch it asks for the keys and
+/// tombstones the ones the origin no longer lists.
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/manifest",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ManifestQuery,
+    ),
+    responses((status = 200, description = "`{app, dataset, count, live_count, digest, \
+        complete, cap, keys?}` — `digest` is SHA-256 over the sorted live keys; `complete` is \
+        false when the dataset exceeds the walk cap, and a mirror must not reconcile against \
+        an incomplete manifest.", body = crate::routes::dto::DatasetManifest))
+)]
+pub(crate) async fn dataset_manifest(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+    Query(query): Query<ManifestQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let count = state.datasets.record_count(&app, &dataset).await?;
+    // One row over the cap is what makes truncation detectable rather than
+    // indistinguishable from "exactly at the cap".
+    let records = state
+        .datasets
+        .list(&app, &dataset, MANIFEST_KEYS_CAP + 1)
+        .await?;
+    let complete = (records.len() as i64) <= MANIFEST_KEYS_CAP;
+    let live: Vec<String> = records
+        .into_iter()
+        .take(MANIFEST_KEYS_CAP as usize)
+        .filter(|r| r.removed_at.is_none())
+        .map(|r| r.key)
+        .collect();
+    let digest = app_peer::envelope::manifest_digest(&live);
+    let mut body = json!({
+        "app": app,
+        "dataset": dataset,
+        // Every row, tombstones included — the number `GET /datasets` shows.
+        "count": count,
+        // The set the digest is over.
+        "live_count": live.len(),
+        "digest": digest,
+        "complete": complete,
+        "cap": MANIFEST_KEYS_CAP,
+    });
+    if query.keys {
+        body["keys"] = json!(live);
+    }
+    Ok(Json(body))
 }
 
 #[cfg(test)]
