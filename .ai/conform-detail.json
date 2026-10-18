@@ -5472,6 +5472,52 @@
           "evidence": "crates/core/src/cache.rs:98 The cache retrieves typed HTTP responses by key and age; it accepts no callable transform chain requiring purity classification."
         }
       ]
+    },
+    "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/dynamic-secret-lifecycle": {
+      "context": "e2e-data-integrity",
+      "subject": "dynamic-secret-lifecycle",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-18",
+      "evaluatedTs": "2026-10-18T21:48:06.954Z",
+      "techniques": [
+        {
+          "technique": "expiry-buffer-beyond-lease",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:479 The fetch selects a session profile; it creates no remote credential with an expiry to buffer."
+        },
+        {
+          "technique": "idempotent-revoke-and-give-up",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_delete_gate.rs:225 The absent-target operation deletes dataset records, not minted credentials, so this is not a revocation callback."
+        },
+        {
+          "technique": "lease-vs-native-tracking",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/vcr_attempts.rs:55 The persisted artifact is a replay cassette, not an issued authentication artifact requiring a tracking decision."
+        },
+        {
+          "technique": "persist-before-provision",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:33 The write seeds dataset content and does not provision a credential or deliver token plaintext."
+        },
+        {
+          "technique": "ttl-ladder-derivation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/target_exclusion.rs:48 This duration bounds a concurrency probe; no credential lease lifetime or renewal is computed."
+        },
+        {
+          "technique": "wal-per-external-side-effect",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/store_reports.rs:394 The diagnostic checks read-only reporting, with no issuer mutation requiring a durable rollback witness."
+        }
+      ],
+      "withdrawn": {
+        "worker": "9c2565f5-464c-4a30-9479-eecac1a6701e",
+        "state": "not-applicable",
+        "at": "2026-10-18T21:48:29.894501+00:00",
+        "reason": "reviewer (sonnet): The primary anchor (dynamic_apps.rs:48) is a temp-dir/wasm test setup that does not show that no credential lifecycle exists, so it is incidental. The absence claim rests on a grep. engine_conformance.rs also deals with login-session profiles and cookie jars, and the technique anchors only rule out "
+      }
     }
   }
 }
