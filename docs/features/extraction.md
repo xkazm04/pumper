@@ -151,6 +151,14 @@ The worker indexes those datasets **delta-driven from the change feed** (`datase
 
 `records` remains the quick sample a human or agent wants when reading a job result; the dataset (`GET /datasets/extractor/<dataset>`) is the record of truth.
 
+### API X-ray discovery (`[fetcher] xray`)
+
+The extractor is the discovery caller of the [API X-ray loop](fetching.md#api-x-ray-loop-fetcher-xray-default-off), and the only app that can be: discovery scores a page's captured JSON calls by how many of the *extracted* field values each payload contains, and the extractor is where both halves exist at the same moment.
+
+In **urls mode**, with `[fetcher] xray` on, a fetch that escalated to the browser brings its captured calls back on `FetchOutcome.network`. After extraction, each such document's calls are scored against **that document's own record**; a payload clearing the heuristic's bar (≥3 matched values at ≥25% overlap) is stored as an unvalidated recipe, and each document's raw captures are written to their own `network-capture-<sha>.json` artifact in the job's directory (content-addressed over the captured calls, so a page's captures land in one file per page rather than every page overwriting one shared name; re-running a job rewrites the same files instead of accumulating a copy per attempt). The pass is best-effort — a discovery or write failure is logged and never fails the extraction — and completely inert with the X-ray off (no captures exist, so there is nothing to score). Source mode, backfill and the Wayback modes read stored bodies, which have no live render behind them and therefore never discover anything.
+
+Known gaps: one artifact name per job, so a run that captures on several pages keeps only the last page's raw capture (the recipes themselves are all stored); and discovery sees the single record a document produced (a listing's rows live inside it), so a rule set that reads little off the page gives the overlap heuristic little to match on — a thin extraction discovers nothing rather than guessing.
+
 ### Replay-CI (`replay` param)
 
 `{"replay": {"rules": …, "baseline_rules"?: …, "against": {app, dataset, url_pattern?, versions, max_pages}, "bisect_field"?: …}}` runs a **candidate** rule set over stored bodies and diffs it against a baseline — strictly read-only (job result + a `replay-report.json` artifact, never a dataset record). The report carries `fields` (per top-level field: `match_rate`, `baseline_match_rate`, `delta`, and bounded `added`/`lost`/`changed` value samples), `regressions`/`regressed_urls` per URL, and `bisect` (the adjacent observation pair where a field's match flipped).
@@ -184,6 +192,18 @@ The field-level `is_blank` (which decides `FieldStatus::Empty` and `CoercionStat
 `<table>` renders as a **GitHub pipe table**. The first row is the header: `<th>` cells become the headers, and a `<th>`-less table promotes its first `<tr>` to the header. `<thead>`/`<tbody>`/`<tfoot>` wrappers are traversed; ragged rows are padded to a rectangular grid; cells with nested block content degrade to inline text (whitespace collapsed, `|` escaped); a nested table's text is flattened into its enclosing cell.
 
 ## WASM plugin sandbox (`engine-wasm`, `plugin` app)
+
+`engine-wasm` hosts **two** kinds of guest, deliberately kept apart:
+
+| | plugin sandbox (this section) | dynamic-app host ([apps.md](apps.md#dynamic-wasm-apps)) |
+| --- | --- | --- |
+| guest shape | core module, `alloc` + `extract`/`extract_v2` + optional `describe` | **component** (component-model binary) exporting the `pumper:app@0.1.0` world |
+| imports | **none by default** — an empty linker, no ambient authority. Since N10 a module may declare `capabilities` in its `describe()` manifest and be granted exactly those imports (`pumper_http_request`, `pumper_kv_get/put`); one it did not declare fails to link. See [trigger-plugins.md §Capabilities](trigger-plugins.md#capabilities-n10). | exactly the metered `AppContext` seams the WIT world declares |
+| what it is | a pure document transformer called per document | a whole `ScrapeApp`: it drives its own job |
+| bounds | per **call** fuel + memory, blocking-pool admission | per **job** fuel, wall clock, host-call ceiling, live-instance admission |
+| switch | `[plugins] enabled` (on by default) | `[wasm_apps] enabled` (**off** by default) |
+
+A core module in the app dir stays exactly what it was — listed, `runnable: false`. A component is refused by the plugin host (it has no `extract` ABI) and picked up by the app host. The two are told apart by the wasm header itself (`is_component`: same `asm` magic, different version/layer word), never by filename.
 
 Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-src/` holds sources), executed under wasmtime with **fuel + memory limits**. `GET /plugins` lists, `POST /plugins/reload` rescans. `max_memory_mb` bounds **one** store, so the host also enforces a **global concurrency cap** (`[plugins] max_concurrent`, `0` = one per CPU core) via a semaphore acquired before each run — otherwise a wide fan-out admits `max_memory_mb × concurrent_calls` of aggregate wasm memory and can saturate tokio's blocking pool.
 
@@ -237,6 +257,8 @@ The worker then indexes that dataset **delta-driven from the change feed** (`dat
 ### Observatory mode — differential replay against the stored web
 
 `{"observatory": true}` (or an object narrowing it) replays each audited plugin over N sampled stored pages per **site**, classifies each replay `ok` / `trap` / `empty` / `schema_invalid`, and upserts one row per **(plugin, configuration, site)** into the `observatory` dataset with a drift score against the previous run's row. Zero new fetches: it reads bodies the crawl already stored (`pages` + the `page_versions` archive). Sample = newest half + a deterministic-random rest seeded by the site name, so a re-run over an unchanged corpus picks the same pages; every row reports `sampled`/`total_pages`, and a site with fewer than 5 stored pages is marked `low_confidence`. `sample_per_site` defaults to 25 with a ceiling of **500** (the replay count is sites × plugins × this, and the host's semaphore caps parallelism, not count).
+
+**`sample_by`** picks which end of each site's page list that sample is drawn from: `"recency"` (default, newest first — unchanged behaviour) or `"rank"`, which orders by whole-corpus PageRank read from the crawl app's [`page_rank`](crawling.md#corpus-graph-intelligence-mode-graph) dataset. The sampler always takes the head of the list, so under recency the pages audited every run are whatever was crawled last — on a large site, a leaf nobody links to — while the nav hub every extraction rule depends on may never be sampled at all, and its rot stays invisible until every leaf rule breaks. `rank` is a **reordering, not a filter**: a page with no `page_rank` record ranks 0 and keeps its recency position, so nothing is dropped and a corpus that has never had a `crawl` `mode: "graph"` run behaves exactly as before (the ranking is read only when `rank` is asked for). The run result echoes `sample_by`.
 
 **Change detection on this dataset is the intended consumer, and it now works.** Every measurement a row carries is volatile by construction — `run_at`, `prev_run_at`, `avg_elapsed_ms`, `avg_fuel_used`, `max_fuel_used`, `max_memory_bytes`, `drift_score` — and change detection hashes the whole canonical value, so writing them through a plain upsert marked **every row `changed` on every run**: `unchanged` was structurally always 0, a watch on `plugin/observatory` fired on 100% of its rows every run, and the drift signal the feature exists to raise was buried in universal noise. Those seven fields are now declared [derived paths](datasets.md#derived-paths--a-producer-can-say-which-fields-arent-its-own-news), excluding them from the hash and nothing else — the stored row and every revision still carry them in full. Everything that is a **finding** stays in the identity (`outcomes`, `rates`, `shape`, `total_pages`, `sampled`, `classified`, `unreadable`, `empty_artifacts`, `low_confidence`, `empty_rate_rising`, `params`), so real extraction rot still fires. `drift_score` is derived because it is a statement about the *pair* of runs — it settles `null` → `0.0` on the second run ever and `d` → `0.0` after any real change — and it is computed from `rates`, which is in the identity. **The first run after deploy re-hashes every stored row, so they report `changed` once and then settle.**
 

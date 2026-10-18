@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::auth::CallerPrincipal;
 use crate::events::JobEvent;
 use crate::routes::error::{
     default_limit, keyset_cursor, parse_cursor, parse_rfc3339_param, parse_since, ApiError,
@@ -97,17 +98,18 @@ pub(crate) struct EnqueueBody {
     params(("name" = String, Path, description = "App name")),
     request_body = EnqueueBody,
     responses(
-        (status = 202, description = "Job enqueued", body = Object),
-        (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
-        (status = 404, description = "Unknown app", body = Object),
-        (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = Object),
-        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths), or `budget_usd` is not a positive number of dollars", body = Object),
+        (status = 202, description = "Job enqueued", body = crate::routes::dto::JobDto),
+        (status = 200, description = "Idempotency-Key replay: the original job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Unknown app", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths), or `budget_usd` is not a positive number of dollars", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn enqueue_job(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: axum::http::HeaderMap,
+    caller: Option<axum::Extension<CallerPrincipal>>,
     body: Option<Json<EnqueueBody>>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Some(app) = state.registry.get(&name) else {
@@ -170,8 +172,24 @@ pub(crate) async fn enqueue_job(
         trigger_id: None,
         source_job_id: None,
         target_key,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
-    let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
+    // N20 attribution: the principal the identity layer resolved is stamped onto
+    // the job row, which is what makes `cost_events.principal_id` (copied from
+    // the job at metering time) anything other than NULL. `stored_id()` is
+    // `None` for the synthetic `open`-mode operator — an identity this server
+    // invented rather than authenticated — so an `open` node keeps reporting its
+    // spend as `(unattributed)`, which is the truth about it.
+    let principal_id = caller
+        .as_ref()
+        .and_then(|axum::Extension(c)| c.stored_id())
+        .map(str::to_string);
+    let (job, created) = state
+        .storage
+        .enqueue_dedup_as(&name, opts, principal_id.as_deref())
+        .await?;
     if created {
         state.notify.notify_one();
         Ok((StatusCode::ACCEPTED, Json(job)))
@@ -313,7 +331,7 @@ pub(crate) fn rollup_body(counts: &[(String, i64)]) -> Value {
     tag = "jobs",
     params(ListQuery),
     responses(
-        (status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset. With `rollup=status`, `{total, counts}` from one GROUP BY over the same filters."),
+        (status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset. With `rollup=status`, `{total, counts}` from one GROUP BY over the same filters.", body = crate::routes::dto::JobsResponse),
         (status = 400, description = "A query param this endpoint does not understand, an unparseable `since`/`until`, an unknown `status`, or a `rollup` other than `status`", body = Object),
     )
 )]
@@ -356,8 +374,8 @@ pub(crate) async fn list_jobs(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "The job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
+        (status = 200, description = "The job", body = crate::routes::dto::JobDetail),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_job(
@@ -386,9 +404,9 @@ pub(crate) async fn get_job(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 202, description = "Re-queued job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in a retryable (failed/cancelled) state", body = Object),
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in a retryable (failed/cancelled) state", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn retry_job(
@@ -445,8 +463,8 @@ pub(crate) fn requeued_events(requeued: &[(Uuid, String)]) -> Vec<JobEvent> {
     tag = "jobs",
     request_body = BulkRetryBody,
     responses(
-        (status = 200, description = "`{retried: <count>, ids: [uuid]}`"),
-        (status = 400, description = "status must be failed|cancelled", body = Object),
+        (status = 200, description = "`{retried: <count>, ids: [uuid]}`", body = crate::routes::dto::BulkRetryResponse),
+        (status = 400, description = "status must be failed|cancelled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn bulk_retry_jobs(
@@ -490,9 +508,9 @@ pub(crate) async fn bulk_retry_jobs(
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 202, description = "Re-queued job", body = Object),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in `running` state", body = Object),
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in `running` state", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn reset_job(
@@ -511,6 +529,63 @@ pub(crate) async fn reset_job(
     }
 }
 
+#[derive(Deserialize, ToSchema, Default)]
+pub(crate) struct ResumeBody {
+    /// The answer the parked job asked for (`input_request` on `GET
+    /// /jobs/{id}`). Any JSON; the app is what interprets it. Omitted = `null`,
+    /// which is a legitimate answer for a pure "proceed" gate.
+    #[serde(default)]
+    input: Value,
+}
+
+/// Answers a `waiting` job and re-queues it (N02).
+///
+/// The job resumes from the checkpoint `ctx.await_input(..)` forced before it
+/// parked, and reads `input` back through `ctx.restore_input()`. **No attempt is
+/// burned**: the re-queue uses `reset`'s `max_attempts = MAX(max_attempts,
+/// attempts + 1)` headroom, so a job that waited an hour for a human still has
+/// every retry it started with.
+///
+/// 409 on anything that is not `waiting` — including a second resume of a job
+/// the first one already re-queued. That guard IS the `(status, attempts)` fence
+/// applied at the door: a stale resume (the operator's tab was open across the
+/// answer, the expiry sweep already fired) matches no row, so it cannot restart
+/// a lineage that has moved on.
+#[utoipa::path(
+    post,
+    path = "/jobs/{id}/resume",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    request_body = ResumeBody,
+    responses(
+        (status = 202, description = "Re-queued job", body = crate::routes::dto::JobDto),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job not in `waiting` state", body = crate::routes::dto::ErrorEnvelope),
+    )
+)]
+pub(crate) async fn resume_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<ResumeBody>>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    let input = body.map(|Json(b)| b.input).unwrap_or(Value::Null);
+    match state.storage.resume(id, &input).await? {
+        Some(job) => {
+            state
+                .events
+                .emit(JobEvent::new(job.id, job.app.clone(), "queued"));
+            state.notify.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(job)))
+        }
+        None => Err(job_state_error(
+            &state,
+            id,
+            "job is not in 'waiting' state (nothing is awaiting input on it)",
+        )
+        .await),
+    }
+}
+
 /// Distinguishes a missing job (404) from a job in the wrong state (409) after a
 /// state-guarded mutation reported no rows changed — one extra lookup to give the
 /// caller an actionable status instead of a blanket conflict.
@@ -522,7 +597,9 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     }
 }
 
-/// Cancels a job. A `queued` job is cancelled synchronously; a `running` job
+/// Cancels a job. A `queued` job — or a `waiting` one, parked on external
+/// input with no executor to interrupt — is cancelled synchronously; a
+/// `running` job
 /// has its cancellation token fired so the worker aborts the app future and
 /// marks it `cancelled` (the response reports `running: true`). A terminal job
 /// is `409`, an unknown one `404`.
@@ -538,9 +615,9 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight). During a graceful shutdown a run that already committed to a checkpoint suspend answers `{cancelled: false, running: true, suspended: true, note}` — it was re-queued, not cancelled."),
-        (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = Object),
+        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight). During a graceful shutdown a run that already committed to a checkpoint suspend answers `{cancelled: false, running: true, suspended: true, note}` — it was re-queued, not cancelled.", body = crate::routes::dto::CancelJobResponse),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn cancel_job(
@@ -604,8 +681,8 @@ pub(crate) async fn cancel_job(
     tag = "costs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "`{job_id, app, total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, calls, fresh_records, cost_per_fresh_record_usd, cost_per_fresh_record_unavailable, budget_usd, budget_remaining_usd, budget_remaining_certainty, budget_imputed_usd, budget_imputation, unpriceable, breached, events}`. `billed_usd` is the money we can price; `total_certainty` is `exact` or `at_least`. `budget_remaining_usd` is charged for the calls we could not price and `budget_imputed_usd` says how much of that charge is an estimate; it is `null` with `unpriceable: true` when the job has unreadable bills and no readable one, where the ceiling refuses further metered spend."),
-        (status = 404, description = "Job not found", body = Object),
+        (status = 200, description = "`{job_id, app, total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, calls, fresh_records, cost_per_fresh_record_usd, cost_per_fresh_record_unavailable, budget_usd, budget_remaining_usd, budget_remaining_certainty, budget_imputed_usd, budget_imputation, unpriceable, breached, events}`. `billed_usd` is the money we can price; `total_certainty` is `exact` or `at_least`. `budget_remaining_usd` is charged for the calls we could not price and `budget_imputed_usd` says how much of that charge is an estimate; it is `null` with `unpriceable: true` when the job has unreadable bills and no readable one, where the ceiling refuses further metered spend.", body = crate::routes::dto::JobCostsResponse),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn job_costs(
@@ -655,6 +732,11 @@ pub(crate) struct CostSummaryQuery {
     app: Option<String>,
     /// RFC 3339 lower bound for the window.
     since: Option<String>,
+    /// Restrict the ledger to one caller (N20). Pass the literal
+    /// `(unattributed)` for the rows that carry no caller — every legacy row,
+    /// and every row an `open`-mode node or an internal producer (scheduler,
+    /// trigger hop, workflow step of an unauthenticated run) creates.
+    principal: Option<String>,
     /// Keep only (app, engine) groups holding at least one call of this
     /// certainty: `billed` | `unmetered` | `unknown` | `free`.
     certainty: Option<String>,
@@ -685,8 +767,8 @@ fn parse_certainty(raw: Option<&str>) -> Result<Option<SpendCertainty>, ApiError
     tag = "costs",
     params(CostSummaryQuery),
     responses(
-        (status = 200, description = "`{total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, by_app_engine: [{app, engine, calls, cost_usd, unmetered_calls, unknown_calls}]}`"),
-        (status = 400, description = "Unknown `certainty` value", body = Object),
+        (status = 200, description = "`{total_usd, billed_usd, unmetered_calls, unknown_calls, total_certainty, by_app_engine: [{app, engine, calls, cost_usd, unmetered_calls, unknown_calls}], principal}`. With `?principal=` the ledger is restricted to that caller (`(unattributed)` selects the rows with no caller)", body = crate::routes::dto::CostSummaryResponse),
+        (status = 400, description = "Unknown `certainty` value", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn cost_summary(
@@ -695,9 +777,12 @@ pub(crate) async fn cost_summary(
 ) -> Result<Json<Value>, ApiError> {
     let since = parse_since(query.since.as_deref())?;
     let certainty = parse_certainty(query.certainty.as_deref())?;
+    let principal = query.principal.as_deref().map(principal_filter);
+    // `Option<Option<&str>>`: absent = no filter, `Some(None)` = the rows with
+    // no caller, `Some(Some(id))` = that caller. See `summary_filtered`.
     let summary = state
         .costs
-        .summary_filtered(query.app.as_deref(), since, certainty)
+        .summary_filtered(query.app.as_deref(), since, certainty, principal)
         .await?;
     let total: f64 = summary.iter().map(|s| s.cost_usd).sum();
     let unmetered: i64 = summary.iter().map(|s| s.unmetered_calls).sum();
@@ -708,8 +793,39 @@ pub(crate) async fn cost_summary(
         "unmetered_calls": unmetered,
         "unknown_calls": unknown,
         "total_certainty": total_certainty(unmetered + unknown),
+        // Echoed so a caller can see the filter was applied — an empty ledger
+        // under a mistyped principal must not read as "this caller spent $0".
+        "principal": query.principal,
         "by_app_engine": summary,
     })))
+}
+
+/// Maps the caller-facing `principal=` value onto the ledger's own encoding.
+///
+/// The by-principal report renders NULL rows as `(unattributed)`
+/// ([`pumper_core::costs::UNATTRIBUTED_PRINCIPAL`]), so that label has to be
+/// accepted back as a filter — otherwise the one row an operator is most likely
+/// to click on is the one row that cannot be drilled into. Anything else is a
+/// literal principal id.
+pub(crate) fn principal_filter(requested: &str) -> Option<&str> {
+    (requested != pumper_core::costs::UNATTRIBUTED_PRINCIPAL).then_some(requested)
+}
+
+#[cfg(test)]
+mod principal_filter_tests {
+    use super::principal_filter;
+
+    /// The anti-pattern: `(unattributed)` — the label the by-principal report
+    /// prints for rows with no caller — read as an ordinary principal id. The
+    /// filter would then match no row, and the one line an operator is most
+    /// likely to click on would answer "$0 spent" about the largest bucket on
+    /// most deployments.
+    #[test]
+    fn the_unattributed_label_selects_null_rows_not_a_principal_named_that() {
+        assert_eq!(principal_filter("(unattributed)"), None);
+        assert_eq!(principal_filter("p_abc"), Some("p_abc"));
+        assert_eq!(principal_filter(""), Some(""));
+    }
 }
 
 #[cfg(test)]
@@ -1088,13 +1204,15 @@ mod cost_sum_inventory {
 
     /// Sites that sum `cost_usd`, as `"<path>: <line>"`, sorted.
     ///
-    /// Both survivors fold **`CostSummary`** rows, not raw events: the group
-    /// already carries `unmetered_calls` / `unknown_calls` and `GET /economics`
-    /// publishes them beside the money. Nothing here may sum a `CostEvent`.
+    /// Every survivor folds summary GROUPS (`CostSummary`,
+    /// `PrincipalCostSummary`), not raw events: the group already carries
+    /// `unmetered_calls` / `unknown_calls` and the route publishes them beside
+    /// the money. Nothing here may sum a `CostEvent`.
     const EXPECTED: &[&str] = &[
         "routes/economics.rs: e.claude_cost_usd += c.cost_usd;",
         "routes/economics.rs: e.cost_usd += c.cost_usd;",
         "routes/jobs.rs: let total: f64 = summary.iter().map(|s| s.cost_usd).sum();",
+        "routes/principals.rs: let total: f64 = rows.iter().map(|r| r.cost_usd).sum();",
     ];
 
     /// Reduces a source file to the code a reader would call *executable*:

@@ -36,6 +36,7 @@ fn flow() -> TransactRequest {
         submit: false,
         idempotency_key: "contract-probe".into(),
         wait_for_selector: None,
+        confirm_selector: None,
         extra_wait_ms: None,
         max_body_bytes: None,
     }

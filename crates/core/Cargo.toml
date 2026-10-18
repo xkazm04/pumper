@@ -12,7 +12,7 @@ publish = false
 # (e.g. Personas) depend with `default-features = false` to drop sqlx entirely
 # (avoids a duplicate libsqlite3 link against a bundled rusqlite).
 default = ["storage"]
-storage = ["dep:sqlx"]
+storage = ["dep:sqlx", "dep:ring", "dep:cron"]
 # Shared test harness (`pumper_core::testing`): TempStore RAII fixture, Dead
 # engines, AppContext builder. Enable from [dev-dependencies] ONLY.
 test-support = ["storage", "dep:tempfile"]
@@ -41,6 +41,18 @@ uuid.workspace = true
 chrono.workspace = true
 skyscraper = "0.7"
 tempfile = { version = "3", optional = true }
+# App-declared schedules (P.4): the cron a run asks for is PARSED before the
+# row is written, so an unreadable expression is refused instead of stored as a
+# schedule that never fires.
+cron = { workspace = true, optional = true }
+# N16 mesh envelopes: ed25519 verification. Optional so a
+# `default-features = false` embedder (engines + Fetcher only) never links it.
+# (The hex wire encoding uses the unconditional `hex` dependency above.)
+ring = { workspace = true, optional = true }
+# LightTrack emitter (M25): a fire-and-forget POST alongside the internal cost
+# ledger. Same reqwest major the HTTP/archive engines already carry, so this
+# adds no new dependency to the tree — just a new edge from core onto it.
+reqwest.workspace = true
 
 [dev-dependencies]
 # Self-referential: core's own integration tests get the harness.

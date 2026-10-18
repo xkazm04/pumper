@@ -41,6 +41,8 @@ async fn job_trigger(state: &AppState, name: &str) -> pumper_core::Trigger {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap()

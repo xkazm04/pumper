@@ -12,6 +12,9 @@
         "crates/core/src/costs.rs",
         "crates/core/src/vcr.rs",
         "crates/server/src/worker.rs",
+        "crates/server/src/executors.rs",
+        "crates/server/src/executor_main.rs",
+        "crates/server/src/routes/executors.rs",
         "crates/server/src/scheduler.rs",
         "crates/server/src/progress.rs",
         "crates/server/src/state.rs",
@@ -87,7 +90,11 @@
       "doc": "docs/features/events-webhooks.md",
       "sourceGlobs": [
         "crates/server/src/webhook.rs",
-        "crates/server/src/events.rs"
+        "crates/server/src/events.rs",
+        "crates/server/src/routes/watches.rs",
+        "crates/server/src/subscriptions.rs",
+        "crates/server/src/routes/subscriptions.rs",
+        "crates/server/src/routes/events.rs"
       ]
     },
     {
@@ -101,14 +108,38 @@
       "doc": "docs/features/trigger-plugins.md",
       "sourceGlobs": [
         "crates/server/src/triggers.rs",
+        "crates/engine-wasm/src/caps.rs",
+        "crates/server/src/plugin_caps.rs",
         "plugins-src/trigger-gate/**",
-        "plugins-src/delta-slim/**"
+        "plugins-src/delta-slim/**",
+        "plugins-src/sink-postgrest/**"
       ]
     },
     {
       "doc": "docs/features/http-api.md",
       "sourceGlobs": [
         "crates/server/src/routes/**"
+      ]
+    },
+    {
+      "doc": "docs/features/mcp.md",
+      "sourceGlobs": [
+        "crates/server/src/mcp/**",
+        "crates/core/src/agent_tools.rs"
+      ]
+    },
+    {
+      "doc": "docs/features/workflows.md",
+      "sourceGlobs": [
+        "crates/server/src/workflow.rs",
+        "crates/server/src/routes/workflows.rs"
+      ]
+    },
+    {
+      "doc": "docs/features/auth.md",
+      "sourceGlobs": [
+        "crates/server/src/auth.rs",
+        "crates/server/src/routes/principals.rs"
       ]
     },
     {
@@ -129,25 +160,43 @@
     {
       "doc": "docs/features/apps.md",
       "sourceGlobs": [
-        "crates/apps/**"
+        "crates/apps/**",
+        "crates/engine-wasm/wit/**",
+        "crates/engine-wasm/src/app_host.rs",
+        "crates/server/src/registry.rs",
+        "crates/core/src/transactions.rs",
+        "crates/server/src/routes/transactions.rs"
       ]
     },
     {
       "doc": "docs/features/datahub.md",
       "sourceGlobs": [
-        "crates/server/src/datahub.rs"
+        "crates/server/src/datahub.rs",
+        "crates/server/src/lineage.rs"
       ]
     },
     {
-      "doc": "docs/features/peering.md",
+      "doc": "docs/features/mesh.md",
       "sourceGlobs": [
-        "crates/apps/peer/**"
+        "crates/apps/peer/**",
+        "crates/core/src/mesh.rs",
+        "crates/server/src/node.rs",
+        "crates/server/src/routes/mesh.rs"
       ]
     },
     {
-      "doc": "docs/features/sdk-typescript.md",
+      "doc": "docs/features/ingress.md",
       "sourceGlobs": [
-        "clients/typescript/src/**"
+        "crates/server/src/routes/ingress.rs"
+      ]
+    },
+    {
+      "doc": "docs/features/sdks.md",
+      "sourceGlobs": [
+        "clients/typescript/src/**",
+        "clients/python/pumper_sync/**",
+        "clients/cli/src/**",
+        "scripts/gen/**"
       ]
     },
     {

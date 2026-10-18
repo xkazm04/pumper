@@ -117,23 +117,33 @@ export function extractSites(src) {
   const list = fnBody(src, 'fn server_tools(');
   if (!list) problems.push('cannot find fn server_tools');
 
+  // A site may be spelled in more than one block: tools appended by a later
+  // change get their own `if GATE { ... }` block (so the advertised ORDER, which
+  // an e2e inventory pins, does not move). The vocabulary is the union of the
+  // blocks; parity is judged over that union, exactly as it is for one block.
   let listedGated = [];
   let listedUngated = [];
   if (list) {
-    const guardAt = list.indexOf(`if ${GATE}`);
-    if (guardAt === -1) {
-      problems.push(`server_tools has no \`if ${GATE}\` block`);
-    } else {
+    let rest = '';
+    let from = 0;
+    let blocks = 0;
+    for (;;) {
+      const guardAt = list.indexOf(`if ${GATE}`, from);
+      if (guardAt === -1) break;
       const open = list.indexOf('{', guardAt);
       const block = braceBlock(list, open);
-      if (!block) problems.push('unbalanced braces in the allow_enqueue block');
-      else {
-        listedGated = toolNames(block);
-        listedUngated = toolNames(
-          list.slice(0, guardAt) + list.slice(guardAt + block.length)
-        );
+      if (!block) {
+        problems.push('unbalanced braces in an allow_enqueue block');
+        break;
       }
+      listedGated.push(...toolNames(block));
+      rest += list.slice(from, guardAt);
+      from = open + block.length;
+      blocks += 1;
     }
+    rest += list.slice(from);
+    if (blocks === 0) problems.push(`server_tools has no \`if ${GATE}\` block`);
+    else listedUngated = toolNames(rest);
   }
 
   const dispatch = fnBody(src, 'async fn tools_call(');
@@ -152,11 +162,16 @@ export function extractSites(src) {
       ),
     ].map((m) => m[1]);
 
-    // The refusal arm: two or more alternated string patterns arrowing to Err.
-    const alt = dispatch.match(
-      /((?:"[a-z0-9_]+"\s*\|\s*)+"[a-z0-9_]+")\s*=>\s*Err\(/
-    );
-    if (alt) refusal = [...alt[1].matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
+    // The refusal arms: two or more alternated string patterns arrowing to an
+    // Err that names the switch. Every such arm counts (see the list site);
+    // an alternation refusing for a DIFFERENT switch is not this vocabulary.
+    for (const alt of dispatch.matchAll(
+      /((?:"[a-z0-9_]+"\s*\|\s*)+"[a-z0-9_]+")\s*=>\s*Err\(/g
+    )) {
+      const message = dispatch.slice(alt.index + alt[0].length, alt.index + alt[0].length + 400);
+      if (!message.includes('allow_enqueue')) continue;
+      refusal.push(...[...alt[1].matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+    }
 
     // Plain `"x" =>` arms with no guard and no alternation.
     dispatchUngated = [

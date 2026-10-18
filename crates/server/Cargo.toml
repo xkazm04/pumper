@@ -13,6 +13,11 @@ path = "src/main.rs"
 # Needed at build time (not just dev): the worker's JobCheckpointer implements
 # pumper-core's async CheckpointSink trait.
 async-trait.workspace = true
+# N10: the plugin capability bridge's per-plugin kv namespace runs against the
+# store's own pool (`Storage::pool()`). It is deliberately NOT a Storage method:
+# `plugin_kv` is scratch state owned by the sandbox, not part of the job/dataset
+# model, and it should not widen the store's API surface to say so.
+sqlx.workspace = true
 pumper-core.workspace = true
 pumper-engine-http.workspace = true
 pumper-engine-archive.workspace = true
@@ -47,6 +52,7 @@ app-ca-grants.workspace = true
 app-eu-sedia.workspace = true
 app-mpsv-vpm.workspace = true
 app-mpsv-ispv.workspace = true
+app-mpsv-ciselniky.workspace = true
 app-extractor.workspace = true
 app-plugin.workspace = true
 app-crawl.workspace = true
@@ -68,6 +74,8 @@ serde.workspace = true
 serde_json.workspace = true
 jsonschema.workspace = true
 sha2.workspace = true
+# Node identity (N16): the ed25519 keypair under `data/node.key`.
+ring.workspace = true
 hmac.workspace = true
 hex.workspace = true
 anyhow.workspace = true
@@ -79,9 +87,16 @@ uuid.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
+# N16: the [[peer]] schedule reconcile writes its rows fenced on
+# `managed_by = 'peer'`; there is no storage-layer writer with a caller-chosen
+# id + params, and adding one is outside this change's file scope.
 
 [dev-dependencies]
 pumper-core = { workspace = true, features = ["test-support"] }
+# Compiles the shared component fixture (crates/engine-wasm/tests/fixtures) so
+# the dynamic-app e2e runs a REAL component through the worker without needing
+# an external wasm toolchain on the machine.
+wat = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 async-trait.workspace = true

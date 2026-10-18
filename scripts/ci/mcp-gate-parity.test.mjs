@@ -27,7 +27,19 @@ const SRC = fs.readFileSync(
   'utf8'
 );
 
-const GATED = ['enqueue_job', 'fetch_readable', 'deep_research'];
+const GATED = [
+  'enqueue_job',
+  'fetch_readable',
+  'deep_research',
+  'resume_job',
+  'run_workflow',
+  // N04: the pipeline-authoring tools, advertised in their own block.
+  'create_trigger',
+  'test_trigger',
+  'trigger_decisions',
+  'create_watch',
+  'create_ingress_source',
+];
 
 test('the live source parses to a non-empty gated set at all three sites', () => {
   const s = extractSites(SRC);
@@ -42,9 +54,23 @@ test('the ungated set matches what the e2e test asserts tools/list returns', () 
   // language, from a running server. If these two ever disagree, one of them
   // is reading the wrong thing — that is the point of checking it here.
   const s = extractSites(SRC);
+  // `approve_transaction` is the one name here the e2e list does not carry: it
+  // sits behind a DIFFERENT switch (`[mcp] allow_approve`), which is off in the
+  // e2e config and which this checker does not police, so it reads as
+  // allow_enqueue-ungated here and is absent from a default tools/list.
   assert.deepEqual(
     [...s.listedUngated].sort(),
-    ['list_apps', 'query_dataset', 'search', 'wait_job']
+    [
+      'list_apps',
+      'query_dataset',
+      'search',
+      'wait_job',
+      'wait_workflow',
+      'list_pending_transactions',
+      'approve_transaction',
+      'market_profile',
+      'fetch',
+    ].sort()
   );
 });
 
@@ -114,8 +140,24 @@ test('a source whose shape has moved reports cannot-check, never clean', () => {
   assert.ok(s.problems.length > 0);
 });
 
+test('a drift inside the SECOND gate block is still a finding', () => {
+  // The vocabulary spans two advertised blocks; parity must hold over the union,
+  // so un-guarding a tool advertised only in the second block is still caught.
+  const mutated = SRC.replace(
+    '"create_watch" if state.config.mcp.allow_enqueue => tool_create_watch(state, &args).await,',
+    '"create_watch" => tool_create_watch(state, &args).await,'
+  );
+  assert.notEqual(mutated, SRC, 'mutation did not apply — fixture is stale');
+  const f = findings(extractSites(mutated));
+  assert.ok(
+    f.some((x) => x.includes('create_watch') && x.includes('not guarded')),
+    f.join('; ')
+  );
+});
+
 test('zero parsed gated tools is cannot-check, not a pass', () => {
-  const emptied = SRC.replace(
+  // Every block: the gated vocabulary is the union of them all.
+  const emptied = SRC.replaceAll(
     'if state.config.mcp.allow_enqueue {',
     'if false {'
   );

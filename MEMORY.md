@@ -15,6 +15,7 @@ rediscover. Anything you can learn from a five-minute skim does not belong here.
 | [.perfect/Architect/backlog.md](.perfect/Architect/backlog.md) | The architectural queue: pending / shipped / abandoned, ranked by (reach × payoff) / (risk × effort). **Check "Pending" before proposing structural work.** |
 | [.perfect/Architect/decisions/](.perfect/Architect/decisions/) | ADR-style records, one per shipped decision, with the commits that carried it. |
 | [.perfect/Architect/coverage.md](.perfect/Architect/coverage.md) | Which themes/areas have been scanned and when — the anti-rescan ledger. |
+| [.perfect/Architect/kpi-baselines.md](.perfect/Architect/kpi-baselines.md) | The back-measure ledger: each goal's meters, the command behind each number, and the last reading. **Re-run the commands and diff; do not re-describe.** |
 | [.perfect/Architect/strong-patterns.md](.perfect/Architect/strong-patterns.md) | Patterns codified as house style. Follow them; don't reinvent. |
 | [.perfect/Architect/weak-patterns.md](.perfect/Architect/weak-patterns.md) | Known anti-patterns and where they still live. |
 | [.perfect/Architect/architect-preferences.md](.perfect/Architect/architect-preferences.md) | How the user wants scans run and proposals framed. |
@@ -23,11 +24,12 @@ rediscover. Anything you can learn from a five-minute skim does not belong here.
 
 Other durable references live outside `.perfect/`:
 `docs/harness/harness-learnings.md` (structural facts + pattern catalogue),
+`docs/harness/moonshot-2026-09-01/INDEX.md` (generation-2 moonshot deck: 37 L/XL items ranked by scout corroboration, decisions pending — M01–M44 of the 2026-07-30 scan are all shipped, do not re-propose them),
 `docs/features/` (what the product does today), `context-map.json` (file → feature).
 
 ## Invariants and gotchas
 
-Eight things this repo does that are **not** derivable from a skim, and that prose
+Thirteen things this repo does that are **not** derivable from a skim, and that prose
 elsewhere gets wrong.
 
 1. **CORS is OFF by default — README.md and ONBOARDING.md §2 say the opposite.**
@@ -108,6 +110,77 @@ elsewhere gets wrong.
    on every job type, from 2026-07-13 until the heartbeat moved to a spawn-per-tick
    write (`worker.rs`, `should_beat`; `e2e/heartbeat_pool.rs`). The tick itself must stay
    in the loop: a wedged job has to stop beating, or the reaper can never recover it.
+
+9. **Door-inventory tests read a file's "production half" as everything before the
+   first `#[cfg(test)]`.** `mcp::tests::every_door_that_creates_work_runs_the_shared_params_check`
+   (and the EXPECTED-diff idiom generally) scan source text, so a `#[cfg(test)]` item placed
+   high in a door file silently hides every door below it from the test that polices them.
+   Found 2026-09-02 (N15 build): a test-gated `handle_rpc` near the top of `mcp/mod.rs` hid the
+   `enqueue` doors. Keep test-gated items at the bottom of door files.
+
+10. **Parallel worktree builders all pick the same migration number.** Four of five wave-1
+   builders took 0041; the coordinator renumbers at merge and greps docs/tests for the old
+   name. `config.rs` conflicts on every merge because every builder appends a section at the
+   end — resolve by keeping both sides, and re-check for braces lost at the hunk boundary
+   (`5bfad5d`).
+
+11. **The mesh wire format lives in `crates/core/src/mesh.rs` — one implementation, for
+   everyone.** Signing bytes, ed25519 verification, the key fingerprint, the live-set
+   digest, `ghost_keys` and the bundle shapes (`weather_entries`, `exportable_recipe`,
+   `importable_recipe`) are all there; `app_peer::envelope` is a re-export of it, kept so
+   the paths the app and the server have always used keep resolving. Consumers:
+   `crates/server/src/{node.rs, routes/mesh.rs, routes/host_weather.rs, routes/recipes.rs,
+   routes/datasets.rs}` and `crates/apps/peer`. Do **not** re-implement any of it: two
+   implementations of "what bytes a bundle is" is an interoperability bug that shows up only
+   between two nodes on different builds. The module is behind core's `storage` feature
+   (the weather bundle is typed by `tiers::WeatherEntry`), and `ring`/`hex` are optional
+   core deps that feature turns on, so a `default-features = false` embedder still links
+   neither. Related traps: node identity is memoised per **key-file path**, never a
+   `OnceLock` (the two-node e2e runs both nodes in one process and a shared keypair makes
+   the forgery test pass for the wrong reason); a corrupt `node.key` is a hard error, never
+   a silent re-key; and `[[peer]]` is reconciled into schedules at **boot only**, unlike the
+   catalog.
+
+12. **An empty replay ring reports "nothing missed", not "reset".** `EventBus::replay`
+   answers `Events([])` when the ring is empty ("no buffered events, so no loss possible"),
+   which is right for a fresh process that has emitted nothing and catastrophically wrong for
+   a process that has just *restarted*: a client resuming with `Last-Event-ID` got an empty
+   answer, no events and no `reset`. Any code reading the ring for a resume must check that
+   the first buffered event is exactly `after + 1` before trusting it — that is what
+   `routes::events::replay_or_log` does before falling through to the `events` table. Found
+   2026-09-02 (N05 build), by the restart e2e.
+
+   Two more N05 traps in the same area: the durable log is written **asynchronously** —
+   `emit` queues, and the transaction happens at the next outbox pass (`subscriptions::drain`,
+   on the scheduler tick and at the end of a job's fan-out), so a test that reads the table
+   right after an emit must `persist_pending` first. And the drain must run **after**
+   `finalize_with_stages`, which is what publishes `job.succeeded` — the most-subscribed kind
+   there is; draining before it left that event in the queue until the next tick.
+
+13. **The invariants above were renumbered before wave 3, and again when the moonshot
+   wave merged into master** (master had grown its own 7 and 8 in the meantime).
+   Renumbering on merge is normal here; cite invariants by their text, not their number.
+
+14. **A new route or a changed response shape has THREE coupled artifacts, not one.**
+   Since N23 the OpenAPI document is the client contract, and it is committed:
+   (a) the route's `responses(...)` must name a DTO from `crates/server/src/routes/dto.rs`
+   — `spec_schema_tests::every_success_response_references_a_component_schema` diffs the
+   untyped set against `SCHEMALESS_RESPONSES` **in both directions**, so a new untyped 2xx
+   fails naming itself AND a stale allowlist entry fails too; (b) `clients/openapi.json`
+   must be regenerated (`just openapi`), or
+   `spec_snapshot_tests::committed_spec_matches_the_router` fails `cargo test`; (c) the
+   generated clients must be regenerated (`just clients`), or the CI `sdk` job's
+   `generate-clients.mjs --check` fails. The DTOs are **declarations only** — nothing
+   constructs one, and editing one changes no response; if you find yourself wanting a DTO
+   to change a payload, you are editing the wrong thing. The dual-mode list endpoints
+   (bare array or legacy envelope without `?cursor=`, keyset page with it) are declared as
+   untagged unions and both arms are load-bearing: tightening one breaks the consumers the
+   whole surface exists for. Two smaller traps: utoipa renders `Option<T>` as
+   **non-required**, while a `json!` literal always writes the key as `null`, so the
+   document is looser than the server and `@pumper/sync` corrects for it with `Required<>`;
+   and a schema-only struct is `never constructed` as far as rustc is concerned, which is
+   why `dto.rs` carries a module-level `#![allow(dead_code)]` with a comment saying so.
+   Learned 2026-09-02 (N23 build).
 
 ## How to extend this file
 

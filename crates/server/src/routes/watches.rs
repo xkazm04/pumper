@@ -1,6 +1,16 @@
 //! Dataset change webhooks: list (delivery-enriched), create (namespace-gated),
 //! delete, enable/disable, and the per-watch delivery log — the
 //! `dataset.changed` delivery subscriptions.
+//!
+//! **Since N05 these routes are a thin adapter.** A watch IS a cursor
+//! subscription with a `{kinds: ["dataset.changed"], app, dataset}` selector:
+//! the `watches` table stays the source of truth for watch rows and every route
+//! here keeps working unchanged, but the fan-out runs through the shared outbox
+//! (`crate::subscriptions`), so a watch now has a durable cursor and resumes
+//! after a restart or a disable instead of missing whatever happened while it
+//! was away. `POST /watches` is **deprecated** in favour of
+//! `POST /subscriptions` and will be removed one release after N05; see
+//! `docs/features/events-webhooks.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -216,8 +226,8 @@ pub(crate) struct WatchesQuery {
     tag = "watches",
     params(WatchesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{watches: [Watch]}`, or `{items, next_cursor}` when `cursor` is present. Each watch is enriched with `last_delivery` (`{id, status, at}`, or **explicit `null`** when it has never delivered) so a watch that has never fired is distinguishable from one that fires into a dead receiver."),
-        (status = 400, description = "Unknown `app` (the filter names a namespace nothing delivers under; the message lists the accepted values)", body = Object),
+        (status = 200, description = "Dual-mode: `{watches: [Watch]}`, or `{items, next_cursor}` when `cursor` is present. Each watch is enriched with `last_delivery` (`{id, status, at}`, or **explicit `null`** when it has never delivered) so a watch that has never fired is distinguishable from one that fires into a dead receiver.", body = crate::routes::dto::WatchesResponse),
+        (status = 400, description = "Unknown `app` (the filter names a namespace nothing delivers under; the message lists the accepted values)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_watches(
@@ -298,15 +308,78 @@ pub(crate) struct CreateWatchBody {
     sink: Option<String>,
 }
 
+/// Validates a `(sink, url)` pair and returns the url to store.
+///
+/// Extracted from `create_watch` because N05's `POST /subscriptions` takes the
+/// same pair and must refuse it identically: a `plugin:` sink naming a module
+/// that was never installed, or a `webhook` sink with no scheme, is a
+/// subscription that looks configured and dead-letters every event. Two copies
+/// of this gate would mean one door quietly accepting what the other refuses.
+///
+/// The four sinks and what `url` means for each:
+/// - `file`: nothing. The path derives from the subscriber id alone (the
+///   traversal guard lives in the delivery layer), so any supplied url is
+///   dropped rather than half-honored.
+/// - `webhook` / `slack`: the http(s) endpoint. Required.
+/// - `plugin:<name>` (N10): OPTIONAL, and it is the *connector's target* — it
+///   reaches the module as `params.target`. It must be http(s) when present,
+///   because it rides the delivery row's pseudo-URL after `?target=` and a `?`
+///   in the stored value would be re-parsed as the separator.
+pub(crate) async fn validate_sink<'a>(
+    state: &AppState,
+    sink: &str,
+    url: Option<&'a str>,
+) -> Result<&'a str, ApiError> {
+    match sink {
+        "file" => Ok(""),
+        "webhook" | "slack" => {
+            let url = url.unwrap_or("");
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "url must be http(s)".into(),
+                ));
+            }
+            Ok(url)
+        }
+        other if other.starts_with(crate::webhook::PLUGIN_SINK_PREFIX) => {
+            let name = &other[crate::webhook::PLUGIN_SINK_PREFIX.len()..];
+            if !state.plugins.has(name) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "no executable plugin named '{name}' is loaded — build and install it \
+                         (`just plugins-install`), then POST /plugins/reload"
+                    ),
+                ));
+            }
+            let url = url.unwrap_or("");
+            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "a plugin sink's url is the connector's target and must be http(s) \
+                     (or omitted, for a connector with its destination built in)"
+                        .into(),
+                ));
+            }
+            Ok(url)
+        }
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown sink '{other}' (expected webhook, file, slack, or plugin:<name>)"),
+        )),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/watches",
     tag = "watches",
     request_body = CreateWatchBody,
     responses(
-        (status = 201, description = "Created watch", body = Object),
-        (status = 400, description = "Invalid sink, url missing/not http(s), or an `(app, dataset)` pair that could never fire — the message names the namespace those records actually land under", body = Object),
-        (status = 404, description = "Unknown app: the namespace is neither a registered app nor one the change fan-out delivers under", body = Object),
+        (status = 201, description = "Created watch", body = crate::routes::dto::WatchDto),
+        (status = 400, description = "Invalid sink, url missing/not http(s), or an `(app, dataset)` pair that could never fire — the message names the namespace those records actually land under", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown app: the namespace is neither a registered app nor one the change fan-out delivers under", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_watch(
@@ -324,30 +397,20 @@ pub(crate) async fn create_watch(
         return Err(ApiError(status, msg));
     }
     let sink = body.sink.as_deref().unwrap_or("webhook");
-    let url = match sink {
-        // The file path derives from the watch id only (path-traversal guard
-        // lives in the delivery layer); any supplied url is ignored.
-        "file" => "",
-        "webhook" | "slack" => {
-            let url = body.url.as_deref().unwrap_or("");
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "url must be http(s)".into(),
-                ));
-            }
-            url
-        }
-        other => {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("unknown sink '{other}' (expected webhook, file, or slack)"),
-            ));
-        }
-    };
+    let url = validate_sink(&state, sink, body.url.as_deref()).await?;
+
     let watch = state
         .storage
-        .create_watch(&body.app, dataset, url, body.secret.as_deref(), sink)
+        // From NOW (N05): a watch has never delivered a change that happened
+        // before it existed, and the durable log would let it.
+        .create_watch(
+            &body.app,
+            dataset,
+            url,
+            body.secret.as_deref(),
+            sink,
+            state.events.latest_seq() as i64,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(watch)))
 }
@@ -377,9 +440,9 @@ pub(crate) struct WatchDeliveriesQuery {
     tag = "watches",
     params(("id" = String, Path, description = "Watch id"), WatchDeliveriesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{watch_id, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`."),
-        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = Object),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "Dual-mode: `{watch_id, count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. Bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`.", body = crate::routes::dto::WatchDeliveryFeed),
+        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn watch_deliveries(
@@ -424,8 +487,8 @@ pub(crate) async fn watch_deliveries(
     tag = "watches",
     params(("id" = String, Path, description = "Watch id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_watch(
@@ -446,8 +509,8 @@ pub(crate) async fn delete_watch(
     params(("id" = String, Path, description = "Watch id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Watch not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Watch not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_watch_enabled(

@@ -289,6 +289,11 @@ pub const REPLAY_BYPASS_APPS: &[(&str, ReplayFidelity, &str)] = &[
          the migration is banked rather than done (see the raw-engine inventory)",
     ),
     (
+        "mpsv-ciselniky",
+        ReplayFidelity::Unreplayable,
+        "the four MPSV codebook documents: raw JSON, and the app's whole payload",
+    ),
+    (
         "mpsv-ispv",
         ReplayFidelity::Unreplayable,
         "the ISPV wage API: raw JSON, and the app's whole payload",
@@ -609,6 +614,9 @@ pub fn to_fetch_outcome(entry: &CassetteEntry, replay_of: Uuid) -> Result<FetchO
         // A recorded archive win replays as an archive win, capture time and
         // all — read back through the same seam that wrote it.
         snapshot: crate::engine::snapshot_provenance(&entry.headers),
+        // Captures are not recorded on the cassette: a replayed fetch has no
+        // live render behind it, so the X-ray has nothing honest to discover.
+        network: Vec::new(),
     })
 }
 
@@ -625,6 +633,7 @@ pub fn to_research_output(entry: &CassetteEntry, replay_of: Uuid) -> Result<Rese
         duration_ms: Some(0),
         num_turns: None,
         session_id: None,
+        model: None,
     })
 }
 
@@ -1013,6 +1022,7 @@ mod tests {
             trace: Vec::new(),
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         }
     }
 
@@ -1206,6 +1216,7 @@ mod tests {
             duration_ms: Some(900),
             num_turns: Some(3),
             session_id: Some("s".into()),
+            model: None,
         };
         let entry = research_entry("canonical-key", &req, &out);
         assert_eq!(entry.method, METHOD_RESEARCH);
@@ -1387,6 +1398,7 @@ mod tests {
             duration_ms: None,
             num_turns: None,
             session_id: None,
+            model: None,
         };
         let mut entry = research_entry("canonical-key", &req, &out);
         entry.req_hash = "not-a-digest".into();
@@ -1498,6 +1510,7 @@ mod tests {
                 duration_ms: None,
                 num_turns: None,
                 session_id: None,
+                model: None,
             },
         ))
         .await;

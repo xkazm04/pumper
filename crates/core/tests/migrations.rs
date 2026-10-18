@@ -152,6 +152,26 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let api_recipes = column_names(&pool, "api_recipes").await;
+    for col in [
+        "consecutive_failures", // 0028 recipe strikes
+        "retired_at",           // 0046 recipe lifecycle
+        "last_failure_at",      // 0046 recipe lifecycle
+        "validation_reason",    // 0049 X-ray validation verdict
+        "validated_at",         // 0049 X-ray validation verdict
+    ] {
+        assert!(
+            api_recipes.contains(col),
+            "api_recipes lost column `{col}`: {api_recipes:?}"
+        );
+    }
+
+    let watches = column_names(&pool, "watches").await;
+    assert!(
+        watches.contains("cursor_seq"), // 0055 durable event log
+        "watches lost column `cursor_seq`: {watches:?}"
+    );
+
     let triggers = column_names(&pool, "triggers").await;
     for col in [
         "filters",      // 0021 external triggers
@@ -661,7 +681,7 @@ async fn the_certainty_filter_selects_whole_groups_that_contain_one() {
     assert_eq!(all.len(), 2, "the unfiltered rollup keeps every group");
 
     let unmetered = ledger
-        .summary_filtered(None, None, Some(SpendCertainty::Unmetered))
+        .summary_filtered(None, None, Some(SpendCertainty::Unmetered), None)
         .await
         .expect("filtered summary");
     assert_eq!(unmetered.len(), 1, "only the affected group: {unmetered:?}");
@@ -682,7 +702,7 @@ async fn the_certainty_filter_selects_whole_groups_that_contain_one() {
     assert_eq!(quiet.uncertain_calls(), 0);
     assert_eq!(quiet.total_certainty(), "exact");
     let unknown = ledger
-        .summary_filtered(None, None, Some(SpendCertainty::Unknown))
+        .summary_filtered(None, None, Some(SpendCertainty::Unknown), None)
         .await
         .expect("filtered summary");
     assert!(unknown.is_empty(), "nothing is `unknown` here: {unknown:?}");

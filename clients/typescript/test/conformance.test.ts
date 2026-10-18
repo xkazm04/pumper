@@ -13,10 +13,19 @@
 // a live server); this form only proves both sides agree on the *shape* of
 // the fixtures, which is what actually drifted here (the `removed=` default
 // flip, `trust=` gaining teeth on `/export`).
+//
+// N23 turned the shape-pinning half into a GENERATED-vs-SERVED check. The field
+// lists below used to be hand-written here, which meant they described what
+// somebody believed the server sent and could never catch a field the server
+// ADDED. They are now read out of `clients/openapi.json` — the document the
+// router generates, a Rust test pins to the live router, and `src/generated.ts`
+// is generated from — so the whole chain is answerable to one artifact:
+//   router → clients/openapi.json → src/generated.ts → src/types.ts → these
+//   fixtures.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -35,13 +44,58 @@ const revisionPage = () => fixture<RevisionPage<Record<string, unknown>>>("revis
 
 // ---- Shape pinning ---------------------------------------------------------
 
-test("record fixture has every field PumperRecord requires, including trust", () => {
-  const r = record();
-  for (const field of ["key", "data", "first_seen", "last_seen", "updated_at", "removed_at", "trust"]) {
-    assert.ok(field in r, `record fixture missing '${field}'`);
+// The served OpenAPI document, found by walking up from wherever this test is
+// running (`test/` from source, `dist-test/test/` after the pretest compile).
+// This is the artifact `src/generated.ts` is generated FROM and that a Rust test
+// pins to the live router, so reading it here closes the loop:
+//   router  →  clients/openapi.json  →  src/generated.ts  →  these fixtures.
+const specPath = (() => {
+  let dir = here;
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = join(dir, "openapi.json");
+    if (existsSync(candidate)) return candidate;
+    const up = dirname(dir);
+    if (up === dir) break;
+    dir = up;
   }
+  throw new Error("clients/openapi.json not found — run `just clients`");
+})();
+
+const schema = (name: string): { properties: Record<string, unknown> } => {
+  const doc = JSON.parse(readFileSync(specPath, "utf8")) as {
+    components: { schemas: Record<string, { properties?: Record<string, unknown> }> };
+  };
+  const found = doc.components.schemas[name];
+  assert.ok(found, `the served spec has no component schema '${name}'`);
+  return { properties: found.properties ?? {} };
+};
+
+/** Every property the SERVED schema declares must be present in the fixture.
+ *
+ *  This replaces a hand-written field list. A list written here can only ever
+ *  describe what somebody believed the server sent; reading the spec makes the
+ *  fixtures answerable to what it actually sends, so a field ADDED server-side
+ *  fails here too — which the old list could never do. */
+const assertFixtureCoversSchema = (name: string, value: Record<string, unknown>) => {
+  const missing = Object.keys(schema(name).properties).filter((k) => !(k in value));
+  assert.deepEqual(missing, [], `${name} fixture is missing served fields: ${missing.join(", ")}`);
+};
+
+test("record fixture carries every field the served RecordDto schema declares", () => {
+  const r = record();
+  assertFixtureCoversSchema("RecordDto", r as unknown as Record<string, unknown>);
   assert.equal(typeof r.trust, "string");
   assert.equal(r.removed_at, null, "live record fixture must have removed_at: null");
+});
+
+test("revision fixtures carry every field the served RevisionDto schema declares", () => {
+  for (const item of revisionPage().items) {
+    assertFixtureCoversSchema("RevisionDto", item as unknown as Record<string, unknown>);
+  }
+  assertFixtureCoversSchema(
+    "RevisionPageDto",
+    revisionPage() as unknown as Record<string, unknown>,
+  );
 });
 
 test("removed record fixture carries a non-null removed_at (tombstone shape)", () => {
@@ -461,4 +515,58 @@ test("replaying the Rust-emitted shared-stamp feed across two runs loses no stam
   const expected = new Set(f.pages.flatMap((p) => p.items.map((i) => i.key)));
   assert.equal(expected.size, f.distinct_keys);
   for (const k of expected) assert.ok(sink.keys.includes(k), `stamp-sibling '${k}' was lost`);
+});
+
+test("subscribe walks the log forward from a cursor and stops when the server says caught up", async () => {
+  // Two pages: the first FILLS (next_after set), the second does not (null).
+  // The anti-pattern this pins: a poller that treats "no events" as "keep
+  // asking immediately" and spins, or one that stops at the first page and
+  // silently never sees the rest of its backlog.
+  const pages = [
+    {
+      count: 2,
+      next_after: 2,
+      latest_seq: 3,
+      retained: 3,
+      retention_days: 7,
+      events: [
+        { seq: 1, kind: "job.succeeded", app: "fake", subject_id: "j1", payload: {}, created_at: "2026-09-02T00:00:00Z" },
+        { seq: 2, kind: "dataset.changed", app: "grants", subject_id: "unified", payload: {}, created_at: "2026-09-02T00:00:01Z" },
+      ],
+    },
+    {
+      count: 1,
+      next_after: null,
+      latest_seq: 3,
+      retained: 3,
+      retention_days: 7,
+      events: [
+        { seq: 3, kind: "external", app: "src", subject_id: "e1", payload: {}, created_at: "2026-09-02T00:00:02Z" },
+      ],
+    },
+  ];
+  const requested: string[] = [];
+  let call = 0;
+  const fetchSpy: typeof fetch = (async (url: string | URL) => {
+    requested.push(String(url));
+    const body = JSON.stringify(pages[Math.min(call++, pages.length - 1)]);
+    return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const client = new PumperClient({ baseUrl: "http://example.invalid:1", fetch: fetchSpy });
+  const seen: number[] = [];
+  for await (const ev of client.subscribe({ cursor: 0, kind: "job.succeeded" })) seen.push(ev.seq);
+
+  assert.deepEqual(seen, [1, 2, 3], "every page is walked, ascending, exactly once");
+  assert.equal(requested.length, 2, "a non-full page ends the walk — no spin");
+
+  const first = new URL(requested[0]!);
+  assert.equal(first.pathname, "/events/log", "the cursor surface, not the SSE stream");
+  assert.equal(first.searchParams.get("after"), "0");
+  assert.equal(first.searchParams.get("kind"), "job.succeeded", "filters are pushed to the server");
+  assert.equal(
+    new URL(requested[1]!).searchParams.get("after"),
+    "2",
+    "the second call resumes from the page's next_after, not from 0",
+  );
 });

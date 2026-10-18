@@ -84,8 +84,8 @@ pub(crate) struct SourcesQuery {
             `[source.contract]` catalog block that have run since boot; verdicts are held in \
             memory and never expire on their own, so `stale: true` (age past the source's \
             freshness window, or the source is no longer live) marks a verdict that describes \
-            a run that is no longer current, and `stale: null` one that cannot be judged."),
-        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+            a run that is no longer current, and `stale: null` one that cannot be judged.", body = crate::routes::dto::SourceListResponse),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_sources(
@@ -187,9 +187,9 @@ pub(crate) async fn list_sources(
             `statistical_coverage: false` means the *latest run* was below the cohort \
             floor (recorded with verdict `below_cohort`: it moved neither the state nor \
             the baseline), and `source.monitored: false` means no run ever cleared it, so \
-            the source is watched only by the assumption-free rules."),
-        (status = 404, description = "Unknown source", body = Object),
-        (status = 503, description = "Detection is disabled", body = Object),
+            the source is watched only by the assumption-free rules.", body = crate::routes::dto::SourceDetailResponse),
+        (status = 404, description = "Unknown source", body = crate::routes::dto::ErrorEnvelope),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_source(
@@ -277,8 +277,8 @@ pub(crate) struct SourceRunsQuery {
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`"), SourceRunsQuery),
     responses(
         (status = 200, description = "`{id, count, runs: [{job_id, docs, fetch_ok_rate, d_text, \
-            d_dom, d_val, verdict, diagnosis, score, reasons, state_after, build_id, created_at}]}`"),
-        (status = 503, description = "Detection is disabled", body = Object),
+            d_dom, d_val, verdict, diagnosis, score, reasons, state_after, build_id, created_at}]}`", body = crate::routes::dto::SourceRunsResponse),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn source_runs(
@@ -346,8 +346,8 @@ pub(crate) struct EnforcementPreviewQuery {
             `[resilience] enforce` would change nothing about the next run; `not_ready` names \
             the sources that make it false. Counts are **runs and the documents in them**, \
             never deliveries — how many webhooks a suppressed run would have sent is not \
-            stored. Deletes and writes nothing."),
-        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+            stored. Deletes and writes nothing.", body = crate::routes::dto::EnforcementPreview),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn enforcement_preview(
@@ -414,10 +414,10 @@ pub(crate) struct SourceStateBody {
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
     request_body = SourceStateBody,
     responses(
-        (status = 200, description = "`{id, state, reason}`"),
-        (status = 400, description = "Unrecognized state", body = Object),
-        (status = 404, description = "Unknown source", body = Object),
-        (status = 503, description = "Detection is disabled", body = Object),
+        (status = 200, description = "`{id, state, reason}`", body = crate::routes::dto::SourceStateResponse),
+        (status = 400, description = "Unrecognized state", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown source", body = crate::routes::dto::ErrorEnvelope),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_source_state(
@@ -628,7 +628,7 @@ async fn dry_run_diff(
     responses(
         (status = 200, description = "`{id, active: {rules_hash, parent_hash, origin, epoch, \
             activated_at, licence_at_move} | null, lineage: [same, newest epoch first]}`. \
-            `active: null` = not enrolled (the source runs inline rules)."),
+            `active: null` = not enrolled (the source runs inline rules).", body = crate::routes::dto::SourceRulesResponse),
         (status = 404, description = "Unknown source", body = Object),
     )
 )]
@@ -663,7 +663,7 @@ pub(crate) struct RulesImportBody {
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
     request_body = RulesImportBody,
     responses(
-        (status = 200, description = "`{id, active}` — the new head (epoch 1)"),
+        (status = 200, description = "`{id, active}` — the new head (epoch 1)", body = crate::routes::dto::RulesImportResponse),
         (status = 400, description = "Bad job id; the job is not an extractor job writing this \
             source's dataset; or it carries no inline rules", body = Object),
         (status = 404, description = "Unknown source or job", body = Object),
@@ -774,7 +774,7 @@ pub(crate) struct RulesActivateBody {
         (status = 200, description = "Dry run: `{id, dry_run: true, candidate_hash, active, \
             replay: {source, docs, docs_matching, truncated, missing, missing_keys, baseline, \
             fields, inner_fields, regressed_urls, regressions}}`. Activation: `{id, dry_run: \
-            false, active}` — the new head."),
+            false, active}` — the new head.", body = crate::routes::dto::RulesChangeResponse),
         (status = 400, description = "Rules do not parse or compile; not an extractor source", body = Object),
         (status = 404, description = "Unknown source", body = Object),
         (status = 409, description = "That ruleset is already the active one", body = Object),
@@ -820,7 +820,7 @@ pub(crate) struct RulesRollbackBody {
     request_body = RulesRollbackBody,
     responses(
         (status = 200, description = "Dry run: `{id, dry_run: true, candidate_hash, active, \
-            replay}`. Activation: `{id, dry_run: false, active}`."),
+            replay}`. Activation: `{id, dry_run: false, active}`.", body = crate::routes::dto::RulesChangeResponse),
         (status = 400, description = "`to` shorter than 8 hex, not hex, or ambiguous", body = Object),
         (status = 404, description = "Unknown source, or `to` matches nothing in the lineage", body = Object),
         (status = 409, description = "`to` is already the active ruleset", body = Object),
@@ -888,7 +888,7 @@ fn golden_error(e: pumper_core::golden::GoldenError) -> ApiError {
         (status = 200, description = "`{id, pinned: [{source_id, key, generation, url, \
             body_sha, expected, stable_fields, rules_hash, pinned_by: enrol|operator, pinned_at}]}`. \
             `stable_fields` are the fields whose churn over the keys' revision history \
-            is under 5%."),
+            is under 5%.", body = crate::routes::dto::GoldenPinResponse),
         (status = 400, description = "Not an extractor source, no keys, a key with no record \
             or no pinned body, or a source with no active ruleset", body = Object),
         (status = 404, description = "Unknown source", body = Object),
@@ -928,7 +928,7 @@ pub(crate) async fn pin_source_golden(
         (status = 200, description = "`{id, rules_hash, frozen: {keys, exact}, live: {keys, \
             agree}, mismatches: [{key, field, expected, got, kind: frozen|live}]}`. \
             `field: null` = the whole document could not be compared (its frozen body is \
-            gone, or its live record is)."),
+            gone, or its live record is).", body = crate::routes::dto::GoldenCheckResponse),
         (status = 400, description = "Not an extractor source", body = Object),
         (status = 404, description = "Unknown source", body = Object),
         (status = 409, description = "The source has no active ruleset to check against", body = Object),
@@ -1318,7 +1318,6 @@ mod tests {
         for tool in [
             "watch",
             "readable",
-            "research",
             "extractor",
             "plugin",
             "crawl",
@@ -1336,6 +1335,10 @@ mod tests {
         // is doing real work, not padding the list.
         let unexempted = pumper_core::uncovered_apps(&registered, &[], &catalog.sourced_apps());
         assert!(unexempted.contains(&"transact".to_string()));
+        // `research` left the roster when it began publishing datasets (N25): it
+        // is covered by its own rows now, not by an exemption.
+        assert!(!exempt.contains(&"research"));
+        assert!(!unexempted.contains(&"research".to_string()));
     }
 }
 

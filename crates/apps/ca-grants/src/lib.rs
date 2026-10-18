@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use grants_common::{append_warning, sweep_warning, walk_end, SweepEnd, SweepVocab};
+use pumper_core::datasets::JsonFilter;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
     Provenance, Result, ScrapeApp,
@@ -24,6 +26,15 @@ pub struct CaGrants;
 const CKAN_URL: &str = "https://data.ca.gov/api/3/action/datastore_search";
 // California Grants Portal dataset on data.ca.gov (verified 2026-07-03).
 const RESOURCE_ID: &str = "111c8c88-21f6-453c-ae2c-b4785a0624f5";
+// CKAN's dialect for `grants_common::sweep_warning` — the page-size param this
+// app's manifest actually publishes, the upstream's name, and the field the
+// total is read from. This struct is all that used to justify a private fork of
+// the whole warning function.
+const SWEEP_VOCAB: SweepVocab = SweepVocab {
+    page_size_param: "limit",
+    source: "CKAN",
+    total_field: "result.total",
+};
 
 #[async_trait]
 impl ScrapeApp for CaGrants {
@@ -89,9 +100,13 @@ impl ScrapeApp for CaGrants {
             ],
             output_shape: Some(
                 "{source, status, total, fetched, pages, new, changed, unchanged, sweep, \
-                 truncated, unified: {new, changed, events, dataset, trust, sourceState}, \
+                 truncated, unifiedDropped, unified: {new, changed, events, dataset, trust, \
+                 sourceState}, \
                  swept, crossSourceDups, recurrenceLinks, \
-                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept, \
+                 programs: {rows, withProjection, withEvents, stamped, complete}}, \
+                 fits: {profiles, evaluated, eligible, likely, blocked, unknown, fresh}, \
+                 warnings[], \
                  index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
                  (keyed by PortalID) plus the shared grants/unified cross-source layer. \
                  `sweep` names how the walk ended — complete|capped|short_page|\
@@ -100,8 +115,15 @@ impl ScrapeApp for CaGrants {
                  non-complete arm also lands in `warnings[]`. \
                  The corpus-wide relation pass (sweep + duplicate/recurrence links) runs \
                  once per UTC-day cycle, on whichever grant source gets there first; a run \
-                 that did not own it reports `crossSourceDups`/`recurrenceLinks` as null \
-                 (not 0) and `corpusPass.ran: false`",
+                 that did not own it reports `crossSourceDups`/`recurrenceLinks` and \
+                 `corpusPass.programs` as null (not 0) and `corpusPass.ran: false`. \
+                 `corpusPass.programs` is the `grants/programs` registry that pass \
+                 materialized — one row per funding PROGRAM (N29). \
+                 `fits` is the applicant-fit pass (N31) over THIS run's delta — one verdict per \
+                 `grants/profiles` row x changed opportunity, upserted into `grants/fits`, where \
+                 `fresh` is exactly the alert set; it is null (not a zeroed block) on a run whose \
+                 contribution was diverted to the shadow dataset, and a run that wrote rows also \
+                 names `grants/fits` in `index_datasets[]`",
             ),
             cost_class: CostClass::Free,
         }
@@ -135,7 +157,7 @@ impl ScrapeApp for CaGrants {
         // assigns it from `walk_end`, so the compiler proves the reported arm and
         // the actual stop can never disagree. A default here would be a second,
         // silent opinion about how the walk ended.
-        let end;
+        let end: SweepEnd;
 
         loop {
             let mut body = json!({
@@ -194,8 +216,22 @@ impl ScrapeApp for CaGrants {
             pages += 1;
             offset += limit;
 
+            // Drift guard, per PAGE: a page that CKAN's own `result.total` places
+            // inside the corpus came back with nothing in it — `result.records`
+            // was renamed/moved and `unwrap_or_default` emptied it. Catches the
+            // mid-sweep rename too, which otherwise reads as an ordinary short
+            // page (a warning) while the post-loop guard sees a non-empty batch.
+            if grants_common::empty_page_is_drift(pages, limit, total, got) {
+                // `SourceDrift`, not `App`: terminal for the job — see below.
+                return Err(Error::SourceDrift(format!(
+                    "ca-grants schema drift: result.total={total} but page {pages} \
+                     (offset={}) parsed 0 records (result.records missing or not an array)",
+                    offset - limit
+                )));
+            }
+
             if let Some(reason) =
-                walk_end(pages, limit, total, got, records.len() as u64, max_pages)
+                walk_end(limit, total, got, records.len() as u64, pages >= max_pages)
             {
                 end = reason;
                 break;
@@ -207,13 +243,45 @@ impl ScrapeApp for CaGrants {
         // (`pages >= max_pages && offset < total`), so a short page and a
         // renamed/dropped `result.total` each returned Ok identically to a full
         // sweep — and the latter capped California at one page indefinitely.
-        // See [`SweepEnd`].
-        let truncated = end != SweepEnd::Complete;
+        // See `grants_common::SweepEnd`.
+        let truncated = end.truncated();
+
+        // A listing that reports nothing at all while grants are already stored
+        // is drift, not a clean sweep: `result.total` AND `result.records` both
+        // renamed reads as `total:0, records:[]`, which `walk_end` (rightly)
+        // calls Complete — the guard below is gated on `total > 0` and can never
+        // see it. The stored corpus is the one denominator the source cannot
+        // rename. Compare like with like: a `Status` filter counts the stored
+        // rows of THAT status, so a narrow pull that honestly matches nothing is
+        // not accused of drift by the rows sitting next to it.
+        if total == 0 && records.is_empty() {
+            let filters: Vec<JsonFilter> = if status.is_empty() {
+                Vec::new()
+            } else {
+                vec![JsonFilter::Eq {
+                    path: "Status".into(),
+                    value: status.clone(),
+                }]
+            };
+            let stored_corpus = ctx
+                .datasets
+                .count_filtered(&ctx.app, "opportunities", &filters)
+                .await?;
+            if grants_common::empty_listing_is_drift(total, records.len(), stored_corpus) {
+                return Err(Error::SourceDrift(format!(
+                    "ca-grants schema drift: CKAN reported result.total=0 with no records \
+                     for Status={status:?} while {stored_corpus} grants of that status are \
+                     already stored — result.total or result.records was renamed or moved. \
+                     Nothing was written; the stored corpus is left untouched."
+                )));
+            }
+        }
 
         // Drift guard: CKAN reported a positive `result.total` but we parsed zero
         // records — the `result.records` array was renamed/moved and
         // `unwrap_or_default` silently emptied it. Fail loudly instead of
-        // reporting a successful empty run.
+        // reporting a successful empty run. (Page 1 of the per-page guard above
+        // fires first for the same shape; this stays as the belt to that brace.)
         if total > 0 && records.is_empty() {
             // `SourceDrift`, not `App`: terminal for the job. A rename does not
             // un-rename itself between attempts, and the params are frozen at
@@ -262,174 +330,50 @@ impl ScrapeApp for CaGrants {
             "status": status,
             "total": total,
             "fetched": records.len(),
+            // Fetched records that did not normalize into grants/unified (no
+            // usable id). Non-zero is a warning; equal to `fetched` is drift.
+            "unifiedDropped": records.len().saturating_sub(unified_items.len()),
             "pages": pages,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-            // How the walk ended, named — see [`SweepEnd`]. `truncated` is its
+            // How the walk ended, named — see `grants_common::SweepEnd`. `truncated` is its
             // boolean projection ("anything but complete"), kept because it is
             // the key consumers already read.
             "sweep": end.as_str(),
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
-        // Pushed after the merge, which sets `warnings` to the drift warnings.
-        if let Some(msg) = sweep_warning(end, pages, max_pages, limit, total, records.len()) {
+        if let Some(msg) =
+            grants_common::unnormalized_warning("ca-grants", records.len(), unified_items.len())
+        {
+            append_warning(&mut out, msg);
+        }
+        // Pushed after the merge, which appended the drift warnings.
+        if let Some(msg) = sweep_warning(
+            end,
+            pages,
+            max_pages,
+            limit,
+            total,
+            records.len(),
+            SWEEP_VOCAB,
+        ) {
             append_warning(&mut out, msg);
         }
         Ok(out)
     }
 }
 
-/// How the CKAN walk ended. Four endings, and **only one proves the corpus was
-/// covered** — the single `truncated` boolean collapsed them into one claim and
-/// three of them read as a complete corpus.
-///
-/// This is grants-gov's vocabulary — same four names, same meanings, same
-/// ordering — deliberately reused rather than re-invented, because a second
-/// dialect of "how much did this sweep prove" across two grant sources would be
-/// worse than the bug. (grants-gov in turn took `Complete`/`Capped`/`ShortPage`
-/// from cordis and added `UnknownTotal`.) It lives here rather than in
-/// `grants-common` only because apps may not depend on apps and the shared crate
-/// was out of this change's write set; lifting all three copies into
-/// `grants_common` is the follow-up.
-///
-/// The arm this app was missing entirely is [`SweepEnd::UnknownTotal`], and the
-/// ledger records what it was worth on the federal side: *the renamed-`hitCount`
-/// case capped the corpus at one page indefinitely*. `ca-grants` read
-/// `result.total` once, from page 1, with `unwrap_or(0)`, and then broke the walk
-/// on `offset >= total` — so `1000 >= 0` after page 1. California capped at one
-/// page, green, with `truncated: false` and a drift guard (gated on `total > 0`)
-/// that could never fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepEnd {
-    /// The records actually COLLECTED reach CKAN's own reported `result.total`.
-    /// The only ending that reads as complete.
-    Complete,
-    /// Stopped at `maxPages` with records left to walk.
-    Capped,
-    /// A page came back shorter than `limit` while the reported `total` says more
-    /// remains. A transient truncation (a rate-limited or partially-served page),
-    /// NOT the end of the corpus.
-    ShortPage,
-    /// Records served under a `result.total` of 0 — absent, renamed, or moved.
-    /// The total is unusable, so no arithmetic can prove the end; the walk runs
-    /// on until a short page or the cap and reports coverage as unproven.
-    UnknownTotal,
-}
-
-impl SweepEnd {
-    fn as_str(self) -> &'static str {
-        match self {
-            SweepEnd::Complete => "complete",
-            SweepEnd::Capped => "capped",
-            SweepEnd::ShortPage => "short_page",
-            SweepEnd::UnknownTotal => "unknown_total",
-        }
-    }
-}
-
-/// How the walk ends after fetching the 1-based `page`, or `None` to keep going.
-///
-/// `collected` is every record gathered so far **including this page**, and it —
-/// not offset arithmetic — is what proves coverage. The old break asked
-/// `offset >= total`, which counts the rows *requested*: a page that asked for
-/// 1000 and delivered 100 still advanced the offset by 1000, so on the second
-/// page of a 1366-record corpus that test read `2000 >= 1366` and called 1100
-/// records a complete sweep. Counting what actually arrived is the only proof
-/// that survives a partially-served page.
-///
-/// The ordering is load-bearing and mirrors grants-gov's: proof of coverage
-/// first, then the per-run cap, then the short page — because a short page is
-/// **evidence of nothing** (a rate-limited upstream produces exactly the same
-/// shape as a genuine tail) and must never outrank the proof.
-///
-/// Termination: every path either returns `Some` or leaves `page < max_pages`,
-/// so `maxPages` still bounds the walk — including on an `unknown_total` feed,
-/// where there is no total left to bound it.
-fn walk_end(
-    page: u64,
-    limit: u64,
-    total: u64,
-    got: u64,
-    collected: u64,
-    max_pages: u64,
-) -> Option<SweepEnd> {
-    if total == 0 {
-        // No usable total. Two sub-cases, told apart by what the SAME response
-        // served — which is the only evidence available here.
-        if got == 0 {
-            // Self-consistent: no total, no records. An honestly empty result
-            // set (a `Status` filter matching nothing) IS fully swept. This is
-            // the boundary that must not be reported as drift.
-            return Some(SweepEnd::Complete);
-        }
-        // Self-contradictory: records served under a zero total. Keep walking —
-        // a short page or the cap is the only end signal left — but never report
-        // complete.
-        return (got < limit || page >= max_pages).then_some(SweepEnd::UnknownTotal);
-    }
-    if collected >= total {
-        return Some(SweepEnd::Complete);
-    }
-    if page >= max_pages {
-        return Some(SweepEnd::Capped);
-    }
-    if got < limit {
-        return Some(SweepEnd::ShortPage);
-    }
-    None
-}
-
-/// The human-readable warning for a walk that did not prove its coverage, or
-/// `None` for a complete sweep.
-///
-/// Every non-complete arm reaches the caller through `warnings[]` as well as
-/// through `sweep`/`truncated`, because a consumer reading only the warnings
-/// channel is exactly the consumer who would otherwise never learn that the
-/// California corpus is short.
-fn sweep_warning(
-    end: SweepEnd,
-    pages: u64,
-    max_pages: u64,
-    limit: u64,
-    total: u64,
-    fetched: usize,
-) -> Option<String> {
-    match end {
-        SweepEnd::Complete => None,
-        SweepEnd::Capped => Some(format!(
-            "coverage truncated: stopped at maxPages={max_pages} after {fetched} of \
-             {total} records — raise limit/maxPages to cover the full corpus"
-        )),
-        SweepEnd::ShortPage => Some(format!(
-            "coverage truncated: page {pages} returned fewer than limit={limit} while \
-             CKAN reports {total} total, so the walk stopped at {fetched} records — \
-             treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
-             partially-served page looks exactly like a genuine tail)"
-        )),
-        SweepEnd::UnknownTotal => Some(format!(
-            "coverage unproven: CKAN served {fetched} records over {pages} page(s) while \
-             reporting result.total:0 — the total is missing or renamed, so nothing can \
-             prove the corpus was covered. The walk ran to a short page or \
-             maxPages={max_pages} instead of trusting the total"
-        )),
-    }
-}
-
-/// Appends a warning to a result's `warnings` array (creating it if absent).
-/// `UnifiedOutcome::merge_into` sets `warnings` to the drift warnings, so any
-/// coverage warning must be pushed *after* the merge to survive.
-fn append_warning(out: &mut Value, msg: String) {
-    if let Value::Object(map) = out {
-        match map.get_mut("warnings") {
-            Some(Value::Array(w)) => w.push(json!(msg)),
-            _ => {
-                map.insert("warnings".into(), json!([msg]));
-            }
-        }
-    }
-}
+// `SweepEnd`, `walk_end`, `sweep_warning` and `append_warning` are
+// `grants_common`'s. This app forked all four privately, and its own doc comment
+// named the fix: *"lifting all three copies into `grants_common` is the
+// follow-up"*. This is that follow-up. The only genuinely Californian part was
+// the wording — `limit`, `CKAN`, `result.total` — which now travels as
+// `SWEEP_VOCAB` above, so the emitted warnings are byte-identical while the walk
+// arithmetic and the extend-not-clobber rule have ONE definition each. The
+// federal `unknown_total` bug that cost this app a one-page corpus can no longer
+// be fixed on one side of the fleet only.
 
 /// Stable key for a portal record: PortalID, then GrantID, then a fallback that
 /// is never the raw `_id` (which renumbers on reload).
@@ -509,14 +453,14 @@ mod tests {
     /// capped at one page, green, indefinitely.
     #[test]
     fn a_renamed_total_does_not_prove_a_one_page_corpus() {
-        let full_page = walk_end(1, 1000, 0, 1000, 1000, 25);
+        let full_page = walk_end(1000, 0, 1000, 1000, 1 >= 25);
         assert_eq!(
             full_page, None,
             "a full page under a zero total keeps walking"
         );
         // …and when the walk does end, it ends UNPROVEN, never complete.
         assert_eq!(
-            walk_end(2, 1000, 0, 400, 1400, 25),
+            walk_end(1000, 0, 400, 1400, 2 >= 25),
             Some(SweepEnd::UnknownTotal)
         );
     }
@@ -526,7 +470,7 @@ mod tests {
     /// a `Status` filter that matches nothing IS fully swept.
     #[test]
     fn a_genuinely_empty_answer_is_complete_not_unproven() {
-        assert_eq!(walk_end(1, 1000, 0, 0, 0, 25), Some(SweepEnd::Complete));
+        assert_eq!(walk_end(1000, 0, 0, 0, 1 >= 25), Some(SweepEnd::Complete));
     }
 
     /// Coverage is proven by records COLLECTED, never by offsets requested — the
@@ -534,7 +478,7 @@ mod tests {
     #[test]
     fn a_short_page_is_a_truncated_page_not_the_end_of_the_corpus() {
         assert_eq!(
-            walk_end(2, 1000, 1366, 100, 1100, 25),
+            walk_end(1000, 1366, 100, 1100, 2 >= 25),
             Some(SweepEnd::ShortPage),
             "1100 of 1366 collected is not a complete sweep, however far the offset ran"
         );
@@ -543,7 +487,7 @@ mod tests {
     #[test]
     fn the_page_cap_reads_as_capped_not_as_a_finished_walk() {
         assert_eq!(
-            walk_end(25, 1000, 100_000, 1000, 25_000, 25),
+            walk_end(1000, 100_000, 1000, 25_000, 25 >= 25),
             Some(SweepEnd::Capped)
         );
     }
@@ -551,7 +495,7 @@ mod tests {
     #[test]
     fn a_walk_that_collected_the_reported_total_is_complete() {
         assert_eq!(
-            walk_end(2, 1000, 1366, 366, 1366, 25),
+            walk_end(1000, 1366, 366, 1366, 2 >= 25),
             Some(SweepEnd::Complete)
         );
     }
@@ -561,25 +505,28 @@ mod tests {
     #[test]
     fn an_unknown_total_walk_is_still_bounded_by_max_pages() {
         // Full pages, no usable total: keeps going while under the cap...
-        assert_eq!(walk_end(4, 100, 0, 100, 400, 5), None);
+        assert_eq!(walk_end(100, 0, 100, 400, 4 >= 5), None);
         // ...and stops AT the cap, reported as unproven rather than complete.
         assert_eq!(
-            walk_end(5, 100, 0, 100, 500, 5),
+            walk_end(100, 0, 100, 500, 5 >= 5),
             Some(SweepEnd::UnknownTotal)
         );
     }
 
     #[test]
     fn sweep_warnings_name_the_arm_they_came_from() {
-        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366).is_none());
-        let capped = sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000).unwrap();
+        assert!(sweep_warning(SweepEnd::Complete, 2, 25, 1000, 1366, 1366, SWEEP_VOCAB).is_none());
+        let capped =
+            sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000, SWEEP_VOCAB).unwrap();
         assert!(capped.contains("maxPages=25"), "{capped}");
-        let short = sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100).unwrap();
+        let short =
+            sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100, SWEEP_VOCAB).unwrap();
         assert!(
             short.contains("limit=1000") && short.contains("1366"),
             "{short}"
         );
-        let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400).unwrap();
+        let unproven =
+            sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400, SWEEP_VOCAB).unwrap();
         assert!(
             unproven.contains("coverage unproven") && unproven.contains("result.total:0"),
             "{unproven}"
@@ -597,9 +544,9 @@ mod tests {
             (SweepEnd::UnknownTotal, "unknown_total", true),
         ] {
             assert_eq!(end.as_str(), name);
-            assert_eq!(end != SweepEnd::Complete, truncated, "{name}");
+            assert_eq!(end.truncated(), truncated, "{name}");
             assert_eq!(
-                sweep_warning(end, 1, 25, 1000, 10, 5).is_some(),
+                sweep_warning(end, 1, 25, 1000, 10, 5, SWEEP_VOCAB).is_some(),
                 truncated,
                 "every non-complete arm also warns: {name}"
             );
@@ -671,9 +618,36 @@ mod drift_inventory {
             .collect()
     }
 
+    /// THE REFUTED BEHAVIOR: with `result.total` AND `result.records` both
+    /// renamed, page 1 reads `total:0, got:0`, which `walk_end` (rightly) calls
+    /// Complete — and the only drift guard was gated on `total > 0`. A green,
+    /// empty run against a corpus of stored grants. `Complete` is not evidence;
+    /// the stored corpus is the denominator the source cannot rename.
+    #[test]
+    fn a_complete_empty_walk_over_a_stored_corpus_is_drift_not_a_clean_sweep() {
+        assert_eq!(
+            crate::walk_end(100, 0, 0, 0, 1 >= 25),
+            Some(crate::SweepEnd::Complete)
+        );
+        assert!(grants_common::empty_listing_is_drift(0, 0, 1366));
+        // An honestly empty portal (nothing stored either) stays a clean sweep.
+        assert!(!grants_common::empty_listing_is_drift(0, 0, 0));
+        // And the mid-sweep rename the post-loop guard cannot see: page 3 of a
+        // 1366-grant listing served nothing.
+        assert!(grants_common::empty_page_is_drift(3, 100, 1366, 0));
+        assert!(
+            !grants_common::empty_page_is_drift(15, 100, 1366, 0),
+            "past the end"
+        );
+    }
+
     /// Every pre-write drift refusal in this app, by a stable fragment of its
     /// message. Adding or removing one fails this test until it is classified.
-    const EXPECTED_TERMINAL: &[&str] = &["ca-grants schema drift: result.total="];
+    const EXPECTED_TERMINAL: &[&str] = &[
+        "ca-grants schema drift: result.total=",
+        "ca-grants schema drift: result.total={total} but page",
+        "ca-grants schema drift: CKAN reported result.total=0",
+    ];
 
     /// Drift this app reports **without** failing the job. None here: ca-grants
     /// has one stage, so its only drift signal is the pre-write listing refusal.

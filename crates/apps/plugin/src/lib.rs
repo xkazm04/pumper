@@ -718,9 +718,11 @@ impl ScrapeApp for Plugin {
          + current), or source.backfill: true + url_pattern (batched fan over the whole \
          page_versions archive); historical records are keyed {url}@{date} and tagged \
          _url + _observed_at. Observatory mode: {\"observatory\": true | {\"plugins\": \
-         [\"name\" | {\"name\": .., \"params\": {..}}]?, \"sample_per_site\": 25}} replays \
+         [\"name\" | {\"name\": .., \"params\": {..}}]?, \"sample_per_site\": 25, \
+         \"sample_by\": \"recency\"|\"rank\"}} replays \
          each plugin (default all loaded) with its configured params over \
-         sampled stored pages per site (newest + seeded-random across the live dataset + \
+         sampled stored pages per site (newest — or highest whole-corpus PageRank under \
+         sample_by: \"rank\" — plus seeded-random across the live dataset + \
          page_versions), classifies outcomes (ok/trap/empty/schema_invalid) and upserts \
          per (plugin, config, site) drift rows into the `observatory` dataset (sampled/total \
          reported; <5 stored pages => low_confidence; rising empty-rate flagged; unreadable \
@@ -823,6 +825,11 @@ impl ScrapeApp for Plugin {
                                         "minimum": 1,
                                         "maximum": 500,
                                         "description": "Stored pages sampled per site: newest half + seeded-random rest (default 25, ceiling 500 — the replay count is sites x plugins x this). Rows report sampled/total; sites with <5 stored pages are marked low_confidence."
+                                    },
+                                    "sample_by": {
+                                        "type": "string",
+                                        "enum": ["recency", "rank"],
+                                        "description": "Which end of each site's page list the sample is drawn from: \"recency\" (default, newest first) or \"rank\" (highest whole-corpus PageRank first, read from the crawl app's `page_rank` dataset — needs a `crawl` `mode: \"graph\"` run; pages with no rank fall back to their recency position, nothing is dropped)."
                                     }
                                 },
                                 "additionalProperties": false
@@ -898,7 +905,7 @@ impl ScrapeApp for Plugin {
                  scanned, skipped_pattern, loaded, batches, missing, missing_keys[]}. urls and \
                  source also carry {records[] (a BOUNDED echo — see `records_echo`), \
                  records_total, records_truncated}; backfill never echoes. Observatory mode: \
-                 {sites, rows, pages_replayed, pages_unreadable, pages_empty, \
+                 {sites, rows, pages_replayed, pages_unreadable, pages_empty, sample_by, \
                  low_confidence_sites, flagged_empty_rising, new, changed, unchanged} with \
                  per-(plugin, config, site) drift rows in the observatory dataset. Those rows' \
                  measurement fields (run_at, prev_run_at, avg_elapsed_ms, the fuel/memory \

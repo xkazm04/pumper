@@ -36,7 +36,7 @@ async fn structured_run() -> Value {
         .params(json!({ "query": "what changed in rust 1.80" }))
         .engines(engines_with(Arc::new(Dead), Arc::new(Dead), researcher))
         .build();
-    Research
+    Research::default()
         .run(ctx)
         .await
         .expect("a shaped reply completes the run")
@@ -52,7 +52,7 @@ async fn unstructured_run() -> Value {
         .params(json!({ "query": "q", "turns_per_step": 1 }))
         .engines(engines_with(Arc::new(Dead), Arc::new(Dead), researcher))
         .build();
-    Research
+    Research::default()
         .run(ctx)
         .await
         .expect("an unstructured but non-empty reply still succeeds")
@@ -75,7 +75,7 @@ async fn restored_finished_run() -> Value {
             "result": finished,
         }))
         .build();
-    Research
+    Research::default()
         .run(ctx)
         .await
         .expect("a finished checkpoint is returned without new spend")
@@ -142,7 +142,7 @@ fn key_name(entry: &str) -> String {
 }
 
 fn declaration() -> &'static str {
-    Research
+    Research::default()
         .manifest()
         .output_shape
         .expect("research declares an output_shape")

@@ -450,10 +450,17 @@ impl CostLedger {
         certainty: SpendCertainty,
         detail: Option<&str>,
     ) -> Result<()> {
+        // `principal_id` is copied from the job row rather than passed in: the
+        // caller identity is already recorded once, at the enqueue door, and a
+        // second parameter threaded through every metered seam is a second
+        // place for it to be wrong. The subselect yields NULL for an
+        // unattributed job (`open` mode, the scheduler, a trigger hop), which
+        // is the honest answer and exactly what the column means.
         sqlx::query(
             "INSERT INTO cost_events \
-             (job_id, app, engine, url, cost_usd, spend_certainty, detail, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (job_id, app, engine, url, cost_usd, spend_certainty, detail, created_at, \
+              principal_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT principal_id FROM jobs WHERE id = ?1))",
         )
         .bind(job_id.to_string())
         .bind(app)
@@ -523,21 +530,34 @@ impl CostLedger {
         app: Option<&str>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<CostSummary>> {
-        self.summary_filtered(app, since, None).await
+        self.summary_filtered(app, since, None, None).await
     }
 
-    /// [`Self::summary`] with a certainty filter: `Some(c)` keeps only the
-    /// (app, engine) groups holding **at least one** call of that certainty.
+    /// [`Self::summary`] with a certainty filter and a **principal** scope (N20)
+    /// — the query behind `GET /costs?certainty=&principal=`.
     ///
-    /// The filter is a `HAVING`, not a `WHERE`, deliberately: an operator
-    /// asking "where is my unmetered spend" wants the affected group's *whole*
-    /// picture — its billed total alongside the calls that make that total a
-    /// floor — not a synthetic group containing only the bad rows.
+    /// `certainty`: `Some(c)` keeps only the (app, engine) groups holding **at
+    /// least one** call of that certainty. The filter is a `HAVING`, not a
+    /// `WHERE`, deliberately: an operator asking "where is my unmetered spend"
+    /// wants the affected group's *whole* picture — its billed total alongside
+    /// the calls that make that total a floor — not a synthetic group containing
+    /// only the bad rows.
+    ///
+    /// `principal` is deliberately a nested option, because this filter has
+    /// THREE states and collapsing them to two is the bug: `None` = no filter
+    /// (every row), `Some(None)` = the rows with **no** caller (what the
+    /// by-principal report labels [`UNATTRIBUTED_PRINCIPAL`], and the one row an
+    /// operator is most likely to want to drill into), `Some(Some(id))` = that
+    /// caller. A flat `Option<&str>` would make "unattributed" indistinguishable
+    /// from "unfiltered" and silently answer the whole ledger. The NULL-safe
+    /// `IS` comparison is what lets one statement serve all three; `= NULL`
+    /// would match nothing.
     pub async fn summary_filtered(
         &self,
         app: Option<&str>,
         since: Option<DateTime<Utc>>,
         certainty: Option<SpendCertainty>,
+        principal: Option<Option<&str>>,
     ) -> Result<Vec<CostSummary>> {
         let rows: Vec<(String, String, i64, f64, i64, i64)> = sqlx::query_as(
             "SELECT app, engine, COUNT(*), COALESCE(SUM(cost_usd), 0), \
@@ -545,6 +565,7 @@ impl CostLedger {
              COALESCE(SUM(spend_certainty = 'unknown'), 0) \
              FROM cost_events \
              WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR created_at > ?2) \
+             AND (?4 = 0 OR principal_id IS ?5) \
              GROUP BY app, engine \
              HAVING (?3 IS NULL OR SUM(spend_certainty = ?3) > 0) \
              ORDER BY app, engine",
@@ -552,6 +573,8 @@ impl CostLedger {
         .bind(app)
         .bind(since.map(ts))
         .bind(certainty.map(SpendCertainty::as_str))
+        .bind(i64::from(principal.is_some()))
+        .bind(principal.flatten())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -567,6 +590,93 @@ impl CostLedger {
                 },
             )
             .collect())
+    }
+
+    /// Spend grouped by the **calling principal** (N20), optionally windowed.
+    ///
+    /// Rows with no principal are reported under
+    /// [`UNATTRIBUTED_PRINCIPAL`] rather than dropped or folded into some
+    /// caller: every legacy row, and every row produced in `open` mode or by an
+    /// internal producer (scheduler, trigger hop), genuinely has no caller, and
+    /// a by-principal report whose parts do not sum to the total is a lie about
+    /// where the money went.
+    pub async fn summary_by_principal(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<PrincipalCostSummary>> {
+        // The same certainty columns `summary_filtered` carries per (app, engine)
+        // group: a by-principal total that cannot say it is a floor would
+        // republish unpriceable spend as a price.
+        let rows: Vec<(Option<String>, i64, f64, i64, i64)> = sqlx::query_as(
+            "SELECT principal_id, COUNT(*), COALESCE(SUM(cost_usd), 0), \
+             COALESCE(SUM(spend_certainty = 'unmetered'), 0), \
+             COALESCE(SUM(spend_certainty = 'unknown'), 0) \
+             FROM cost_events \
+             WHERE (?1 IS NULL OR created_at > ?1) \
+             GROUP BY principal_id ORDER BY principal_id",
+        )
+        .bind(since.map(ts))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(principal_id, calls, cost_usd, unmetered_calls, unknown_calls)| {
+                    PrincipalCostSummary {
+                        principal_id,
+                        calls,
+                        cost_usd,
+                        unmetered_calls,
+                        unknown_calls,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// What one principal has spent since `since` — the per-principal daily
+    /// ceiling check, the direct analogue of [`Self::job_total`].
+    pub async fn principal_total_since(
+        &self,
+        principal_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<f64> {
+        let total: Option<f64> = sqlx::query_scalar(
+            "SELECT SUM(cost_usd) FROM cost_events WHERE principal_id = ?1 AND created_at > ?2",
+        )
+        .bind(principal_id)
+        .bind(ts(since))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total.unwrap_or(0.0))
+    }
+}
+
+/// The label a by-principal report gives spend that carries no caller. Not a
+/// principal id and never confusable with one (no id is empty or contains a
+/// space); rendered so the parts of the report sum to its total.
+pub const UNATTRIBUTED_PRINCIPAL: &str = "(unattributed)";
+
+/// Aggregated spend for one caller.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalCostSummary {
+    /// `None` = no caller recorded; renders as [`UNATTRIBUTED_PRINCIPAL`].
+    pub principal_id: Option<String>,
+    pub calls: i64,
+    /// The money we can price — a floor when either count below is non-zero.
+    pub cost_usd: f64,
+    /// Calls that were billed and whose amount is unreadable.
+    pub unmetered_calls: i64,
+    /// Calls where even "was this billed?" has no answer.
+    pub unknown_calls: i64,
+}
+
+impl PrincipalCostSummary {
+    /// The label to show for this row — the id, or the honest placeholder.
+    pub fn label(&self) -> &str {
+        self.principal_id
+            .as_deref()
+            .unwrap_or(UNATTRIBUTED_PRINCIPAL)
     }
 }
 

@@ -109,7 +109,7 @@ pub(crate) struct DoctorQuery {
         (applied/pending/ahead migration versions and table drift against the chain this \
         binary carries), `coverage`, \
         `tables`, `search` (index enabled/doc_count vs live record count) and per-app `artifacts` \
-        byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.")),
+        byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.", body = crate::routes::dto::DoctorReport)),
 )]
 pub(crate) async fn datasets_doctor(
     State(state): State<AppState>,

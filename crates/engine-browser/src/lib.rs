@@ -54,9 +54,9 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
 use pumper_core::engine::{
-    interaction_outcome, parse_transact_probe, pass_fully_succeeded, require_existing_profile,
-    require_safe_profile_name, summarize_steps, transact_probe_js, CapturedCall, PageAction,
-    StepOutcome,
+    commit_guard, evidence_digest, interaction_outcome, parse_transact_probe, pass_fully_succeeded,
+    require_existing_profile, require_safe_profile_name, summarize_steps, transact_probe_js,
+    ApprovedTransaction, CapturedCall, PageAction, StepOutcome, TransactReceipt,
 };
 use pumper_core::{
     lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
@@ -1018,6 +1018,92 @@ impl Browser for BrowserEngine {
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
         Ok(evidence_from_render(req, &fill, page, cap))
     }
+
+    /// Performs the approved irreversible action (N01 Transact v2) — the only
+    /// code path in this repository that can click a submit button.
+    ///
+    /// Two passes, deliberately:
+    ///
+    /// 1. **Re-stage and check.** The flow is re-driven exactly as
+    ///    [`Browser::transact`] drives it — same steps, same probe — and the
+    ///    live page's [`evidence_digest`] is compared to the one the reviewer
+    ///    approved. A mismatch ends here, as a terminal `Error::Transact`
+    ///    naming `probe_mismatch`. **Nothing has been submitted**: the pass
+    ///    that checks is the pass that never appends `submit_action`.
+    /// 2. **Submit.** Only if pass 1 agreed, the flow is driven again with
+    ///    `submit_action` appended and `confirm_selector` waited for, and the
+    ///    post-submit DOM is captured as the receipt.
+    ///
+    /// Why two passes rather than one mid-session check: `render` is one shot —
+    /// it opens a tab, runs the actions, evaluates, captures and closes — so
+    /// there is no seam inside it at which Rust could look at the page and then
+    /// decide whether to click. Re-driving is sound here because a transact
+    /// flow's `steps` are **declared reversible** by the app's own contract
+    /// (that is what makes them steps rather than the submit action), and v1
+    /// deliberately carries no live session handle between the review and the
+    /// submit — it rebuilds deterministically. The cost is that the reversible
+    /// steps run twice; the benefit is that the guard cannot be bypassed by any
+    /// ordering of the render's internals.
+    async fn commit(
+        &self,
+        req: TransactRequest,
+        approved: ApprovedTransaction,
+    ) -> Result<TransactReceipt> {
+        req.validate()?;
+        if let Some(name) = &req.profile {
+            let browser_dir = profile_browser_dir(&self.profiles_dir, name)?;
+            require_existing_profile(name, browser_dir.is_dir())?;
+        }
+        let fill = req.fill_selectors();
+        let submit_selector = req.submit_action.selector().map(str::to_string);
+
+        // Pass 1: re-stage and check.
+        let check = self
+            .render(stage_render(&req, &fill, submit_selector.as_deref()))
+            .await?;
+        let (checked_fields, checked_target) =
+            parse_transact_probe(&fill, submit_selector.as_deref(), check.evaluated.as_ref());
+        let observed = evidence_digest(checked_target.as_ref(), &checked_fields);
+        // Terminal, not retryable: the live page differs from what a human
+        // read, and no number of retries turns that into consent. Failing ONCE
+        // is also what stops the retry ladder from turning one approval into
+        // four attempts at an irreversible action.
+        commit_guard(&approved.evidence_sha, &observed)
+            .map_err(|refusal| Error::Transact(refusal.message()))?;
+
+        // Pass 2: submit.
+        let mut render = stage_render(&req, &fill, submit_selector.as_deref());
+        // The one place in this codebase where `submit_action` becomes a step.
+        render.actions.push(req.submit_action.clone());
+        // The confirmation state, waited for AFTER the action — the request's
+        // own `wait_for_selector` runs before the steps and cannot serve twice.
+        render.wait_for_selector = req.confirm_selector.clone();
+        render.evaluate = None;
+        let page = self.render(render).await?;
+        let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
+        Ok(receipt_from_render(req, approved, observed, page, cap))
+    }
+}
+
+/// The render that drives a flow to its confirmation state: the reversible
+/// steps and the evidence probe, nothing else. Shared by both of `commit`'s
+/// passes so the checked page and the submitted page are reached identically —
+/// a divergence here would let the guard pass on a page the submit never sees.
+fn stage_render(
+    req: &TransactRequest,
+    fill: &[String],
+    submit_selector: Option<&str>,
+) -> RenderRequest {
+    let mut render = RenderRequest::new(&req.url);
+    render.profile = req.profile.clone();
+    render.wait_for_selector = req.wait_for_selector.clone();
+    render.extra_wait_ms = req.extra_wait_ms;
+    // Same reason as the dry run: the transact path caps the DOM itself, so an
+    // over-cap page degrades the evidence rather than destroying it.
+    render.max_body_bytes = Some(0);
+    render.actions = req.steps.clone();
+    render.evaluate = Some(transact_probe_js(fill, submit_selector));
+    render
 }
 
 /// Truncates `html` to at most `cap` bytes, on a UTF-8 char boundary, reporting
@@ -1077,6 +1163,62 @@ fn evidence_from_render(
         // Honest gap: the render path does not expose screenshot capture yet;
         // claiming a path here would be a lie the reviewer acts on.
         screenshot_path: None,
+        nav_timed_out: page.nav_timed_out,
+    }
+}
+
+/// Assembles the post-submit receipt from the completed submit pass. Pure, so
+/// the honest-accounting contract is testable without Chrome: the submit's OWN
+/// outcome is reported separately from the reversible steps, and an
+/// unrequested confirmation is `None` rather than a fabricated `false`.
+///
+/// The submit action is the LAST entry in the render's actions, so its outcome
+/// is the last entry in `action_outcomes` — and it is missing entirely when the
+/// flow's deadline cut the list before reaching it. That case reports
+/// `submitted: false`, never a success nobody observed.
+fn receipt_from_render(
+    req: TransactRequest,
+    approved: ApprovedTransaction,
+    observed_evidence_sha: String,
+    page: RenderedPage,
+    dom_cap_bytes: u64,
+) -> TransactReceipt {
+    let reached_submit = page.action_outcomes.len() == req.steps.len() + 1;
+    let submit_outcome = if reached_submit {
+        page.action_outcomes[req.steps.len()]
+    } else {
+        StepOutcome::Partial
+    };
+    let step_outcomes: Vec<StepOutcome> = page
+        .action_outcomes
+        .iter()
+        .take(req.steps.len())
+        .copied()
+        .collect();
+    let steps = summarize_steps(req.steps.len(), &step_outcomes);
+    let dom_bytes = page.html.len();
+    let (dom_html, dom_truncated) = truncate_to_cap(page.html, dom_cap_bytes);
+    TransactReceipt {
+        submitted: reached_submit && submit_outcome.is_ok(),
+        transaction_id: approved.transaction_id,
+        idempotency_key: req.idempotency_key,
+        profile: req.profile,
+        url: req.url,
+        final_url: page.final_url,
+        approved_evidence_sha: approved.evidence_sha,
+        observed_evidence_sha,
+        submit_action: req.submit_action,
+        submit_outcome,
+        confirm_selector_found: req.confirm_selector.as_ref().and(page.selector_found),
+        confirm_selector: req.confirm_selector,
+        steps_requested: steps.requested,
+        steps_attempted: steps.attempted,
+        steps_completed: steps.completed,
+        step_outcomes,
+        steps_deadline_hit: steps.deadline_hit,
+        dom_html,
+        dom_bytes,
+        dom_truncated,
         nav_timed_out: page.nav_timed_out,
     }
 }
@@ -1886,6 +2028,110 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(rx.try_recv().is_err(), "the tab was closed twice");
+    }
+
+    fn approval() -> ApprovedTransaction {
+        ApprovedTransaction {
+            transaction_id: "tx-1".into(),
+            evidence_sha: "sha-approved".into(),
+        }
+    }
+
+    /// A submit pass whose action list completed reports the submit's own
+    /// outcome, and reports the reversible steps SEPARATELY from it — the
+    /// receipt must never let a successful `type` stand in for a click that
+    /// never happened.
+    #[test]
+    fn receipt_reports_the_submits_own_outcome_not_the_steps() {
+        let mut req = flow_with_two_steps();
+        req.confirm_selector = Some("#thanks".into());
+        let mut page = clean_page();
+        page.action_outcomes = vec![StepOutcome::Ok, StepOutcome::Ok, StepOutcome::Ok];
+        page.selector_found = Some(true);
+        let receipt = receipt_from_render(req, approval(), "sha-approved".into(), page, 0);
+        assert!(receipt.submitted);
+        assert_eq!(receipt.submit_outcome, StepOutcome::Ok);
+        assert_eq!(receipt.step_outcomes.len(), 2, "steps exclude the submit");
+        assert_eq!(receipt.steps_completed, 2);
+        assert_eq!(receipt.confirm_selector.as_deref(), Some("#thanks"));
+        assert_eq!(receipt.confirm_selector_found, Some(true));
+        assert_eq!(receipt.approved_evidence_sha, "sha-approved");
+        assert_eq!(receipt.observed_evidence_sha, "sha-approved");
+        assert_eq!(receipt.transaction_id, "tx-1");
+    }
+
+    /// The anti-pattern: a flow whose deadline cut the action list before the
+    /// submit reported `submitted: true` because the steps had all succeeded.
+    /// A submit that was never reached — or that missed its selector — is
+    /// `submitted: false`, so the ledger cannot record a submission nobody saw.
+    #[test]
+    fn submit_not_reached_is_not_reported_as_submitted() {
+        let req = flow_with_two_steps();
+        let mut page = clean_page();
+        // Deadline cut the list: two step outcomes, no third for the submit.
+        page.action_outcomes = vec![StepOutcome::Ok, StepOutcome::Ok];
+        let receipt = receipt_from_render(req.clone(), approval(), "sha".into(), page, 0);
+        assert!(
+            !receipt.submitted,
+            "an unreached submit is not a submission"
+        );
+        assert_eq!(receipt.submit_outcome, StepOutcome::Partial);
+
+        // Reached but the button was gone: still not a submission.
+        let mut page = clean_page();
+        page.action_outcomes = vec![
+            StepOutcome::Ok,
+            StepOutcome::Ok,
+            StepOutcome::SelectorMissing,
+        ];
+        let receipt = receipt_from_render(req, approval(), "sha".into(), page, 0);
+        assert!(!receipt.submitted);
+        assert_eq!(receipt.submit_outcome, StepOutcome::SelectorMissing);
+    }
+
+    /// No `confirm_selector` asked for means the receipt says nothing about a
+    /// confirmation — `None`, never a `false` a reader would treat as "the
+    /// confirmation did not appear", and never a `true` borrowed from the
+    /// request's own pre-steps `wait_for_selector`.
+    #[test]
+    fn unrequested_confirmation_is_unknown_not_failed() {
+        let mut req = flow_with_two_steps();
+        req.confirm_selector = None;
+        let mut page = clean_page();
+        page.action_outcomes = vec![StepOutcome::Ok, StepOutcome::Ok, StepOutcome::Ok];
+        page.selector_found = Some(true);
+        let receipt = receipt_from_render(req, approval(), "sha".into(), page, 0);
+        assert_eq!(receipt.confirm_selector, None);
+        assert_eq!(receipt.confirm_selector_found, None);
+        assert!(receipt.submitted);
+    }
+
+    /// Both of `commit`'s passes must reach the page the SAME way, or the guard
+    /// checks one page and the click lands on another. The shared builder is
+    /// what guarantees it; this pins that it carries the identity, the waits
+    /// and the self-capped DOM through.
+    #[test]
+    fn both_commit_passes_are_built_from_one_render_recipe() {
+        let req = flow_with_two_steps();
+        let fill = req.fill_selectors();
+        let submit = req.submit_action.selector().map(str::to_string);
+        let a = stage_render(&req, &fill, submit.as_deref());
+        let b = stage_render(&req, &fill, submit.as_deref());
+        assert_eq!(a.profile, b.profile);
+        assert_eq!(a.profile.as_deref(), Some("portal_login"));
+        assert_eq!(a.wait_for_selector, b.wait_for_selector);
+        assert_eq!(a.evaluate, b.evaluate);
+        assert_eq!(a.actions.len(), b.actions.len());
+        assert_eq!(
+            a.actions.len(),
+            req.steps.len(),
+            "the probe pass never carries the submit"
+        );
+        assert_eq!(
+            a.max_body_bytes,
+            Some(0),
+            "the transact path caps the DOM itself"
+        );
     }
 
     #[test]

@@ -73,7 +73,10 @@ async fn a_failing_candidate_retires_instead_of_being_picked_forever() {
     // Nine strikes: still a candidate, still selectable opportunistically.
     for _ in 0..9 {
         assert!(
-            !recipes.record_failure(&id, 3).await.unwrap(),
+            !recipes
+                .record_failure(&id, 3, "replay failed")
+                .await
+                .unwrap(),
             "retirement is not a demotion signal"
         );
     }
@@ -90,7 +93,10 @@ async fn a_failing_candidate_retires_instead_of_being_picked_forever() {
     );
 
     // The tenth strike retires it.
-    recipes.record_failure(&id, 3).await.unwrap();
+    recipes
+        .record_failure(&id, 3, "replay failed")
+        .await
+        .unwrap();
     let (failures, retired_at, _) = row_state(&store.storage.pool(), &id).await;
     assert_eq!(
         failures, 10,
@@ -109,7 +115,10 @@ async fn a_failing_candidate_retires_instead_of_being_picked_forever() {
     assert!(recipes.best_for_host(HOST, false).await.unwrap().is_none());
 
     // Further strikes do not re-stamp or crash.
-    recipes.record_failure(&id, 3).await.unwrap();
+    recipes
+        .record_failure(&id, 3, "replay failed")
+        .await
+        .unwrap();
     let (_, again, _) = row_state(&store.storage.pool(), &id).await;
     assert_eq!(
         again, retired_at,
@@ -125,7 +134,10 @@ async fn retire_after_zero_restores_the_immortal_candidate() {
     let recipes = store.storage.recipes().with_retire_after(0);
     let id = recipes.upsert(&fixture()).await.unwrap();
     for _ in 0..50 {
-        recipes.record_failure(&id, 3).await.unwrap();
+        recipes
+            .record_failure(&id, 3, "replay failed")
+            .await
+            .unwrap();
     }
     let (failures, retired_at, _) = row_state(&store.storage.pool(), &id).await;
     assert_eq!(failures, 50);
@@ -145,10 +157,19 @@ async fn a_validated_recipe_demotes_to_candidate_and_is_not_retired() {
     let id = recipes.upsert(&fixture()).await.unwrap();
     recipes.set_validated(&id, true).await.unwrap();
 
-    assert!(!recipes.record_failure(&id, 3).await.unwrap());
-    assert!(!recipes.record_failure(&id, 3).await.unwrap());
+    assert!(!recipes
+        .record_failure(&id, 3, "replay failed")
+        .await
+        .unwrap());
+    assert!(!recipes
+        .record_failure(&id, 3, "replay failed")
+        .await
+        .unwrap());
     assert!(
-        recipes.record_failure(&id, 3).await.unwrap(),
+        recipes
+            .record_failure(&id, 3, "replay failed")
+            .await
+            .unwrap(),
         "the third consecutive strike un-validates"
     );
 
@@ -173,7 +194,10 @@ async fn a_success_clears_the_strikes_and_the_failure_stamp() {
     let recipes = store.storage.recipes().with_retire_after(10);
     let id = recipes.upsert(&fixture()).await.unwrap();
     for _ in 0..7 {
-        recipes.record_failure(&id, 3).await.unwrap();
+        recipes
+            .record_failure(&id, 3, "replay failed")
+            .await
+            .unwrap();
     }
     // auto_validate's success path: resets AND promotes.
     recipes.record_success(&id, true).await.unwrap();
@@ -208,8 +232,14 @@ async fn list_carries_the_state_the_strikes_and_the_failure_stamp() {
     doomed.url_template = "https://example.test/api/dead?page={page}".into();
     doomed.score = 0.1;
     let doomed_id = recipes.upsert(&doomed).await.unwrap();
-    recipes.record_failure(&doomed_id, 3).await.unwrap();
-    recipes.record_failure(&doomed_id, 3).await.unwrap();
+    recipes
+        .record_failure(&doomed_id, 3, "replay failed")
+        .await
+        .unwrap();
+    recipes
+        .record_failure(&doomed_id, 3, "replay failed")
+        .await
+        .unwrap();
 
     let all = recipes.list(None, None, 100).await.unwrap();
     assert_eq!(all.len(), 3);

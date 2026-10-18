@@ -21,11 +21,11 @@ default:
 # is ambiguous.
 #
 # Boot the server (http://127.0.0.1:8088 by default; see [server] in config.toml).
-run:
+run: _hooks-auto
     cargo run -p pumper-server --bin pumper
 
 # Boot the server with verbose logs (ONBOARDING.md §8).
-dev:
+dev: _hooks-auto
     RUST_LOG=debug cargo run -p pumper-server --bin pumper
 
 # --- build / verify ----------------------------------------------------------
@@ -37,15 +37,15 @@ dev:
 # can never invalidate the build/test artifacts.
 #
 # Fast type-check of the whole workspace.
-check:
+check: _hooks-auto
     CARGO_INCREMENTAL=1 cargo check --workspace
 
 # Build the binaries (debug); append `--release` yourself for an optimized build.
-build:
+build: _hooks-auto
     cargo build -p pumper-server
 
 # Unit + integration tests, exactly as CI runs them.
-test:
+test: _hooks-auto
     cargo test --workspace
 
 # The #[ignore]d environment-dependent tests (real Chrome, built wasm, timing).
@@ -69,15 +69,15 @@ test-recorded:
 # direction this drift ever goes.
 #
 # Lint exactly as CI does (.github/workflows/ci.yml, job `test`, step `Clippy`).
-lint:
+lint: _hooks-auto
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Format in place.
-fmt:
+fmt: _hooks-auto
     cargo fmt
 
 # Format check exactly as CI does (fails on drift).
-fmt-check:
+fmt-check: _hooks-auto
     cargo fmt --check
 
 # Needs `cargo install cargo-deny`. `licenses` is deliberately absent from the
@@ -87,24 +87,68 @@ fmt-check:
 audit:
     cargo deny check advisories bans sources
 
-# The published consumer SDK in clients/typescript — its own npm project, which
-# `cargo test --workspace` cannot reach and nothing here compiled until the
-# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` once.
+# The published consumer clients under clients/ — their own npm/python projects,
+# which `cargo test --workspace` cannot reach and nothing here compiled until the
+# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` and
+# `npm --prefix clients/cli ci` once.
 #
-# Typecheck + test the TypeScript SDK, as its CI job does.
-sdk:
+# Typecheck + test every client, as their CI job does.
+sdk: clients-check
     npm --prefix clients/typescript run typecheck
     npm --prefix clients/typescript test
+    npm --prefix clients/cli run typecheck
+    npm --prefix clients/cli test
+    python -m unittest discover -s clients/python -t clients/python
+
+# --- the consumer plane: one document, every client generated from it ---------
+
+# The document exists only inside the router, so this is the one step in the
+# chain that needs the Rust toolchain — which is exactly why it is separate from
+# `clients` below, whose generators are Node-only and run in a job with no cargo.
+#
+# The same test that writes the file asserts it matches on every `cargo test`, so
+# a route or DTO change that skips this step fails the Rust suite rather than
+# silently shipping clients built from last week's contract.
+#
+# Regenerate clients/openapi.json from the router. Needs cargo.
+openapi:
+    UPDATE_OPENAPI=1 cargo test -p pumper-server --bin pumper spec_snapshot
+
+# TypeScript through openapi-typescript (a devDependency of clients/typescript,
+# so the SDK's existing `npm ci` installs it), the CLI's own copy of the same
+# output, and the Python TypedDicts from a ~120-line emitter in the script.
+#
+# Regenerate every client's wire types from clients/openapi.json. Node only.
+clients:
+    node scripts/gen/generate-clients.mjs
+
+# Regenerates into memory and diffs against the committed output, so a spec
+# change that was not regenerated fails the build instead of shipping clients
+# built from the previous contract. Part of `sdk`, so `just ci` blocks on it.
+#
+# The generated-client drift gate: exit 1 when the clients are stale.
+clients-check:
+    node scripts/gen/generate-clients.mjs --check
 
 # Walks the tree for package manifests and fails on any that no CI job claims
 # (the out-of-graph check), then replays the doc-sync hook against its fixtures.
 # Node only, no dependencies, seconds.
 #
-# The two node-only gates, as the `Ship inventory + doc-sync hook` job runs them.
+# The node-only gates, as the `Ship inventory + doc-sync hook + supply chain` job
+# runs them. `commit-lint.test.mjs` joins the list for the reason the doc-sync
+# fixtures are in it: a guardrail whose wiring nobody checks (the hook that
+# delegates, the recipes that auto-install, the CI step that judges) reads as
+# enforcement long after it stopped being any. `branch-protection` is here for
+# the same reason and one worse: its subject lives on GitHub's side, so the only
+# thing a checkout can keep honest is whether the declaration still describes the
+# workflows — and it is the rung every other rung hangs off.
 inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
     node --test scripts/ci/mcp-gate-parity.test.mjs
+    node --test scripts/ci/commit-lint.test.mjs
+    node scripts/ci/branch-protection.mjs
+    node --test scripts/ci/branch-protection.test.mjs
 
 # Asserts the MCP surface's gated-tool vocabulary is spelled identically at all
 # three sites that spell it (advertised / dispatched / refused). Three
@@ -117,6 +161,184 @@ inventory:
 # Fail if the MCP gated-tool vocabulary has drifted between its three sites.
 mcp-gate-parity:
     node scripts/ci/mcp-gate-parity.mjs
+
+# --- branch protection ---------------------------------------------------------
+
+# The branch-protection rule as a versioned declaration
+# (.github/branch-protection.json), reconciled against the workflows that produce
+# the checks it requires.
+#
+# It cannot ask GitHub whether the rule is ON — no token in a worktree. What it
+# checks is the half that rots: that every required check still names a context a
+# job actually reports (matrix legs expanded), that no job in a gated workflow is
+# un-required by OMISSION, and that the settings are not weakened. A stale
+# required-check name is the worst failure available, because GitHub either waits
+# forever for a check nobody sends or never matches the name — and the settings
+# page keeps showing the rung either way.
+#
+# 0 clean / 2 findings / 3 CANNOT CHECK. A 3 is not a pass.
+protection-check:
+    node scripts/ci/branch-protection.mjs
+
+# The required-check list, and the one command that applies it.
+protection-report:
+    node scripts/ci/branch-protection.mjs --report
+
+# Apply the declaration to GitHub. Needs `gh` authenticated with ADMIN rights on
+# the repo, so it is a maintainer action and not part of `just ci` — but it is one
+# command, which is the difference between a control that gets turned on and a
+# paragraph in a doc. `--json` refuses to emit a payload while the declaration has
+# findings, so this cannot install a stale required-check list.
+protection-apply repo="xkazm04/pumper":
+    #!/usr/bin/env sh
+    set -e
+    node scripts/ci/branch-protection.mjs --json \
+      | gh api -X PUT "repos/{{repo}}/branches/master/protection" --input -
+    echo "branch protection: applied — verify with"
+    echo "  gh api repos/{{repo}}/branches/master/protection --jq .required_status_checks.contexts"
+
+# --- supply chain -------------------------------------------------------------
+
+# Every `uses:` in .github/workflows must resolve to a 40-hex commit SHA, or be
+# named in .github/unpinned-actions.json with a reason and an owner. A floating
+# tag is third-party code fetched at run time from a ref its author can move
+# AFTER review, executed with the workflow's credentials; a SHA cannot be
+# re-pointed.
+#
+# Reconciles in both directions (an unregistered floating ref fails, and so does
+# a waiver naming an action no workflow uses any more) and enforces a ceiling
+# that only moves down. Three outcomes, three exit codes: 0 clean / 2 findings /
+# 3 CANNOT CHECK. A 3 is not a pass.
+#
+# The action-pinning register as a gate. Node only, milliseconds.
+pin-check:
+    node scripts/ci/pinned-actions.mjs
+
+# The burn-down: what is pinned, what is still floating, and the ceiling.
+pin-report:
+    node scripts/ci/pinned-actions.mjs --report
+
+# A CycloneDX 1.6 SBOM of everything linked into the binary, generated from the
+# committed Cargo.lock — which already names every crate at the exact version
+# that will be linked, with the SHA-256 cargo verified before unpacking it. No
+# network, no cargo, no dependencies, and byte-for-byte deterministic, so "did
+# the dependency set change" is answerable by diff.
+#
+# .github/workflows/release.yml runs this per release target and binds the output
+# to that exact binary with a Sigstore SBOM attestation.
+#
+# Write the SBOM to stdout (or `just sbom --out dist/pumper.cdx.json`).
+sbom *args:
+    node scripts/ci/sbom.mjs {{args}}
+
+# Component counts — how many carry a checksum, how many are workspace-local.
+sbom-summary:
+    node scripts/ci/sbom.mjs --summary
+
+# The pinning gate's verdict plus the fixture suites behind BOTH supply-chain
+# instruments. The pinning gate lands green by construction (everything floating
+# today is registered), so "it passed" carries no information about whether it
+# works — the fixtures are what prove it can still go red. Node only, seconds.
+supply-chain:
+    node scripts/ci/pinned-actions.mjs
+    node --test scripts/ci/pinned-actions.test.mjs
+    node --test scripts/ci/sbom.test.mjs
+
+# --- local guardrails ---------------------------------------------------------
+
+# The hooks install THEMSELVES, on the first `just` invocation in a clone.
+#
+# Why this changed: `just hooks-install` was a setup step a contributor had to
+# know about and remember, which makes the pre-commit rungs a guardrail for
+# whoever already knew — everyone else discovered a formatting or pinning
+# violation from a red CI run, after the commit existed and after the push. The
+# repo already treats "a gate nobody installed and a gate that works look
+# identical from the outside" as a bug (see `hooks-status`); this closes the
+# install half of it.
+#
+# Deliberately narrow, so it can never surprise anyone:
+#   - it writes core.hooksPath ONLY when this clone has none set, so an explicit
+#     `just hooks-uninstall`, or a hooksPath of your own, is never overridden;
+#   - it is --local, so it cannot touch a global or system config;
+#   - PUMPER_NO_HOOKS=1 opts out entirely;
+#   - it never fails a recipe: no git, no repo, no permission — it says nothing
+#     and gets out of the way, because a task runner that refuses to run
+#     `cargo check` over a hook-config problem is worse than the drift.
+#
+# It prints once (the run that installs), and is silent on every run after.
+_hooks-auto:
+    #!/usr/bin/env sh
+    [ -n "$PUMPER_NO_HOOKS" ] && exit 0
+    command -v git >/dev/null 2>&1 || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+    current=$(git config --local core.hooksPath 2>/dev/null || true)
+    [ -n "$current" ] && exit 0
+    [ -d .githooks ] || exit 0
+    chmod +x .githooks/* 2>/dev/null || true
+    git config --local core.hooksPath .githooks 2>/dev/null || exit 0
+    echo "hooks: installed for this clone (core.hooksPath -> .githooks)"
+    echo "hooks: pre-commit fmt/pin, commit-msg shape, pre-push clippy — \`just hooks-uninstall\` or PUMPER_NO_HOOKS=1 to opt out"
+
+# The conventional-commit rule, run the way CI runs it. The same file the
+# commit-msg hook delegates to, so a local verdict predicts the remote one.
+#
+#   just commit-lint                     # judge HEAD's subject
+#   just commit-lint "--range master..HEAD"
+#   just commit-lint --report            # print the rule
+#
+# 0 clean / 2 findings / 3 CANNOT CHECK — a 3 is not a pass.
+commit-lint *args:
+    #!/usr/bin/env sh
+    if [ -n "{{args}}" ]; then
+        node scripts/ci/commit-lint.mjs {{args}}
+    else
+        git log -1 --format=%s | node scripts/ci/commit-lint.mjs
+    fi
+
+# Point core.hooksPath at .githooks/ — the ONE thing that turns the versioned
+# hooks in that directory from files into enforcement. `_hooks-auto` above now
+# does this for you on the first `just` run; this recipe stays for the clone
+# that opted out and changed its mind, and for re-running after an uninstall.
+#
+# Git hooks are not versioned and .git/hooks is per-clone, so a CLONE can never
+# arrive with them live — `_hooks-auto` narrows that window to "the first `just`
+# command you run" rather than "whenever you read the setup docs", and it cannot
+# close it entirely. That limit is stated rather than assumed: .ai/manifest.yaml
+# records these under `localAutoInstalled`, still not under the binding rung,
+# because a projection that overstates a gate is read as authoritative and this
+# repo has been burned by exactly that before. The conventional-commit rule is
+# the one that ALSO runs server-side (scripts/ci/commit-lint.mjs, in CI), so it
+# holds on a clone that never ran `just` at all.
+#
+# What you get:
+#   pre-commit  cargo fmt --check (staged .rs), pin-check + protection-check
+#               (staged workflows)
+#   commit-msg  conventional-commit shape
+#   pre-push    cargo clippy -D warnings; PUMPER_HOOKS_FULL=1 runs `just ci`
+# Bypass any of them with PUMPER_SKIP_HOOKS=1, or git's own --no-verify.
+hooks-install:
+    #!/usr/bin/env sh
+    set -e
+    chmod +x .githooks/* 2>/dev/null || true
+    git config core.hooksPath .githooks
+    echo "hooks: core.hooksPath -> .githooks"
+    echo "hooks: pre-commit, commit-msg, pre-push are now live for this clone"
+
+# Restore git's default (.git/hooks), leaving the versioned hooks in place.
+hooks-uninstall:
+    git config --unset core.hooksPath || true
+    @echo "hooks: core.hooksPath cleared — .githooks/ is inert again"
+
+# Is this clone actually running them? A hook nobody installed and a hook that
+# works look identical from the outside.
+hooks-status:
+    #!/usr/bin/env sh
+    p=$(git config core.hooksPath || true)
+    if [ "$p" = ".githooks" ]; then
+        echo "hooks: INSTALLED (core.hooksPath = .githooks)"
+    else
+        echo "hooks: not installed (core.hooksPath = ${p:-<default .git/hooks>}) — run \`just hooks-install\`, or any \`just\` recipe (they auto-install unless PUMPER_NO_HOOKS is set)"
+    fi
 
 # --- test harness: the flake register and the long lanes ----------------------
 
@@ -224,8 +446,13 @@ lane-health:
 # gate whose red nobody would ever see. gates.json records that binding and
 # gate-inventory.test.mjs reconciles this dependency list against it.
 #
+# `supply-chain` joins the list for the same reason: the `Ship inventory` job
+# runs the pinning gate and both supply-chain fixture suites, so a local `ci`
+# that skipped them would understate the enforced policy — the only direction
+# this drift ever goes.
+#
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake-check harness-test disk-check
+ci: _hooks-auto fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity supply-chain flake-check harness-test disk-check
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:
@@ -381,6 +608,20 @@ enforcement-preview app='':
 datahub-preview port='8088':
     curl -s "http://127.0.0.1:{{port}}/datahub/governance/preview"
 
+# Whole-corpus in-degree over the crawl's persisted link graph, with NO new code
+# and no job: one derived spec (`group_by $.to_url` + `count`) that recomputes
+# `crawl/in_degree` incrementally on every crawl's edge writes. Needs the server
+# RUNNING. Creating it twice is not harmful — the second POST just answers with
+# the conflict.
+#
+# In-degree only. `POST /jobs {"app":"crawl","params":{"mode":"graph"}}` is the
+# run that computes PageRank, out-degree and structural drift — see
+# docs/features/crawling.md "Corpus graph intelligence".
+graph-indegree port='8088':
+    curl -s -X POST "http://127.0.0.1:{{port}}/derived" \
+      -H 'content-type: application/json' \
+      -d '{"source_app":"crawl","source_dataset":"edges","target_dataset":"in_degree","group_by":["$.to_url"],"aggregates":{"links_in":"count"}}'
+
 # A scope is required, e.g.
 #   just search-backfill "--app grants --dataset unified"
 #   just search-backfill --all
@@ -396,6 +637,41 @@ search-backfill scope:
 # Build ONE example WASM plugin from plugins-src/<crate> (detached workspace).
 plugin crate:
     cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown
+
+# Build ONE dynamic APP from plugins-src/<crate> and install it into data/apps/.
+#
+# Different from `just plugin` in the one way that matters: an app is a
+# COMPONENT (component-model binary exporting the pumper:app@0.1.0 world), not a
+# core module, so the wasm32 build is followed by a componentization step.
+# `cargo build` cannot emit a component for wasm32-unknown-unknown, so this
+# needs `wasm-tools` (`cargo install wasm-tools`) — the recipe says so rather
+# than producing a core module the host will refuse to run.
+#
+# After installing, set `[plugins] app_dir = "data/apps"` and `[wasm_apps]
+# enabled = true`, then restart: `GET /apps` lists it with `runnable: true`.
+# The host's own ABI gate does NOT depend on this recipe — it runs against the
+# hand-written component fixture in crates/engine-wasm/tests/fixtures/, so
+# `just test` proves the world on a machine with no wasm toolchain at all.
+plugin-app crate:
+    #!/usr/bin/env sh
+    set -e
+    if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
+        echo "error: the wasm32-unknown-unknown target is not installed." >&2
+        echo "       run: rustup target add wasm32-unknown-unknown" >&2
+        exit 1
+    fi
+    if ! command -v wasm-tools >/dev/null 2>&1; then
+        echo "error: wasm-tools is not installed, so the module cannot be turned" >&2
+        echo "       into a component (the host refuses core modules as apps)." >&2
+        echo "       run: cargo install wasm-tools" >&2
+        exit 1
+    fi
+    artifact=$(echo "{{crate}}" | tr '-' '_')
+    ( cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown )
+    mkdir -p data/apps
+    wasm-tools component new         "plugins-src/{{crate}}/target/wasm32-unknown-unknown/release/$artifact.wasm"         -o "data/apps/{{crate}}.wasm"
+    echo "installed data/apps/{{crate}}.wasm"
+    echo "sha256: $(sha256sum "data/apps/{{crate}}.wasm" | cut -d" " -f1)  <- the catalog's module_sha256"
 
 # Builds AND installs every plugins-src crate, which `just plugin` does for one.
 #
@@ -422,6 +698,10 @@ plugins-install:
     mkdir -p data/plugins
     for dir in plugins-src/*/; do
         crate=$(basename "$dir")
+        # Dynamic APPS are not plugins: they build to components, install into
+        # data/apps/, and are refused by the plugin host (no extract ABI). They
+        # have their own recipe, `just plugin-app`.
+        case "$crate" in *-app-template) continue ;; esac
         # cargo underscores the artifact name; the INSTALLED file stem is the
         # plugin name the host loads — what a job's `params.plugin` and a
         # trigger's `plugins.predicate.plugin` name — so it must be the
@@ -447,6 +727,12 @@ plugins-test:
     #!/usr/bin/env sh
     set -e
     for dir in plugins-src/*/; do
+        crate=$(basename "$dir")
+        # An app template's lib is generated against a WIT world and only
+        # compiles for wasm32; its host-target tests would fail to link, which
+        # says nothing about the app. Its guard is the loader's manifest
+        # validation, plus the host's own fixture gate.
+        case "$crate" in *-app-template) echo "== $dir (skipped: wasm32-only)"; continue ;; esac
         echo "== $dir"
         ( cd "$dir" && cargo test )
     done

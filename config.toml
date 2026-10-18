@@ -227,9 +227,32 @@ dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /
 fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
 max_memory_mb = 64          # hard linear-memory cap per call (per instance)
 max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU core); bounds aggregate wasm memory + blocking-pool use
-# app_dir = "data/apps"     # OPTIONAL (M28 v1): dir scanned at boot for dynamic-app .wasm modules exporting describe().
-#                           # Discovered apps are LISTED read-only in GET /apps (dynamic: true, runnable: false) and
-#                           # enqueue rejects them with 409 — running them needs the component-model host (next slice).
+# allow_http_hosts = []     # N10: the OPERATOR half of the plugin capability gate. A plugin's
+#                           # pumper_http_request import reaches a host only if BOTH this list and
+#                           # the plugin's own describe().capabilities.http.hosts allow it. Empty
+#                           # (the default) means NO plugin reaches the network. ".example.com"
+#                           # covers a domain and its subdomains; "*" delegates the whole decision
+#                           # to the plugins' manifests and is honored only from here. A host you
+#                           # list is a host EVERY capability-declaring plugin in `dir` may reach,
+#                           # loopback included — see docs/features/trigger-plugins.md §Capabilities.
+# app_dir = "data/apps"     # OPTIONAL: dir scanned at boot for dynamic-app .wasm modules.
+#                           # A describe-only CORE module is LISTED read-only in GET /apps (dynamic: true,
+#                           # runnable: false) — it exports a manifest and no run, so there is nothing to
+#                           # execute. A COMPONENT exporting the pumper:app@0.1.0 world becomes a runnable
+#                           # app when [wasm_apps] below is enabled. See docs/features/apps.md.
+
+# Running the components found in [plugins] app_dir. OFF by default: giving
+# third-party code fetch and dataset-write authority is an operator decision,
+# so a module already on disk stays listed-but-inert until this is flipped.
+[wasm_apps]
+enabled = false
+# fuel_per_job = 2000000000  # whole-job CPU instruction ceiling (never re-armed per call)
+# yield_interval = 10000000  # fuel between yields back to the runtime; what makes a run cancellable
+# max_memory_mb = 128        # per live instance; aggregate ceiling = max_concurrent x this
+# max_wall_secs = 900        # wall clock around the run, re-checked at every host import
+# max_concurrent = 0         # concurrent RUNS (0 = one per CPU core); bounds live wasm memory
+# max_host_calls = 10000     # a guest looping on fetch burns host time, not fuel — this bounds it
+# max_payload_bytes = 33554432  # per host call, refused (never truncated) when exceeded
 
 # Embedded full-text search (Tantivy) — in-process, no external service.
 [search]
@@ -238,6 +261,14 @@ dir = "data/search-index"
 # Per-run cap on hits a materialized saved search (POST /searches with
 # `materialize: {app, dataset}`) snapshots into its view dataset.
 max_materialize_results = 500
+# Index-time entity enrichment passes, IN ORDER (N11). "builtin" is the shipped
+# regex pass (amount + event_date); "plugin:<name>" runs an installed core-module
+# plugin's `enrich` export under the usual fuel/memory caps, fail-open per
+# document. An earlier entry wins a colliding entity kind, so appending only ADDS
+# kinds. Entities land in one stored JSON field, so a new KIND never changes the
+# schema (and never wipes the index); after changing this list, refresh existing
+# documents with: search-backfill --app <app> --dataset <ds> --re-enrich
+enrichers = ["builtin"]
 
 # Result delivery via webhooks (job callbacks + dataset-watch events).
 [webhooks]
@@ -343,6 +374,17 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # govern_interval_secs = 300                  # governance poll cadence (min 30)
 # govern_pause_max_stale_secs = 900           # cost:pause expires (loudly) after this long with no SUCCESSFUL poll; 0 = freeze until DataHub is readable again
 
+# Vendor-neutral lineage (N24) — the SECOND catalog writer, plus the two classes
+# of fact Pumper already knows and never pushed. Every key here is off by
+# default and the defaults are load-bearing: with this section absent the
+# DataHub emitter produces byte-for-byte the entity set it produced before N24.
+[lineage]
+# openlineage_url = "http://localhost:5000"   # Marquez / any OpenLineage HTTP receiver; unset = writer off. /api/v1/lineage is appended.
+# namespace = "pumper"                        # OpenLineage job/dataset namespace for this node
+# api_key = "..."                             # or put OPENLINEAGE_API_KEY in .env
+# emit_sources = false                        # catalog [[source]] rows as `web`-platform upstream entities; column lineage names them instead of upstreamType NONE
+# emit_quality = false                        # contract verdicts -> dataQualityAssertions / DataHub assertionRunEvent; health + trust -> globalTags
+
 # Information economics (M04) — GET /economics joins the cost ledger with
 # per-job yield (job_yield) into $/new-record and $/changed-record per app over
 # trailing 7d/30d windows, plus an ADVISORY budget/cadence recommendation per
@@ -401,3 +443,31 @@ enforce = false          # DEFERRED seam — inert today, ships OFF so landing e
 #                               # rounds with NO connection held, so an abandoned pass is
 #                               # incomplete, never corrupt. Rung 2 runs a single round.
 # analyze_every_passes = 24     # one ANALYZE per this many optimize passes
+
+# ── Pumper mesh (N16): [[peer]] — federation, entirely by pulling ────────────
+#
+# ABSENT BY DEFAULT. With no [[peer]] rows this node is not in a mesh: nothing
+# is scheduled, nothing is pulled, and bundle imports behave exactly as they did
+# before the mesh existed. Full reference: docs/features/mesh.md
+#
+# Each row becomes ONE SCHEDULE PER STREAM at boot (id `peer-<name>-<stream>`,
+# fenced on managed_by = 'peer'), running the `peer` app — so budgets, receipts,
+# retries, cancel and the /jobs surface all apply unchanged.
+#
+# `public_key` is the only thing that makes a bundle believable: get it from the
+# peer's `GET /node`. Without it a bundle can only be accepted UNVERIFIED, and
+# only when allow_unsigned is explicitly true.
+#
+# [[peer]]
+# name = "vps"
+# url = "https://vps.example:8088"
+# public_key = "9f3c..."             # 64 hex, from the peer's GET /node
+# pull = ["datasets:grants-gov/opportunities", "weather", "recipes"]
+# every = "15m"                      # must divide an hour, or (>= 1h) divide a day
+# allow_unsigned = false             # accept pre-mesh / unverifiable bundles
+# max_penalty_secs = 60              # ceiling on an imported politeness penalty
+# api_key = "env:PUMPER_VPS_KEY"     # sent as x-pumper-key when the PEER runs [auth] keys.
+#                                    # USE THE env: FORM — the schedule row and every job it
+#                                    # enqueues are readable on GET /schedules and GET /jobs/{id}.
+# namespace = "edge_grants"          # default peer_{remote app}
+# enabled = true                     # false disables the schedules, keeping their history

@@ -418,6 +418,22 @@ notes = "Canada's clean national registry (~86k charities, 24 T3010 CSVs). Canad
 # is the backbone; commercial boards are ToS-risky and kept planned/blocked.
 
 [[source]]
+id = "mpsv-ciselniky"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV codebooks (číselníky): skills, education, regions, wage types"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-dovednost/ciselnik-dovednost.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "live"
+confidence = 4
+dataset = "dovednost"
+notes = "Mirrors four MPSV open-data codebooks (dovednost, vzdelani, kraj, typ_mzdy) as one dataset each, keyed by the codebook's own id, so mpsv-vpm can stamp Czech labels on the ids its vacancy rows carry. Reference data that changes a few times a year: refreshed on the first of every third month, before the consumers' runs. Every codebook is fetched and judged before anything is written; a codebook below its per-codebook row floor (a collapsed download) fails the run and writes nothing, so the last good label vintage stays in place. The four URLs are ASSUMED constants that a param can override (urlSource says which)."
+
+[[source]]
 id = "mpsv-vpm"
 app = "mpsv-vpm"
 market = "cz"
@@ -489,6 +505,123 @@ sfera = "string"
 [source.contract.ranges]
 medianMzda = { min = 1000.0, max = 5000000.0 }
 mzdaPrumer = { min = 1000.0, max = 5000000.0 }
+
+# ── MPSV číselníky (codebooks) — the LABEL side of the labour datasets ───────
+# One row per mirrored codebook, all served by the `mpsv-ciselniky` app. Keyed
+# by the SAME codebook URI the vacancy feed publishes, which is what lets
+# mpsv-vpm resolve `Dovednost/…` / `Vzdelani/…` / `Kraj/116` to a readable name
+# by an exact key lookup instead of a substring match.
+#
+# STATUS IS `planned`, DELIBERATELY. The app is implemented and tested, but the
+# `/od/soubory` distribution slugs below are ASSUMED, not verified live (built
+# without network access; the same guess that 404'd for `mpsv-vpm-prirustky`).
+# `catalog.live()` drives both the cron cross-check and `Catalog::reconcile`, so
+# a `planned` row keeps a quarterly job that would only 404 off the scheduler
+# until someone confirms the URL. FIRST LIVE RUN: `POST /apps/mpsv-ciselniky/jobs`
+# with `{"codebooks":["kraj"]}`; on a 404 re-run with `params.urls.kraj` set to
+# the real distribution and move that URL into `CODEBOOKS` in
+# `crates/apps/mpsv-ciselniky/src/lib.rs`, then flip these four rows to
+# `status = "live"` (the cron already matches the app's `schedule()`).
+
+[[source]]
+id = "mpsv-ciselnik-dovednost"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Dovednost (skills codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-dovednost/ciselnik-dovednost.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "dovednost"
+notes = "URL ASSUMED (doubled-slug pattern of the two verified MPSV feeds), NOT verified live. {polozky:[]}, keyed by the `Dovednost/…` URI the vacancy feed publishes. Row floor 100 — below it the run refuses as a collapsed codebook. Resolves skill_demand.skillLabel."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-vzdelani"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Vzdělání (education-level codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-vzdelani/ciselnik-vzdelani.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "vzdelani"
+notes = "URL ASSUMED, NOT verified live. Education-level scale keyed by the `Vzdelani/…` URI. Row floor 5. Resolves education_agg.educationLabel."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-kraj"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Kraj (region codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-kraj/ciselnik-kraj.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "kraj"
+notes = "URL ASSUMED, NOT verified live. The 14 kraje keyed by the `Kraj/…` URI. Row floor 10. Turns every `kraj Kraj/108` title in mpsv-vpm into `Jihomoravský kraj`."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
+
+[[source]]
+id = "mpsv-ciselnik-typ-mzdy"
+app = "mpsv-ciselniky"
+market = "cz"
+name = "MPSV – číselník Typ mzdy (wage-type codebook)"
+url = "https://data.mpsv.cz/od/soubory/ciselnik-typ-mzdy/ciselnik-typ-mzdy.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 6 1 */3 *"
+status = "planned"
+confidence = 2
+dataset = "typ_mzdy"
+notes = "URL ASSUMED, NOT verified live. Wage-type enumeration keyed by the `TypMzdy/…` URI — the dimension whose unresolved URI once silently discarded every posted salary in mpsv-vpm. Row floor 2. Mirrored for completeness; no mpsv-vpm field stamps it in v1."
+
+[source.contract]
+required_fields = ["id", "codebook", "title"]
+max_row_delta_pct = 25.0
+
+[source.contract.types]
+id = "string"
+codebook = "string"
+title = "string"
 
 [[source]]
 id = "mpsv-vpm-prirustky"
@@ -569,6 +702,12 @@ notes = "No public read API; JS SPA; LMC ToS is the binding constraint (robots a
 #     `enforce_contracts` (worker.rs) reads the pair off each revision, i.e.
 #     ("census", …), and /catalog/health reads `datasets.list(s.app, s.dataset)`.
 # So the only row shape that would function is exactly the one the test refuses.
+# UPDATE (N35, 2026-09-02): the missing seam now exists — `census` is a declared
+# VirtualNamespace (registry.rs) and the coverage test already accepted a row
+# naming one, so `census-atlas` at the bottom of this file IS cataloged under
+# app = "census". Giving `market_blend` and `saturation` their own rows is now
+# unblocked and is a deliberate follow-up: each needs its own contract written,
+# which is not a side effect of adding the atlas.
 # Filing them under a producing app instead (app = "census-density", dataset =
 # "market_blend") would compile and pass, and would be a lie: that pair is never
 # written, so the contract would never evaluate and /catalog/health would report
@@ -812,7 +951,7 @@ engine = "string"
 # governance; the catalog is the pipeline registry for every pipeline this
 # binary runs. The server-side gate is
 # `registry::catalog_coverage_tests::the_registered_apps_are_exactly_the_sourced_ones_plus_the_roster`,
-# and the only remaining exemptions are the nine TOOL apps on
+# and the only remaining exemptions are the eight TOOL apps on
 # `registry::NON_SOURCE_APPS`, each with the reason it can never have an
 # upstream at all.
 #
@@ -974,3 +1113,268 @@ status = "live"
 confidence = 5
 dataset = "stories"
 notes = "The example/template app for classic fetch-and-parse use cases, upserting the front page into `stories` via the plain-HTTP engine. Cataloged not because the data is a product input but because it is a REGISTERED app that publishes a dataset: an app the catalog has never heard of is an app no cron, staleness window or contract verdict can attach to, and the template app is the one every new app gets copied from — leaving it uncataloged taught step four of ONBOARDING §10 as optional. Unrelated to `registry::AWAITING_THE_JUDGE`, which tracks whether an app reports a `completeness` verdict in its output_shape; a catalog row neither satisfies nor affects that ratchet."
+
+[[source]]
+id = "research-findings"
+app = "research"
+market = "global"
+name = "Agentic research findings (Claude research, self-derived)"
+url = "local Claude CLI (agentic web research; no upstream endpoint)"
+category = "registry"
+engine = "claude"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "findings"
+notes = "N25. One record per key finding of a structured research run, keyed {slug(topic)}#{index}, written behind persist (default true). Model synthesis, not a fetched source: revisions carry job_id provenance only, never source_url or artifact_sha. On demand (no cron) — a topic is refreshed by re-running it with the same `topic`, which UPDATES its keys instead of forking a second set. Superseded keys from a longer prior run are not removed in v1. Costs real money per run (cost_class=claude). See docs/features/apps.md #research-a-living-knowledge-base."
+
+[[source]]
+id = "research-sources"
+app = "research"
+market = "global"
+name = "Cited sources of agentic research runs (with optional snapshots)"
+url = "the URLs a research report cites (fetched through the tiered fetcher)"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "sources"
+notes = "N25. One record per cited URL, keyed by the URL. Revisions always stamp source_url; artifact_sha ONLY when snapshot_sources actually archived the body as source-N.md, so an unarchived citation never claims to be re-derivable. Capped per run by [research] max_watched_sources (default 20) — the same cap bounds the record write, the snapshot fetch and the proposed watch, and a run that cites more reports sources_truncated. watch_sources emits POST /schedules bodies; the app creates no schedules itself. See docs/features/apps.md #research-a-living-knowledge-base."
+
+# `grants/programs` (N29) — the funding PROGRAM as an entity, not the posting.
+#
+# `app` is the VIRTUAL NAMESPACE, for the same reason `grants-opportunity-details`
+# above is: the rollup writes ("grants", "programs"), and both consumers key on
+# that pair — `enforce_contracts` (worker.rs) reads it off each revision, and
+# /catalog/health reads `datasets.list(s.app, s.dataset)`. Filing it under any
+# one of the three source apps would compile and be a lie.
+#
+# `cron` MUST stay empty: `Catalog::reconcile` derives desired schedules from
+# `Source::is_scheduled()`, and there is no app called `grants` to schedule. The
+# rollup rides the once-per-cycle corpus pass, claimed by whichever grant source
+# reaches `finalize_unified` first that UTC day, so `max_staleness_hours` is what
+# actually holds it to a daily cadence.
+#
+# `max_row_delta_pct` IS declared here (unlike the two upsert-only grants rows,
+# and like `cordis-topic-stats`): the rollup writes with removal detection when
+# the corpus read is complete, so a mass tombstone is reachable and the tripwire
+# can genuinely fire.
+[[source]]
+id = "grants-programs"
+app = "grants"
+market = "us"
+name = "Cross-source funding-program registry (rollup of grants/unified)"
+url = "derived from grants/unified + grants/recurrence_links + grants/events + cordis/topic_stats"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "programs"
+notes = "N29. One record per funding program, keyed `aln:<listing set>` | `family:<Horizon topic lineage>` | `<agency>|<program title>` — precision over recall, so two programs with the same stripped title and different ALNs stay distinct and a row that names neither is left out rather than bucketed. Recomputed over the WHOLE live unified corpus by whichever grant source owns that UTC day's corpus pass, after link_relations. Carries the recurrence projection (period_days, next_expected_open/close, prediction_basis — null unless the program's own dated cycles support one), amendment behaviour from grants/events (deadline_extended_count, closed_early_count, extension_rate — null when the events read was windowed), last_award_ceiling, and Horizon win_history joined from cordis/topic_stats. Removal detection runs only when the corpus read did not come back at its cap; a windowed read upserts and warns instead of tombstoning programs it never looked at. `program_key` is also stamped onto every unified row as a DerivedPath, so GET /grants?program= filters in SQL without a program change reading as a source publication. Queryable at GET /grants/programs."
+
+# `cycles_observed` is required alongside the key because a program row without
+# it is a claim about a program with no evidence attached — the count of postings
+# is what every other number on the row rests on.
+[source.contract]
+required_fields = ["program_key", "cycles_observed"]
+max_row_delta_pct = 10.0
+max_staleness_hours = 48
+
+[source.contract.types]
+program_key = "string"
+cycles_observed = "number"
+
+
+# ── The cross-FAMILY market product (N33) ────────────────────────────────────
+# `market/profile` joins the two Ledgerline-facing products that answer halves
+# of one question under keys a consumer cannot join: `trades/operator_economics`
+# (`<ST>:<trade>`) and `census/market_blend` (`{naics4}:{state_fips}`). The join
+# is `trades_common::market::sync_market_profile`, called at the end of BOTH
+# `sync_operator_economics` and `sync_market_blend` — so whichever of the nine
+# publishing apps refreshed last republishes the product.
+#
+# `app = "market"` is the VIRTUAL NAMESPACE the rows actually land under (the
+# pair `enforce_contracts` and /catalog/health both key on), which the coverage
+# test explicitly allows — the seam the census header comment above says does
+# not exist was built for `grants` and now serves this row too. `cron` MUST stay
+# empty: the write rides a publisher's job, and a cron here would ask the
+# scheduler to create a schedule for an app that does not exist.
+#
+# No `max_row_delta_pct`: the product is written with `upsert_many_derived`,
+# which never tombstones, so the mass-delete tripwire could not fire.
+[[source]]
+id = "market-profile"
+app = "market"
+market = "us"
+name = "State x trade market profile (trades economics joined to census density)"
+url = ""
+category = "market-stats"
+engine = ""
+access = ""
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "profile"
+notes = "One row per state x trade, keyed <ST>:<trade> (51 jurisdictions x the enabled taxonomy). Economics (wage_band, pricing, tax, compliance, valuation) from trades/operator_economics; density (employer/solo/total, per_10k + basis), succession and formation from census/market_blend; a `vintages` block naming the year of every input. DENSITY IS 4-DIGIT NAICS and every row says so (density_grain=naics4): the nonemployer series publishes no finer grain, so Plumbing, Electrical and HVAC (all 238220) share one density block and Landscaping/Pool service share 5617. Coverage is honest and never zeroed — a trade with no NES cell is coverage=economics_only with density=null, which is NOT a market of zero. National facts replicated onto every row (wage band, valuation, federal tax, the national BFS formation block) are declared derived, so a weekly national refresh does not mark ~255 rows changed. Derived only: revisions carry job_id + a derived:// source_url naming both inputs, never an artifact_sha. Read one row via GET /market/profile/{state}/{trade} or the MCP market_profile tool. See docs/features/apps.md #market-profile."
+
+# Declared data contract (M20): the five fields a consumer keys, branches on or
+# reads the economics half through,
+# plus the headline density number. `total_market_per_10k` is deliberately NOT
+# required — it is Null on an `economics_only` row, and requiring it would push
+# the join toward fabricating a zero, which is the exact failure this product's
+# coverage marker exists to prevent. Contract fields are top-level keys (no
+# nested paths in v1), which is why the headline metric and its basis are
+# hoisted out of the density block.
+[source.contract]
+required_fields = ["state", "trade", "coverage", "density_grain", "economics"]
+
+[source.contract.types]
+state = "string"
+trade = "string"
+coverage = "string"
+density_grain = "string"
+economics = "object"
+total_market_per_10k = "number"
+total_market_per_10k_basis = "string"
+
+[source.contract.ranges]
+total_market_per_10k = { min = 0.0 }
+
+# --- N31 applicant fit engine (grants/profiles + grants/fits) ------------------
+#
+# Two rows in the `grants` virtual namespace, neither of them a scrape.
+#
+# `cron` MUST stay empty on both: `Catalog::reconcile` derives desired schedules
+# from `Source::is_scheduled()`, and there is no app called `grants` to schedule.
+# Profiles are written by an operator through `POST /grants/profiles`; fits ride
+# every grant source's own run, over that run's delta.
+#
+# Neither declares `max_row_delta_pct`: both are written with
+# `upsert_stamped` / `upsert_many_derived`, which never tombstone, so the
+# row-delta tripwire could not fire — the same reasoning that removed the inert
+# one from the grants-gov and grants-opportunity-details contracts above.
+[[source]]
+id = "grants-profiles"
+app = "grants"
+market = "us"
+name = "Applicant profiles (operator-authored, POST /grants/profiles)"
+url = "written through POST /grants/profiles"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "live"
+confidence = 5
+dataset = "profiles"
+notes = "N31. One row per applicant: {name, org_type (nonprofit|gov|tribal|smb|university|individual), country, state?, ein?, uei?, ntee?, budget_band, focus_tags[], cost_share_capacity, programs_watched[]}, keyed by the slugged name. NOT a scrape and NOT a table: the fit pass runs inside an app and reaches storage only through AppContext::datasets, so a SQL table would be invisible to the code that reads it. Validation is strict (an unknown field is refused, not dropped) and every absent optional field is stored as an explicit null — absent means UNKNOWN, and unknown never blocks a fit. ein/uei/ntee are stored, never verified: irs-eo-bmf is still planned."
+
+# No `max_staleness_hours`: this dataset is authored by an operator, not
+# refreshed by a source, so a freshness window would report a stable roster of
+# profiles as a broken pipeline. Absence of a bound is the honest declaration.
+[source.contract]
+required_fields = ["name", "org_type", "country"]
+
+[source.contract.types]
+name = "string"
+org_type = "string"
+country = "string"
+
+[[source]]
+id = "grants-fits"
+app = "grants"
+market = "us"
+name = "Applicant fit verdicts (grants/profiles x grants/unified)"
+url = "derived from grants/profiles + grants/unified + grants/opportunity_details"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "fits"
+notes = "N31. One scored, explained verdict per profile x opportunity, keyed {profile}:{unified_key}: {profile, unified_key, source, verdict (eligible|likely|blocked|unknown), score, method, reasons[], blockers[], unknowns[]}. Five pure gates — status, geography, applicant type, cost share, award band — over the eligibility fields the corpus already carried. `eligible` requires positive published evidence on every gate and is unreachable by absence; a Null field, an empty published applicant list, or a term outside the vocabulary map all yield `unknown`, never a fabricated `blocked`. Written by EVERY grant source over THAT run's delta (not the corpus, and not off the once-per-cycle corpus-pass lease, which holds no delta), canonical dataset only — a quarantined contribution reports fits: null rather than alerting on rows the canonical layer does not publish. The new/changed rows of a run are exactly the alert set for a watch or dataset trigger on grants/fits. Deliberately verdict-shaped: it copies nothing from the opportunity, so a changed revision means the FIT moved, not that an agency fixed a typo. Queryable at GET /grants/fits and GET /grants?profile=."
+
+# `verdict` is required beside the two identity fields because a fit row without
+# one is a claim about an applicant with no answer attached — it is the whole
+# payload, and `reasons`/`blockers` only explain it.
+[source.contract]
+required_fields = ["profile", "unified_key", "verdict"]
+max_staleness_hours = 48
+
+[source.contract.types]
+profile = "string"
+unified_key = "string"
+verdict = "string"
+
+
+# ── The sub-state launch atlas (N35) ─────────────────────────────────────────
+# `census/atlas` is the county/metro grain of the launch ranking: the top-N
+# counties per trade by county SATURATION and by the blend cell's own
+# `total_market_per_10k`, scoped to the top-K states (`[census] atlas_states_k`,
+# default 10) and carrying the metro each county sits in.
+#
+# `app = "census"` is the VIRTUAL NAMESPACE the rows land under — the pair
+# `enforce_contracts` and /catalog/health both key on — which is now a
+# registered `VirtualNamespace` (registry.rs, publishers: the four census apps).
+# That is what the header comment further up this file said did not exist yet;
+# it does now, for this row. The other two census products (`market_blend`,
+# `saturation`) are deliberately still uncataloged: adding them is a follow-up
+# that has to think about their own contracts, not a side effect of this row.
+#
+# `cron` MUST stay empty: the write rides a publisher's job (the atlas is
+# rebuilt at the end of every `sync_market_blend`), and a cron here would ask
+# the scheduler to create a schedule for an app that does not exist.
+#
+# No `max_row_delta_pct`: the atlas is a RANKING, and a ranking legitimately
+# swaps most of its membership when the scope (`atlas_states_k`) or the top-N
+# changes. A mass-delta tripwire here would fire on a re-parameterisation.
+[[source]]
+id = "census-atlas"
+app = "census"
+market = "us"
+name = "Sub-state launch atlas (top counties per trade, with their metro)"
+url = ""
+category = "market-stats"
+engine = ""
+access = ""
+cadence = "annual"
+cron = ""
+status = "live"
+confidence = 3
+dataset = "atlas"
+notes = "One row per (naics4, county) that entered EITHER ranking, keyed {naics4}:{county_fips5}. Ranked by county saturation (census/saturation per_10k) and by the blend cell's total_market_per_10k; a county that made only one ranking carries Null for the other, never a position it did not reach. SCOPE: the top-K states by state_total_market ([census] atlas_states_k, default 10) - NOT by formation velocity, because BFS is NATIONAL-grain only and cannot rank states; the basis is on every row as atlas_state_rank_basis. GRAINS ARE LABELLED PER BLOCK (`grains`): employers at county, solos at county OR `state_carried` (NES county availability is ASSUMED unavailable - see the census-nonemp doc header for the probe and its unverified verdict), saturation at county, succession at 2-digit sector x state, formation at national sector. A state_carried row has solo_operators = null and a total_market that counts employers only; the state's solo total rides along as solo_state_operators, labelled, never apportioned. `metro` is the county's CBSA from the PARTIAL hand-curated crosswalk in census-common (crosswalk_vintage = omb_2020); an unknown county has metro = null and is counted as unmapped, never given a substitute market. Derived only: revisions carry job_id + a derived:// source_url naming census/market_blend + census/saturation, never an artifact_sha. See the 'census/atlas' section of docs/features/apps.md."
+
+# Declared data contract (M20): the five top-level keys a consumer keys on or
+# branches on. `rank_by_saturation` / `rank_by_total_market_per_10k` are
+# deliberately NOT required — each is Null on a row that entered only the other
+# ranking, and requiring them would push the builder toward fabricating a rank.
+# `total_market_per_10k` is likewise optional: it is Null when no ACS base is
+# known for the county, and a required numeric would invite a zero.
+[source.contract]
+required_fields = ["naics4", "geo", "geo_fips", "state_fips", "grains"]
+
+[source.contract.types]
+naics4 = "string"
+geo = "string"
+geo_fips = "string"
+state_fips = "string"
+grains = "object"
+saturation_per_10k = "number"
+total_market_per_10k = "number"
+employer_establishments = "number"
+
+[source.contract.ranges]
+saturation_per_10k = { min = 0.0 }
+total_market_per_10k = { min = 0.0 }
+employer_establishments = { min = 0.0 }

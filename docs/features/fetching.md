@@ -4,7 +4,7 @@ One `Fetcher` escalates across three engines by cost: **http → browser → cla
 
 ## FetchRequest / FetchOutcome
 
-`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass), `archive_max_age` (opt into the archive tier — see below), `profile` (named login profile, threaded to both tiers — see [Session vault](#session-vault-named-login-profiles)). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), structured `trace` (see below), `cost_usd` (Claude tier actual), `snapshot` (archive provenance — see below).
+`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass), `archive_max_age` (opt into the archive tier — see below), `profile` (named login profile, threaded to both tiers — see [Session vault](#session-vault-named-login-profiles)). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), structured `trace` (see below), `cost_usd` (Claude tier actual), `snapshot` (archive provenance — see below), `network` (the JSON calls an *escalated* browser render observed, only with `[fetcher] xray` on — see [API X-ray loop](#api-x-ray-loop-fetcher-xray-default-off); absent from the JSON when empty, which is every other fetch).
 
 Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — it adds cost attribution, budget governance, and tier routing.
 
@@ -61,6 +61,19 @@ Three properties worth knowing:
 - **It reaches the receipt and the trace, not just the return value.** The winning `TierTrace.detail` reads `served from archive snapshot captured <ts>`, and `AppContext::fetch` puts the same line **first** in the fetch's `cost_events.detail`, ahead of the escalation trail. Recorded VCR cassettes carry it too (through the entry's header map), so a replayed archive fetch does not come back looking live.
 
 Historical **backfill** over a date range is a different surface — the extractor app's `source.archive` mode, which enumerates CDX captures and tags records `_fetched_via: "wayback"`. See [extraction.md](extraction.md).
+
+### What an archive miss tells you
+
+Every failure here is a fall-through, so the *message* is the only thing that ever distinguishes them — nothing downstream will contradict it, because the live ladder then succeeds. Four are told apart deliberately:
+
+| Situation | What you get |
+| --- | --- |
+| The index holds no 200-status capture | `no archive snapshot recorded for <url>` — a fact about the world; stop asking |
+| The index answered and none of its rows parsed | `unreadable archive CDX index for <url>: <n> row(s) came back and none parsed…` — a fact about **this engine** (a changed CDX field order, an HTML error page served with a 200, a truncated response). It used to share the sentence above, which sent people to check a URL's archive coverage when the parser was what broke |
+| The CDX request returned `400` | the status **plus its one known cause**: the CDX API refuses a request with no `User-Agent`. The production HTTP engine always sets one from `[http] user_agent`, so this only reaches somebody who wired a different inner client. Other statuses stay bare rather than guessing at causes this engine has not verified |
+| `list_snapshots` was given `from` after `to` | refused before any request: `archive range for <url> is empty by construction…`. CDX answers an inverted window with an empty body — the same value as "no captures in this range" — and narrowing `from`/`to` by hand is the documented way to resume a truncated enumeration, so it is the mistake the workflow invites. Bounds are digit prefixes of different lengths, so each is widened to the extreme it denotes: `from=2019, to=20190101` is a real window, `from=20200701, to=2019` is not |
+
+**Only content-negotiation headers reach archive.org.** A snapshot fetch forwards `Accept`, `Accept-Charset`, `Accept-Language` and `User-Agent` (which the CDX API requires) from the caller's request, and drops everything else. It is an allowlist rather than a scrub of credential-looking names, per the registry's `broker-proxy-attaches-secret`: a denylist forwards whatever header is invented next. Nothing routes a credential here today — `FetchRequest` carries no headers at all — so this is a guard against the day it does, on the tier that runs first and therefore on every fetch.
 
 ## Engine capability contract
 
@@ -283,6 +296,23 @@ A failure that never started a process (a bad `binary`) writes no row at all —
 
 **Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
 
+#### The subprocess can fetch through pumper instead of around it (N15)
+
+`[claude] self_hosted_tools` (default **OFF**) replaces the CLI's own
+`WebFetch`/`WebSearch` with pumper's `fetch` MCP tool: a per-run `.mcp.json`
+carrying a single-job token, `--mcp-config … --strict-mcp-config`, and
+`self_hosted_allowed_tools` in place of `allowed_tools`. Every byte the model
+then pulls goes down **this** ladder — recipe tier, archive tier, http, browser
+— under the governor, the response cache, the session profile and the job's own
+`budget_usd`, and lands in `cost_events` like every other fetch. The tier-3
+default prompt names the tool. Full contract, the two auth modes, the refusals
+and what is out of the v1 slice: [mcp.md § The self-hosted agent
+loop](mcp.md#the-self-hosted-agent-loop-claude-self_hosted_tools).
+
+Two things this does **not** do: the model's fetches are not recorded into a VCR
+cassette (so a replayed research run's sub-fetches still go live), and the tool
+refuses `auto_with_research` — the research tier may not re-enter itself.
+
 #### What may cross the cmd.exe shim
 
 Only the Windows shim path re-parses (`[claude] binary` pointing at a real `.exe`, and every POSIX spawn, deliver argv byte-exact and are not restricted). On that path cmd.exe parses the command line a second time, and the following were **measured** through a real round-trip rather than assumed:
@@ -376,6 +406,26 @@ Config: `[recipes] enabled`, `auto_validate`, `max_failures` (3),
 [runtime.md § `[recipes]`](runtime.md#recipes--learned-api-recipe-replay-and-its-two-strike-rungs).
 Surface: `GET /recipes?host=&state=&limit=` plus the two actions, in
 [http-api.md](http-api.md). Columns: [datasets.md § Migration 0046](datasets.md#migration-0046--api_recipes-gains-two-lifecycle-columns).
+## Sharing what the fetcher learned: the mesh
+
+Both of the fetcher's learned assets — the per-host tier memory below and the
+API recipes further down — travel between nodes as **signed bundles** on a
+schedule. See [mesh.md](mesh.md): `GET /host-weather/export` and
+`GET /recipes/export` are the serving side, `[[peer]] pull = ["weather",
+"recipes"]` is the pulling side, and both imports refuse a bundle whose
+signature does not verify against the key that peer pinned.
+
+Two rules matter here rather than there:
+
+- **Weather is a prior, not truth.** The merge is raise-only and count-weighted
+  and never downgrades a locally-observed pin, because hosts behave differently
+  per egress IP and geo (see the import precedence below). A per-peer
+  `max_penalty_secs` bounds the worst a compromised peer can do to this node's
+  politeness. A *scheduled* import lands in tier memory and the persisted
+  penalty snapshot; the live in-process governor adopts it at the next restart.
+- **A recipe's validation never travels.** An imported recipe always lands
+  `validated: false` and is proven by this node's own replay, because a
+  validation verdict is a claim about a replay from a particular egress IP.
 
 ## Politeness governor (adaptive)
 
@@ -397,10 +447,33 @@ Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain
 
 Learned host state is inspectable and resettable via the `/hosts` API (see [http-api.md](http-api.md)): `GET /hosts` (paginated), `GET /hosts/{host}`, `DELETE /hosts/{host}/memory` (clears strikes, pin, and the live + persisted penalty). The `penalty_ms` reported by those endpoints is the **live** governor value (the row's stored snapshot is only for boot restore). The reset clears the **live** governor penalty first and the row second, and takes the same lock the write-behind pass holds across its snapshot→commit — so a background tick can no longer land mid-reset and re-create the row that was just deleted.
 
-Config keys (`[fetcher]`): `min_content_chars` (250), `host_memory_ttl_secs` (604800), `host_penalty_persist_secs` (60), `profiles_dir` (`data/profiles` — root of the session vault).
+**A third learned state: `api_recipe` (N14).** `preferred_tier` is no longer browser-or-nothing. When a validated API recipe actually serves a fetch for a host (the `api_recipe` tier won), that host is pinned to `api_recipe` and its http strikes reset — the cheapest outcome in the ladder, learned the same way the browser pin is. The pin is retired the moment it stops being true: an http win clears it like any other pin, and **any page tier serving that host (browser/claude/archive) clears it too**, because a render is proof no recipe served the page. A page-tier win still teaches nothing about the http tier — it only ever clears that one pin, and never touches strikes or the aging clock of a row that has no `api_recipe` pin. The browser strike ladder is unchanged. **The router honours both pins (N15 carry-forward).** `AppContext::fetch` used to branch on `browser` and nothing else, so the `api_recipe` pin was learned state that the routing decision never read: a host the loop had proved could be served without fetching the page still walked http → browser on every fetch unless `[recipes] enabled`, `[fetcher] xray` or a per-request `use_recipes` happened to be on. One pure function (`router_pin`) now reads the pin for both cases: a `browser` pin sets `skip_http` (escalating strategies only, as before), and an `api_recipe` pin sets `use_recipes` for that fetch — on every strategy except an explicit `browser` render, which asked for a JS page and cannot be answered with an API payload (the same exclusion `recipes_consulted` makes). Honouring the pin adds an `api_recipe tier consulted: learned host preference …` line to `escalations`; the recipe tier still writes its own `TierTrace` only when it actually runs, and it is still never terminal, so a stale pin costs one extra governed JSON GET and then falls through to the live ladder (and the page-tier win retires the pin, as above).
+
+Host-weather bundles export the pin like any other learned state, but an **imported** `api_recipe` pin is never adopted — a peer's recipe is not in your store, so the pin would name a tier you cannot run (recipe sharing between nodes is a separate item). A local `api_recipe` pin does count as a local pin, which imports never downgrade.
+
+Config keys (`[fetcher]`): `min_content_chars` (250), `host_memory_ttl_secs` (604800), `host_penalty_persist_secs` (60), `profiles_dir` (`data/profiles` — root of the session vault), `xray` (`false` — see below).
+
+## API X-ray loop (`[fetcher] xray`, default OFF)
+
+A JS-heavy page is usually a thin shell around a JSON API. The **X-ray** finds that API by watching what the page fetched, and then serves the host from it instead of paying for a Chrome render. `[fetcher] xray = false` is the shipping default and the whole loop is inert until it is flipped: no capture, no discovery, no recipe tier beyond the pre-existing `[recipes] enabled` / per-request `use_recipes` opt-ins.
+
+With it ON, four things happen in order.
+
+1. **Capture on escalation, not on every render.** The browser tier sets `RenderRequest.capture_network` when — and only when — the render is an *escalation*: the learned router skipped the http tier for this host (`skip_http`), or the http tier already lost on this fetch (`thin` / `blocked` / `error`). A browser-first render captures nothing. Volume is bounded by the browser engine's existing caps (30 calls / 256 KiB per body / 2 MiB total). The captures ride back on `FetchOutcome.network`.
+2. **Discovery at the extraction seam.** Only the app that extracted the page knows which values the page was *about*, so discovery runs there: the `extractor` scores each captured payload by how many of its extracted field values it contains and stores the high-overlap calls as recipes (`validated: false`). See [extraction.md § API X-ray discovery](extraction.md#api-x-ray-discovery-fetcher-xray).
+3. **One proving replay.** `xray` implies recipe consultation *and* auto-validation, so the next fetch of that host replays the candidate's API URL once, through the HTTP tier, ahead of the live ladder. A replay that comes back with a success status, JSON, and the recipe's expected field paths still present promotes it to `validated: true`; anything else records a strike **with the reason it was refused** (`non-success status`, `non-JSON payload`, `payload lost the expected field paths`, `replay failed`) and the fetch falls through to the live ladder — the recipe tier is never terminal. `[recipes] max_failures` (default 3) consecutive strikes un-validate a validated recipe, and an *unvalidated* candidate that reaches the same count is **burned**: it is never replayed again, so a junk candidate cannot cost one wasted request per fetch forever.
+4. **The router learns it.** An `api_recipe` win pins the host (see the tier-router section above), so `GET /hosts` shows which hosts are being served without fetching the page at all, and `GET /recipes` shows each recipe's validation state, verdict reason, verdict time and standing strike count.
 
 ## Known gaps
 
+- **A pinned host is consulted; an unpinned one is not.** The `api_recipe` pin is now an input to `AppContext::fetch`'s routing decision (see "The router honours both pins" above), so a pinned host consults recipes even with `xray` and `[recipes] enabled` both off. What the pin still cannot do is *rank* the recipe tier — its position in the ladder is fixed (ahead of archive), so a pin cannot express "try http first anyway", and there is no per-host memory of how good the recipe was, only that it once served.
+- **A mesh-imported recipe still costs its own proving replay.** Importing is
+  sharing candidates, not sharing verdicts ([mesh.md](mesh.md) § Weather and
+  recipe streams), so a fleet of N nodes performs N validations of the same
+  endpoint — deliberately, since each is validating from its own egress.
+- **No per-host cap on unvalidated tries.** A freshly discovered candidate is replayed on the next fetch of its host; the only bound is the burn count (`[recipes] max_failures`), not a per-day ceiling.
+- **A validating replay is not separately metered.** It happens inside a normal `AppContext::fetch`, so it is governed, cached and traced like any HTTP request, but it does not appear as its own cost event.
+- **Recipes for `GET` endpoints only, and with the parameters as observed.** `replay_url` refuses a template with an unfilled placeholder, but not a stale *filled* one — a paginated endpoint replays with the page parameter the capture saw, which is why `payload_overlaps` (not the status alone) is the acceptance bar and the strike ladder is short. POST APIs and recipe sharing between nodes are out of scope.
 - Single static proxy per tier (`[http] proxy` / `[browser] proxy`, per-request override on the HTTP tier). No proxy **pool / rotation** and no stealth tier (backlog moonshots). Browser-tier proxy auth (`user:pass@`) is unsupported (Chrome `--proxy-server` limitation).
 - Aging is time-based only; there is no success-rate / half-life model of host reliability.
 - **Archive provenance stops at `FetchOutcome`.** It reaches the outcome, the trace, the job's cost events and the VCR cassette, but nothing stamps it onto a *dataset revision* — `Provenance` (job id, source URL, artifact sha, rules hash) has no snapshot field, so an app that upserts a record extracted from a snapshot must carry the fact itself (the extractor's backfill mode does, as `_fetched_via`). The **remote/peer tier** used to have the same gap at every layer; it now reaches the trace, the cost events and the job receipt (see "Egress attribution" above), but stops in the same place — no *dataset revision* records which node fetched it, and the fact travels as a trail marker rather than a typed `served_by` field on `FetchOutcome`. Making it typed means updating the literal `FetchOutcome` / `TierTrace` constructions in `crates/core/src/app.rs`, `crates/core/src/vcr.rs` and `crates/apps/provisioner`, and teaching `fetch_cost_detail` to render it the way it renders `SnapshotProvenance::note()`.

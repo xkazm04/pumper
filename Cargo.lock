@@ -338,6 +338,7 @@ dependencies = [
  "chrono",
  "hex",
  "pumper-core",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
@@ -405,6 +406,16 @@ dependencies = [
  "pumper-core",
  "serde_json",
  "trades-common",
+]
+
+[[package]]
+name = "app-mpsv-ciselniky"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -483,9 +494,11 @@ name = "app-research"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "pumper-core",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
 ]
@@ -3790,6 +3803,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "cron",
  "dashmap",
  "ego-tree",
  "futures",
@@ -3797,6 +3811,8 @@ dependencies = [
  "pumper-core",
  "rayon",
  "regex",
+ "reqwest 0.13.5",
+ "ring",
  "scraper",
  "serde",
  "serde_json",
@@ -3850,6 +3866,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3901,9 +3918,11 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -3925,6 +3944,7 @@ dependencies = [
  "app-grants-gov",
  "app-hackernews",
  "app-homewyse-pricing",
+ "app-mpsv-ciselniky",
  "app-mpsv-ispv",
  "app-mpsv-vpm",
  "app-peer",
@@ -3960,6 +3980,7 @@ dependencies = [
  "pumper-engine-search",
  "pumper-engine-wasm",
  "reqwest 0.13.5",
+ "ring",
  "sentry",
  "sentry-tracing",
  "serde",
@@ -3975,6 +3996,7 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "wat",
 ]
 
 [[package]]
@@ -5837,6 +5859,7 @@ dependencies = [
 name = "trades-common"
 version = "0.1.0"
 dependencies = [
+ "census-common",
  "chrono",
  "pumper-core",
  "serde_json",

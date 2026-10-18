@@ -76,6 +76,8 @@ async fn multi_dataset_run_fires_one_hop_per_dataset_not_one_per_run() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();
@@ -144,6 +146,8 @@ async fn view_materialization_hop_does_not_dedup_against_the_fanout_hop() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

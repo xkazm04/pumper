@@ -120,14 +120,22 @@ impl ArchiveEngine {
                 }
             }
         }
+        // An inverted window is refused rather than queried: CDX answers it with
+        // an empty body, which is the same answer as "never archived here" (see
+        // `inverted_cdx_range`).
+        if inverted_cdx_range(from, to) {
+            return Err(Error::http(format!(
+                "archive range for {url} is empty by construction: 'from' {} is after 'to' {} \
+                 — narrow the window, do not invert it",
+                from.unwrap_or_default(),
+                to.unwrap_or_default()
+            )));
+        }
         let max = max.max(1);
         let req = HttpRequest::get(cdx_range_query_url(&self.base_url, url, from, to, max + 1));
         let resp = self.inner.fetch(req).await?;
         if !resp.is_success() {
-            return Err(Error::http(format!(
-                "archive CDX range query for {url} failed: status {}",
-                resp.status
-            )));
+            return Err(cdx_failure("range query", url, resp.status));
         }
         let list = select_snapshots(parse_cdx_lines(&resp.body), max);
         debug!(
@@ -141,9 +149,20 @@ impl ArchiveEngine {
 }
 
 /// The CDX query for the newest 200-status capture of `target`.
+///
 /// `to` (14-digit or any prefix, e.g. `2019`) bounds the capture time from
-/// above — unused by the freshness path (which wants the newest capture and
-/// window-checks it locally) but the seam the future backfill job builds on.
+/// above: "the newest capture no later than T". The freshness path passes
+/// `None` — it wants the newest capture outright and window-checks it locally,
+/// which is one query instead of two and the reason the bound is unused there.
+///
+/// **It has no caller today, and the doc used to explain that by pointing at
+/// "the future backfill job".** That job shipped: `list_snapshots` +
+/// [`cdx_range_query_url`] enumerate a range, which is a different query
+/// (ascending, `collapse=digest`, `limit = max + 1`) and does not go through
+/// here. The bound is kept because point-in-time retrieval — one capture as of
+/// a date, not every capture in a window — is a real and distinct shape that
+/// range enumeration answers expensively. Naming the plan that superseded it is
+/// the point: a parameter documented by a promise nobody kept reads as live.
 pub fn cdx_query_url(base_url: &str, target: &str, to: Option<&str>) -> String {
     let mut url = format!(
         "{}/cdx/search/cdx?url={}&limit=1&sort=reverse&filter=statuscode:200",
@@ -190,6 +209,156 @@ pub fn cdx_range_query_url(
 /// `YYYYMMDDhhmmss` timestamp or any prefix, e.g. `2019` or `201906`).
 pub fn valid_cdx_bound(s: &str) -> bool {
     (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The **only** request headers forwarded to the archive: content negotiation,
+/// plus the `User-Agent` the CDX API requires.
+///
+/// An allowlist, not a denylist of credential-ish names, and that is the
+/// registry's call rather than this file's taste — `software-engineering /
+/// browser-credential-boundary / broker-proxy-attaches-secret` puts it plainly:
+/// *"A denylist fails the same way it always fails: the header added to the
+/// protocol next year is forwarded by default, and nobody who added it knew
+/// about your route."* A first pass here shipped exactly that denylist
+/// (`authorization`, `cookie`, `api-key`, `auth-token` as substrings), which
+/// would have forwarded `X-Amz-Security-Token` and every future spelling.
+///
+/// Compared lowercased. The cost of the stricter form is that a genuinely
+/// useful new header must be added here deliberately, which is the direction
+/// this failure should point.
+const ARCHIVE_FORWARDABLE_HEADERS: &[&str] =
+    &["accept", "accept-charset", "accept-language", "user-agent"];
+
+/// The caller's headers, minus anything that carries a credential.
+///
+/// **This is a guard, not a fix for a reachable leak, and the distinction is
+/// worth stating.** `AppContext::fetch` reaches this engine through
+/// `FetchRequest`, which has no `headers` field at all, and the one place that
+/// does set `HttpRequest::headers` to a credential (`apps/peer/src/mesh.rs`
+/// sends an API key) calls `ctx.engines.http` directly and never touches the
+/// archive tier. So nothing leaks today — traced, not assumed.
+///
+/// What made it safe, though, is the *absence* of a field on someone else's
+/// struct, not a decision anyone took here. The day `FetchRequest` grows
+/// `headers` (a reasonable thing to want: per-request `Accept-Language`, a
+/// site-specific token), this engine would begin forwarding the origin's
+/// credentials to archive.org, silently, on the tier that runs FIRST and
+/// therefore on every fetch. The guard costs a `retain` and makes that
+/// impossible instead of unlikely.
+///
+/// What survives is [`ARCHIVE_FORWARDABLE_HEADERS`]: the negotiation headers,
+/// which mean the same thing to the archive as to the origin, and `User-Agent`,
+/// which the CDX API requires. Everything else is dropped whether or not it
+/// looks like a secret — an allowlist does not need to recognise the danger.
+fn headers_safe_for_the_archive(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            ARCHIVE_FORWARDABLE_HEADERS.contains(&lower.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Why the newest-capture lookup produced nothing, told apart by what the CDX
+/// index actually sent back.
+///
+/// THE ANTI-PATTERN THIS CLOSES: one sentence, "no archive snapshot recorded
+/// for <url>", for two different facts. `parse_cdx_first_line` returns `None`
+/// both for an empty body (the archive genuinely holds no 200-status capture)
+/// and for a body whose every line failed to parse (the archive answered and
+/// this engine could not read it — a changed field order, an HTML error page
+/// served with a 200, a truncated response). The first is a fact about the
+/// world and the correct answer is "fall through to the live ladder and stop
+/// asking". The second is a fact about this parser, and reporting it as the
+/// first sends an operator to check a URL's archive coverage when what broke
+/// is here. `copy-auditor`'s misdirection class, in a tier-zero miss that
+/// nothing else in the stack will ever contradict.
+///
+/// Both remain typed [`Error::Http`] misses, because both must still fall
+/// through — the tiered fetcher's behaviour is unchanged and only the sentence
+/// differs.
+fn no_snapshot_reason(body: &str, url: &str) -> Error {
+    if body.trim().is_empty() {
+        return Error::http(format!("no archive snapshot recorded for {url}"));
+    }
+    let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    Error::http(format!(
+        "unreadable archive CDX index for {url}: {lines} row(s) came back and none parsed as \
+         `urlkey timestamp original ...` with a 14-digit timestamp — the archive answered, this \
+         engine could not read it"
+    ))
+}
+
+/// The error one failed CDX request raises — the same sentence for both CDX
+/// call sites, carrying the cause when the status has a known one.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `failed: status 400`, and nothing else. This
+/// module's own header records a live-verified fact — *the CDX API returns 400
+/// for requests without a User-Agent header* — and that fact sat four hundred
+/// lines away from the only place an operator ever meets the 400. The
+/// production `HttpEngine` always sets one from `[http] user_agent`, so the
+/// person who hits this is by definition the one who wired a different inner
+/// client, which is exactly the reader who cannot know why.
+///
+/// Only the 400 carries a cause. Every other status gets the bare status
+/// deliberately: this engine is tier zero and any error here means "fall
+/// through to the live ladder", so guessing at causes it has not verified
+/// would trade one unhelpful message for a misleading one.
+fn cdx_failure(what: &str, url: &str, status: u16) -> Error {
+    let cause = if status == 400 {
+        " — the CDX API answers 400 to a request with no User-Agent header, \
+         so the inner HttpClient must set one (the production HTTP engine \
+         does, via `[http] user_agent`)"
+    } else {
+        ""
+    };
+    Error::http(format!(
+        "archive CDX {what} for {url} failed: status {status}{cause}"
+    ))
+}
+
+/// Widens a digit-prefix bound to a full 14-digit timestamp at the extreme it
+/// stands for: `filler` is `b'0'` for a lower bound (the earliest instant the
+/// prefix admits) and `b'9'` for an upper one (the latest). The padded upper
+/// bound is not a real datetime — it does not need to be, because two 14-digit
+/// numeric strings order the same way the instants they denote do.
+fn widen_cdx_bound(bound: &str, filler: u8) -> String {
+    let mut s = String::with_capacity(CDX_TS_LEN);
+    s.push_str(bound);
+    while s.len() < CDX_TS_LEN {
+        s.push(filler as char);
+    }
+    s
+}
+
+/// Whether a `from`/`to` pair names a window that is **empty by construction** —
+/// `from` strictly after `to`.
+///
+/// THE ANTI-PATTERN THIS CLOSES: both bounds pass [`valid_cdx_bound`]
+/// individually, nothing compared them, and CDX answers an inverted range with
+/// an empty body. [`ArchiveEngine::list_snapshots`] then returned
+/// `SnapshotList { snapshots: [], truncated: false }` — byte-identical to the
+/// answer for a URL that was genuinely never archived in that window. The
+/// caller cannot tell a typo from a fact.
+///
+/// It is not a hypothetical typo, either: the documented way to resume a
+/// truncated enumeration (`extractor/src/lib.rs:31`) is to *narrow the
+/// `from`/`to` window*, so the workflow that produces these pairs by hand is
+/// exactly the workflow this engine ships for.
+///
+/// Bounds are prefixes of different lengths (`2019` against `20200630`), so
+/// each is widened to the extreme it denotes before comparing: `from=2020,
+/// to=2019` becomes `20200000000000 > 20199999999999` and is refused, while
+/// `from=2019, to=2019` widens to a whole year and is not.
+fn inverted_cdx_range(from: Option<&str>, to: Option<&str>) -> bool {
+    let (Some(from), Some(to)) = (from, to) else {
+        return false;
+    };
+    widen_cdx_bound(from, b'0') > widen_cdx_bound(to, b'9')
 }
 
 /// Raw snapshot-body URL: the `id_` flag asks Wayback for the archived bytes
@@ -308,13 +477,10 @@ impl HttpClient for ArchiveEngine {
         cdx_req.timeout_secs = req.timeout_secs;
         let cdx_resp = self.inner.fetch(cdx_req).await?;
         if !cdx_resp.is_success() {
-            return Err(Error::http(format!(
-                "archive CDX query for {} failed: status {}",
-                req.url, cdx_resp.status
-            )));
+            return Err(cdx_failure("query", &req.url, cdx_resp.status));
         }
         let snap = parse_cdx_first_line(&cdx_resp.body)
-            .ok_or_else(|| Error::http(format!("no archive snapshot recorded for {}", req.url)))?;
+            .ok_or_else(|| no_snapshot_reason(&cdx_resp.body, &req.url))?;
         let captured = snapshot_datetime(&snap.timestamp).ok_or_else(|| {
             Error::http(format!(
                 "unparseable archive capture timestamp '{}' for {}",
@@ -342,7 +508,10 @@ impl HttpClient for ArchiveEngine {
         body_req.ttl_override = req.ttl_override;
         body_req.max_body_bytes = req.max_body_bytes;
         body_req.timeout_secs = req.timeout_secs;
-        body_req.headers = req.headers.clone();
+        // The caller's headers were composed for the ORIGIN site; this request
+        // goes to archive.org. Credential-class headers are dropped rather than
+        // forwarded to a third party (see `headers_safe_for_the_archive`).
+        body_req.headers = headers_safe_for_the_archive(&req.headers);
         let mut resp = self.inner.fetch(body_req).await?;
         debug!(
             url = %req.url,
@@ -492,6 +661,236 @@ mod tests {
         assert!(!u.contains("&from=") && !u.contains("&to="));
     }
 
+    /// THE ANTI-PATTERN: two bounds each valid on their own, never compared to
+    /// each other. CDX answers an inverted range with an empty body, so
+    /// `list_snapshots` returned an empty, untruncated list — the exact same
+    /// value it returns for a URL genuinely never archived in that window. The
+    /// documented way to resume a truncated enumeration is to narrow `from`/`to`
+    /// by hand, so this is the mistake the shipped workflow invites.
+    #[test]
+    fn an_inverted_range_is_not_the_same_as_no_captures() {
+        assert!(inverted_cdx_range(Some("2020"), Some("2019")));
+        assert!(inverted_cdx_range(
+            Some("20200101000000"),
+            Some("20190101000000")
+        ));
+        // Prefixes of different lengths widen to the extreme each denotes.
+        assert!(
+            inverted_cdx_range(Some("20200701"), Some("2019")),
+            "a July 2020 lower bound is after all of 2019"
+        );
+        assert!(
+            !inverted_cdx_range(Some("2019"), Some("20190101")),
+            "a whole-year lower bound starts before 1 Jan of that year ends"
+        );
+        assert!(
+            !inverted_cdx_range(Some("2019"), Some("2019")),
+            "one year to itself is a real window, not an inversion"
+        );
+        assert!(!inverted_cdx_range(Some("2019"), Some("2020")));
+        // An open-ended window cannot be inverted.
+        assert!(!inverted_cdx_range(Some("2020"), None));
+        assert!(!inverted_cdx_range(None, Some("2019")));
+        assert!(!inverted_cdx_range(None, None));
+    }
+
+    /// THE ANTI-PATTERN: `failed: status 400` with the cause documented four
+    /// hundred lines away in the module header. The 400 has exactly one known
+    /// trigger (a CDX request with no User-Agent), and the only operator who
+    /// can hit it is one who wired a non-production inner client — the reader
+    /// least able to guess. Both CDX call sites now raise the one sentence.
+    #[test]
+    fn a_cdx_400_names_the_missing_user_agent_instead_of_only_its_status() {
+        let msg = cdx_failure("query", "https://example.com/", 400).to_string();
+        assert!(msg.contains("status 400"), "{msg}");
+        assert!(
+            msg.contains("User-Agent"),
+            "the known cause is named: {msg}"
+        );
+        assert!(msg.contains("user_agent"), "and the setting that fixes it");
+
+        // Every other status stays bare rather than guessing at a cause this
+        // engine has not verified.
+        for status in [403u16, 429, 500, 503] {
+            let msg = cdx_failure("range query", "https://example.com/", status).to_string();
+            assert!(msg.contains(&format!("status {status}")), "{msg}");
+            assert!(
+                !msg.contains("User-Agent"),
+                "a {status} must not be blamed on the header: {msg}"
+            );
+        }
+
+        // One sentence, two call sites - only the noun differs. (`Error::Http`
+        // adds its own Display prefix, so this matches the body, not the head.)
+        assert!(cdx_failure("query", "https://a/", 500)
+            .to_string()
+            .contains("archive CDX query for https://a/ failed: status 500"));
+        assert!(cdx_failure("range query", "https://a/", 500)
+            .to_string()
+            .contains("archive CDX range query for https://a/ failed: status 500"));
+    }
+
+    /// THE ANTI-PATTERN: one sentence for two facts. "No archive snapshot
+    /// recorded for X" was raised both when the index was empty (true, and the
+    /// operator should stop asking) and when the index answered with rows this
+    /// parser could not read (false, and the operator should look here). The
+    /// second sent people to check a URL's archive coverage over a bug in the
+    /// field-order assumption.
+    #[test]
+    fn an_unreadable_index_is_not_reported_as_an_unarchived_url() {
+        let absent = no_snapshot_reason("", "https://example.com/").to_string();
+        assert!(absent.contains("no archive snapshot recorded"), "{absent}");
+        assert!(
+            no_snapshot_reason("\n   \n", "https://example.com/")
+                .to_string()
+                .contains("no archive snapshot recorded"),
+            "a whitespace-only body is still an empty index"
+        );
+
+        // Rows came back and none parsed: a changed field order, an HTML error
+        // page served with a 200, a truncated response.
+        let garbage = no_snapshot_reason(
+            "<html><body>Server Error</body></html>\n",
+            "https://example.com/",
+        )
+        .to_string();
+        assert!(
+            garbage.contains("unreadable archive CDX index"),
+            "{garbage}"
+        );
+        assert!(
+            !garbage.contains("no archive snapshot recorded"),
+            "the two facts must not share a sentence: {garbage}"
+        );
+        assert!(garbage.contains("1 row"), "the count is shown: {garbage}");
+
+        // A body of well-formed rows never reaches here (parse succeeds), so
+        // the only multi-row case is the unreadable one - and it counts them.
+        let two = no_snapshot_reason("bad one\nbad two\n", "https://example.com/").to_string();
+        assert!(two.contains("2 row"), "{two}");
+    }
+
+    /// The same distinction, driven through the engine so the miss path is
+    /// proved to REACH it rather than merely to have it available.
+    #[tokio::test]
+    async fn both_empty_and_unreadable_indexes_miss_but_say_which() {
+        let (engine, _) = engine_over(ScriptedInner {
+            cdx_body: String::new(),
+            page_body: "never served".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("an empty index is a miss");
+        assert!(err.to_string().contains("no archive snapshot"), "{err}");
+
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: "<html>rate limited</html>\n".into(),
+            page_body: "never served".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("an unreadable index is also a miss");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+        assert!(
+            matches!(err, Error::Http { .. }),
+            "both stay typed misses so the tiered fetcher still falls through"
+        );
+        assert_eq!(
+            inner.seen.lock().unwrap().len(),
+            1,
+            "no snapshot body is fetched on either miss"
+        );
+    }
+
+    /// THE ANTI-PATTERN: forwarding the caller's whole header map to a third
+    /// party because it happened to arrive on the request. The headers were
+    /// composed for the ORIGIN site; the snapshot fetch goes to archive.org.
+    /// Nothing reaches this with a credential today — `FetchRequest` has no
+    /// `headers` field, and the one credential-setting caller
+    /// (`apps/peer/src/mesh.rs`) goes straight to `engines.http` — so what this
+    /// pins is that the day either of those changes, the secret still does not
+    /// travel.
+    #[test]
+    fn a_credential_meant_for_the_origin_is_not_forwarded_to_the_archive() {
+        let headers = HashMap::from([
+            (
+                "Authorization".to_string(),
+                "Bearer sk-live-abc".to_string(),
+            ),
+            ("Cookie".to_string(), "session=deadbeef".to_string()),
+            ("X-Api-Key".to_string(), "k-123".to_string()),
+            ("x-auth-token".to_string(), "t-456".to_string()),
+            ("PROXY-AUTHORIZATION".to_string(), "Basic zzz".to_string()),
+            // Content negotiation means the same thing to the archive.
+            ("Accept-Language".to_string(), "cs-CZ".to_string()),
+            ("Accept".to_string(), "text/html".to_string()),
+            ("User-Agent".to_string(), "pumper/1.0".to_string()),
+        ]);
+        let safe = headers_safe_for_the_archive(&headers);
+
+        for secret in ["sk-live-abc", "deadbeef", "k-123", "t-456", "zzz"] {
+            assert!(
+                !safe.values().any(|v| v.contains(secret)),
+                "{secret} must not reach archive.org: {safe:?}"
+            );
+        }
+        assert_eq!(
+            safe.len(),
+            3,
+            "only the negotiation headers survive: {safe:?}"
+        );
+        assert_eq!(
+            safe.get("Accept-Language").map(String::as_str),
+            Some("cs-CZ")
+        );
+        assert_eq!(
+            safe.get("User-Agent").map(String::as_str),
+            Some("pumper/1.0"),
+            "the CDX API requires a User-Agent, so it must never be scrubbed"
+        );
+        // Casing is not a bypass.
+        assert!(headers_safe_for_the_archive(&HashMap::from([(
+            "aUtHoRiZaTiOn".to_string(),
+            "Bearer x".to_string()
+        )]))
+        .is_empty());
+        // An empty map stays empty rather than gaining anything.
+        assert!(headers_safe_for_the_archive(&HashMap::new()).is_empty());
+    }
+
+    /// AND IT MUST BE AN ALLOWLIST, not a denylist of credential-ish names.
+    /// The registry's `broker-proxy-attaches-secret` states the reason a first
+    /// pass here got wrong: *"the header added to the protocol next year is
+    /// forwarded by default, and nobody who added it knew about your route."*
+    /// Each of these four carries a secret and matches none of the words a
+    /// denylist would have been written from, so under one shape they travel to
+    /// archive.org and under the other they do not.
+    #[test]
+    fn the_forward_set_is_an_allowlist_so_an_unrecognised_secret_still_stops() {
+        let exotic = HashMap::from([
+            ("X-Amz-Security-Token".to_string(), "IQoJb3Jp".to_string()),
+            ("Dpop".to_string(), "eyJhbGci".to_string()),
+            ("X-Csrf".to_string(), "9f2c".to_string()),
+            ("Signature".to_string(), "keyId=live".to_string()),
+        ]);
+        assert!(
+            headers_safe_for_the_archive(&exotic).is_empty(),
+            "an allowlist drops what it does not recognise, which is the point: \
+             none of these contains 'authorization', 'cookie', 'api-key' or \
+             'auth-token'"
+        );
+        // The set is exactly what it says, and nothing has crept into it.
+        assert_eq!(
+            super::ARCHIVE_FORWARDABLE_HEADERS,
+            ["accept", "accept-charset", "accept-language", "user-agent"],
+            "widening the forward set is a deliberate act, not a drive-by"
+        );
+    }
+
     #[test]
     fn cdx_bounds_validate_digit_prefixes() {
         assert!(valid_cdx_bound("2019"));
@@ -621,6 +1020,33 @@ mod tests {
         assert!(inner.seen.lock().unwrap().is_empty());
     }
 
+    /// An inverted window is refused at the door, like a malformed bound — and
+    /// for the same reason: the answer CDX would give (an empty body) is
+    /// indistinguishable from the answer for a URL with no captures in range,
+    /// so querying it would spend a request to buy an ambiguous result.
+    #[tokio::test]
+    async fn list_snapshots_refuses_an_inverted_window_instead_of_reporting_it_empty() {
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: String::new(),
+            page_body: String::new(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .list_snapshots("https://example.com/", Some("2020"), Some("2019"), 10)
+            .await
+            .expect_err("an inverted window is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("empty by construction"), "{msg}");
+        assert!(
+            msg.contains("2020") && msg.contains("2019"),
+            "the refusal must show the operator both bounds it compared: {msg}"
+        );
+        assert!(
+            inner.seen.lock().unwrap().is_empty(),
+            "refusing must cost no CDX request"
+        );
+    }
+
     #[test]
     fn snapshot_datetime_parses_utc() {
         let dt = snapshot_datetime("20240102030405").unwrap();
@@ -675,6 +1101,54 @@ mod tests {
                 cache_hit: false,
             })
         }
+    }
+
+    /// Inner stub that answers every request with one non-success status —
+    /// the shape an operator hits when their inner client sends no User-Agent.
+    struct FailingInner(u16);
+
+    #[async_trait]
+    impl HttpClient for FailingInner {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: self.0,
+                headers: HashMap::new(),
+                body: String::new(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn engine_over_failing(status: u16) -> ArchiveEngine {
+        let cfg = ArchiveConfig {
+            enabled: true,
+            base_url: "https://web.archive.org".into(),
+        };
+        ArchiveEngine::new(&cfg, Arc::new(FailingInner(status)))
+    }
+
+    /// Both CDX doors must REACH the shared sentence, not merely produce an
+    /// equivalent one of their own — the point of `cdx_failure` existing. Gut
+    /// it and this goes red for both `fetch` and `list_snapshots`.
+    #[tokio::test]
+    async fn both_cdx_doors_surface_the_cause_of_a_400() {
+        let engine = engine_over_failing(400);
+
+        let err = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .expect_err("a 400 from CDX is a miss");
+        assert!(err.to_string().contains("User-Agent"), "fetch: {err}");
+
+        let err = engine
+            .list_snapshots("https://example.com/", None, None, 5)
+            .await
+            .expect_err("a 400 from CDX is a failure");
+        assert!(
+            err.to_string().contains("User-Agent"),
+            "list_snapshots: {err}"
+        );
     }
 
     fn engine_over(inner: ScriptedInner) -> (ArchiveEngine, Arc<ScriptedInner>) {

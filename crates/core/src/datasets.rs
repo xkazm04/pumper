@@ -818,9 +818,16 @@ impl Datasets {
         }
     }
 
-    /// The pool, for the crate's golden-document store (`golden`), which reads
-    /// `golden_docs` and `body_pins` beside the records this handle serves.
-    pub(crate) fn pool(&self) -> &SqlitePool {
+    /// The store handle behind this dataset writer.
+    ///
+    /// `Datasets` is the only store handle an [`crate::AppContext`] carries, so
+    /// this is how code reaches a table that is not a dataset: the crate's
+    /// golden-document store (`golden`), which reads `golden_docs` and
+    /// `body_pins` beside the records this handle serves, and the N01
+    /// transactions ledger, which a `transact` run must stage a `pending` row
+    /// into before it parks for approval. Clone it for an owned handle: a
+    /// `SqlitePool` is a handle, not a connection.
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 

@@ -17,6 +17,9 @@ use pumper_core::resilience::{write_dataset, SourceState};
 use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
 use serde_json::{json, Value};
 
+pub mod fit;
+pub mod programs;
+
 /// Derivation stamp (M12) for a cross-source write. `job_id` is the one fact
 /// the runtime always knows; `source_url` is passed ONLY where the whole batch
 /// genuinely came from that one endpoint (a source app's listing URL). Derived
@@ -31,13 +34,46 @@ fn stamp(ctx: &AppContext, source_url: Option<&str>) -> Provenance {
     }
 }
 
+/// The ONE way this crate writes `grants/unified` (or its `@q` shadow).
+///
+/// Every unified write goes through here for two reasons that must not drift
+/// apart: each row is stamped with its [`programs::program_key`] so
+/// `GET /grants?program=` can filter in SQL, and that field is declared
+/// **derived** so the stamp is excluded from change detection.
+///
+/// Both halves are load-bearing at EVERY site. A write that stamped but did not
+/// declare would mint a `changed` revision for the whole corpus (watches,
+/// triggers, webhooks, the yield ledger) the first time it ran, and one that
+/// declared but did not stamp would silently strip the stamp from every row it
+/// touched — the source apps re-list rows daily, so `program=` would go blank
+/// for that source until the next corpus pass.
+async fn write_unified(
+    ctx: &AppContext,
+    dataset: &str,
+    items: &[(String, Value)],
+    trust: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<UpsertSummary> {
+    let stamped = programs::stamp_program_keys(items);
+    ctx.datasets
+        .upsert_many_derived(
+            UNIFIED_APP,
+            dataset,
+            &stamped,
+            trust,
+            Some(&stamp(ctx, source_url)),
+            &programs::derived_paths(),
+        )
+        .await
+}
+
 /// Virtual app namespace holding the cross-source datasets.
 pub const UNIFIED_APP: &str = "grants";
 pub const UNIFIED_DATASET: &str = "unified";
 pub const DUP_DATASET: &str = "duplicate_links";
 
 /// Annual-cycle links (`grants/recurrence_links`), keyed `a|b` like
-/// [`DUP_DATASET`]. A DISTINCT relation, not a tighter duplicate: these two rows
+/// [`DUP_DATASET`] (see [`oriented_pair`] for which key is `a`). A DISTINCT relation, not a tighter duplicate: these two rows
 /// are the same program in two different years, so the earlier one is over and
 /// the later one is the live opportunity. See [`classify_relation`].
 pub const RECURRENCE_DATASET: &str = "recurrence_links";
@@ -142,6 +178,16 @@ pub struct UnifiedOutcome {
     /// Annual-cycle links written to `grants/recurrence_links`, or `None` when
     /// this run did not own the corpus pass.
     pub recurrences: Option<usize>,
+    /// The `grants/programs` rollup this run produced, or `None` when it did not
+    /// own the corpus pass — the same "we did not look" vs "there were none"
+    /// distinction the two link counts draw.
+    pub programs: Option<programs::ProgramRollup>,
+    /// The applicant-fit pass over THIS run's delta (N31), or `None` when the
+    /// contribution was diverted to the shadow dataset — the same "we did not
+    /// look" vs "there were none" distinction the two link counts draw. A
+    /// quarantined source's rows are not in the canonical corpus, so scoring
+    /// them would alert on grants the canonical layer does not publish.
+    pub fits: Option<fit::FitPass>,
     /// Whether this run owned (and therefore ran) this cycle's corpus-wide pass.
     pub corpus_pass: bool,
     /// The sync cycle this run belongs to (see [`corpus_cycle`]).
@@ -178,7 +224,11 @@ impl UnifiedOutcome {
             }),
         );
         map.insert("swept".into(), json!(self.swept));
-        map.insert("warnings".into(), json!(self.warnings));
+        // EXTEND, never replace: a caller that already has warnings in `out`
+        // (a sweep or detail-stage warning pushed before the merge) must not
+        // lose them. Every consumer used to push after the merge and guard the
+        // ordering with a comment — the ordering is now irrelevant.
+        merge_warnings(map, &self.warnings);
         // Null when this run did not own the corpus pass — see the field docs.
         map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
         // The sibling relation: same program, next annual cycle. Reported
@@ -195,18 +245,66 @@ impl UnifiedOutcome {
                 "cycle": self.cycle,
                 "batchSwept": self.batch_swept,
                 "corpusSwept": self.corpus_swept,
+                // The program registry the pass materialized — `null` (not a
+                // zeroed block) on a run that did not own the pass, for the same
+                // reason `corpusSwept` is.
+                "programs": self.programs.as_ref().map(|p| p.block()),
             }),
         );
+        // Applicant fit over this run's delta (N31). `null` — not a zeroed block
+        // — on a run whose contribution was diverted to the shadow dataset, for
+        // the same reason `corpusSwept` is: "we did not look" is not "there were
+        // none". With no profiles stored the block is all zeros, which is the
+        // honest reading of an inert feature.
+        map.insert("fits".into(), json!(self.fits.as_ref().map(|f| f.block())));
         // Per-opportunity search docs come from the unified dataset (compact
         // result, one indexed doc per grant) — see worker `dataset_search_docs`.
         // Withheld entirely when the source's health says so: the worker's own
         // gate on ("grants","unified") can never fire (see `indexable`).
         if indexable(self.state) {
-            map.insert(
-                "index_datasets".into(),
-                json!([{ "app": UNIFIED_APP, "dataset": self.dataset }]),
-            );
+            let mut specs = vec![json!({ "app": UNIFIED_APP, "dataset": self.dataset })];
+            // The program registry is indexed by the run that WROTE it and only
+            // then: `dataset_search_docs` reads the revisions this job produced,
+            // so naming `grants/programs` on a run that did not own the corpus
+            // pass would index an empty window and claim coverage it has not got.
+            if self.programs.is_some() {
+                specs.push(json!({ "app": UNIFIED_APP, "dataset": programs::PROGRAMS_DATASET }));
+            }
+            // Same rule for the fit rows: named only by the run that WROTE some,
+            // because `dataset_search_docs` reads this job's revisions and
+            // naming an empty window claims coverage it has not got.
+            if self.fits.as_ref().is_some_and(fit::FitPass::wrote) {
+                specs.push(json!({ "app": UNIFIED_APP, "dataset": fit::FITS_DATASET }));
+            }
+            map.insert("index_datasets".into(), Value::Array(specs));
         }
+    }
+}
+
+/// Appends `warnings` to the result's `warnings` array, creating it when absent
+/// and keeping whatever a caller put there first. A non-array `warnings` value
+/// (a foreign shape) is replaced, not extended.
+fn merge_warnings(map: &mut serde_json::Map<String, Value>, warnings: &[String]) {
+    match map.get_mut("warnings") {
+        Some(Value::Array(existing)) => existing.extend(warnings.iter().map(|w| json!(w))),
+        _ => {
+            map.insert("warnings".into(), json!(warnings));
+        }
+    }
+}
+
+/// Appends one warning to a result object's `warnings` array, creating it when
+/// absent and keeping whatever a caller put there first.
+///
+/// The extend-not-clobber rule has exactly one implementation ([`merge_warnings`])
+/// and this is its single-message door. Three source apps carried byte-identical
+/// private copies of this function and eu-sedia carried the same `match` inline;
+/// a fix to the rule (the `insert`-clobbers-preexisting-warnings bug that
+/// `merge_into_extends_preexisting_warnings_not_clobbers_them` records) had to be
+/// mirrored by hand into each. Now it cannot be.
+pub fn append_warning(out: &mut Value, msg: String) {
+    if let Value::Object(map) = out {
+        merge_warnings(map, std::slice::from_ref(&msg));
     }
 }
 
@@ -266,14 +364,38 @@ pub async fn finalize_unified(
     // corrections into a shadow dataset it did not read from.
     let cycle = corpus_cycle(now);
     let corpus_pass = claim_corpus_pass(ctx, &cycle).await?;
-    let (corpus_swept, cross_source_dups, recurrences) = if corpus_pass {
+    let (corpus_swept, cross_source_dups, recurrences, program_rollup) = if corpus_pass {
         let swept = sweep_closed(ctx).await?;
         let (dups, recurrences) = link_relations(ctx, DUP_DISTANCE).await?;
-        (Some(swept), Some(dups), Some(recurrences))
+        // The program registry is folded LAST, from what the two passes above
+        // have just settled: `sweep_closed` decides which postings are still
+        // live, and `link_relations` is the corroboration the rollup reports
+        // beside its own projection.
+        let rollup = programs::roll_up_programs(ctx).await?;
+        (Some(swept), Some(dups), Some(recurrences), Some(rollup))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
-    let warnings = drift_warnings(unified_items);
+    // Applicant fit (N31), over THIS run's delta — the unified keys just
+    // published as new or changed. Deliberately NOT hung off the corpus-pass
+    // lease above: that lease covers work derived from the STORED corpus and
+    // holds no delta at all, so gating fits on it would drop two of the three
+    // sources' new grants on the floor every day. Canonical dataset only — a
+    // quarantined contribution lives in the shadow dataset and must not alert.
+    let fits = if dataset == UNIFIED_DATASET {
+        let delta: Vec<String> = unified.fresh_keys().cloned().collect();
+        Some(fit::evaluate_fits(ctx, &delta).await?)
+    } else {
+        None
+    };
+
+    let mut warnings = drift_warnings(unified_items);
+    if let Some(rollup) = &program_rollup {
+        warnings.extend(rollup.warnings.iter().cloned());
+    }
+    if let Some(pass) = &fits {
+        warnings.extend(pass.warnings.iter().cloned());
+    }
     Ok(UnifiedOutcome {
         unified,
         swept: batch_swept + corpus_swept.unwrap_or(0),
@@ -281,6 +403,8 @@ pub async fn finalize_unified(
         corpus_swept,
         cross_source_dups,
         recurrences,
+        programs: program_rollup,
+        fits,
         corpus_pass,
         cycle,
         warnings,
@@ -577,15 +701,7 @@ pub async fn sync_unified(
             "grants/unified contribution gated on source health"
         );
     }
-    ctx.datasets
-        .upsert_many_stamped(
-            UNIFIED_APP,
-            &dataset,
-            items,
-            trust,
-            Some(&stamp(ctx, source_url)),
-        )
-        .await
+    write_unified(ctx, &dataset, items, trust, source_url).await
 }
 
 /// The award amounts a stored `grants/opportunity_details` record carries, as
@@ -1001,15 +1117,7 @@ async fn sweep_batch(
     }
     // An inferred closure, not a source publish: no source_url is honest here.
     // The trust stamp is the contribution's, because these ARE this run's rows.
-    ctx.datasets
-        .upsert_many_stamped(
-            UNIFIED_APP,
-            dataset,
-            &updates,
-            trust,
-            Some(&stamp(ctx, None)),
-        )
-        .await?;
+    write_unified(ctx, dataset, &updates, trust, None).await?;
     Ok(updates.len())
 }
 
@@ -1060,15 +1168,7 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     }
     if !updates.is_empty() {
         // An inferred closure, not a source publish: no source_url is honest here.
-        ctx.datasets
-            .upsert_many_stamped(
-                UNIFIED_APP,
-                UNIFIED_DATASET,
-                &updates,
-                None,
-                Some(&stamp(ctx, None)),
-            )
-            .await?;
+        write_unified(ctx, UNIFIED_DATASET, &updates, None, None).await?;
     }
     Ok(updates.len())
 }
@@ -1103,6 +1203,36 @@ fn is_past_due_open(
 /// wholesale column rename. `close_date`-null is intentionally NOT a drift
 /// signal — forecasted grants legitimately have no close date.
 pub const TITLE_NULL_DRIFT_THRESHOLD: f64 = 0.5;
+
+/// The `warnings[]` line a source owes when records it fetched did not reach
+/// `grants/unified`, or `None` when every fetched record normalized (or nothing
+/// was fetched — an empty pull has nothing to drop).
+///
+/// The `normalize_*` functions return `None` for a record with no usable id,
+/// and the callers `filter_map` them — so a renamed id column silently dropped
+/// the WHOLE batch from the cross-source layer while the listing sync reported
+/// `fetched: 1366, sweep: complete`, and [`drift_warnings`] (which returns
+/// early on an empty batch) could not see it either. A total drop is named as
+/// such: it is the shape of contract drift, not of a few malformed rows.
+pub fn unnormalized_warning(source: &str, fetched: usize, normalized: usize) -> Option<String> {
+    let dropped = fetched.saturating_sub(normalized);
+    if fetched == 0 || dropped == 0 {
+        return None;
+    }
+    Some(if normalized == 0 {
+        format!(
+            "{source}: ALL {fetched} fetched records failed to normalize into grants/unified \
+             (no usable id) — the id field was renamed or moved upstream, so this run \
+             contributed nothing to the cross-source layer while its own listing sync \
+             succeeded"
+        )
+    } else {
+        format!(
+            "{source}: {dropped} of {fetched} fetched records did not normalize into \
+             grants/unified (no usable id) and were left out of the cross-source layer"
+        )
+    })
+}
 
 /// Non-fatal schema-drift warnings over a run's normalized unified items. Empty
 /// when nothing looks wrong; otherwise human-readable strings for the result's
@@ -1265,6 +1395,42 @@ pub fn classify_relation(a: &Value, b: &Value, same_source: bool) -> Option<Pair
     match annual_period_days(close_a, close_b) {
         Some(period_days) => Some(PairRelation::Recurrence { period_days }),
         None => fallback,
+    }
+}
+
+/// Recurrence pairs pooled per [`chain_key`]: `(a, b, distance, observed period)`.
+type RecurrenceChains =
+    std::collections::BTreeMap<(String, String), Vec<(String, String, u32, i64)>>;
+
+/// The chain a recurrence pair belongs to: `(normalized agency, program title)`.
+///
+/// [`classify_relation`] accepts a pair only when the two rows share an agency,
+/// so the chain — where the pairs of one program are pooled to corroborate a
+/// period and predict the next window — must be scoped the same way. Keyed by
+/// program title alone, two agencies running a same-named program ("Community
+/// Development Block Grant" is run by dozens) pooled into one chain: one
+/// blended median period, one bogus predicted window, and every row stamped
+/// with the first pair's agency and ALN. On the output whose doc says
+/// precision over recall, that is a fabricated prediction.
+fn chain_key(row: &Value) -> (String, String) {
+    (
+        norm_text(row.get("agency").and_then(Value::as_str).unwrap_or("")),
+        program_title(row.get("title").and_then(Value::as_str).unwrap_or("")),
+    )
+}
+
+/// The canonical orientation of a pair link: lexicographically smaller key
+/// first. `DUP_DATASET` / `RECURRENCE_DATASET` are keyed `a|b`, and the pair
+/// scan iterates `records` with no `ORDER BY` — so without this a vacuum,
+/// restore or rebuild that flips the scan order would upsert the same relation
+/// again as `b|a` and leave the stale `a|b` row standing, never tombstoned.
+/// [`classify_relation`] is orientation-blind, so canonicalizing first costs
+/// nothing.
+fn oriented_pair<'k>(a: &'k str, b: &'k str) -> (&'k str, &'k str) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -1495,24 +1661,29 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
 
     let mut dups: Vec<(String, Value)> = Vec::new();
     // Recurrence pairs, grouped by the program they belong to, so a third cycle
-    // can corroborate the period the first two only observed.
-    let mut chains: std::collections::BTreeMap<String, Vec<(String, String, u32, i64)>> =
-        std::collections::BTreeMap::new();
+    // can corroborate the period the first two only observed. Keyed by
+    // [`chain_key`] — agency AND program — because `classify_relation` requires
+    // the same agency per PAIR, and a title-only chain re-merged what it had
+    // just kept apart.
+    let mut chains: RecurrenceChains = RecurrenceChains::new();
     for p in &pairs {
-        let (Some(a), Some(b)) = (rows.get(&p.a), rows.get(&p.b)) else {
+        // The SimHash scan hands pairs back in table order, which nothing orders.
+        // Canonicalize before the orientation reaches a key or a payload, so the
+        // same relation is one row however the store happened to iterate.
+        let (key_a, key_b) = oriented_pair(&p.a, &p.b);
+        let (Some(a), Some(b)) = (rows.get(key_a), rows.get(key_b)) else {
             continue;
         };
-        let same_source = source_of(&p.a) == source_of(&p.b);
+        let same_source = source_of(key_a) == source_of(key_b);
         match classify_relation(a, b, same_source) {
             Some(PairRelation::Duplicate) => dups.push((
-                format!("{}|{}", p.a, p.b),
-                json!({ "a": p.a, "b": p.b, "distance": p.distance, "relation": "duplicate" }),
+                format!("{key_a}|{key_b}"),
+                json!({ "a": key_a, "b": key_b, "distance": p.distance, "relation": "duplicate" }),
             )),
             Some(PairRelation::Recurrence { period_days }) => {
-                let program = program_title(a.get("title").and_then(Value::as_str).unwrap_or(""));
-                chains.entry(program).or_default().push((
-                    p.a.clone(),
-                    p.b.clone(),
+                chains.entry(chain_key(a)).or_default().push((
+                    key_a.to_string(),
+                    key_b.to_string(),
                     p.distance,
                     period_days,
                 ));
@@ -1522,7 +1693,7 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
     }
 
     let mut recurrences: Vec<(String, Value)> = Vec::new();
-    for (program, pairs) in &chains {
+    for ((_, program), pairs) in &chains {
         // Every distinct opportunity this program's pairs touch is one cycle.
         let mut cycles: Vec<ProgramCycle> = Vec::new();
         for key in pairs.iter().flat_map(|(a, b, _, _)| [a, b]) {
@@ -1549,8 +1720,11 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
         let Some(projection) = project_recurrence(&cycles) else {
             continue;
         };
-        let sample = rows.get(&pairs[0].0);
         for (a, b, distance, period_days) in pairs {
+            // This pair's OWN row, never the chain's first pair: the chain is
+            // one agency by construction now, but the ALN can still differ
+            // across pairs where one side publishes none.
+            let own = rows.get(a);
             recurrences.push((
                 format!("{a}|{b}"),
                 json!({
@@ -1559,8 +1733,8 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
                     "distance": distance,
                     "relation": "recurrence",
                     "program": program,
-                    "agency": sample.and_then(|r| r.get("agency")).cloned().unwrap_or(Value::Null),
-                    "aln": sample.and_then(|r| r.get("aln")).cloned().unwrap_or(Value::Null),
+                    "agency": own.and_then(|r| r.get("agency")).cloned().unwrap_or(Value::Null),
+                    "aln": own.and_then(|r| r.get("aln")).cloned().unwrap_or(Value::Null),
                     // This pair's own observed gap, and the program-level median
                     // the projection is built on.
                     "observed_period_days": period_days,
@@ -1972,16 +2146,14 @@ fn norm_status(s: Option<&str>) -> Value {
 /// parser.
 ///
 /// This is `grants-gov`'s and `ca-grants`' vocabulary — same four names, same
-/// meanings, same ordering — lifted here rather than forked a third time.
-/// `ca-grants` (`src/lib.rs`) nominated `grants_common` as its home in a
-/// comment: *"It lives here rather than in `grants-common` only because apps may
-/// not depend on apps and the shared crate was out of this change's write set."*
-/// This IS that home. Adopted by `eu-sedia`, then by `cordis` — whose private
-/// fork had already **diverged** (it proved coverage from rows *requested*, the
-/// refuted form named in [`walk_end`]'s doc below, and that verdict wrapped its
-/// resume cursor on a truncated final page). `grants-gov`'s and `ca-grants`'
-/// copies are still in place and are still verbatim; folding them in is
-/// ~115 further references and is tracked as its own change.
+/// meanings, same ordering. Every grant-source app forked it privately
+/// (`ca-grants` nominated `grants_common` as its home in a comment: *"lifting all
+/// three copies into `grants_common` is the follow-up"*), and this IS that home:
+/// the forks are gone — `cordis`'s had already **diverged** (it proved coverage
+/// from rows *requested*, the refuted form named in [`walk_end`]'s doc below) —
+/// every grant-source app names the four endings through this one enum, and the
+/// per-source wording that used to justify a fork now travels as [`SweepVocab`]
+/// instead.
 ///
 /// The arm apps keep missing is [`SweepEnd::UnknownTotal`], and the ledger
 /// records what it has cost three times: `grants-gov`'s renamed `hitCount`,
@@ -2091,15 +2263,35 @@ pub fn walk_end(
     None
 }
 
+/// The three per-source words a coverage warning needs so that ONE message
+/// template can speak every grant source's own dialect.
+///
+/// These names are the entire reason `grants-gov` and `ca-grants` each kept a
+/// private `sweep_warning`: the *logic* was byte-identical, only the nouns
+/// differed ("rows" vs "limit" vs "pageSize", "search2" vs "CKAN", "hitCount" vs
+/// "result.total"). A message that says `pageSize` to an operator whose manifest
+/// param is `rows` is not actionable, so the nouns are load-bearing — but they
+/// are DATA, not a reason to fork a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepVocab {
+    /// The page-size parameter as the operator sets it in `params` (`rows`,
+    /// `limit`, `pageSize`) — what the "raise X/maxPages" remedy must name.
+    pub page_size_param: &'static str,
+    /// How to name the upstream in prose (`search2`, `CKAN`, `the source`).
+    pub source: &'static str,
+    /// The upstream field the total was read from (`hitCount`, `result.total`,
+    /// `totalResults`), because "the total is missing" is only actionable if the
+    /// message says WHICH field to go looking for.
+    pub total_field: &'static str,
+}
+
 /// The human-readable warning for a walk that did not prove its coverage, or
 /// `None` for a complete sweep.
 ///
 /// Every non-complete arm reaches the caller through `warnings[]` as well as
 /// through `sweep`/`truncated`, because a consumer reading only the warnings
 /// channel is exactly the consumer who would otherwise never learn the corpus is
-/// short. `total_field` is the upstream field name the total was read from
-/// (`totalResults`, `hitCount`, `result.total`), because "the total is missing"
-/// is only actionable if the message says WHICH field to go looking for.
+/// short. The per-source nouns come from `vocab` — see [`SweepVocab`].
 pub fn sweep_warning(
     end: SweepEnd,
     pages: u64,
@@ -2107,23 +2299,28 @@ pub fn sweep_warning(
     page_size: u64,
     total: u64,
     fetched: usize,
-    total_field: &str,
+    vocab: SweepVocab,
 ) -> Option<String> {
+    let SweepVocab {
+        page_size_param,
+        source,
+        total_field,
+    } = vocab;
     match end {
         SweepEnd::Complete => None,
         SweepEnd::Capped => Some(format!(
             "coverage truncated: stopped at maxPages={max_pages} after {fetched} of {total} \
-             records — raise pageSize/maxPages to cover the full corpus"
+             records — raise {page_size_param}/maxPages to cover the full corpus"
         )),
         SweepEnd::ShortPage => Some(format!(
-            "coverage truncated: page {pages} returned fewer than pageSize={page_size} while \
-             the source reports {total} total, so the walk stopped at {fetched} records — \
+            "coverage truncated: page {pages} returned fewer than {page_size_param}={page_size} \
+             while {source} reports {total} total, so the walk stopped at {fetched} records — \
              treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
              partially-served page looks exactly like a genuine tail)"
         )),
         SweepEnd::UnknownTotal => Some(format!(
-            "coverage unproven: the source served {fetched} records over {pages} page(s) while \
-             reporting `{total_field}`:0 — the total is missing or renamed, so nothing can \
+            "coverage unproven: {source} served {fetched} records over {pages} page(s) while \
+             reporting {total_field}:0 — the total is missing or renamed, so nothing can \
              prove the corpus was covered. The walk ran to a short page or maxPages={max_pages} \
              instead of trusting the total"
         )),
@@ -2212,6 +2409,100 @@ pub fn topic_lineage(identifier: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- result merge ----
+
+    /// THE REFUTED BEHAVIOR: `merge_into` did `map.insert("warnings", ...)`, so
+    /// a warning the app pushed BEFORE the merge vanished. Three consumers
+    /// worked only because each pushed after the merge behind a comment.
+    #[test]
+    fn merge_into_extends_preexisting_warnings_not_clobbers_them() {
+        let mut out = json!({ "warnings": ["sweep: short page"] });
+        let Value::Object(map) = &mut out else {
+            unreachable!()
+        };
+        merge_warnings(map, &["drift: 60% null titles".to_string()]);
+        assert_eq!(
+            out["warnings"],
+            json!(["sweep: short page", "drift: 60% null titles"])
+        );
+
+        // Absent -> created; a foreign non-array shape -> replaced, not extended.
+        let mut fresh = json!({});
+        let Value::Object(map) = &mut fresh else {
+            unreachable!()
+        };
+        merge_warnings(map, &["w".to_string()]);
+        assert_eq!(fresh["warnings"], json!(["w"]));
+        let mut foreign = json!({ "warnings": "not-an-array" });
+        let Value::Object(map) = &mut foreign else {
+            unreachable!()
+        };
+        merge_warnings(map, &[]);
+        assert_eq!(foreign["warnings"], json!([]));
+    }
+
+    // ---- unified drop ----
+
+    /// THE REFUTED BEHAVIOR: `filter_map(normalize_*)` dropped a batch whose id
+    /// column was renamed, and nothing counted the gap — `fetched: 1366` with
+    /// zero unified rows and no warning.
+    #[test]
+    fn a_batch_that_normalizes_to_nothing_is_named_as_drift_not_silence() {
+        assert_eq!(
+            unnormalized_warning("ca-grants", 0, 0),
+            None,
+            "nothing fetched"
+        );
+        assert_eq!(
+            unnormalized_warning("ca-grants", 10, 10),
+            None,
+            "nothing dropped"
+        );
+        let total = unnormalized_warning("ca-grants", 1366, 0).expect("a total drop warns");
+        assert!(total.contains("ALL 1366"), "{total}");
+        assert!(total.contains("renamed"), "{total}");
+        let partial = unnormalized_warning("grants-gov", 10, 7).expect("a partial drop warns");
+        assert!(partial.contains("3 of 10"), "{partial}");
+        assert!(!partial.contains("ALL"), "{partial}");
+    }
+
+    // ---- recurrence chains ----
+
+    /// THE REFUTED BEHAVIOR: chains were keyed by `program_title` alone, so two
+    /// agencies' same-named programs pooled into one chain that stamped every
+    /// row with the first pair's agency.
+    #[test]
+    fn a_recurrence_chain_is_one_agency_not_one_title() {
+        let hud = json!({ "title": "Community Development Block Grant FY2026", "agency": "HUD" });
+        let state =
+            json!({ "title": "Community Development Block Grant 2026", "agency": "CA HCD" });
+        assert_ne!(chain_key(&hud), chain_key(&state));
+        assert_eq!(chain_key(&hud).1, chain_key(&state).1, "same program title");
+        // The same agency spelled differently is still one chain.
+        let hud2 = json!({ "title": "Community Development Block Grant FY2027", "agency": "hud " });
+        assert_eq!(chain_key(&hud), chain_key(&hud2));
+    }
+
+    // ---- pair links ----
+
+    /// THE REFUTED BEHAVIOR: the link key was `format!("{}|{}", p.a, p.b)` in
+    /// whatever order the unordered SimHash scan returned the pair, so a flipped
+    /// scan order minted a second key for one relation.
+    #[test]
+    fn a_pair_link_key_is_orientation_independent() {
+        assert_eq!(
+            oriented_pair("grants-gov:2", "ca-grants:9"),
+            ("ca-grants:9", "grants-gov:2")
+        );
+        assert_eq!(
+            oriented_pair("ca-grants:9", "grants-gov:2"),
+            ("ca-grants:9", "grants-gov:2")
+        );
+        let (x, y) = oriented_pair("b", "a");
+        let (p, q) = oriented_pair("a", "b");
+        assert_eq!(format!("{x}|{y}"), format!("{p}|{q}"));
+    }
 
     // ---- sweep coverage vocabulary ----
 
@@ -2369,17 +2660,102 @@ mod tests {
             assert_eq!(end.as_str(), name);
             assert_eq!(end.truncated(), truncated, "{name}");
             assert_eq!(
-                sweep_warning(end, 1, 50, 100, 10, 5, "totalResults").is_some(),
+                sweep_warning(end, 1, 50, 100, 10, 5, SEDIA).is_some(),
                 truncated,
                 "{name}: every non-complete arm must reach warnings[] too"
             );
         }
-        let unproven =
-            sweep_warning(SweepEnd::UnknownTotal, 3, 50, 100, 0, 240, "totalResults").unwrap();
+        let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 50, 100, 0, 240, SEDIA).unwrap();
         assert!(
             unproven.contains("totalResults"),
             "the warning must name the field to go looking for: {unproven}"
         );
+    }
+
+    // The three dialects the source apps speak, as their own crates declare
+    // them. Duplicated here ON PURPOSE: the test below is the guard that the
+    // shared template still renders each app's exact wording, so it must not
+    // read the constants it is checking.
+    const SEDIA: SweepVocab = SweepVocab {
+        page_size_param: "pageSize",
+        source: "the source",
+        total_field: "totalResults",
+    };
+    const SEARCH2: SweepVocab = SweepVocab {
+        page_size_param: "rows",
+        source: "search2",
+        total_field: "hitCount",
+    };
+    const CKAN: SweepVocab = SweepVocab {
+        page_size_param: "limit",
+        source: "CKAN",
+        total_field: "result.total",
+    };
+
+    /// THE ANTI-PATTERN: three apps forked `sweep_warning` because one template
+    /// spoke only one source's nouns — a message telling a grants.gov operator to
+    /// "raise pageSize" names a param their manifest does not have. Unifying the
+    /// function is only safe if the nouns still arrive, so this asserts the
+    /// remedy, the upstream's name and the drifted field name for every dialect
+    /// and every unproven arm. A regression here is a warning that sends an
+    /// operator looking for the wrong knob.
+    #[test]
+    fn one_template_still_speaks_each_sources_own_nouns() {
+        for (vocab, param, source, field) in [
+            (SEARCH2, "rows", "search2", "hitCount"),
+            (CKAN, "limit", "CKAN", "result.total"),
+            (SEDIA, "pageSize", "the source", "totalResults"),
+        ] {
+            let capped = sweep_warning(SweepEnd::Capped, 25, 25, 1000, 100_000, 25_000, vocab)
+                .expect("capped warns");
+            assert!(
+                capped.contains(&format!("raise {param}/maxPages")),
+                "the remedy must name the caller's own page-size param: {capped}"
+            );
+            let short = sweep_warning(SweepEnd::ShortPage, 2, 25, 1000, 1366, 1100, vocab)
+                .expect("short page warns");
+            assert!(
+                short.contains(&format!("fewer than {param}=1000"))
+                    && short.contains(&format!("while {source} reports 1366 total"))
+                    && short.contains("TRUNCATED page"),
+                "{short}"
+            );
+            let unproven = sweep_warning(SweepEnd::UnknownTotal, 3, 25, 1000, 0, 2400, vocab)
+                .expect("unknown total warns");
+            assert!(
+                unproven.contains("coverage unproven")
+                    && unproven.contains(&format!("{source} served 2400 records"))
+                    && unproven.contains(&format!("reporting {field}:0")),
+                "{unproven}"
+            );
+        }
+    }
+
+    /// THE REFUTED BEHAVIOR: `append_warning`'s three private copies were each
+    /// one `map.insert` away from dropping a warning an app had already pushed —
+    /// the same bug `merge_into` shipped. One door, one rule.
+    #[test]
+    fn append_warning_extends_a_preexisting_array_and_leaves_non_objects_alone() {
+        let mut out = json!({ "warnings": ["drift: 60% null titles"] });
+        append_warning(&mut out, "coverage truncated".to_string());
+        assert_eq!(
+            out["warnings"],
+            json!(["drift: 60% null titles", "coverage truncated"])
+        );
+
+        let mut fresh = json!({ "fetched": 3 });
+        append_warning(&mut fresh, "w".to_string());
+        assert_eq!(fresh["warnings"], json!(["w"]));
+
+        // A foreign `warnings` shape is replaced, never appended into.
+        let mut foreign = json!({ "warnings": "one string" });
+        append_warning(&mut foreign, "w".to_string());
+        assert_eq!(foreign["warnings"], json!(["w"]));
+
+        // Not an object: nothing to append to, and no panic.
+        let mut arr = json!([1, 2]);
+        append_warning(&mut arr, "w".to_string());
+        assert_eq!(arr, json!([1, 2]));
     }
 
     /// THE REFUTED BEHAVIOR: the shipped guard is `total > 0 && got == 0`, gated
@@ -2980,6 +3356,8 @@ mod tests {
                 corpus_swept: Some(0),
                 cross_source_dups: Some(0),
                 recurrences: Some(0),
+                programs: Some(programs::ProgramRollup::default()),
+                fits: Some(fit::FitPass::default()),
                 corpus_pass: true,
                 cycle: "2026-08-04".to_string(),
                 warnings: vec![],
@@ -2993,9 +3371,25 @@ mod tests {
         outcome(SourceState::Healthy).merge_into(&mut healthy);
         assert_eq!(
             healthy["index_datasets"],
-            json!([{ "app": "grants", "dataset": "unified" }])
+            json!([
+                { "app": "grants", "dataset": "unified" },
+                { "app": "grants", "dataset": "programs" }
+            ])
         );
         assert_eq!(healthy["unified"]["trust"], "stable");
+
+        // A run that did not own the corpus pass wrote no program rows, so it
+        // must not name the dataset: `dataset_search_docs` indexes THIS job's
+        // revision window, and naming it would report coverage of an empty one.
+        let mut passenger = json!({});
+        let mut solo = outcome(SourceState::Healthy);
+        solo.programs = None;
+        solo.merge_into(&mut passenger);
+        assert_eq!(
+            passenger["index_datasets"],
+            json!([{ "app": "grants", "dataset": "unified" }])
+        );
+        assert_eq!(passenger["corpusPass"]["programs"], Value::Null);
 
         let mut quarantined = json!({});
         outcome(SourceState::Quarantined).merge_into(&mut quarantined);
@@ -3542,9 +3936,11 @@ mod tests {
             .list(UNIFIED_APP, DUP_DATASET, 100)
             .await
             .unwrap();
+        // Canonical orientation (smaller key first), NOT the order the corpus was
+        // inserted in — the key must not depend on how the store iterated.
         assert!(dup_rows
             .iter()
-            .any(|r| r.key == "grants-gov:100|ca-grants:CA-7"));
+            .any(|r| r.key == "ca-grants:CA-7|grants-gov:100"));
         assert!(dup_rows.iter().all(|r| r.data["relation"] == "duplicate"));
         // The annual cycle is NOT also filed as a duplicate — that conflation is
         // the whole thing this direction removes.
