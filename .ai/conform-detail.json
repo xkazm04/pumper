@@ -5431,6 +5431,47 @@
         "at": "2026-10-17T21:26:41.984706+00:00",
         "reason": "reviewer (sonnet): Line 694 does clamp keep to 1 (`keep.max(1)`), but I found no caller anywhere in crates/ that passes 0 as a sentinel, and no non-test caller of HealthStore::prune at all, so the 'zero sentinel' and 'unattended janitor' claims are unconfirmed; the supporting anchors retention.rs:343 (delete_artifacts"
       }
+    },
+    "e070c6d1-28bc-4b66-bdac-e9a46f152f10/deterministic-prefix-caching": {
+      "context": "core-http-cache",
+      "subject": "deterministic-prefix-caching",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-18",
+      "evaluatedTs": "2026-10-18T21:08:14.427Z",
+      "worker": "1361eceb-80c0-468e-ae6e-c1f8e7f9eff0",
+      "techniques": [
+        {
+          "technique": "atomic-write-then-move",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:286 Entries are SQLite rows, rather than individual serialized head-output files published by competing loader workers."
+        },
+        {
+          "technique": "capability-marker-boundary-scan",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-http/src/lib.rs:540 Cache eligibility examines HTTP request properties; there is no transform chain whose cache boundary must be discovered."
+        },
+        {
+          "technique": "enumerate-the-non-working-cases",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/vcr.rs:94 VCR intentionally replays recorded results, including sampled answers; it is not a caching dataset consumed by a training loader."
+        },
+        {
+          "technique": "hash-inputs-and-pipeline",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:68 The key identifies an HTTP request, not a record plus an assembled transform head requiring advisory pipeline hashing."
+        },
+        {
+          "technique": "running-window-replacement",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/lru.rs:24 This is capacity-driven LRU eviction for pooled handles, not an epoch-based dataset window with background replacement."
+        },
+        {
+          "technique": "unknown-callable-is-nondeterministic",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:98 The cache retrieves typed HTTP responses by key and age; it accepts no callable transform chain requiring purity classification."
+        }
+      ]
     }
   }
 }

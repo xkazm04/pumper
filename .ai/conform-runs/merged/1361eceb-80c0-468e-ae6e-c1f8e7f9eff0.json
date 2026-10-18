@@ -1,0 +1,77 @@
+{
+ "schema": "conform-run/1",
+ "worker": "1361eceb-80c0-468e-ae6e-c1f8e7f9eff0",
+ "subject": "deterministic-prefix-caching",
+ "evaluatedAt": "2026-10-18T21:08:14.427174+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "core-http-cache",
+   "subject": "deterministic-prefix-caching",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-http/src/lib.rs:1133 The cache stores HTTP responses directly, and searches of the context and repository found none of the listed prefix-caching terms, so the subject's transform-prefix and live-random-tail precondition does not hold.",
+   "techniques": [
+    {
+     "technique": "atomic-write-then-move",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:286 Entries are SQLite rows, rather than individual serialized head-output files published by competing loader workers."
+    },
+    {
+     "technique": "capability-marker-boundary-scan",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-http/src/lib.rs:540 Cache eligibility examines HTTP request properties; there is no transform chain whose cache boundary must be discovered."
+    },
+    {
+     "technique": "enumerate-the-non-working-cases",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/vcr.rs:94 VCR intentionally replays recorded results, including sampled answers; it is not a caching dataset consumed by a training loader."
+    },
+    {
+     "technique": "hash-inputs-and-pipeline",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:68 The key identifies an HTTP request, not a record plus an assembled transform head requiring advisory pipeline hashing."
+    },
+    {
+     "technique": "running-window-replacement",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/lru.rs:24 This is capacity-driven LRU eviction for pooled handles, not an epoch-based dataset window with background replacement."
+    },
+    {
+     "technique": "unknown-callable-is-nondeterministic",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:98 The cache retrieves typed HTTP responses by key and age; it accepts no callable transform chain requiring purity classification."
+    }
+   ],
+   "absenceTerms": [
+    "randomizable",
+    "cacheable_prefix",
+    "transform_chain",
+    "persistent_workers"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-18T21:08:14.427174+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "deterministic-prefix-caching"
+   ],
+   "techniques": [
+    "atomic-write-then-move",
+    "capability-marker-boundary-scan",
+    "enumerate-the-non-working-cases",
+    "hash-inputs-and-pipeline",
+    "running-window-replacement",
+    "unknown-callable-is-nondeterministic"
+   ],
+   "deviations": 0,
+   "context": "core-http-cache",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

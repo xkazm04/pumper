@@ -2685,7 +2685,11 @@
           "revision": 2,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/engine-http/src/lib.rs:1133 The cache stores HTTP responses directly, and searches of the context and repository found none of the listed prefix-caching terms, so the subject's transform-prefix and live-random-tail precondition does not hold.",
+          "evaluatedAt": "2026-10-18",
+          "evaluatedAgainst": "sha256-b2:018e88a8c6d68b18",
+          "evaluatedRevision": 2
         },
         {
           "subject": "paged-block-cache",
