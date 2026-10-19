@@ -1,0 +1,76 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a1e9279f-9e26-4579-a3c1-6d550ad06738",
+ "subject": "proactive-nudges",
+ "evaluatedAt": "2026-10-19T22:40:53.844084+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "job-scheduler",
+   "subject": "proactive-nudges",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/scheduler.rs:586 Context and repository searches found no efficacy, attention_budget, or trigger_evaluator identifiers, and this firing path enqueues scheduled work rather than discretionary notices for human attention.",
+   "techniques": [
+    {
+     "technique": "attention-budgets",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:583 The schedule carries a monetary ceiling per job; it does not allocate daily human-contact allowances."
+    },
+    {
+     "technique": "efficacy-feedback",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:600 This outcome records a scheduled job firing, not a person's response to a delivered nudge."
+    },
+    {
+     "technique": "notice-delivery-decoupling",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:586 The durable queue receives executable jobs, so notice deferral and revalidation requirements have no notice lifecycle to govern here."
+    },
+    {
+     "technique": "nudge-identity-dedup",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1173 Overlap protection follows the latest job's active status; it is not semantic deduplication of news delivered to a person."
+    },
+    {
+     "technique": "quiet-windows",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/quiet_window.rs:63 The similarly named tests gate database maintenance on foreground activity, not human contact on declared local hours."
+    },
+    {
+     "technique": "trigger-evaluators",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1302 The decision evaluates a cron firing time, not whether an agent's judgment warrants human attention."
+    }
+   ],
+   "absenceTerms": [
+    "efficacy",
+    "attention_budget",
+    "trigger_evaluator"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T22:40:53.844084+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "proactive-nudges"
+   ],
+   "techniques": [
+    "attention-budgets",
+    "efficacy-feedback",
+    "notice-delivery-decoupling",
+    "nudge-identity-dedup",
+    "quiet-windows",
+    "trigger-evaluators"
+   ],
+   "deviations": 0,
+   "context": "job-scheduler",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

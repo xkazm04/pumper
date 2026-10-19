@@ -4451,7 +4451,11 @@
           "revision": 6,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:586 Context and repository searches found no efficacy, attention_budget, or trigger_evaluator identifiers, and this firing path enqueues scheduled work rather than discretionary notices for human attention.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:b74b09e6bda5ece0",
+          "evaluatedRevision": 6
         },
         {
           "subject": "job-coordination",
