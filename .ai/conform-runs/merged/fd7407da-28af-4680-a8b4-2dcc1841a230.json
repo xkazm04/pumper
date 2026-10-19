@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "fd7407da-28af-4680-a8b4-2dcc1841a230",
+ "subject": "llm-extracted-entity-graph",
+ "evaluatedAt": "2026-10-19T21:34:31.759543+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "llm-extracted-entity-graph",
+   "context": "web-crawl-extraction",
+   "reason": "The subject 'llm-extracted-entity-graph' does not apply to 'web-crawl-extraction': crawl/ traverses HTML hyperlink graphs and computes PageRank over URL edges (link_graph.rs), while extractor/ performs declarative CSS/XPath and statistical DOM wrapper induction (induce.rs) without LLM extraction of entities or relations from prose. Per seat instructions prohibiting not-applicable, the pair is declined."
+  }
+ ],
+ "consults": []
+}
