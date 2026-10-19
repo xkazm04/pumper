@@ -3757,7 +3757,11 @@
           "revision": 16,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:60 The panic regression relies on a persisted prose prefix to distinguish failure kinds, and the inspected worker/storage path does not preserve the structured panic outcome.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:d811928687fd4faf",
+          "evaluatedRevision": 17
         },
         {
           "subject": "mcp-tools",

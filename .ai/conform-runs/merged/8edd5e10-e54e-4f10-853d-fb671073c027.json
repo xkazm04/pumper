@@ -1,0 +1,83 @@
+{
+ "schema": "conform-run/1",
+ "worker": "8edd5e10-e54e-4f10-853d-fb671073c027",
+ "subject": "error-handling",
+ "evaluatedAt": "2026-10-19T08:49:53.201565+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "e2e-api-contract",
+   "subject": "error-handling",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/panic_containment.rs:60 The panic regression relies on a persisted prose prefix to distinguish failure kinds, and the inspected worker/storage path does not preserve the structured panic outcome.",
+   "techniques": [
+    {
+     "technique": "consumer-decides-error-shape",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/error_contract.rs:145 The HTTP contract exposes and pins a machine-readable category for independently released clients."
+    },
+    {
+     "technique": "containment-boundary-restores-state",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/panic_containment.rs:56 For the queue state exercised here, containment promptly transitions the job through ordinary failure handling; the companion test verifies ordinary retry/backoff."
+    },
+    {
+     "technique": "exit-contract-is-a-taxonomy-projection",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/error_contract.rs:18 These tests exercise HTTP status/body contracts rather than process exit statuses consumed by shells or supervisors."
+    },
+    {
+     "technique": "parse-failure-keeps-identity",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/router.rs:25 This decodes the repository's own router response as one document; it is not a continuing reader of independently meaningful, externally owned items."
+    },
+    {
+     "technique": "reclassification-is-not-repair",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/request_panics.rs:33 The internal failures are deliberately injected; the technique excludes such tests from its naturally reachable invariant-violation detector."
+    },
+    {
+     "technique": "structured-propagation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/panic_containment.rs:60 Panic identity crosses persistence as message text: worker handling passes FailReason::Text, which supplies no typed cause to storage."
+    },
+    {
+     "technique": "swallowed-error-prevention",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/enqueue_door_parity.rs:301 The regression checks the semantic target: a rejected trigger produces a persisted bad_params decision instead of disappearing."
+    },
+    {
+     "technique": "taxonomy-design",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/budget_terminal.rs:80 Budget exhaustion earns distinct treatment because retry policy stops immediately, while a companion transient-error test requires requeueing."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T08:49:53.201565+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "error-handling"
+   ],
+   "techniques": [
+    "consumer-decides-error-shape",
+    "containment-boundary-restores-state",
+    "exit-contract-is-a-taxonomy-projection",
+    "parse-failure-keeps-identity",
+    "reclassification-is-not-repair",
+    "structured-propagation",
+    "swallowed-error-prevention",
+    "taxonomy-design"
+   ],
+   "deviations": 1,
+   "context": "e2e-api-contract",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
