@@ -5040,7 +5040,11 @@
           "revision": 10,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:2641 The vacancy lifecycle metric is named time_to_close rather than time_to_fill to honestly reflect the observable endpoints of the feed.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:b702c58e785c6c51",
+          "evaluatedRevision": 11
         }
       ],
       "governance": "governed"

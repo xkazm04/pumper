@@ -1,0 +1,83 @@
+{
+ "schema": "conform-run/1",
+ "worker": "57f09c58-733a-4063-a981-6ebd5781db4b",
+ "subject": "measurement-honesty",
+ "evaluatedAt": "2026-10-19T21:50:31.058219+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [
+  {
+   "context": "pricing-valuation",
+   "subject": "measurement-honesty",
+   "bundle": "software-engineering",
+   "state": "conformant",
+   "evidence": "crates/apps/mpsv-vpm/src/lib.rs:2641 The vacancy lifecycle metric is named time_to_close rather than time_to_fill to honestly reflect the observable endpoints of the feed.",
+   "techniques": [
+    {
+     "technique": "co-published-numbers-must-reconcile",
+     "verdict": "conformant",
+     "evidence": "crates/apps/valuation-multiples/src/lib.rs:287 SDE valuation multiples published together enforce monotonicity low <= median <= high and reject inverted bands before ingestion."
+    },
+    {
+     "technique": "control-failure-is-not-a-datum-state",
+     "verdict": "conformant",
+     "evidence": "crates/apps/mpsv-vpm/src/lib.rs:2073 When nowcast projection ratio or projected median fails admission checks, the cell's nowcast_median is published as null with the reason in withheld rather than dropping the row or synthesizing an uncalibrated estimate."
+    },
+    {
+     "technique": "incomplete-not-verdict",
+     "verdict": "conformant",
+     "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:167 Dump watch uses completeness::judge with a suppress_only disposition, downgrading partial parses to suppress removals rather than tombstoning unparsed dump records."
+    },
+    {
+     "technique": "lower-bound-disclosure",
+     "verdict": "conformant",
+     "evidence": "crates/apps/state-licensing/src/lib.rs:425 When metered calls omit pricing, cost_usd is reported alongside cost_unreported_calls so partial spend totals are explicitly disclosed as a lower-bound floor."
+    },
+    {
+     "technique": "minimum-sample-floors",
+     "verdict": "conformant",
+     "evidence": "crates/apps/mpsv-vpm/src/lib.rs:359 Aggregated metrics enforce a minCount sample floor (default 3) before publication, suppressing thin cells from publication."
+    },
+    {
+     "technique": "renormalize-over-present",
+     "verdict": "conformant",
+     "evidence": "crates/apps/mpsv-vpm/src/lib.rs:2898 Salary percentiles in Cell aggregates are computed over observed non-zero salaries only, and both total postings count and salaryCount are co-published to avoid imputing missing salaries as zero."
+    },
+    {
+     "technique": "speed-figure-names-its-endpoints",
+     "verdict": "conformant",
+     "evidence": "crates/apps/mpsv-vpm/src/lib.rs:2641 The posting duration metric is named time_to_close rather than time_to_fill because disappearance from the feed conflates filled, withdrawn, and expired postings."
+    },
+    {
+     "technique": "unmeasurable-vs-zero",
+     "verdict": "conformant",
+     "evidence": "crates/apps/homewyse-pricing/src/lib.rs:388 Missing or unmeasured price units map to explicit JSON Null rather than coercing to a default string or zero value."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T21:50:31.058219+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "measurement-honesty"
+   ],
+   "techniques": [
+    "co-published-numbers-must-reconcile",
+    "control-failure-is-not-a-datum-state",
+    "incomplete-not-verdict",
+    "lower-bound-disclosure",
+    "minimum-sample-floors",
+    "renormalize-over-present",
+    "speed-figure-names-its-endpoints",
+    "unmeasurable-vs-zero"
+   ],
+   "deviations": 0,
+   "context": "pricing-valuation",
+   "via": "curator-multi:agy",
+   "model": "gemini-3.8-flash-high"
+  }
+ ]
+}
