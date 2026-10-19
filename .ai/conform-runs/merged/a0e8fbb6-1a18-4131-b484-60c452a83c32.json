@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a0e8fbb6-1a18-4131-b484-60c452a83c32",
+ "subject": "paged-block-cache",
+ "evaluatedAt": "2026-10-19T22:20:49.043166+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "paged-block-cache",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
