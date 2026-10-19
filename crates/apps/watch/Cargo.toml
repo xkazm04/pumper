@@ -2,12 +2,15 @@
 name = "app-watch"
 version.workspace = true
 edition.workspace = true
+# Path-only workspace member: never published to a registry.
+publish = false
 
 [dependencies]
 pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

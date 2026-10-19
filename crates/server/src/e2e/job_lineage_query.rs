@@ -450,6 +450,13 @@ async fn absent_params_leave_both_legacy_response_modes_untouched() {
         "available_at",
         "started_at",
         "finished_at",
+        // The moonshot wave's job fields: N02 (a parked job says what it asked
+        // for and since when) and N18 (which executor ran it). `resumed_input`
+        // is deliberately absent - never serialized, it can carry credentials.
+        "input_request",
+        "waiting_since",
+        "waiting_expires_at",
+        "executor_id",
     ];
     let mut got: Vec<&str> = bare[0]
         .as_object()

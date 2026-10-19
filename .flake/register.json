@@ -166,6 +166,16 @@
       "id": "pumper-server::bin:pumper::e2e::trigger_plugins::shipped_delta_slim_slims_the_envelope_without_losing_lineage",
       "gate": "wasm-artifact",
       "reason": "Requires the BUILT data/plugins/delta-slim.wasm; same lane."
+    },
+    {
+      "id": "pumper-engine-wasm::test:plugins::the_reference_enricher_answers_the_entity_contract",
+      "gate": "wasm-artifact",
+      "reason": "Requires the BUILT data/plugins/enrich-money-date.wasm (N11). Runs in CI after `just plugins-verify` builds it, like the other reference-plugin tests in this file."
+    },
+    {
+      "id": "pumper-engine-wasm::test:plugins::the_reference_connector_loads_with_its_declared_capabilities",
+      "gate": "wasm-artifact",
+      "reason": "Requires the BUILT data/plugins/sink-postgrest.wasm (N10). Runs in CI after `just plugins-verify` builds it, like the other reference-plugin tests in this file."
     }
   ]
 }

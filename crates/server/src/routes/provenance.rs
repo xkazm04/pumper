@@ -49,8 +49,8 @@ pub(crate) struct ProvenanceQuery {
     responses(
         (status = 200, description = "`{key, trust, coverage, chain: [..]}` — each chain entry \
             carries the revision's provenance stamp (job_id/source_url/artifact_sha/rules_hash, \
-            null = unknown) and, when a job is stamped, its schedule/trigger lineage"),
-        (status = 404, description = "No such record"),
+            null = unknown) and, when a job is stamped, its schedule/trigger lineage", body = crate::routes::dto::ProvenanceResponse),
+        (status = 404, description = "No such record", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_provenance(
@@ -165,11 +165,11 @@ pub(crate) struct RederiveQuery {
             `observation_id` names it, and `rules_from` says whether the ruleset is the pinning \
             job's reported `rules_hash` (`observation_job`) or the active head (`active`); \
             otherwise `replayed_from: \"revision\"`, `observation_id: null`, `rules_from: \
-            \"revision\"`. Read-only: nothing is written either way."),
-        (status = 404, description = "No such record / revision"),
+            \"revision\"`. Read-only: nothing is written either way.", body = crate::routes::dto::RederiveResponse),
+        (status = 404, description = "No such record / revision", body = crate::routes::dto::ErrorEnvelope),
         (status = 409, description = "Not replayable, with the reason: stamp incomplete \
             (artifact_sha/rules_hash unknown), ruleset not registered, archived body missing, \
-            or body no longer matching its stamped hash"),
+            or body no longer matching its stamped hash", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn rederive_provenance(
@@ -409,7 +409,7 @@ async fn replay_from_observation(
 
 /// 409 unless `body` IS the body `sha` names.
 fn verify_body(body: &str, sha: &str) -> Result<(), ApiError> {
-    let body_sha = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let body_sha = hex::encode(Sha256::digest(body.as_bytes()));
     if body_sha != sha {
         return Err(ApiError(
             StatusCode::CONFLICT,

@@ -368,7 +368,7 @@ async fn run_saved_search_fixture(enforce: bool) -> (Vec<Value>, Vec<Value>, usi
         .unwrap();
     state
         .storage
-        .create_watch("view", "hits", &view_watch.url(), None, "webhook")
+        .create_watch("view", "hits", &view_watch.url(), None, "webhook", 0)
         .await
         .unwrap();
 

@@ -127,10 +127,12 @@ async fn dump(pool: &SqlitePool) -> String {
         ("field_invariants", "source_id, field"),
     ] {
         out.push_str(&format!("-- {table}\n"));
-        let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY {order}"))
-            .fetch_all(pool)
-            .await
-            .expect("dump table");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT * FROM {table} ORDER BY {order}"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("dump table");
         for row in rows {
             for i in 0..row.len() {
                 // Read every column as raw bytes so BLOBs (the sketch encodings)
@@ -402,13 +404,17 @@ const ENFORCED_STATE_CONSUMERS: &[(&str, usize, &[&str])] = &[
         1,
         &["diverted_writes", "skipped_index_writes"],
     ),
-    // trades-common: `write_target` for the cross-source `trades` join. Nothing
-    // calls `observe_extraction` for that namespace yet, so it resolves `Healthy`
-    // and gates nothing today — the plumbing, present and correct, declared
-    // anyway so it is not a surprise the day a producer starts judging it.
+    // trades-common: TWO `write_target`s, one per virtual namespace this crate
+    // writes into — `unified::write_target` for the cross-source `trades` join
+    // and `market::write_target` for the cross-FAMILY `market/profile` join
+    // (N33). Nothing calls `observe_extraction` for either namespace yet, so both
+    // resolve `Healthy` and gate nothing today — the plumbing, present and
+    // correct, declared anyway so it is not a surprise the day a producer starts
+    // judging them. Same consequence in both cases: a quarantined namespace
+    // diverts its write to `<dataset>@q`.
     (
         "crates/apps/trades-common/src/lib.rs::ctx.health.enforced_state",
-        1,
+        2,
         &["diverted_writes"],
     ),
 ];

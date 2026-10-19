@@ -1121,6 +1121,41 @@ mod tests {
         assert_eq!(r.slow_line_micros, 5_000, "the count carries its predicate");
     }
 
+    /// The healthy path pays nothing for the push-mode consumer: a record and a
+    /// below-the-line `warn_if_slow` must never touch the per-key warn mutex.
+    /// The rule (derive outside the hot loop) lives in prose above; this pins
+    /// it. Every warn lock is held by the test thread while a worker runs the
+    /// healthy path, so a lock taken before the threshold check blocks the
+    /// worker and the join times out instead of passing quietly.
+    #[test]
+    fn the_healthy_path_never_takes_the_warn_lock() {
+        use std::sync::{mpsc, Arc};
+        let inst = Arc::new(StoreInstrument::new());
+        let held: Vec<_> = inst
+            .warns
+            .iter()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&inst);
+        std::thread::spawn(move || {
+            for op in StoreOp::ALL {
+                for phase in StorePhase::ALL {
+                    let healthy = Duration::from_micros(1);
+                    worker.record(*op, *phase, healthy, 1, OpOutcome::Ok);
+                    worker.warn_if_slow(*op, *phase, healthy);
+                }
+            }
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert!(
+            done.is_ok(),
+            "a healthy record/warn_if_slow blocked on the warn mutex"
+        );
+    }
+
     /// A saturated pool is the strongest "not a quiet window" signal there is,
     /// and it is invisible to a gauge that only counts requests and jobs.
     #[test]

@@ -139,7 +139,16 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         // HTTP boundary if a schema fault appeared while the process was up
         // (`Storage::connect` refuses it at boot), and its message names
         // absolute paths under the data dir, so it redacts like the rest.
+        //
+        // `AwaitingInput` is here on purpose. It is not a failure at all — it is
+        // the worker's park signal (N02), consumed by the outcome arm long
+        // before anything HTTP-shaped is involved, and no route runs an app
+        // synchronously. So it reaching this boundary means a seam raised it
+        // outside a job run, which is a bug; dressing that as a tidy 202 or 409
+        // would hide it forever, exactly as remapping `Storage(RowNotFound)` to
+        // 404 would. It stays a 500, which is what a bug is.
         E::Schema(_)
+        | E::AwaitingInput(_)
         | E::Storage(_)
         | E::Parse { .. }
         | E::Config { .. }
@@ -363,6 +372,10 @@ mod contract_tests {
         ("OK", 200, None),
         ("CREATED", 201, None),
         ("ACCEPTED", 202, None),
+        // N18: `POST /executors/claim` answers 204 when the queue holds
+        // nothing this executor may run. A success with no body, so no
+        // error envelope and no code — like the three above it.
+        ("NO_CONTENT", 204, None),
         ("BAD_REQUEST", 400, Some("bad_request")),
         ("UNAUTHORIZED", 401, Some("unauthorized")),
         ("PAYMENT_REQUIRED", 402, Some("budget_exhausted")),
@@ -378,42 +391,66 @@ mod contract_tests {
         ("SERVICE_UNAVAILABLE", 503, Some("unavailable")),
     ];
 
-    /// Collects the status constants named in every `.rs` file under the HTTP
-    /// surface. Rooted at `CARGO_MANIFEST_DIR` (a compile-time absolute path)
-    /// rather than the CWD, and walking the directories rather than an
-    /// `include_str!` list, so a NEW route module is covered the moment it
-    /// exists instead of when someone remembers to add it here.
+    /// The one directory of `.rs` files this scan skips: `#[cfg(test)] mod e2e`.
+    /// Those files ASSERT statuses rather than emit them, so counting them would
+    /// let a test fixture keep a stale entry alive after the last handler that
+    /// produced it was deleted (the `stale` half of the diff below).
+    const NOT_A_HANDLER_SURFACE: &str = "e2e";
+
+    /// Collects the status constants named in every `.rs` file this crate ships,
+    /// with the files it read.
+    ///
+    /// Rooted at `CARGO_MANIFEST_DIR` (a compile-time absolute path) rather than
+    /// the CWD, and walking the tree rather than an `include_str!` list, so a NEW
+    /// module is covered the moment it exists instead of when someone remembers
+    /// to add it here.
+    ///
+    /// **It walks `src`, not a hand-listed `["routes", "mcp"]`.** That list was
+    /// the bug: `crate::auth` — the N20 identity layer — builds the SAME
+    /// `{error, code}` envelope through the `error_code`/`INTERNAL_MESSAGE` this
+    /// very module re-exports to it, and emits 401/403/429/402/500 from
+    /// middleware that runs in front of every route. It was outside the scan
+    /// entirely, so the contract this test exists to enforce did not reach the
+    /// one surface that refuses a caller before a handler ever sees them. The
+    /// denominator has to come from the tree, not from a list somebody maintains.
     ///
     /// Comment lines are skipped: prose that merely *mentions* a status is not
     /// a handler emitting one, and without this the test fails on its own
     /// documentation (it did).
-    fn statuses_in_use() -> BTreeSet<String> {
+    fn statuses_in_use() -> (BTreeSet<String>, BTreeSet<String>) {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found = BTreeSet::new();
-        for area in ["routes", "mcp"] {
-            scan(&src.join(area), &mut found);
-        }
+        let mut files = BTreeSet::new();
+        scan(&src, &src, &mut found, &mut files);
         assert!(
             found.len() > 5,
             "the scan found almost nothing — it is looking in the wrong place, and a test that \
              cannot see the handlers cannot police them"
         );
-        found
+        (found, files)
     }
 
-    fn scan(dir: &Path, found: &mut BTreeSet<String>) {
+    fn scan(root: &Path, dir: &Path, found: &mut BTreeSet<String>, files: &mut BTreeSet<String>) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
-                scan(&path, found);
+                if path.file_name().and_then(|n| n.to_str()) != Some(NOT_A_HANDLER_SURFACE) {
+                    scan(root, &path, found, files);
+                }
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source");
+            files.insert(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
             for line in source.lines().filter(|l| !l.trim_start().starts_with("//")) {
                 for (at, marker) in line.match_indices("StatusCode::") {
                     let name: String = line[at + marker.len()..]
@@ -435,7 +472,26 @@ mod contract_tests {
             .iter()
             .map(|(name, ..)| name.to_string())
             .collect();
-        let in_use = statuses_in_use();
+        let (in_use, files) = statuses_in_use();
+
+        // The anti-pattern this scan was carrying: the areas were a hand-listed
+        // `["routes", "mcp"]`, so the identity middleware — which refuses a
+        // caller with 401/403/429/402 BEFORE any handler runs, using this
+        // module's own `error_code` — was outside the contract entirely. The
+        // surface is now derived from the tree, and these are the files that
+        // would have been missed.
+        for must_cover in ["auth.rs", "activity.rs", "executor_main.rs"] {
+            assert!(
+                files.contains(must_cover),
+                "{must_cover} is not in the scanned surface — a module that builds the error \
+                 envelope is outside the contract that polices it. Scanned: {files:?}"
+            );
+        }
+        assert!(
+            !files.iter().any(|f| f.starts_with("e2e/")),
+            "the e2e fixtures ASSERT statuses rather than emit them; counting them would keep a \
+             stale EXPECTED entry alive after its last producer was deleted"
+        );
 
         let unlisted: Vec<_> = in_use.difference(&listed).collect();
         assert!(
@@ -657,6 +713,59 @@ mod contract_tests {
         );
     }
 
+    /// The shipped lines of one module: every `#[cfg(test)]` block removed by
+    /// span (attribute line through the next column-0 `}`), comments dropped,
+    /// each line trimmed.
+    ///
+    /// Extracted and pure so the span logic is a tested fact rather than an
+    /// inline `take_while`. A guard that silently stops looking part-way through
+    /// a file reports a clean codebase in a voice indistinguishable from
+    /// success, which is exactly what the truncating version did.
+    fn production_lines(source: &str) -> Vec<&str> {
+        let mut in_test = false;
+        source
+            .lines()
+            .filter(|line| {
+                if line.trim_end() == "#[cfg(test)]" {
+                    in_test = true;
+                    return false;
+                }
+                if in_test {
+                    // rustfmt puts a module's closing brace at column 0.
+                    if *line == "}" {
+                        in_test = false;
+                    }
+                    return false;
+                }
+                !line.trim_start().starts_with("//")
+            })
+            .map(str::trim)
+            .collect()
+    }
+
+    /// The anti-pattern, in miniature: production code AFTER a test block must
+    /// survive the filter, or the guard below stops policing the rest of the
+    /// file the day someone adds a small test module near the top.
+    #[test]
+    fn production_lines_keeps_what_follows_a_test_block() {
+        let source = "fn before() {}\n#[cfg(test)]\nmod t {\n    fn helper() { x.lock().unwrap(); }\n}\nfn after() { y.lock().unwrap(); }\n";
+        let body = production_lines(source);
+        assert!(body.contains(&"fn before() {}"));
+        assert!(
+            body.contains(&"fn after() { y.lock().unwrap(); }"),
+            "code after a test block is shipped code: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|l| l.contains("fn helper")),
+            "the test block itself is still excluded: {body:?}"
+        );
+        // A file whose test block IS last behaves exactly as before.
+        assert_eq!(
+            production_lines("fn a() {}\n#[cfg(test)]\nmod t {\n    fn b() {}\n}\n"),
+            vec!["fn a() {}"]
+        );
+    }
+
     fn scan_for_lock_unwraps(dir: &Path, offenders: &mut Vec<String>, scanned: &mut usize) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
@@ -673,15 +782,18 @@ mod contract_tests {
             // Production code only. The rule is about the REQUEST PATH, and a
             // `#[cfg(test)]` block is not on it — this very file's poison
             // fixture has to lock-and-unwrap to create the poisoned state.
-            // Every module in this tree puts its test block last (checked: no
-            // route file defines a function after its first one), so truncating
-            // at the first column-0 marker keeps all shipped code.
-            let body: Vec<&str> = source
-                .lines()
-                .take_while(|l| *l != "#[cfg(test)]")
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .map(str::trim)
-                .collect();
+            //
+            // Test blocks are removed by SPAN, not by truncating at the first
+            // one. The truncating version carried the claim "every module in
+            // this tree puts its test block last (checked: no route file
+            // defines a function after its first one)" — and that was false for
+            // three files: `routes/meta.rs` (test block at line 58 of 1365),
+            // `routes/query.rs` (346 of 1334) and `mcp/mod.rs` (1504 of 1957).
+            // Roughly 2,750 lines of shipped request-path code sat outside a
+            // guard that reported itself as covering the surface, and any module
+            // that puts a small test block near the top blinds the rest of
+            // itself the moment the block lands.
+            let body: Vec<&str> = production_lines(&source);
             if body.is_empty() {
                 continue;
             }

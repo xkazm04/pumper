@@ -104,6 +104,8 @@ fn trigger_with(hooks: Option<TriggerPluginHooks>) -> Trigger {
         created_at: chrono::Utc::now(),
         filters: None,
         plugin_hooks: hooks,
+        bind: None,
+        each: None,
     }
 }
 
@@ -332,6 +334,7 @@ async fn the_predicate_stage_answers_or_records_across_the_verdict_grammar() {
         let t = trigger_with(Some(TriggerPluginHooks {
             predicate: Some(hook(plugin, on_error)),
             transform: None,
+            post_enqueue: None,
         }));
         // The generated input, carried into every message below. This, not the
         // seed, is what a failure hands the reader.
@@ -489,6 +492,7 @@ async fn the_transform_stage_restamps_or_records_including_behind_a_stopped_pred
         let t = trigger_with(Some(TriggerPluginHooks {
             predicate: None,
             transform: Some(hook(plugin, None)),
+            post_enqueue: None,
         }));
         let case_id = format!(
             "plugin={plugin} behind_predicate={p_plugin}/{p_on_error:?} stopped={stopped} \

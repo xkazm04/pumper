@@ -137,7 +137,7 @@ fn trust_predicate(n: usize) -> String {
 /// second copy for the QueryBuilder paths is exactly the divergence
 /// [`TRUST_PREDICATE`]'s doc warns about — a consumer that believes it filtered
 /// and did not.
-fn push_trust_filter(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, trust: Option<&str>) {
+fn push_trust_filter(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, trust: Option<&str>) {
     let Some(t) = trust else { return };
     let mut parts = TRUST_PREDICATE.split("?T");
     qb.push(" AND ");
@@ -429,7 +429,7 @@ pub fn pinned_body_path(
 
 /// sha256 (hex) of a body — the `artifact_sha` / `body_sha` of a pinned body.
 pub fn body_sha256(body: &str) -> String {
-    format!("{:x}", Sha256::digest(body.as_bytes()))
+    hex::encode(Sha256::digest(body.as_bytes()))
 }
 
 /// One observation of a pinned body (`body_pins`). Bytes are deduplicated by
@@ -818,9 +818,16 @@ impl Datasets {
         }
     }
 
-    /// The pool, for the crate's golden-document store (`golden`), which reads
-    /// `golden_docs` and `body_pins` beside the records this handle serves.
-    pub(crate) fn pool(&self) -> &SqlitePool {
+    /// The store handle behind this dataset writer.
+    ///
+    /// `Datasets` is the only store handle an [`crate::AppContext`] carries, so
+    /// this is how code reaches a table that is not a dataset: the crate's
+    /// golden-document store (`golden`), which reads `golden_docs` and
+    /// `body_pins` beside the records this handle serves, and the N01
+    /// transactions ledger, which a `transact` run must stage a `pending` row
+    /// into before it parks for approval. Clone it for an owned handle: a
+    /// `SqlitePool` is a handle, not a connection.
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
@@ -1126,7 +1133,7 @@ impl Datasets {
         limit: i64,
         trust: Option<&str>,
     ) -> Result<Vec<Revision>> {
-        let rows: Vec<RevisionRow> = sqlx::query_as(&format!(
+        let rows: Vec<RevisionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT app, dataset, key, revision, change, data, diff, created_at, trust, \
                     job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions \
@@ -1134,7 +1141,7 @@ impl Datasets {
              AND {} \
              ORDER BY created_at DESC LIMIT ?4",
             trust_predicate(5)
-        ))
+        )))
         .bind(app)
         .bind(dataset)
         .bind(since.map(ts))
@@ -1272,12 +1279,12 @@ impl Datasets {
         let (after_ts, after_rowid) = after
             .map(|(t, r)| (Some(t), Some(r)))
             .unwrap_or((None, None));
-        let rows: Vec<RevisionFeedRow> = sqlx::query_as(&format!(
+        let rows: Vec<RevisionFeedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust,                     job_id, source_url, artifact_sha, rules_hash              FROM record_revisions              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3)              AND {}              AND {}              ORDER BY {} LIMIT ?6",
             order.keyset_predicate(),
             trust_predicate(7),
             order.order_by(),
-        ))
+        )))
         .bind(app)
         .bind(dataset)
         .bind(since.map(ts))
@@ -2412,14 +2419,14 @@ impl Datasets {
         let (after_ts, after_key) = after
             .map(|(t, k)| (Some(t), Some(k)))
             .unwrap_or((None, None));
-        let rows: Vec<RecordRow> = sqlx::query_as(&format!(
+        let rows: Vec<RecordRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE app = ?1 AND dataset = ?2 \
              AND (?3 IS NULL OR updated_at < ?3 OR (updated_at = ?3 AND key < ?4)) \
              AND {} \
              ORDER BY updated_at DESC, key DESC LIMIT ?5",
             trust_predicate(6)
-        ))
+        )))
         .bind(app)
         .bind(dataset)
         .bind(after_ts)
@@ -3245,9 +3252,9 @@ impl Datasets {
     /// predicate it counts over would be a different population wearing the
     /// same name. Hence [`REPLAYABLE_PREDICATE`] rather than a second WHERE.
     pub async fn replayable_revision_count(&self) -> Result<i64> {
-        let n: i64 = sqlx::query_scalar(&format!(
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM record_revisions WHERE {REPLAYABLE_PREDICATE}"
-        ))
+        )))
         .fetch_one(&self.pool)
         .await?;
         Ok(n)
@@ -3257,17 +3264,18 @@ impl Datasets {
     /// The doctor pairs this with the filesystem to find revisions whose stamped
     /// body is gone — a provenance claim the store can no longer honour.
     pub async fn replayable_revisions(&self, limit: i64) -> Result<Vec<ReplayableRevision>> {
-        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(&format!(
-            "SELECT app, dataset, key, revision, \
+        let rows: Vec<(String, String, String, i64, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT app, dataset, key, revision, \
                     json_extract(data, '$.job_id'), \
                     json_extract(data, '$.artifact_path') \
              FROM record_revisions \
              WHERE {REPLAYABLE_PREDICATE} \
              ORDER BY created_at DESC LIMIT ?1"
-        ))
-        .bind(limit.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+            )))
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .into_iter()
             .map(
@@ -3407,11 +3415,11 @@ impl Datasets {
 
     /// Enabled specs whose source is `(app, dataset)` — the recompute set.
     async fn enabled_derived(&self, app: &str, dataset: &str) -> Result<Vec<DerivedSpec>> {
-        let rows: Vec<DerivedRow> = sqlx::query_as(&format!(
+        let rows: Vec<DerivedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {DERIVED_COLUMNS} FROM derived \
              WHERE source_app = ?1 AND source_dataset = ?2 AND enabled = 1 \
              ORDER BY created_at, id"
-        ))
+        )))
         .bind(app)
         .bind(dataset)
         .fetch_all(&self.pool)
@@ -4169,7 +4177,7 @@ impl Datasets {
 /// Appends the ` AND …` predicate clauses for a set of [`JsonFilter`]s onto a
 /// query builder. Shared by `list_filtered`, `list_filtered_ordered`, and
 /// `count_filtered` so the three can never interpret a filter differently.
-fn push_json_filters<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, filters: &'a [JsonFilter]) {
+fn push_json_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filters: &[JsonFilter]) {
     for filter in filters {
         match filter {
             JsonFilter::Eq { path, value } => {
@@ -5248,7 +5256,7 @@ fn summarize_chunk(chunk: &[(String, Value)], plans: &[PlannedWrite]) -> UpsertS
 
 /// Pushes a comma-separated list of bound key parameters (the body of an
 /// `IN (…)`). Bound, never interpolated — a record key is caller data.
-fn push_key_list<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, keys: &[&'a str]) {
+fn push_key_list(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, keys: &[&str]) {
     let mut sep = qb.separated(", ");
     for key in keys {
         sep.push_bind(*key);
@@ -5344,7 +5352,7 @@ impl From<BodyPinRow> for BodyPin {
 fn hash_value(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Fixed-width RFC 3339 UTC micros — the stored timestamp format. Public so
@@ -5521,7 +5529,7 @@ mod tests {
         // TRUST_PREDICATE with its ?T slots bound.
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT 1 WHERE x = 1");
         push_trust_filter(&mut qb, Some("stable"));
-        let sql = qb.sql().to_string();
+        let sql = qb.sql().as_str().to_string();
         let expected = format!(
             "SELECT 1 WHERE x = 1 AND {}",
             TRUST_PREDICATE

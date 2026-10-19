@@ -15,6 +15,13 @@
 //! `fetch_readable` / `deep_research` — sit behind the `[mcp] allow_enqueue`
 //! switch and clamp every job budget to `[mcp] max_job_budget_usd`.
 //!
+//! `approve_transaction` (N01) sits behind a THIRD switch, `[mcp]
+//! allow_approve`, and is additionally inert unless `[transact] allow_live` is
+//! on. It is not folded into `allow_enqueue` because the two authorities are
+//! not the same size: an enqueue spends money a ceiling bounds, while an
+//! approval submits a form on a live site under the operator's logged-in
+//! identity and cannot be undone by anything this process controls.
+//!
 //! **Notifications** (the transport's SSE half) live in [`live`]: `GET /mcp`
 //! opens an SSE stream of JSON-RPC `notifications/pumper/*` messages bridged
 //! read-only from the EventBus (subscribe + replay ring, `Last-Event-ID`
@@ -22,9 +29,11 @@
 //! buffering). POST stays stateless — the stream is a one-way event feed, not
 //! a session.
 
+pub(crate) mod jobtoken;
 mod live;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -54,12 +63,21 @@ pub(crate) fn router() -> Router<AppState> {
 
 /// One streamable-HTTP exchange: a JSON-RPC request, notification, or batch in;
 /// a JSON response (or 202 for notification-only input) out.
-async fn handle_post(State(state): State<AppState>, Json(payload): Json<Value>) -> Response {
+async fn handle_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    // N15: the only thing read off the request itself is the job token a
+    // self-hosted Claude subprocess presents. Every other client is anonymous
+    // here and unaffected; the API key, when `[auth] mode = "keys"`, was
+    // already resolved by the identity layer this route sits behind.
+    let caller = jobtoken::McpCaller::from_headers(&headers);
     match payload {
         Value::Array(msgs) => {
             let mut responses = Vec::new();
             for msg in &msgs {
-                if let Some(resp) = handle_rpc(&state, msg).await {
+                if let Some(resp) = handle_rpc_as(&state, msg, &caller).await {
                     responses.push(resp);
                 }
             }
@@ -69,15 +87,21 @@ async fn handle_post(State(state): State<AppState>, Json(payload): Json<Value>) 
                 Json(Value::Array(responses)).into_response()
             }
         }
-        msg => match handle_rpc(&state, &msg).await {
+        msg => match handle_rpc_as(&state, &msg, &caller).await {
             Some(resp) => Json(resp).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
 }
 
-/// Dispatches one JSON-RPC message. `None` = notification (nothing to send).
-pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
+/// [`handle_rpc`] for a caller that presented something about itself — today,
+/// only a job token (N15). Kept as a separate entry point so every existing
+/// call site keeps its two-argument shape.
+pub(crate) async fn handle_rpc_as(
+    state: &AppState,
+    msg: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Option<Value> {
     let id = msg.get("id").cloned();
     let Some(method) = msg.get("method").and_then(Value::as_str) else {
         // A message with neither method nor id is garbage; with an id it is an
@@ -95,7 +119,7 @@ pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": server_tools(state) })),
-        "tools/call" => return Some(tools_call(state, id, &params).await),
+        "tools/call" => return Some(tools_call(state, id, &params, caller).await),
         "resources/list" => Ok(json!({ "resources": resources_list(state) })),
         "resources/read" => resources_read(state, &params),
         other => Err((-32601, format!("method '{other}' not found"))),
@@ -128,9 +152,11 @@ fn initialize_result(params: &Value) -> Value {
             query_dataset (`$.path:op:value` filters) and search (full text). enqueue_job, \
             fetch_readable, and deep_research are only offered when the operator has enabled \
             [mcp] allow_enqueue; every budget_usd is clamped to [mcp] max_job_budget_usd. Await \
-            a job with wait_job (timeout capped by [mcp] wait_job_max_secs), or open GET /mcp \
+            a job with wait_job (timeout capped by [mcp] wait_job_max_secs) - it settles on \
+            a terminal status OR on 'waiting', a job asking YOU for input, which you answer \
+            with resume_job - or open GET /mcp \
             (SSE, optional ?app=/?kind= filters, Last-Event-ID resume) for live \
-            notifications/pumper/* events. Catalog + app manifests are resources.",
+            notifications/pumper/* events. list_pending_transactions is the approval inbox             for transact runs parked on a human decision; approve_transaction releases one and             is offered ONLY when the operator enabled both [mcp] allow_approve and [transact]             allow_live, because it performs a live, irreversible web action under their             logged-in profile. Catalog + app manifests are resources.",
     })
 }
 
@@ -241,11 +267,13 @@ fn server_tools(state: &AppState) -> Vec<Value> {
         json!({
             "name": "wait_job",
             "description": format!(
-                "Wait for a job to reach a terminal status (succeeded | failed | cancelled), \
-                 watching the live event stream. timeout_secs is clamped to the operator's \
-                 [mcp] wait_job_max_secs cap ({}s; omitted = that cap). Hitting the deadline \
-                 returns timed_out: true with the job's current snapshot — call again to keep \
-                 waiting.",
+                "Wait for a job to SETTLE, watching the live event stream. It settles on a \
+                 terminal status (succeeded | failed | cancelled) OR on 'waiting' - a job that \
+                 parked to ask YOU for something, in which case the result carries input_request: \
+                 answer it with resume_job, then call wait_job again. timeout_secs is clamped to \
+                 the operator's [mcp] wait_job_max_secs cap ({}s; omitted = that cap). Hitting \
+                 the deadline returns timed_out: true with the job's current snapshot - call \
+                 again to keep waiting.",
                 state.config.mcp.wait_job_max_secs
             ),
             "inputSchema": {
@@ -281,7 +309,11 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "Agentic web research (search, read, synthesize) via the Claude engine: \
                  enqueues a 'research' job and returns its job id (then wait_job for the \
                  result). budget_usd is the run's spend ceiling, clamped to the operator's \
-                 [mcp] max_job_budget_usd rail (${:.2}); omitted = that rail.",
+                 [mcp] max_job_budget_usd rail (${:.2}); omitted = that rail. The awaited \
+                 result carries session_id (pass it back as the research app's session_id \
+                 param to drill down on the context it built) and datasets.findings / \
+                 datasets.sources - the record keys this run wrote to research/findings and \
+                 research/sources, readable with query_dataset as the agent's memory.",
                 state.config.mcp.max_job_budget_usd
             ),
             "inputSchema": {
@@ -290,6 +322,28 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string", "minLength": 1 },
                     "budget_usd": { "type": "number", "minimum": 0 }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "resume_job",
+            "description": "Answer a job that is 'waiting' (its request is in wait_job's input_request) \
+                and let it continue: it resumes from the checkpoint it parked at, reads `input` \
+                back through ctx.restore_input(), and burns no retry attempt. 409-equivalent \
+                refusal if the job is not waiting - including a second resume of one you have \
+                already answered. Same operator gate as enqueue_job, because resuming lets a job \
+                spend the rest of its budget.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["job_id"],
+                "properties": {
+                    "job_id": { "type": "string", "format": "uuid" },
+                    "input": {
+                        "description": "The answer, in whatever shape the job's input_request \
+                            asked for. Omitted = null, which is a fine answer to a pure \
+                            'proceed?' gate."
+                    }
                 },
                 "additionalProperties": false
             }
@@ -315,7 +369,328 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "additionalProperties": false
             }
         }));
+        // N03 workflow runs. Appended at the END of the tool table (three wave-2
+        // items add tools here); no existing entry is reordered.
+        tools.push(json!({
+            "name": "run_workflow",
+            "description": "Start a run of a DECLARED multi-step workflow (see GET /workflows) \
+                and return its run id. A workflow is a DAG of ordinary jobs with fan-in join \
+                barriers, so a crawl -> extract -> research pipeline is ONE call and ONE \
+                receipt instead of N enqueue_job/wait_job round-trips. budget_usd is the \
+                envelope for the WHOLE run: each step's ceiling is clamped to what is left of \
+                it, and it is clamped to the operator's [mcp] max_job_budget_usd rail. Then \
+                wait_workflow for the outcome. Same operator gate as enqueue_job.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workflow"],
+                "properties": {
+                    "workflow": { "type": "string", "description": "Workflow id or name." },
+                    "budget_usd": { "type": "number", "minimum": 0 },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Replaying a start with the same key returns the ORIGINAL \
+                            run instead of executing the plan twice."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
     }
+    tools.push(json!({
+        "name": "wait_workflow",
+        "description": format!(
+            "Wait for a workflow run to settle (succeeded | failed | cancelled) and return its \
+             step matrix plus the rolled-up receipt: cost summed over the run's job set, yield \
+             from job_yield. timeout_secs is clamped to the operator's [mcp] wait_job_max_secs \
+             cap ({}s; omitted = that cap). Hitting the deadline returns timed_out: true with \
+             the run's current step matrix - call again to keep waiting. A step that never \
+             became a job reports cost_usd: null, not $0.",
+            state.config.mcp.wait_job_max_secs
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id"],
+            "properties": {
+                "run_id": { "type": "string" },
+                "timeout_secs": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+        }
+    }));
+    // N01 Transact v2. `list_pending_transactions` is a READ and rides the same
+    // posture as the other reads — an agent may always see what is waiting on a
+    // human. `approve_transaction` is the only tool on this surface that can
+    // release an irreversible action, so it has its own switch: it is offered
+    // only when the operator set BOTH `[mcp] allow_approve` and
+    // `[transact] allow_live`, because a tool that is offered and then always
+    // refuses is worse than one that was never listed.
+    tools.push(json!({
+        "name": "list_pending_transactions",
+        "description": "List transact transactions awaiting a human decision: the ledger row \
+            (id, idempotency_key, profile, state, evidence_sha, expires_at) plus the operator's \
+            allow_live switch. Read the full evidence bundle a run parked on through \
+            wait_job's input_request, or GET /transactions/{id}. Approving is a SEPARATE tool \
+            the operator must enable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": TRANSACTION_LIMIT_CAP }
+            },
+            "additionalProperties": false
+        }
+    }));
+    if state.config.mcp.allow_approve && state.config.transact.allow_live {
+        tools.push(json!({
+            "name": "approve_transaction",
+            "description": "Approve one pending transaction and let its parked job perform the \
+                irreversible action it staged — a live form submission under the operator's \
+                logged-in profile, which nothing in this process can undo. You MUST quote \
+                evidence_sha, the digest of the bundle you actually read, so an approval cannot \
+                be given for evidence you never saw; a mismatch, an expired request, a \
+                non-pending row or the profile's daily cap is a refusal. The commit re-probes \
+                the live page and refuses again if it drifted. One idempotency key submits at \
+                most once, ever.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["transaction_id", "evidence_sha"],
+                "properties": {
+                    "transaction_id": { "type": "string" },
+                    "evidence_sha": {
+                        "type": "string",
+                        "description": "The evidence digest from the transaction row or the \
+                            job's input_request. Required here even though the HTTP door \
+                            treats it as optional: an agent approving without naming what it \
+                            read is the case this gate exists for."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
+    // N04: the pipeline-AUTHORING tools. Everything above lets an agent run a
+    // job; these let it wire the edge that runs jobs by itself, which is a
+    // standing commitment rather than one enqueue — so all five ride
+    // `allow_enqueue`, including the two reads, because a decision ledger and a
+    // dry-run are only useful to something that can author. Appended before
+    // `fetch`, which stays LAST (the e2e inventory pins it).
+    if state.config.mcp.allow_enqueue {
+        tools.push(json!({
+            "name": "create_trigger",
+            "description": "Create a standing reactive EDGE: when a source event happens, \
+                enqueue a target app. source_kind is 'dataset' (a run's change batch), 'job' (a \
+                terminal status) or 'external' (an inbound signed webhook on /ingest). Use \
+                `bind` to steer the target's OWN params from the event — a map of {target \
+                param: JSON pointer} resolved against the {template, _trigger} view, e.g. \
+                {\"url\": \"/_trigger/payload/repository/html_url\"} — and `each` (a JSON \
+                pointer to an array) to fan ONE event out into one job per element, which then \
+                read `/_trigger/item`. A pointer that resolves to nothing does NOT enqueue: it \
+                records the `bind_miss` decision, which trigger_decisions shows. Dry-run the \
+                edge with test_trigger before you rely on it. Same door, same validation as \
+                POST /triggers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["source_kind", "source_app", "target_app"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "source_kind": { "type": "string", "enum": ["dataset", "job", "external"] },
+                    "source_app": {
+                        "type": "string",
+                        "description": "The source app or namespace; for 'external', an ingress \
+                            source id (see create_ingress_source) or '*' for any source."
+                    },
+                    "source_dataset": { "type": "string" },
+                    "on_change": {
+                        "type": "string",
+                        "enum": ["new", "changed", "removed", "fresh", "any"]
+                    },
+                    "on_status": { "type": "string", "enum": ["succeeded", "failed", "any"] },
+                    "target_app": { "type": "string" },
+                    "params": {
+                        "type": "object",
+                        "description": "Static params template. `_trigger` is merged over it, \
+                            and `bind` is applied on top of that."
+                    },
+                    "bind": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "{target param: JSON pointer}. Pointers are RFC 6901 \
+                            (start with '/'), NOT the dotted '$.path' form `filters` uses."
+                    },
+                    "each": {
+                        "type": "string",
+                        "description": "JSON pointer to an array; one job per element, capped by \
+                            the operator's [triggers] fan_out_cap. Not valid for source_kind \
+                            'job'."
+                    },
+                    "filters": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "source_kind 'external' only: '$.path:op:value' specs \
+                            ANDed against the inbound payload."
+                    },
+                    "budget_usd": { "type": "number", "exclusiveMinimum": 0 },
+                    "priority": { "type": "integer" },
+                    "max_attempts": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "test_trigger",
+            "description": "DRY-RUN one trigger against its most recent matching source job and \
+                return what it would do: would_fire, the fully resolved target params (binding \
+                and fan-out applied exactly as the live path applies them), the fan-out shape \
+                when `each` is set, and any hook incidents. Nothing is enqueued unless you pass \
+                fire: true, which enqueues every planned hop with the idempotency key bypassed \
+                (so it is repeatable) and is refused if the resolved params fail the target \
+                app's schema. External triggers have no source job to preview — exercise those \
+                by POSTing a signed event to /ingest/{source}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["trigger_id"],
+                "properties": {
+                    "trigger_id": { "type": "string" },
+                    "fire": {
+                        "type": "boolean",
+                        "description": "Actually enqueue the planned hops (default false)."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "trigger_decisions",
+            "description": "Why an edge did or did not fire: one page of the DECISION LEDGER for \
+                one trigger, newest first, plus the jobs it enqueued. Every evaluation is \
+                recorded, skips included — `fired`, `bind_miss` (a bind/each pointer resolved to \
+                nothing), `fan_out_empty`, `filter_miss`, `no_change_match`, `status_mismatch`, \
+                `bad_params`, `dedup`, `cycle`, `depth`, `predicate_veto`, the hook faults, \
+                `target_unregistered`, `enqueue_failed`. This is the tool that answers 'I wired \
+                it and nothing happened'. Page with the returned next_cursor.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["trigger_id"],
+                "properties": {
+                    "trigger_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "cursor": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "create_watch",
+            "description": "Subscribe an external destination to a dataset's changes: every new \
+                or changed record under app/dataset is delivered to `url` (sink 'webhook', the \
+                default, or 'slack'), appended to data/sinks/<id>.ndjson (sink 'file'), or run \
+                through an installed WASM connector (sink 'plugin:<name>'). `app` is the \
+                NAMESPACE records land under, which is not always the app that produced them \
+                (grant sources publish into 'grants'); an (app, dataset) pair that could never \
+                fire is refused with the namespace that would. Same door as POST /watches.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["app"],
+                "properties": {
+                    "app": { "type": "string" },
+                    "dataset": { "type": "string", "description": "'*' (default) = every dataset." },
+                    "url": { "type": "string" },
+                    "secret": {
+                        "type": "string",
+                        "description": "Delivery bodies are HMAC-SHA256 signed with it."
+                    },
+                    "sink": { "type": "string", "description": "webhook | file | slack | plugin:<name>" }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "create_ingress_source",
+            "description": "Create a named credential an EXTERNAL system can POST signed events \
+                to at /ingest/{id}, which is what a source_kind 'external' trigger reacts to. \
+                The signing secret is returned by this call and NEVER again — hand it to the \
+                sender now or delete the source and make another. GitHub-style \
+                x-hub-signature-256 is accepted as-is. The CRUD works while [ingress] enabled = \
+                false, so sources can be staged before the operator flips the switch; until \
+                then /ingest returns 409.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "secret": {
+                        "type": "string",
+                        "description": "Bring your own signing secret; omitted = generated and \
+                            returned once."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
+    // N33: read-only and ungated, like `query_dataset` — it answers from the
+    // store, enqueues nothing and spends nothing. Appended BEFORE `fetch`,
+    // which stays LAST (the e2e inventory pins it).
+    tools.push(json!({
+        "name": "market_profile",
+        "description": "One US state x trade market profile in ONE call: the economics half (wage band, local pricing envelope, state + federal tax, licensing/bonding compliance, business valuation multiples) and the density half (employer firms, solo operators, total market, operators per 10k with its basis, succession pressure, business-formation velocity), plus a `vintages` block naming the year each input came from. This is the tool for 'best state to start an HVAC business' and 'what does a plumber in Texas face' — the two underlying datasets are keyed differently (`TX:Plumbing` vs `2382:48`) and joining them by hand needs a NAICS + FIPS crosswalk you should not have to reproduce. Read `coverage`: `economics_only` means the census publishes no density cell for that trade and `density` is null — it is NOT a market of zero. Read `density_grain` too: it is always `naics4`, so Plumbing, Electrical and HVAC (all NAICS 238220) share one density block, which is the finest grain the source publishes.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["state", "trade"],
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "description": "USPS state code, any case (TX, tx). 'US' has no profile: the national roll-up lives in trades/operator_economics."
+                },
+                "trade": {
+                    "type": "string",
+                    "description": "Canonical trade label, matched case-insensitively (Plumbing, Electrical, HVAC, Landscaping, Pool service)."
+                }
+            },
+            "additionalProperties": false
+        }
+    }));
+    // N15 (appended last, per the wave-2 shared-surface rule). Advertised
+    // unconditionally: the token, not a config switch, is what makes it usable,
+    // and hiding it would leave the self-hosted subprocess unable to discover
+    // the one network tool it has.
+    tools.push(json!({
+        "name": "fetch",
+        "description": "Fetch one URL through THIS host's tiered fetcher and return the content \
+            synchronously. Requires the job token pumper writes into a self-hosted Claude run's \
+            MCP config, and the fetch is metered against that job: politeness governor, response \
+            cache, learned tier router, session profile, archive tier, budget ceiling and cost \
+            ledger all apply. Unlike fetch_readable this does not enqueue a job — it answers in \
+            the same call. Returns {url, engine (archive|api_recipe|http|browser|claude), status, \
+            content, chars, cost_usd, escalations, trace}.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string", "minLength": 1 },
+                "strategy": {
+                    "type": "string", "enum": ["http", "browser", "auto"],
+                    "description": "Ladder entry point; default 'auto' (http, escalating to a \
+                        browser render when the result is thin or blocked). The paid claude tier \
+                        is never reachable from here — a research run must not recurse into \
+                        itself."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Named session profile (cookie jar / browser user-data-dir) \
+                        to fetch under."
+                },
+                "archive_max_age": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Accept an archived snapshot no older than this many seconds \
+                        instead of going live."
+                },
+                "to_markdown": {
+                    "type": "boolean",
+                    "description": "Convert the fetched page to clean Markdown (default true)."
+                }
+            },
+            "additionalProperties": false
+        }
+    }));
     tools
 }
 
@@ -327,7 +702,12 @@ fn server_tools(state: &AppState) -> Vec<Value> {
 /// could fix on the next turn — a tool failure, and every argument that fails
 /// the tool's published schema — is a `result` with `isError: true`, which is
 /// what the agent can actually read and react to.
-async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
+async fn tools_call(
+    state: &AppState,
+    id: Value,
+    params: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tools/call needs a 'name'");
     };
@@ -364,15 +744,58 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         "search" => tool_search(state, &args).await,
         "wait_job" => live::wait_job(state, &args).await,
         "enqueue_job" if state.config.mcp.allow_enqueue => tool_enqueue(state, &args).await,
+        "resume_job" if state.config.mcp.allow_enqueue => tool_resume_job(state, &args).await,
         "fetch_readable" if state.config.mcp.allow_enqueue => {
             tool_fetch_readable(state, &args).await
         }
         "deep_research" if state.config.mcp.allow_enqueue => tool_deep_research(state, &args).await,
-        "enqueue_job" | "fetch_readable" | "deep_research" => Err(
+        // N03: appended at the END of the dispatch, no arm reordered.
+        "wait_workflow" => tool_wait_workflow(state, &args).await,
+        "run_workflow" if state.config.mcp.allow_enqueue => tool_run_workflow(state, &args).await,
+        "enqueue_job" | "fetch_readable" | "deep_research" | "resume_job" | "run_workflow" => Err(
             "enqueue is disabled on this MCP surface — the operator must set \
              [mcp] allow_enqueue = true"
                 .to_string(),
         ),
+        // N01, appended last: see `server_tools`.
+        "list_pending_transactions" => tool_list_pending_transactions(state, &args).await,
+        "approve_transaction"
+            if state.config.mcp.allow_approve && state.config.transact.allow_live =>
+        {
+            tool_approve_transaction(state, &args).await
+        }
+        "approve_transaction" => Err(
+            "approving live transactions is disabled on this MCP surface — the operator must \
+             set BOTH [mcp] allow_approve = true and [transact] allow_live = true. Nothing \
+             was submitted."
+                .to_string(),
+        ),
+        // N04: the pipeline-authoring tools, appended before `fetch`.
+        "create_trigger" if state.config.mcp.allow_enqueue => {
+            tool_create_trigger(state, &args).await
+        }
+        "test_trigger" if state.config.mcp.allow_enqueue => tool_test_trigger(state, &args).await,
+        "trigger_decisions" if state.config.mcp.allow_enqueue => {
+            tool_trigger_decisions(state, &args).await
+        }
+        "create_watch" if state.config.mcp.allow_enqueue => tool_create_watch(state, &args).await,
+        "create_ingress_source" if state.config.mcp.allow_enqueue => {
+            tool_create_ingress_source(state, &args).await
+        }
+        "create_trigger"
+        | "test_trigger"
+        | "trigger_decisions"
+        | "create_watch"
+        | "create_ingress_source" => Err(
+            "authoring reactive pipelines is disabled on this MCP surface — the operator must \
+             set [mcp] allow_enqueue = true. A trigger is a STANDING commitment to enqueue \
+             work, so it rides the same switch as a single enqueue"
+                .to_string(),
+        ),
+        // N33: read-only, ungated, appended before `fetch`.
+        "market_profile" => tool_market_profile(state, &args).await,
+        // N15, appended last per the wave-2 shared-surface rule.
+        "fetch" => tool_fetch(state, &args, caller).await,
         other => return rpc_error(id, -32602, &format!("unknown tool '{other}'")),
     };
     let result = match outcome {
@@ -387,6 +810,58 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         }),
     };
     rpc_result(id, result)
+}
+
+/// The `market_profile` tool (N33): one state × trade row from `market/profile`.
+///
+/// Answers through `routes::query::find_market_profile`, the same function the
+/// HTTP door uses, so the two surfaces cannot disagree about which row exists
+/// or what a miss means. A miss is a readable tool error naming the key that
+/// was looked for and what publishes the dataset — an agent that gets silence
+/// concludes the server is broken.
+async fn tool_market_profile(state: &AppState, args: &Value) -> Result<Value, String> {
+    let st = require_str(args, "state")?;
+    let trade = require_str(args, "trade")?;
+    match crate::routes::query::find_market_profile(state, st, trade).await {
+        Ok(Some(profile)) => Ok(profile),
+        Ok(None) => Err(format!(
+            "no market/profile row for '{}' — the product is derived from trades/operator_economics and census/market_blend, so it covers only states a trades app has data for and trades in the live taxonomy. query_dataset on market/profile lists what exists.",
+            crate::routes::query::market_profile_key(st, trade)
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The `resume_job` tool: answers a parked job (N02).
+///
+/// One store call, through the same `status = 'waiting'` guard the HTTP door
+/// uses - so the two surfaces cannot disagree about what a stale resume does,
+/// and an agent that retries a `resume_job` it already sent gets a refusal
+/// instead of restarting a lineage that has moved on.
+async fn tool_resume_job(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id: uuid::Uuid = require_str(args, "job_id")?
+        .parse()
+        .map_err(|e| format!("invalid job_id: {e}"))?;
+    let input = args.get("input").cloned().unwrap_or(Value::Null);
+    match state.storage.resume(id, &input).await {
+        Ok(Some(job)) => {
+            state.events.emit(crate::events::JobEvent::new(
+                job.id,
+                job.app.clone(),
+                "queued",
+            ));
+            state.notify.notify_one();
+            Ok(json!({ "resumed": true, "job": job }))
+        }
+        // Deliberately not split into `unknown job` vs `wrong state`: the store
+        // cannot tell them apart in one guarded statement, and inventing the
+        // distinction with a second read would be a race, not a fact.
+        Ok(None) => Err(format!(
+            "job '{id}' is not waiting for input (unknown, still running, already \
+            resumed, or terminal) - read its status with wait_job before resuming"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn tool_list_apps(state: &AppState) -> Value {
@@ -569,6 +1044,9 @@ async fn enqueue_app(
         trigger_id: None,
         source_job_id: None,
         target_key,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
     let (job, created) = state
         .storage
@@ -588,6 +1066,101 @@ async fn enqueue_app(
         "budget_usd": budget,
         "note": note,
     }))
+}
+
+/// The `run_workflow` tool (N03): opens a run of a declared plan.
+///
+/// Goes through `workflow::start_run`, the same door `POST /workflows/{id}/runs`
+/// uses, so an agent and an operator cannot get different validation, different
+/// idempotence or a different envelope.
+async fn tool_run_workflow(state: &AppState, args: &Value) -> Result<Value, String> {
+    let name = require_str(args, "workflow")?;
+    let Some(def) = state
+        .storage
+        .get_workflow(name)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Err(format!(
+            "unknown workflow '{name}' — GET /workflows lists the declared plans"
+        ));
+    };
+    let budget = clamp_budget(
+        args.get("budget_usd").and_then(Value::as_f64),
+        state.config.mcp.max_job_budget_usd,
+    );
+    let key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (run, created) = crate::workflow::start_run(
+        state,
+        &def,
+        // 0 is a real ceiling on this surface (free tiers only), exactly as on
+        // `enqueue_app` — so it is passed through rather than dropped to "no
+        // envelope", which is what `None` would mean.
+        Some(budget),
+        key.as_deref(),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "run": run,
+        "created": created,
+        "budget_usd": budget,
+        "note": format!(
+            "wait_workflow {{\"run_id\": \"{}\"}} for the outcome and the rolled-up receipt",
+            run.id
+        ),
+    }))
+}
+
+/// The `wait_workflow` tool: settle on a run, or report the deadline honestly.
+///
+/// Polls rather than riding the event bus: a run's lifecycle events are emitted
+/// on the same bus, but a run can also be advanced by a step that finished
+/// before this call started, and a poll cannot miss that. The deadline is the
+/// operator's `wait_job_max_secs` rail — the same one `wait_job` honours, so an
+/// agent cannot buy a longer hold by waiting on a workflow instead of a job.
+async fn tool_wait_workflow(state: &AppState, args: &Value) -> Result<Value, String> {
+    let run_id = require_str(args, "run_id")?.to_string();
+    let cap = state.config.mcp.wait_job_max_secs.max(1);
+    let secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(cap)
+        .clamp(1, cap);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let Some(run) = state
+            .storage
+            .get_workflow_run(&run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!("unknown workflow run '{run_id}'"));
+        };
+        let settled = run.status != "running";
+        if settled || tokio::time::Instant::now() >= deadline {
+            let report = crate::workflow::run_report(state, &run_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| json!({ "run": run }));
+            let mut out = report;
+            if let Value::Object(obj) = &mut out {
+                obj.insert("timed_out".into(), json!(!settled));
+            }
+            return Ok(out);
+        }
+        tokio::select! {
+            _ = state.shutdown.cancelled() => {
+                return Err("server is shutting down; the run is durable — call wait_workflow \
+                            again after the restart".into());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
+    }
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -727,7 +1300,7 @@ pub(crate) fn validate_tool_args(schema: &Value, args: &Value) -> Result<(), Str
     };
     let errors: Vec<String> = validator
         .iter_errors(args)
-        .map(|e| format!("arguments{}: {e}", e.instance_path))
+        .map(|e| format!("arguments{}: {e}", e.instance_path()))
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -750,7 +1323,7 @@ pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), Stri
     };
     let errors: Vec<String> = validator
         .iter_errors(params)
-        .map(|e| format!("params{}: {e}", e.instance_path))
+        .map(|e| format!("params{}: {e}", e.instance_path()))
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -776,6 +1349,244 @@ pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), Stri
 /// check itself or the schedule-shaped wrapper around it
 /// (`scheduler::validate_schedule_params`, which resolves the effective params
 /// first and then calls [`validate_app_params`]).
+/// Max rows `list_pending_transactions` will return.
+const TRANSACTION_LIMIT_CAP: i64 = 200;
+
+/// The `list_pending_transactions` tool (N01): the approval inbox, read-only.
+///
+/// Stale mandates are swept before the listing, exactly as the HTTP door does
+/// it, so an agent is never shown a pending row the approve door would refuse.
+async fn tool_list_pending_transactions(state: &AppState, args: &Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(TRANSACTION_LIMIT_CAP)
+        .clamp(1, TRANSACTION_LIMIT_CAP);
+    let pool = state.storage.pool();
+    pumper_core::transactions::expire_stale(&pool, state.config.transact.approval_ttl_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows = pumper_core::transactions::list(
+        &pool,
+        Some(pumper_core::transactions::TransactionState::Pending),
+        limit,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let transactions: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "transaction_id": r.id,
+                "idempotency_key": r.idempotency_key,
+                "app": r.app,
+                "job_id": r.job_id,
+                "profile": r.profile,
+                "state": r.state,
+                "evidence_sha": r.evidence_sha,
+                "expires_at": state.config.transact.approval_deadline(r.created_at),
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "count": transactions.len(),
+        // The honest half: on a node with `allow_live = false` every one of
+        // these is unapprovable, and an agent that did not know that would keep
+        // trying. Absence of the approve tool says it too; this says it in data.
+        "allow_live": state.config.transact.allow_live,
+        "approve_enabled": state.config.mcp.allow_approve && state.config.transact.allow_live,
+        "transactions": transactions,
+    }))
+}
+
+/// The `approve_transaction` tool (N01): the one tool on this surface that can
+/// release an irreversible action.
+///
+/// It goes through the SAME pure decision function and the same SQL guard as
+/// the HTTP door — not a second implementation of the rules — so an agent and a
+/// human cannot get different answers about a stale approval, and a race
+/// between them cannot submit twice.
+async fn tool_approve_transaction(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "transaction_id")?.to_string();
+    let quoted = require_str(args, "evidence_sha")?.to_string();
+    let pool = state.storage.pool();
+    pumper_core::transactions::expire_stale(&pool, state.config.transact.approval_ttl_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = pumper_core::transactions::get(&pool, &id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no transaction '{id}' (see list_pending_transactions)"))?;
+    let submitted_today = pumper_core::transactions::submitted_since(
+        &pool,
+        row.profile.as_deref(),
+        chrono::Utc::now() - chrono::Duration::hours(24),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    pumper_core::approve_decision(
+        state.config.transact.allow_live,
+        row.state,
+        state.config.transact.approval_deadline(row.created_at),
+        chrono::Utc::now(),
+        &row.evidence_sha,
+        Some(quoted.as_str()),
+        submitted_today,
+        state.config.transact.daily_cap(),
+    )
+    .map_err(|refusal| refusal.message())?;
+    if !pumper_core::transactions::mark_approved(&pool, &row.id, None)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            "the transaction stopped being pending while this approval was being decided \
+             (another approver, or the expiry sweep) — nothing was submitted"
+                .to_string(),
+        );
+    }
+    // Release the parked run. Its authority is the ledger row, not this input.
+    let resumed = match row.job_id.as_ref().and_then(|j| j.parse().ok()) {
+        Some(job_id) => {
+            let input = json!({ "transaction_id": row.id, "evidence_sha": row.evidence_sha });
+            match state.storage.resume(job_id, &input).await {
+                Ok(Some(job)) => {
+                    state.events.emit(crate::events::JobEvent::new(
+                        job.id,
+                        job.app.clone(),
+                        "queued",
+                    ));
+                    state.notify.notify_one();
+                    true
+                }
+                _ => false,
+            }
+        }
+        None => false,
+    };
+    Ok(json!({
+        "transaction_id": row.id,
+        "state": "approved",
+        "job_id": row.job_id,
+        "resumed": resumed,
+        "note": "the parked job was released; it re-probes the live page and submits only if \
+                 it still hashes to the approved evidence. Poll it with wait_job.",
+    }))
+}
+
+// -- N04: the pipeline-authoring tools ---------------------------------------
+
+/// Turns one HTTP handler's refusal into a readable tool error.
+///
+/// The status is carried into the text rather than dropped, because an agent
+/// that cannot tell "unknown target app" (404) from "invalid on_change" (400)
+/// from "budget_usd must be > 0" (422) will retry the wrong half of its body.
+fn door_error(e: crate::routes::ApiError) -> String {
+    let crate::routes::ApiError(status, message) = e;
+    format!("[{}] {message}", status.as_u16())
+}
+
+/// Deserializes an agent's `arguments` into one of the HTTP request bodies.
+///
+/// The bodies ARE the schema: reusing them is what makes "same door, same
+/// validation" true rather than aspirational, and a field the REST surface
+/// gains is a field this tool gains with it.
+fn tool_body<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, String> {
+    serde_json::from_value(args.clone()).map_err(|e| format!("invalid arguments: {e}"))
+}
+
+/// The `create_trigger` tool (N04): authors one reactive edge through the same
+/// handler `POST /triggers` runs — kind-aware validation, the pointer-syntax
+/// check on `bind`/`each`, the `budget_usd > 0` floor, all of it.
+async fn tool_create_trigger(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateTriggerBody = tool_body(args)?;
+    let (_, axum::Json(trigger)) =
+        crate::routes::create_trigger(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    Ok(json!({
+        "created": true,
+        "trigger": trigger,
+        "note": "the edge is live. Dry-run it with test_trigger, and read why it did or did \
+                 not fire with trigger_decisions.",
+    }))
+}
+
+/// The `test_trigger` tool (N04): the dry-run, wrapped.
+async fn tool_test_trigger(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "trigger_id")?.to_string();
+    let fire = args.get("fire").and_then(Value::as_bool).unwrap_or(false);
+    let query: crate::routes::TestTriggerQuery = tool_body(&json!({ "fire": fire }))?;
+    let axum::Json(out) = crate::routes::test_trigger(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(query),
+    )
+    .await
+    .map_err(door_error)?;
+    Ok(out)
+}
+
+/// The `trigger_decisions` tool (N04): one page of the ledger.
+async fn tool_trigger_decisions(state: &AppState, args: &Value) -> Result<Value, String> {
+    let id = require_str(args, "trigger_id")?.to_string();
+    let mut q = serde_json::Map::new();
+    if let Some(limit) = args.get("limit") {
+        q.insert("limit".into(), limit.clone());
+    }
+    if let Some(cursor) = args.get("cursor") {
+        q.insert("cursor".into(), cursor.clone());
+    }
+    let query: crate::routes::RunsQuery = tool_body(&Value::Object(q))?;
+    let axum::Json(out) = crate::routes::trigger_runs(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(query),
+    )
+    .await
+    .map_err(door_error)?;
+    Ok(out)
+}
+
+/// The `create_watch` tool (N04): a dataset subscription, through the same
+/// namespace gate `POST /watches` applies — so an agent cannot create the
+/// `(app, dataset)` pair that could never fire and that the HTTP door refuses.
+async fn tool_create_watch(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateWatchBody = tool_body(args)?;
+    let (_, axum::Json(watch)) =
+        crate::routes::create_watch(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    Ok(json!({ "created": true, "watch": watch }))
+}
+
+/// The `create_ingress_source` tool (N04): the secret is in the response and
+/// nowhere else, ever again — exactly as `POST /ingress/sources` behaves.
+async fn tool_create_ingress_source(state: &AppState, args: &Value) -> Result<Value, String> {
+    let body: crate::routes::CreateIngressSourceBody = tool_body(args)?;
+    let (_, axum::Json(mut out)) =
+        crate::routes::create_ingress_source(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .map_err(door_error)?;
+    if let Value::Object(map) = &mut out {
+        map.insert(
+            "note".into(),
+            Value::String(
+                "this is the ONLY time the secret is returned — hand it to the sender now. \
+                 The sender POSTs signed bodies to /ingest/{source.id}; a source_kind \
+                 'external' trigger on that id then reacts to them."
+                    .into(),
+            ),
+        );
+        map.insert(
+            "ingress_enabled".into(),
+            Value::Bool(state.config.ingress.enabled),
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
     // POST /apps/{name}/jobs — 422 with pointer paths.
@@ -790,6 +1601,10 @@ const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
     ("triggers.rs", "validate_app_params"),
     // The MCP `enqueue_job` tool and its research sugar.
     ("mcp/mod.rs", "validate_app_params"),
+    // N03 workflow steps — each step's RENDERED params are validated before the
+    // step is claimed, so a template that resolves to something the app refuses
+    // fails that step at its own door instead of minutes later.
+    ("workflow.rs", "validate_app_params"),
 ];
 
 /// Work-creating call sites that deliberately do NOT run the check, each with
@@ -801,9 +1616,145 @@ const EXPECTED_EXEMPT_DOORS: &[(&str, &str)] = &[(
      and `registry::scheduled_apps_default_params_pass_their_schema` pins those",
 )];
 
+/// Dispatches one JSON-RPC message from an anonymous caller. `None` =
+/// notification (nothing to send).
+///
+/// The live surface goes through [`handle_rpc_as`] (it carries the request's
+/// job token); this two-argument shape is what the e2e suite drives, so it is
+/// test-only rather than a second production entry point that could drift.
+///
+/// It lives HERE, below the enqueue call sites, deliberately: the door
+/// inventory (`every_door_that_creates_work_runs_the_shared_params_check`)
+/// reads each file's production half as "everything before the first
+/// `#[cfg(test)]`", so a test-gated item placed near the top of this file
+/// hides the `enqueue` doors below it from the very test that polices them.
+#[cfg(test)]
+pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
+    handle_rpc_as(state, msg, &jobtoken::McpCaller::anonymous()).await
+}
+
+// ── N15: the self-hosted agent loop's `fetch` tool ───────────────────────────
+
+/// The cost-event `detail` marking one fetch the Claude subprocess made for
+/// itself. Zero-cost audit marker beside the real ledger row `AppContext::fetch`
+/// already wrote — the money is counted once, and the receipt can still say how
+/// many of a run's fetches came from the model rather than from the app.
+pub(crate) const SELF_HOSTED_FETCH_DETAIL: &str = "claude_subfetch";
+
+/// The strategy an agent may ask for, and the one it may not.
+///
+/// `auto_with_research` is deliberately unreachable: the caller of this tool
+/// **is** the Claude tier, and letting it request a ladder that ends in another
+/// Claude run is an unbounded spend loop wearing a per-job budget as its only
+/// brake. The anti-pattern: `research_strategy_not_reachable_from_the_agent_loop`.
+fn agent_fetch_strategy(name: Option<&str>) -> Result<pumper_core::FetchStrategy, String> {
+    use pumper_core::FetchStrategy as S;
+    match name {
+        None | Some("auto") => Ok(S::Auto),
+        Some("http") => Ok(S::Http),
+        Some("browser") => Ok(S::Browser),
+        Some("auto_with_research") | Some("claude") => Err(
+            "strategy 'auto_with_research' is not available to this tool: you ARE the research \
+             tier, and a research tier that can re-enter itself has no bound but the job budget. \
+             Use 'auto' (http, escalating to a browser render)."
+                .to_string(),
+        ),
+        Some(other) => Err(format!(
+            "unknown strategy '{other}': use 'http', 'browser' or 'auto'"
+        )),
+    }
+}
+
+/// The body an agent gets back. Prefers Markdown (what the model asked the
+/// ladder for), falls back to extracted text, then to raw HTML — and says which
+/// via `content_kind`, so an empty `content` is never mistaken for an empty page.
+fn fetch_body(outcome: &pumper_core::FetchOutcome, to_markdown: bool) -> (&'static str, String) {
+    if to_markdown {
+        if let Some(md) = outcome.markdown.as_deref().filter(|m| !m.is_empty()) {
+            return ("markdown", md.to_string());
+        }
+    }
+    if let Some(text) = outcome.text.as_deref().filter(|t| !t.is_empty()) {
+        return ("text", text.to_string());
+    }
+    match outcome.html.as_deref().filter(|h| !h.is_empty()) {
+        Some(html) => ("html", html.to_string()),
+        None => ("none", String::new()),
+    }
+}
+
+/// The `fetch` tool: one synchronous fetch through the calling job's own
+/// metered [`pumper_core::AppContext::fetch`].
+///
+/// This is the whole point of N15. `fetch_readable` enqueues a job and hands
+/// back an id, which is useless to a model mid-turn; the CLI's own `WebFetch`
+/// answers in-turn but leaves the ladder entirely — no politeness spacing, no
+/// response cache, no session profile, no archive tier, no tier-router
+/// learning, and no ledger row, on the most expensive tier in the system. This
+/// answers in-turn *and* stays inside the ladder.
+async fn tool_fetch(
+    state: &AppState,
+    args: &Value,
+    caller: &jobtoken::McpCaller,
+) -> Result<Value, String> {
+    let url = require_str(args, "url")?.to_string();
+    let strategy = agent_fetch_strategy(args.get("strategy").and_then(Value::as_str))?;
+    let to_markdown = args
+        .get("to_markdown")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let ctx = jobtoken::job_context(state, caller).await?;
+
+    let mut req = pumper_core::FetchRequest::new(url.clone());
+    req.strategy = strategy;
+    req.to_markdown = to_markdown;
+    req.profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    req.archive_max_age = args.get("archive_max_age").and_then(Value::as_u64);
+
+    let outcome = ctx.fetch(req).await.map_err(|e| e.to_string())?;
+    // The zero-cost marker beside the row `ctx.fetch` already wrote: the money
+    // is metered once (there), and this row is what lets `GET /jobs/{id}/receipt`
+    // count how much of a run's egress the model drove. Accounting must never
+    // fail the call — the fetch already happened.
+    if let Err(e) = state
+        .costs
+        .record(
+            ctx.job_id,
+            &ctx.app,
+            "mcp_fetch",
+            Some(&url),
+            0.0,
+            // A marker, not a bill: the fetch was metered where it happened.
+            pumper_core::costs::SpendCertainty::Free,
+            Some(SELF_HOSTED_FETCH_DETAIL),
+        )
+        .await
+    {
+        tracing::warn!(job = %ctx.job_id, "self-hosted fetch marker not recorded: {e}");
+    }
+    let (content_kind, content) = fetch_body(&outcome, to_markdown);
+    Ok(json!({
+        "url": outcome.url,
+        "engine": outcome.engine,
+        "status": outcome.status,
+        "content_kind": content_kind,
+        "chars": content.chars().count(),
+        "content": content,
+        "cost_usd": outcome.cost_usd,
+        "escalations": outcome.escalations,
+        "trace": outcome.trace,
+        "job_id": ctx.job_id,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_budget, validate_app_params, validate_params};
+    use super::{
+        agent_fetch_strategy, clamp_budget, fetch_body, validate_app_params, validate_params,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::Path;
@@ -926,7 +1877,18 @@ mod tests {
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
             {
-                for marker in [".enqueue(", ".enqueue_dedup(", ".create_schedule("] {
+                // `.enqueue_dedup_as(` earns its own marker rather than being
+                // caught by a prefix of `.enqueue_dedup(`: it is a DIFFERENT
+                // symbol, and the day `routes/jobs.rs` switched to it (N20
+                // principal stamping) this scan stopped seeing the platform's
+                // primary enqueue door entirely. An inventory that silently
+                // loses its most important row is worse than no inventory.
+                for marker in [
+                    ".enqueue(",
+                    ".enqueue_dedup(",
+                    ".enqueue_dedup_as(",
+                    ".create_schedule(",
+                ] {
                     if line.contains(marker) {
                         found.entry(rel.clone()).or_default().insert(marker.into());
                     }
@@ -988,6 +1950,56 @@ mod tests {
             );
             assert!(!reason.is_empty(), "{file}'s exemption needs a reason");
         }
+    }
+
+    /// The anti-pattern: the research tier handed a ladder that ends in another
+    /// research run. Nothing but the job budget would bound the recursion, and
+    /// a budget is a ceiling on the damage, not a design.
+    #[test]
+    fn research_strategy_not_reachable_from_the_agent_loop() {
+        use pumper_core::FetchStrategy as S;
+        assert_eq!(agent_fetch_strategy(None).unwrap(), S::Auto);
+        assert_eq!(agent_fetch_strategy(Some("auto")).unwrap(), S::Auto);
+        assert_eq!(agent_fetch_strategy(Some("http")).unwrap(), S::Http);
+        assert_eq!(agent_fetch_strategy(Some("browser")).unwrap(), S::Browser);
+        for refused in ["auto_with_research", "claude"] {
+            let err = agent_fetch_strategy(Some(refused)).unwrap_err();
+            assert!(err.contains("research tier"), "{err}");
+        }
+        assert!(agent_fetch_strategy(Some("teleport")).is_err());
+    }
+
+    /// An empty answer must be labelled, not silently returned as ordinary
+    /// empty content: a model that reads `content: ""` with no `content_kind`
+    /// cannot tell a blocked page from a genuinely blank one.
+    #[test]
+    fn an_empty_outcome_is_labelled_rather_than_returned_as_content() {
+        let mut outcome = pumper_core::FetchOutcome {
+            url: "https://example.com".into(),
+            engine: "http",
+            status: Some(200),
+            html: None,
+            markdown: None,
+            text: None,
+            escalations: Vec::new(),
+            trace: Vec::new(),
+            cost_usd: None,
+            snapshot: None,
+            network: Vec::new(),
+        };
+        assert_eq!(fetch_body(&outcome, true), ("none", String::new()));
+        outcome.html = Some("<p>hi</p>".into());
+        assert_eq!(fetch_body(&outcome, true), ("html", "<p>hi</p>".into()));
+        outcome.text = Some("hi".into());
+        assert_eq!(fetch_body(&outcome, true), ("text", "hi".into()));
+        outcome.markdown = Some("# hi".into());
+        assert_eq!(fetch_body(&outcome, true), ("markdown", "# hi".into()));
+        // An empty markdown string is not an answer; fall through to text.
+        outcome.markdown = Some(String::new());
+        assert_eq!(fetch_body(&outcome, true), ("text", "hi".into()));
+        // And a caller that did not ask for Markdown never gets it.
+        outcome.markdown = Some("# hi".into());
+        assert_eq!(fetch_body(&outcome, false), ("text", "hi".into()));
     }
 
     #[test]

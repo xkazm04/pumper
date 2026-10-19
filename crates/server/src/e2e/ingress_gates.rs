@@ -33,7 +33,7 @@ async fn ingress_state(
 
 /// GitHub's scheme: `HMAC-SHA256(secret, body)`, hex, `sha256=`-prefixed.
 fn bare_signature(secret: &str, body: &[u8]) -> String {
-    use hmac::{Mac, SimpleHmac};
+    use hmac::{KeyInit, Mac, SimpleHmac};
     let mut mac = <SimpleHmac<sha2::Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
@@ -233,6 +233,8 @@ async fn an_unidentified_replay_dedupes_instead_of_enqueuing_forever() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

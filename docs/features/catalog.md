@@ -15,7 +15,7 @@ Fields (all optional except `id`, `name`, `status`; an **absent** field defaults
 | `market` | jurisdiction in the app's scheme — `us`, `us-ca` (California), `eu`, `au`, `gb`, `cz`, `ca` (Canada). **`us-ca` = California, `ca` = Canada** |
 | `name` / `url` | human name and primary endpoint |
 | `category` | `open-calls` · `awarded-history` · `registry` · `labor-market` · `market-stats` |
-| `engine` | `http` · `browser` · `claude` · `bulk` (import mechanism, not the Pumper engine trait) |
+| `engine` | `http` · `browser` · `claude` · `bulk` · `wasm` (import mechanism, not the Pumper engine trait). `wasm` = a **dynamic app**: the unit serving this source is a component-model `.wasm` in `[plugins] app_dir`, not a compiled-in crate — see [apps.md](apps.md#dynamic-wasm-apps) |
 | `access` | `key-free` · `api-key` · `bulk` · `scrape` |
 | `cadence` | `one-time` · `on-demand` · `daily` · `weekly` · `monthly` · `quarterly` · `annual` |
 | `cron` | exact 6-field expression when on the scheduler; `""` otherwise |
@@ -23,14 +23,17 @@ Fields (all optional except `id`, `name`, `status`; an **absent** field defaults
 | `confidence` | 1–5, how much this source makes downstream output trustworthy |
 | `dataset` | the dataset it writes via `ctx.upsert`; `""` if n/a |
 | `notes` | freeform flags / gotchas |
+| `module_sha256` | lowercase-hex SHA-256 of the component serving this source. **Required on, and only on, `engine = "wasm"` rows** — the dynamic-app loader hashes the module on disk and refuses to register an app whose bytes do not match this pin, so a module swapped under the same filename stops being runnable instead of quietly becoming a different app writing into the same dataset's history |
 
 A source that has only been researched still gets an entry, with `status = "planned"` and `app = ""` — so the catalog doubles as the roadmap and "live vs planned" stays honest.
 
 `Catalog::load()` reads `$PUMPER_CATALOG` or `./catalog/data-sources.toml` (**CWD-relative**). A **missing** file is an empty catalog plus a warn log, so a deployment without it still boots; a **malformed** file is a hard error.
 
-**The closed vocabularies are enforced at parse time**, not merely documented here. `status`, `cadence`, `engine`, `access`, `category` and the 1–5 `confidence` scale are checked in `Catalog::parse` (`Catalog::vocabulary_findings` is the enumeration; every offending field is reported at once, not one per run), and an out-of-set value fails the parse the same way malformed TOML does. An empty string still means *not declared* for the optional axes.
+**The closed vocabularies are enforced at parse time**, not merely documented here. `status`, `cadence`, `engine`, `access`, `category`, the 1–5 `confidence` scale and the `(engine, module_sha256)` pair are checked in `Catalog::parse` (`Catalog::vocabulary_findings` is the enumeration; every offending field is reported at once, not one per run), and an out-of-set value fails the parse the same way malformed TOML does. An empty string still means *not declared* for the optional axes.
 
 This exists because the consumers of these fields are silent about a typo. `cadence = "dayly"` used to parse, then fall through `cadence_secs`'s catch-all to `None` — the identical answer `on-demand` gives — so the source's freshness monitoring switched itself off and `/catalog/health` reported `monitored: false` as if that had been declared. Code gets exercised; data gets believed.
+
+The same rule covers the module pin, in both directions: an `engine = "wasm"` row **without** a `module_sha256` claims a deployment record it does not have (any module that happens to carry the filename would run as this source), and a `module_sha256` on an `http`/`browser` row is a note that looks like a guard — nothing hashes those. Both are parse-time findings; a pin that is not a 64-char hex digest (`"latest"`) is a third.
 
 ## Declared data contracts — and when each clause can actually fire
 
@@ -41,16 +44,16 @@ Two lookups decide whether a declaration does anything at all, and **both key on
 - `Catalog::contract_for(app, dataset)` finds the contract, so a row filed under an app that never writes that pair is never evaluated.
 - `/catalog/health` reads `datasets.list(source.app, source.dataset)`, so the same mismatch reports the source **permanently stale** rather than reporting nothing.
 
-**A row may name a virtual namespace** (`grants`, `census`) rather than a registered app, because that is the pair those datasets land under. `live_catalog_entries_map_to_registered_apps_with_matching_cron` accepts a namespace declared in `registry::VIRTUAL_NAMESPACES` provided **every one of its publishers is a registered app**, so this widens what may be named, not whether it is checked. Filing such a dataset under a producing app instead is the failure mode above, not a workaround.
+**A row may name a virtual namespace** (`grants`, `trades`, `market`, `census`) rather than a registered app, because that is the pair those datasets land under. `live_catalog_entries_map_to_registered_apps_with_matching_cron` accepts a namespace declared in `registry::VIRTUAL_NAMESPACES` provided **every one of its publishers is a registered app**, so this widens what may be named, not whether it is checked. Filing such a dataset under a producing app instead is the failure mode above, not a workaround.
 
 Two rules come with it:
 
 - **`cron` must be empty.** A virtual namespace has no `schedule()` of its own — the write rides a publisher's job — and `Catalog::reconcile` derives desired schedules from `Source::is_scheduled()`, so a cron here would ask the scheduler to create a schedule for an app that does not exist. The guard asserts this rather than trusting it. Hold the cadence with `max_staleness_hours` instead.
 - **The cron-equality check is skipped** for these rows, and only for them; every app-named row still has to match its app's `schedule()` exactly in both directions.
 
-`grants/opportunity_details` is live under this shape as of 2026-08-13. `census/market_blend` is the remaining candidate and is documented in place in the TOML.
+`grants/opportunity_details` is live under this shape as of 2026-08-13, and `market/profile` joined it on 2026-09-02 (N33) — a row under the `market` namespace, `cron` empty, `cadence = "annual"`, contract on the five fields a consumer keys, branches on or reads the economics half through, plus the headline density metric. `census/market_blend` is the remaining candidate and is documented in place in the TOML; the header comment there predates the namespace seam and is stale on the point that no honest row shape exists.
 
-**`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants`, `eu-sedia` and `state-licensing` still declare one on upsert-only writes (`state-licensing` writes via `upsert_many_with_provenance` + `upsert_many_stamped`; found in the round-21 sweep, which is also why this list is now three names and not two — an audit found the list itself had drifted).
+**`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`, and since 2026-09-02 `grants-programs`, whose rollup runs removal detection whenever its corpus read was complete), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants`, `eu-sedia` and `state-licensing` still declare one on upsert-only writes (`state-licensing` writes via `upsert_many_with_provenance` + `upsert_many_stamped`; found in the round-21 sweep, which is also why this list is now three names and not two — an audit found the list itself had drifted).
 
 ### A verdict is recorded, not maintained — so it is served with its age
 
@@ -89,7 +92,7 @@ Two rules the shape encodes:
 - **Only `live` rows count.** A `planned` row declares an intent, not a watched pipeline; counting it as coverage would be the same overstatement `declared` made.
 - **An unreadable catalog OMITS the three list/count fields rather than reporting `[]`/`0`.** Fail-open on gating is deliberate; fail-open on *reporting* would say "nothing is uncovered" at the exact moment nothing is known. `catalog_error` still explains.
 
-Apps on `registry::NON_SOURCE_APPS` are never reported uncovered. That roster is nine **tool** apps — `crawl`, `extractor`, `peer`, `plugin`, `provisioner`, `readable`, `research`, `transact`, `watch` — each with the reason it can never have an upstream to declare (`transact` is the clearest case: it writes no dataset at all, so there is nothing for a contract or a staleness window to attach to). **"It belongs to a sibling product" is not a reason.** That argument had exempted nine apps that do publish datasets (`cms-fee-schedule`, `census-density`, `census-nonemp`, `hackernews`, `homewyse-pricing`, `smlouvy-dump-watch`, `state-tax`, `trade-wages`, `valuation-multiples`); they now carry rows, and `registry::catalog_coverage_tests::the_roster_never_exempts_an_app_that_publishes_a_dataset` names all nine so the exemption cannot be re-granted.
+Apps on `registry::NON_SOURCE_APPS` are never reported uncovered. That roster is eight **tool** apps — `crawl`, `extractor`, `peer`, `plugin`, `provisioner`, `readable`, `transact`, `watch` — each with the reason it can never have an upstream to declare (`transact` is the clearest case: it writes no dataset at all, so there is nothing for a contract or a staleness window to attach to). **"It belongs to a sibling product" is not a reason.** That argument had exempted nine apps that do publish datasets (`cms-fee-schedule`, `census-density`, `census-nonemp`, `hackernews`, `homewyse-pricing`, `smlouvy-dump-watch`, `state-tax`, `trade-wages`, `valuation-multiples`); they now carry rows, and `registry::catalog_coverage_tests::the_roster_never_exempts_an_app_that_publishes_a_dataset` names all nine so the exemption cannot be re-granted.
 
 ### ONBOARDING §10 is a gate, not a sentence
 
@@ -106,6 +109,29 @@ and `enforce_contracts` see their revisions at all — the worker's fan-out is s
 `run_indexed_apps`, so an undeclared cross-source dataset is invisible to every one of those
 mechanisms no matter how often it is rewritten. `cms-fee-schedule` is deliberately not a publisher:
 it is in the same product group but writes only its own datasets and never rebuilds the join.
+
+`market` (N33) is the third, and the only one fed by **two families**: `market/profile` (one row per
+state x trade) is re-derived at the end of both `unified::sync_operator_economics` and
+`app_census_density::sync_market_blend`, so its nine publishers are the five trades apps AND the
+four census apps, and whichever refreshed last publishes it. Only `census-density` declares `market/profile`
+through `index_datasets` today; the other eight publish it without declaring it, because both
+shared declaration lists are pinned by tests in crates outside that change's scope (noted in
+apps.md as a known gap, with the four tests named). The seed's publisher-evidence test accepts
+either spelling a manifest uses for a shared write — a `unified` block (grants, trades) or the
+namespace's own name (`market_blend` / `market_profile`) — because a publisher owes evidence that
+its declared result NAMES the shared layer, not that it uses one family's word for it.
+
+## Sources as lineage entities
+
+With `[lineage] emit_sources = true` every `[[source]]` row also becomes an
+**external upstream entity** in whatever metadata catalog is connected:
+`urn:li:dataset:(urn:li:dataPlatform:web,<id>,<env>)` in DataHub, an input
+dataset in the `web` namespace in OpenLineage. The row's `url`, `cadence`,
+`access` and `category` ride along as properties (blank fields are not stamped),
+and column-level lineage stops claiming `upstreamType: NONE` and names the
+source instead. A dataset is attributed to the row that names its exact
+`(app, dataset)` pair, falling back to the app's catch-all row. Off by default;
+see [`datahub.md`](datahub.md#source-entities-emit_sources).
 
 ## API
 

@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
-use pumper_core::{AppContext, HttpClient, HttpRequest, HttpResponse, Result};
+use pumper_core::testing::{engines_with, Dead, RecordingCheckpoints, TempStore, TestContext};
+use pumper_core::{AppContext, CheckpointSink, HttpClient, HttpRequest, HttpResponse, Result};
 use serde_json::Value;
 
 /// A tiny website served entirely from memory.
@@ -109,6 +109,32 @@ pub fn crawl_ctx(store: &TempStore, site: Arc<StubSite>, params: Value) -> AppCo
         .params(params)
         .engines(engines_with(site, Arc::new(Dead), Arc::new(Dead)))
         .build()
+}
+
+/// An `AppContext` for a `mode: "graph"` run: **every** engine is [`Dead`],
+/// because a graph run that reaches the network is a bug — it reads the `edges`
+/// dataset the crawls already wrote and fetches nothing.
+pub fn graph_ctx(store: &TempStore, params: Value) -> AppContext {
+    TestContext::new(&store.storage, "crawl")
+        .params(params)
+        .build()
+}
+
+/// The same, wired to a recording checkpoint sink (and optionally a restored
+/// blob) so the per-pass checkpointing can be asserted on.
+pub fn graph_ctx_resumable(
+    store: &TempStore,
+    params: Value,
+    sink: Arc<RecordingCheckpoints>,
+    restored: Option<Value>,
+) -> AppContext {
+    let mut ctx = TestContext::new(&store.storage, "crawl")
+        .params(params)
+        .checkpoints(sink as Arc<dyn CheckpointSink>);
+    if let Some(state) = restored {
+        ctx = ctx.restored(state);
+    }
+    ctx.build()
 }
 
 /// The result's keys, sorted — the unit the manifest inventory diffs against.

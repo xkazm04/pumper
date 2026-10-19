@@ -87,7 +87,7 @@ impl HttpCache {
         if let Some(proxy) = &req.proxy {
             hasher.update(proxy.as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Returns a live (non-expired) cached response, if any. `max_age` caps read
@@ -458,6 +458,22 @@ pub fn ewma_update(prev: Option<f64>, gap_secs: f64) -> f64 {
 /// identical requests within the TTL are served from disk. Keyed by every
 /// answer-shaping field of the request; `resume_session` requests bypass the
 /// cache entirely (they are stateful by design). TTL 0 disables.
+///
+/// **Configurations where this cache silently does nothing, or serves the wrong
+/// answer.** None of these fail or log; each is listed with what to do instead.
+/// - A role/model/effort edited in `[claude]` while entries are live: the request
+///   names the role, not the model. The key folds in
+///   [`Researcher::answer_fingerprint`](crate::engine::Researcher::answer_fingerprint),
+///   so the edit starts a fresh key; a researcher that does not override it
+///   (a test double) reuses answers across the edit.
+/// - A prompt carrying anything per-run (timestamp, job id): every call is a new
+///   key, hit rate is zero, and the spend is the uncached spend. Build the prompt
+///   from content only (see `connector-api-watch`'s `change_summary_request`).
+/// - `resume_session` requests: bypass by design. A pipeline built on them is
+///   never cached; use one-shot requests for the steps that should be.
+/// - A TTL longer than the source's change rate (default 24h): identical prompts
+///   over a changed page are not identical inputs. Put the content in the prompt,
+///   or set the TTL to the page's refresh interval.
 pub struct ResearchCache {
     pool: SqlitePool,
     ttl: Duration,
@@ -498,7 +514,24 @@ impl ResearchCache {
         if let Some(schema) = &req.json_schema {
             hasher.update(schema.to_string().as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
+    }
+
+    /// [`key`](Self::key) extended with the researcher's
+    /// [`Researcher::answer_fingerprint`](crate::engine::Researcher::answer_fingerprint), so an answer is only reused by a
+    /// request that would run on the same resolved model, effort and tools. An
+    /// empty fingerprint leaves the key unchanged. The VCR cassette key stays the
+    /// plain [`key`](Self::key): a cassette must replay across config edits.
+    pub fn key_with(req: &ResearchRequest, fingerprint: &str) -> String {
+        let base = Self::key(req);
+        if fingerprint.is_empty() {
+            return base;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(base.as_bytes());
+        hasher.update([0]);
+        hasher.update(fingerprint.as_bytes());
+        hex::encode(hasher.finalize())
     }
 
     /// Fresh cached output, if any. The returned `cost_usd` is the ORIGINAL
@@ -521,6 +554,9 @@ impl ResearchCache {
             duration_ms: None,
             num_turns: None,
             session_id: None,
+            // Not stored in the cache row — a hit never ran the engine, so
+            // there is no model to report.
+            model: None,
         }))
     }
 

@@ -232,7 +232,9 @@ const EXPECTED_CLAUDE_FAILURE_SITES: &[&str] = &[
     "lib.rs::research",
     "lib.rs::resolve",
     "lib.rs::workdir",
-    "lib.rs::write",
+    // The scratch-file refusal (pre-spawn). N15 moved its body from `write` into
+    // `write_as` so the MCP config can be written as `.json`; `write` delegates.
+    "lib.rs::write_as",
 ];
 
 /// How many times each allow-listed function may construct one. A count, not a
@@ -243,7 +245,7 @@ const EXPECTED_CLAUDE_FAILURE_SITE_COUNTS: &[(&str, usize)] = &[
     ("lib.rs::research", 1),
     ("lib.rs::resolve", 2),
     ("lib.rs::workdir", 1),
-    ("lib.rs::write", 1),
+    ("lib.rs::write_as", 1),
 ];
 
 /// The name in `fn <name>`, if this line declares a function.

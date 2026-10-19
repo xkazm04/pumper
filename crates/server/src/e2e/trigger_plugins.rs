@@ -130,6 +130,8 @@ fn trigger(hooks: Option<TriggerPluginHooks>) -> Trigger {
         created_at: chrono::Utc::now(),
         filters: None,
         plugin_hooks: hooks,
+        bind: None,
+        each: None,
     }
 }
 
@@ -151,6 +153,7 @@ fn predicate_only(plugin: &str, params: Value) -> TriggerPluginHooks {
     TriggerPluginHooks {
         predicate: Some(hook(plugin, params)),
         transform: None,
+        post_enqueue: None,
     }
 }
 
@@ -158,6 +161,7 @@ fn transform_only(plugin: &str, params: Value) -> TriggerPluginHooks {
     TriggerPluginHooks {
         predicate: None,
         transform: Some(hook(plugin, params)),
+        post_enqueue: None,
     }
 }
 
@@ -275,6 +279,8 @@ async fn a_transform_cannot_rescope_the_work_of_the_job_it_fires() {
                     max_attempts: 1,
                     filters: None,
                     plugin_hooks: Some(&transform_only(plugin, json!({}))),
+                    bind: None,
+                    each: None,
                 })
                 .await
                 .expect("create trigger"),
@@ -402,6 +408,7 @@ fn missing_hook_plugins_names_only_configured_absent_ones() {
     let t = trigger(Some(TriggerPluginHooks {
         predicate: Some(hook("gone-a", json!({}))),
         transform: Some(hook("gone-b", json!({}))),
+        post_enqueue: None,
     }));
     assert_eq!(
         missing_hook_plugins(plugins.as_ref(), &t),
@@ -435,7 +442,10 @@ async fn a_configured_hook_with_no_loaded_plugin_is_recorded_not_only_silently_p
             plugin_hooks: Some(&TriggerPluginHooks {
                 predicate: Some(hook("never-built", json!({}))),
                 transform: None,
+                post_enqueue: None,
             }),
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();
@@ -496,6 +506,8 @@ async fn hooked_trigger(state: &AppState, hooks: TriggerPluginHooks) -> Trigger 
             max_attempts: 1,
             filters: None,
             plugin_hooks: Some(&hooks),
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger")
@@ -736,7 +748,10 @@ async fn a_loaded_hook_plugin_records_no_plugin_missing_row() {
             plugin_hooks: Some(&TriggerPluginHooks {
                 predicate: Some(hook("allow", json!({}))),
                 transform: None,
+                post_enqueue: None,
             }),
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

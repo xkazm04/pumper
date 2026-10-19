@@ -584,6 +584,28 @@ pub enum Error {
     /// happened to be first.
     #[error("schema: {0}")]
     Schema(String),
+    /// **Not a failure**: the app parked itself waiting for something only the
+    /// outside world can supply — a human approval, a 2FA code, an agent's
+    /// answer to a clarifying question. Raised exclusively by
+    /// [`crate::AppContext::await_input`], which forces a checkpoint before
+    /// building it, so the payload here is the *request* and the resume state
+    /// is already durable.
+    ///
+    /// It travels as an `Error` because that is the only channel a `run()` has
+    /// back to the runtime, and because every intermediate `?` must abandon the
+    /// run exactly as it would for a failure. The runtime is what makes it not
+    /// one: the worker's outcome arm parks the row in
+    /// [`crate::JobStatus::Waiting`] instead of failing it, releases the permit,
+    /// and publishes a non-terminal `waiting` event.
+    ///
+    /// Deliberately **not** in [`Error::is_terminal_for_job`]: that predicate
+    /// answers "should the retry ladder be skipped for this *failure*", and this
+    /// is not a failure at all. The worker matches it before that question is
+    /// ever asked, and an embedder with no waiting support sees an ordinary
+    /// retryable error — the honest degradation, since nothing will ever supply
+    /// the input there either.
+    #[error("awaiting external input: {0}")]
+    AwaitingInput(serde_json::Value),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -799,6 +821,19 @@ impl Error {
         }
     }
 
+    /// The request an [`Error::AwaitingInput`] carries, if this is one.
+    ///
+    /// The runtime routes on THIS rather than on a `matches!` at each call site,
+    /// for the same reason [`Error::plugin_failure`] exists: the park arm and
+    /// the "is this awaiting?" question have to agree, and a second hand-rolled
+    /// match is how they stop agreeing.
+    pub fn awaited_request(&self) -> Option<&serde_json::Value> {
+        match self {
+            Error::AwaitingInput(request) => Some(request),
+            _ => None,
+        }
+    }
+
     /// What this failure reports about money already spent, if it is the kind of
     /// failure that can. Metered seams consult it *before* propagating, so the
     /// ledger sees the spend of a call that failed.
@@ -951,6 +986,9 @@ impl Error {
             // every tier by construction — the schema is not a property of the
             // engine that was about to be asked.
             Error::Schema(_) => true,
+            // Not a failure at all (N02): the worker parks the job on it before
+            // any routing question is asked. Never ours, never a tier's.
+            Error::AwaitingInput(_) => false,
             // Plugins split by kind, and only the load side is ours: an unknown
             // module, a disabled subsystem, a missing export are facts about our
             // own artifacts. A trap, malformed output or a host error happened
@@ -1643,6 +1681,12 @@ mod tests {
             | Error::ReplayMiss(_)
             | Error::SourceDrift(_)
             | Error::Schema(_) => true,
+            // Not a failure at all: the worker parks the job on it (N02) long
+            // before the retry ladder is consulted. `false` here is the honest
+            // answer for the only case where it IS consulted — an embedder with
+            // no waiting support, where "keep retrying" degrades better than
+            // "fail once", since neither will ever get the input.
+            Error::AwaitingInput(_) => false,
             // Everything else can genuinely succeed on the next attempt.
             Error::Http { .. }
             | Error::Browser { .. }
@@ -1682,6 +1726,7 @@ mod tests {
             Error::Io(std::io::Error::other("disk hiccup")),
             Error::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
             Error::Other(anyhow::anyhow!("something else")),
+            Error::AwaitingInput(serde_json::json!({"kind": "approval"})),
             #[cfg(feature = "storage")]
             Error::Storage(sqlx::Error::RowNotFound),
         ];
@@ -1692,6 +1737,31 @@ mod tests {
                 "{e} is classified against the table's intent"
             );
         }
+    }
+
+    /// The park signal must be readable by TYPE, never by message text — the
+    /// same rule `PluginFailure` and `SourceDrift` exist to enforce. The worker
+    /// routes on `awaited_request()`; a `matches!` on the rendered string would
+    /// break the first time somebody reworded the prose.
+    #[test]
+    fn awaiting_input_is_routed_by_type_not_by_message() {
+        let request = serde_json::json!({"kind": "approval", "amount": 42});
+        let parked = Error::AwaitingInput(request.clone());
+        assert_eq!(parked.awaited_request(), Some(&request));
+        // Nothing else answers that question, including an app error whose
+        // prose says the same thing.
+        assert_eq!(
+            Error::App("awaiting external input".into()).awaited_request(),
+            None
+        );
+        assert_eq!(
+            Error::BudgetExhausted("broke".into()).awaited_request(),
+            None
+        );
+        // And a park is not a terminal-for-job failure: that predicate answers
+        // "skip the retry ladder for this FAILURE", a question about a park is
+        // simply the wrong question.
+        assert!(!parked.is_terminal_for_job());
     }
 
     // ---- store contention -------------------------------------------------

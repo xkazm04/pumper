@@ -167,11 +167,27 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    // wait_job is read-only (awaits status, spends nothing) so it is always
-    // offered; the actuating tools are not.
+    // The read-only tools are always offered — `wait_job` and `wait_workflow`
+    // await a status and spend nothing. The actuating ones are not. `fetch`
+    // (N15) is always offered too and is NOT gated by `allow_enqueue`: it
+    // creates no job, and its gate is the per-run job token pumper mints for
+    // its own Claude subprocess — an ordinary client that calls it gets an
+    // `[unauthorized]` tool error rather than a fetch (see `e2e::mcp_fetch`).
+    // It stays LAST.
     assert_eq!(
         names,
-        vec!["list_apps", "query_dataset", "search", "wait_job"]
+        vec![
+            "list_apps",
+            "query_dataset",
+            "search",
+            "wait_job",
+            "wait_workflow",
+            "list_pending_transactions",
+            // N33: read-only, ungated — it answers from the store, enqueues
+            // nothing and spends nothing, so it sits with the other reads.
+            "market_profile",
+            "fetch"
+        ]
     );
 
     // Calling the withheld tool is a readable tool error naming the switch.
@@ -182,6 +198,24 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("allow_enqueue"), "{text}");
 
+    // N01: approving a live action is withheld behind its OWN pair of switches,
+    // and `allow_enqueue` does not imply it. A default node refuses and names
+    // both keys rather than leaving an agent to guess which one is missing.
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "approve_transaction",
+            json!({ "transaction_id": "tx", "evidence_sha": "sha" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("allow_approve"), "{text}");
+    assert!(text.contains("allow_live"), "{text}");
+    assert!(text.contains("Nothing was submitted"), "{text}");
+
     // Opted in, the tool appears.
     let (state, _store2) = mcp_state(true).await;
     let resp = handle_rpc(
@@ -191,7 +225,144 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     .await
     .unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
+    for gated in ["enqueue_job", "run_workflow"] {
+        assert!(
+            tools.iter().any(|t| t["name"] == gated),
+            "{gated} must appear once enqueue is opted in"
+        );
+    }
     assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
+    // ...but opting into enqueue still does not offer the approval tool: the
+    // two authorities are not the same size.
+    assert!(
+        !tools.iter().any(|t| t["name"] == "approve_transaction"),
+        "allow_enqueue must not imply the authority to release an irreversible action"
+    );
+
+    // N04: the five pipeline-AUTHORING tools ride the same switch — a trigger
+    // is a standing commitment to enqueue, not a lesser authority than one
+    // enqueue — and they are appended BEFORE `fetch`, which stays last.
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for authoring in [
+        "create_trigger",
+        "test_trigger",
+        "trigger_decisions",
+        "create_watch",
+        "create_ingress_source",
+    ] {
+        assert!(
+            names.contains(&authoring),
+            "{authoring} must appear once enqueue is opted in: {names:?}"
+        );
+    }
+    assert_eq!(
+        names.last(),
+        Some(&"fetch"),
+        "`fetch` stays LAST however many tools are appended: {names:?}"
+    );
+}
+
+/// N33: the `market_profile` tool answers one state × trade row through the
+/// SAME lookup the HTTP door uses, and a miss is a readable refusal naming the
+/// key it looked for — an agent that gets silence concludes the server is
+/// broken and stops asking.
+#[tokio::test]
+async fn market_profile_answers_one_row_case_insensitively_and_names_a_miss() {
+    let (state, _store) = mcp_state(false).await;
+    state
+        .datasets
+        .upsert_many(
+            "market",
+            "profile",
+            &[(
+                "TX:HVAC".to_string(),
+                json!({
+                    "state": "TX", "state_fips": "48", "trade": "HVAC",
+                    "naics4": "2382", "density_grain": "naics4",
+                    "density_key": "2382:48", "coverage": "both",
+                    "total_market_per_10k": 3.33,
+                    "economics": { "wage_grain": "national" },
+                    "density": { "total_market": 10_000 },
+                }),
+            )],
+        )
+        .await
+        .expect("seed profile");
+
+    // Exact key.
+    let resp = handle_rpc(
+        &state,
+        &call("market_profile", json!({ "state": "TX", "trade": "HVAC" })),
+    )
+    .await
+    .unwrap();
+    let row = structured(&resp);
+    assert_eq!(row["trade"], "HVAC");
+    assert_eq!(row["density_grain"], "naics4");
+    assert_eq!(row["coverage"], "both");
+
+    // Lower-cased on both segments — the fallback finds the stored label
+    // instead of 404-ing on a key an agent could not have guessed.
+    let resp = handle_rpc(
+        &state,
+        &call("market_profile", json!({ "state": "tx", "trade": "hvac" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&resp)["trade"], "HVAC");
+
+    // A miss is a readable tool error that names the key and what publishes it.
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "market_profile",
+            json!({ "state": "CA", "trade": "Plumbing" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("CA:Plumbing"), "{text}");
+    assert!(text.contains("market/profile"), "{text}");
+}
+
+/// The anti-pattern: an agent handed a tool that authors a STANDING commitment
+/// to enqueue work on a node whose operator only opted into reads. The refusal
+/// has to name the switch, like every other withheld tool on this surface —
+/// silence would read to an agent as a broken server.
+#[tokio::test]
+async fn authoring_tools_are_withheld_until_enqueue_is_opted_in() {
+    let (state, _store) = mcp_state(false).await;
+    for (tool, args) in [
+        (
+            "create_trigger",
+            json!({ "source_kind": "job", "source_app": "a", "target_app": "b" }),
+        ),
+        ("test_trigger", json!({ "trigger_id": "T1" })),
+        ("trigger_decisions", json!({ "trigger_id": "T1" })),
+        ("create_watch", json!({ "app": "a" })),
+        ("create_ingress_source", json!({ "name": "x" })),
+    ] {
+        let resp = handle_rpc(&state, &call(tool, args)).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{tool} must be refused");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("allow_enqueue"), "{tool}: {text}");
+    }
+    // And they are not even listed.
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"create_trigger"), "{names:?}");
 }
 
 #[tokio::test]

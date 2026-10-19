@@ -56,8 +56,8 @@ const MAX_ARTIFACTS: usize = 200;
             `undeclared` is not a clean bill. `cost.egress` is `[{node, calls}]`: which remote-fabric peer nodes \
             this run's fetches actually left from (empty when nothing went through a peer, i.e. \
             always on a deployment with `[remote]` off). Any figure this server cannot know is \
-            `null` and the reason is listed in `unknown`; nothing is inferred."),
-        (status = 404, description = "Job not found", body = Object),
+            `null` and the reason is listed in `unknown`; nothing is inferred.", body = crate::routes::dto::JobReceipt),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn job_receipt(
@@ -240,6 +240,9 @@ pub(crate) async fn job_receipt(
             "wall_ms": wall_ms(&job),
             "schedule_id": job.schedule_id,
             "trigger_id": job.trigger_id,
+            // N18: WHERE this job ran. `null` = this coordinator's own worker,
+            // which is every job on a single-process install.
+            "executor_id": job.executor_id,
             "error": job.error,
             // The one place a human deliberately READS a failure rather than a
             // machine classifying it, so it is where a lost cause type costs
@@ -305,6 +308,13 @@ fn cost_block(
         // country, which is precisely the thing the remote fabric exists to
         // change — so a run that used it has to be able to show it.
         "egress": egress_by_node(events),
+        // N15: how many of this run's fetches the MODEL drove, through the
+        // self-hosted `fetch` MCP tool, rather than the app's own code. Always
+        // present and always a number: `0` on every ordinary run is the honest
+        // answer, and it is what makes a run where the Claude tier fetched
+        // through the ladder distinguishable from one where it fetched around
+        // it (which, before N15, every research run did).
+        "self_hosted_fetches": self_hosted_fetches(events),
     });
     crate::routes::jobs::merge_certainty_fields(&mut cost, &roll);
     (cost, cost_floor_note(&roll))
@@ -359,6 +369,20 @@ fn cost_floor_note(roll: &pumper_core::costs::CostRollup) -> Option<String> {
 ///
 /// The structurally better shape is a typed `served_by` on `FetchOutcome`
 /// alongside `snapshot`, read by `fetch_cost_detail`. That needs the literal
+/// Fetches this run's Claude subprocess made for itself through the MCP `fetch`
+/// tool (N15), counted off the zero-cost marker rows that tool writes beside
+/// the real ledger row.
+///
+/// Deliberately counts the marker and not the engine: `AppContext::fetch` also
+/// writes a priced row for the same fetch, and summing both would double-count
+/// the run's egress in the one place an operator goes to find out what it cost.
+fn self_hosted_fetches(events: &[pumper_core::CostEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| e.detail.as_deref() == Some(crate::mcp::SELF_HOSTED_FETCH_DETAIL))
+        .count()
+}
+
 /// `FetchOutcome`/`TierTrace` constructions in `core/src/app.rs`, `core/src/vcr.rs`
 /// and `apps/provisioner` updated in the same change — see the known gap in
 /// `docs/features/fetching.md`.
@@ -564,7 +588,7 @@ async fn read_artifacts(dir: &std::path::Path) -> std::io::Result<Option<(Value,
 mod tests {
     use super::{
         cost_block, coverage_block, coverage_gap_reason, coverage_is_complete, egress_by_node,
-        egress_nodes, stage_gap_reason, wall_ms,
+        egress_nodes, self_hosted_fetches, stage_gap_reason, wall_ms,
     };
     use crate::routes::jobs::{certainty_fields, roll_up};
     use chrono::{Duration, Utc};
@@ -715,6 +739,24 @@ mod tests {
     /// `"; "`-joined trail that also carries target URLs and raw error text, so
     /// a substring search would happily read provenance out of an error message
     /// that merely quotes the phrase. Segment boundaries are the contract.
+    /// The anti-pattern: counting the priced ledger row `AppContext::fetch`
+    /// wrote AND the marker the MCP tool wrote, so one model-driven fetch shows
+    /// up as two on the one surface an operator uses to find out what a run
+    /// actually did.
+    #[test]
+    fn a_self_hosted_fetch_is_not_counted_twice() {
+        let events = vec![
+            event(Some("http tier thin: status 200")),
+            event(None),
+            event(Some(crate::mcp::SELF_HOSTED_FETCH_DETAIL)),
+            event(Some("cost_unreported")),
+        ];
+        assert_eq!(self_hosted_fetches(&events), 1);
+        // An ordinary run reports zero rather than nothing at all.
+        assert_eq!(self_hosted_fetches(&events[..2]), 0);
+        assert_eq!(self_hosted_fetches(&[]), 0);
+    }
+
     #[test]
     fn an_egress_marker_is_read_at_a_segment_boundary_not_anywhere_in_the_text() {
         let real: Vec<&str> =
@@ -779,6 +821,11 @@ mod tests {
             cause_kind: None,
             result: None,
             error: None,
+            input_request: None,
+            waiting_since: None,
+            waiting_expires_at: None,
+            resumed_input: None,
+            executor_id: None,
             created_at: now,
             available_at: now,
             started_at: None,

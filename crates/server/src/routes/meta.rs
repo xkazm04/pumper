@@ -9,23 +9,111 @@ use serde_json::{json, Value};
 use crate::routes::error::ApiError;
 use crate::state::AppState;
 
+/// The generated OpenAPI 3.1 document, rendered **once** for the process.
+///
+/// The anti-pattern this replaces: the handler was
+/// `Json(super::openapi_router().split_for_parts().1)`, which on **every
+/// request** re-registered all ~140 route groups, re-collected every component
+/// schema, and re-serialized the result: measured at **29.6 ms for 277 kB** of
+/// compact JSON per call (debug build, `report_one_full_render_cost` below; the
+/// committed `clients/openapi.json` is the same document pretty-printed, 480 kB).
+/// The route is also in `auth::PUBLIC_PATHS`, so that work is reachable without
+/// a key even when the operator has turned identity on, which makes an amplifier
+/// out of a self-description endpoint.
+///
+/// The document is a pure function of the compiled-in router — no state, no
+/// config, nothing that can change while the process runs — so rendering it
+/// more than once cannot produce a different answer. The bytes are byte-identical
+/// to what `Json` produced: `serde_json::to_string` is the same compact encoder,
+/// and the content type is the same `application/json`.
+fn openapi_document() -> &'static str {
+    static DOCUMENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DOCUMENT.get_or_init(|| {
+        serde_json::to_string(&super::openapi_router().split_for_parts().1)
+            .expect("the OpenAPI document serializes (the spec-snapshot test proves it)")
+    })
+}
+
 /// Serves the generated OpenAPI 3.1 document. The spec is rebuilt from the same
 /// route registration used by `router`, so it always matches what is served.
+// Rendered ONCE per process now — see `openapi_document`. Deliberately a `//`
+// comment rather than a line added to the doc comment above: utoipa lifts that
+// text into the operation's `summary`, so every word of it is part of
+// `clients/openapi.json` and of every client generated from it. Re-wording a doc
+// comment here is a consumer-contract diff, which is not what this change is.
 #[utoipa::path(
     get,
     path = "/openapi.json",
     tag = "meta",
     responses((status = 200, description = "OpenAPI 3.1 document for this API"))
 )]
-pub(crate) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(super::openapi_router().split_for_parts().1)
+pub(crate) async fn openapi_json() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        openapi_document(),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod openapi_document_tests {
+    use super::openapi_document;
+
+    /// The anti-pattern: the handler rebuilt the whole `OpenApiRouter` and
+    /// re-serialized a 480 kB document on every request, on an unauthenticated
+    /// path. The document cannot change while the process runs, so the render
+    /// must happen once — and the bytes must still be exactly the router's own,
+    /// or `/openapi.json` and `clients/openapi.json` would describe different
+    /// APIs.
+    #[test]
+    fn the_document_is_rendered_once_and_is_still_the_routers_own() {
+        let first = openapi_document();
+        let second = openapi_document();
+        assert!(
+            std::ptr::eq(first, second),
+            "a second call re-rendered instead of reusing the cached document"
+        );
+        let fresh =
+            serde_json::to_string(&crate::routes::openapi_router().split_for_parts().1).unwrap();
+        assert_eq!(first, fresh, "the cached bytes drifted from the router");
+        assert!(first.starts_with("{\"openapi\":\"3."), "{}", &first[..32]);
+    }
+
+    /// A quick sanity bound on the thing that made this worth caching: the
+    /// document really is large enough that re-rendering it per request is not
+    /// free. Deliberately loose — it is a floor, not a snapshot.
+    #[test]
+    fn the_document_is_large_enough_that_per_request_rendering_was_not_free() {
+        assert!(
+            openapi_document().len() > 100_000,
+            "{} bytes",
+            openapi_document().len()
+        );
+    }
+
+    /// The measurement behind the change, kept runnable rather than quoted:
+    /// how long ONE full build+serialize takes — which is what the old handler
+    /// did per request, and what the new one does once. It runs in the normal
+    /// suite: one build is milliseconds, it asserts the full render succeeds,
+    /// and the number it prints is a measurement, never a threshold.
+    #[test]
+    fn report_one_full_render_cost() {
+        let start = std::time::Instant::now();
+        let bytes = serde_json::to_string(&crate::routes::openapi_router().split_for_parts().1)
+            .unwrap()
+            .len();
+        println!(
+            "one full openapi build+serialize: {:?} for {bytes} bytes",
+            start.elapsed()
+        );
+    }
 }
 
 #[utoipa::path(
     get,
     path = "/health",
     tag = "health",
-    responses((status = 200, description = "Service is up (`{\"status\":\"ok\"}`)"))
+    responses((status = 200, description = "Service is up (`{\"status\":\"ok\"}`)", body = crate::routes::dto::HealthResponse))
 )]
 pub(crate) async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
@@ -66,12 +154,51 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     let schedules = state.storage.list_schedules().await?;
     let mut out = String::new();
     out.push_str("# HELP pumper_jobs Jobs by status\n# TYPE pumper_jobs gauge\n");
-    for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
+    // `waiting` (N02) is listed so the gauge reads 0 rather than being ABSENT on
+    // a fleet where nothing is parked — an absent series is indistinguishable
+    // from a scrape failure, and "how many jobs are blocked on a human right
+    // now" is the number this feature exists to make answerable.
+    for status in [
+        "queued",
+        "running",
+        "waiting",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ] {
         let n = counts
             .iter()
             .find(|(s, _)| s == status)
             .map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
+    }
+    // N18: the executor plane, by liveness state. Emitted only when the plane is
+    // enabled — a series that is always `0` on the 99% of installs that never
+    // run an executor is noise, and its ABSENCE there is the honest signal.
+    // Every state label is present when it IS enabled, for the same reason
+    // `pumper_jobs{status="waiting"}` is: a missing series and a scrape failure
+    // look identical.
+    if state.config.executors.servable() {
+        let executors = state.storage.list_executors().await?;
+        let now = chrono::Utc::now();
+        let offline_after = state.config.executors.offline_after_secs;
+        out.push_str(
+            "# HELP pumper_executors Outbound executors by liveness state\n\
+             # TYPE pumper_executors gauge\n",
+        );
+        for want in ["busy", "idle", "offline"] {
+            let n = executors
+                .iter()
+                .filter(|e| {
+                    crate::executors::executor_state(
+                        crate::executors::age_secs(&e.last_poll_at, now),
+                        e.running,
+                        offline_after,
+                    ) == want
+                })
+                .count();
+            out.push_str(&format!("pumper_executors{{state=\"{want}\"}} {n}\n"));
+        }
     }
     // Permanent failures per app. DB-derived (current `failed` row count per app),
     // so not strictly monotonic — a retried job leaves the failed set.
@@ -146,6 +273,13 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     // `fetch_chokepoint.rs`'s EXPECTED_RAW_ENGINE_CALLS rather than an exemption.
     out.push_str(&egress_metrics(state.engines.fetch.egress_counters()));
     out.push_str(&checkpoint_metrics(state.checkpoint_failures.totals()));
+    // Mesh (N16). Emitted at zero on a node with no `[[peer]]` rows, like the
+    // egress counters above. A read failure degrades to the zero totals rather
+    // than failing `/metrics` — a scrape endpoint that 500s takes every other
+    // series down with it.
+    out.push_str(&crate::routes::mesh::mesh_metrics_lines(
+        &crate::routes::mesh::MeshTotals::collect(&state).await,
+    ));
     out.push_str(&claim_failure_metrics(
         state
             .claim_failures
@@ -263,10 +397,11 @@ fn checkpoint_metrics(failures: crate::progress::CheckpointFailures) -> String {
 /// series are different answers.
 fn claim_failure_metrics(total: u64) -> String {
     format!(
-        "# HELP pumper_worker_claim_failures_total Job-claim attempts that failed (store          unreachable or erroring). Process-lifetime, reset on restart. The matching log lines are          rate-limited; this count is not
-         # TYPE pumper_worker_claim_failures_total counter
-         pumper_worker_claim_failures_total {total}
-"
+        "# HELP pumper_worker_claim_failures_total Job-claim attempts that failed (store \
+         unreachable or erroring). Process-lifetime, reset on restart. The matching log lines \
+         are rate-limited; this count is not\n\
+         # TYPE pumper_worker_claim_failures_total counter\n\
+         pumper_worker_claim_failures_total {total}\n"
     )
 }
 
@@ -466,10 +601,11 @@ fn queue_age_metrics(ages: &pumper_core::QueueAges) -> String {
 /// as designed.
 fn held_by_target_metric(held: i64) -> String {
     format!(
-        "# HELP pumper_jobs_held_by_target Due queued jobs whose target_key is already held by a          running job. Subtract from pumper_jobs{{status=\"queued\"}} before reading the rest as          worker backlog: these are waiting on the run in front of them, not on capacity
-         # TYPE pumper_jobs_held_by_target gauge
-         pumper_jobs_held_by_target {held}
-"
+        "# HELP pumper_jobs_held_by_target Due queued jobs whose target_key is already held by a \
+         running job. Subtract from pumper_jobs{{status=\"queued\"}} before reading the rest as \
+         worker backlog: these are waiting on the run in front of them, not on capacity\n\
+         # TYPE pumper_jobs_held_by_target gauge\n\
+         pumper_jobs_held_by_target {held}\n"
     )
 }
 
@@ -589,25 +725,59 @@ fn maintenance_metrics(
 fn activity_metrics(reading: u64, pool_saturated: bool) -> String {
     let mut out = String::new();
     out.push_str(
-        "# HELP pumper_store_activity_gauge In-flight foreground work: HTTP requests being          handled plus jobs currently running. The input to the quiet-window maintenance gate          — a pass runs only when this reads 0 and the minimum interval has elapsed
-         # TYPE pumper_store_activity_gauge gauge
-",
+        "# HELP pumper_store_activity_gauge In-flight foreground work: HTTP requests being \
+         handled plus jobs currently running. The input to the quiet-window maintenance gate \
+         — a pass runs only when this reads 0 and the minimum interval has elapsed\n\
+         # TYPE pumper_store_activity_gauge gauge\n",
     );
-    out.push_str(&format!(
-        "pumper_store_activity_gauge {reading}
-"
-    ));
+    out.push_str(&format!("pumper_store_activity_gauge {reading}\n"));
     out.push_str(
-        "# HELP pumper_store_pool_saturated 1 when the most recent connection acquisition on          any measured family waited past its slow line. Counts as busy for the maintenance          gate: a saturated pool is demand for the machine that the activity gauge cannot          see
-         # TYPE pumper_store_pool_saturated gauge
-",
+        "# HELP pumper_store_pool_saturated 1 when the most recent connection acquisition on \
+         any measured family waited past its slow line. Counts as busy for the maintenance \
+         gate: a saturated pool is demand for the machine that the activity gauge cannot see\n\
+         # TYPE pumper_store_pool_saturated gauge\n",
     );
     out.push_str(&format!(
-        "pumper_store_pool_saturated {}
-",
+        "pumper_store_pool_saturated {}\n",
         pool_saturated as u8
     ));
     out
+}
+
+/// Every line of a rendered exposition block that is malformed, with the reason.
+///
+/// Two shapes, and both come from the SAME authoring mistake: a `\`
+/// line-continuation dropped from a multi-line string literal. Rust then keeps
+/// the newline and the source indentation, so the block ships as
+///
+/// ```text
+/// # HELP pumper_x ... (store          unreachable ...
+///          # TYPE pumper_x counter
+///          pumper_x 150
+/// ```
+///
+/// — a HELP sentence with a ten-space hole in the middle of it (that string is
+/// served to every scraper and rendered verbatim in metric-metadata views), and
+/// `# TYPE`/sample lines carrying nine leading spaces. Prometheus's own text
+/// parser skips leading blanks, so nothing ever went red; an OpenMetrics-strict
+/// reader does not, and the HELP text is simply wrong either way.
+///
+/// The reason a `contains(..)` assertion cannot catch this is that
+/// `"pumper_x 150\n"` is a substring of `"         pumper_x 150\n"` — every
+/// existing test in this file passed against the malformed body. So the check
+/// has to be about the LINE, not about a substring of it.
+#[cfg(test)]
+fn malformed_exposition_lines(body: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for line in body.lines().filter(|l| !l.is_empty()) {
+        if line.starts_with([' ', '\t']) {
+            bad.push(format!("leading whitespace: {line:?}"));
+        }
+        if line.trim_start().contains("  ") {
+            bad.push(format!("interior double space: {line:?}"));
+        }
+    }
+    bad
 }
 
 /// Renders the webhook-delivery block of `/metrics` from one health snapshot.
@@ -1079,6 +1249,118 @@ mod webhook_metric_tests {
         assert_eq!(body.matches("# HELP ").count(), 1);
     }
 
+    /// The anti-pattern: three blocks lost the `\` line-continuation from their
+    /// multi-line literal, so `/metrics` shipped HELP sentences with ten-space
+    /// holes in them (`(store          unreachable or erroring)`) and `# TYPE` /
+    /// sample lines indented by nine spaces. Every `contains(..)` assertion in
+    /// this file passed the whole time, because the malformed line CONTAINS the
+    /// well-formed substring.
+    ///
+    /// Covers every pure renderer in this module. The blocks still inlined in
+    /// [`metrics`] itself are covered by the source guard below, which is what
+    /// catches a new one authored the same way.
+    #[test]
+    fn rendered_metric_lines_have_no_lost_line_continuations() {
+        let mut body = String::new();
+        body.push_str(&webhook_metrics(&DeliveryHealth::default(), at(0)));
+        body.push_str(&egress_metrics(
+            &pumper_core::fetcher::EgressCounters::default(),
+        ));
+        body.push_str(&checkpoint_metrics(
+            crate::progress::CheckpointFailures::default(),
+        ));
+        body.push_str(&claim_failure_metrics(150));
+        body.push_str(&store_op_metrics(&instrument_with_traffic().snapshot()));
+        body.push_str(&queue_age_metrics(&pumper_core::QueueAges::default()));
+        body.push_str(&store_size_metrics(&pumper_core::StoreSize::default()));
+        body.push_str(&maintenance_metrics(&pass_counts(
+            &pumper_core::StoreInstrument::new(),
+        )));
+        body.push_str(&activity_metrics(3, true));
+        assert!(
+            super::malformed_exposition_lines(&body).is_empty(),
+            "{:#?}",
+            super::malformed_exposition_lines(&body)
+        );
+        // The checker really does bite — a body carrying the exact defect it was
+        // written for is reported on BOTH of its shapes, and the well-formed
+        // substring a `contains(..)` would have matched is present throughout.
+        let seeded = "# HELP pumper_x a sentence with          a hole\n         # TYPE pumper_x counter\n         pumper_x 1\n";
+        assert!(
+            seeded.contains("pumper_x 1\n"),
+            "a contains() assertion is blind to this"
+        );
+        let bad = super::malformed_exposition_lines(seeded);
+        assert_eq!(bad.len(), 3, "{bad:#?}");
+        assert_eq!(
+            bad.iter()
+                .filter(|b| b.starts_with("leading whitespace"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            bad.iter()
+                .filter(|b| b.starts_with("interior double space"))
+                .count(),
+            1
+        );
+    }
+
+    /// The blocks `metrics` pushes inline never pass through a renderer, so the
+    /// only thing that can police them is their source. Restricted to lines that
+    /// actually carry exposition text (`# HELP` / `# TYPE` / a `pumper_` series)
+    /// so ordinary code and alignment cannot false-positive, and rooted at
+    /// `CARGO_MANIFEST_DIR` like this crate's other source guards.
+    ///
+    /// Leading indentation is stripped first: inside a correctly `\`-continued
+    /// literal the SOURCE line is indented and the OUTPUT line is not, so only
+    /// an interior run of spaces is evidence of a lost continuation.
+    ///
+    /// Test modules are skipped by SPAN (`#[cfg(test)]` to the next column-0
+    /// `}`), not by truncating at the first one: this module puts `list_apps`
+    /// *after* its test block, so a truncating scan would silently stop covering
+    /// the second half of the file.
+    #[test]
+    fn no_metric_literal_in_this_module_has_lost_its_continuation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/meta.rs");
+        let source = std::fs::read_to_string(&path).expect("read this module");
+        let mut in_test = false;
+        let production: Vec<&str> = source
+            .lines()
+            .filter(|l| {
+                if *l == "#[cfg(test)]" {
+                    in_test = true;
+                    return false;
+                }
+                if in_test {
+                    if *l == "}" {
+                        in_test = false;
+                    }
+                    return false;
+                }
+                !l.trim_start().starts_with("//")
+            })
+            .collect();
+        assert!(
+            production.len() > 100,
+            "the truncation ate the module this guard is supposed to police"
+        );
+        let offenders: Vec<&str> = production
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                (t.contains("# HELP") || t.contains("# TYPE") || t.contains("pumper_"))
+                    && t.contains("  ")
+            })
+            .copied()
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a metric literal carries an interior double space — a `\\` line-continuation was \
+             dropped, and the served HELP/TYPE text is malformed: {offenders:#?}"
+        );
+    }
+
     /// Clock skew (a row stamped in the future) must not render a negative age,
     /// which Prometheus would happily graph as a spike downward.
     #[test]
@@ -1107,8 +1389,8 @@ pub(crate) struct AppsQuery {
     tag = "apps",
     params(AppsQuery),
     responses(
-        (status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params, cost_class, output_shape, has_params_schema}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these); `cost_class` is free|metered|claude. When `[plugins] app_dir` is set, discovered dynamic WASM apps are appended with `dynamic: true, runnable: false` and a `reason` string — read-only manifests, not enqueueable. With `?format=tools`: `{tools: [..]}` — each app as an MCP tool definition (`inputSchema` = the app's params JSON Schema, permissive `{type: object}` when undeclared), directly consumable as agent tool definitions; dynamic apps are excluded there because a tool an agent cannot call is a trap."),
-        (status = 400, description = "Unknown `format`", body = Object),
+        (status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params, cost_class, output_shape, has_params_schema}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these); `cost_class` is free|metered|claude. When `[plugins] app_dir` is set, discovered dynamic WASM apps are appended with `dynamic: true, runnable: false` and a `reason` string — read-only manifests, not enqueueable. With `?format=tools`: `{tools: [..]}` — each app as an MCP tool definition (`inputSchema` = the app's params JSON Schema, permissive `{type: object}` when undeclared), directly consumable as agent tool definitions; dynamic apps are excluded there because a tool an agent cannot call is a trap.", body = crate::routes::dto::AppsResponse),
+        (status = 400, description = "Unknown `format`", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_apps(
@@ -1157,11 +1439,30 @@ pub(crate) async fn list_apps(
                     })
                 })
                 .collect();
-            // Dynamic WASM apps (M28 v1): appended after the compiled-in apps,
-            // carrying `dynamic: true, runnable: false` + a reason — visible so
-            // an operator can see what `[plugins] app_dir` picked up, but never
-            // enqueueable (the enqueue handler rejects them with the same reason).
-            let mut apps = apps;
+            // Dynamic WASM apps: appended after the compiled-in apps, each
+            // carrying `dynamic: true` plus either the provenance of a
+            // registered component (`runnable: true`, `world`, `module_sha256`)
+            // or the reason it is not one — visible so an operator can see what
+            // `[plugins] app_dir` picked up either way.
+            //
+            // A RUNNABLE dynamic app is in the registry too (that is what makes
+            // it enqueueable), so its plain registry-derived entry is dropped
+            // here in favour of the richer dynamic one: listing the same app
+            // twice, once with and once without its module hash, is how a
+            // listing starts disagreeing with itself.
+            let dynamic_names: std::collections::HashSet<&str> = state
+                .dynamic_apps
+                .iter()
+                .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+                .collect();
+            let mut apps: Vec<_> = apps
+                .into_iter()
+                .filter(|a| {
+                    !a.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|n| dynamic_names.contains(n))
+                })
+                .collect();
             apps.extend(state.dynamic_apps.iter().cloned());
             Ok(Json(json!({ "apps": apps })))
         }

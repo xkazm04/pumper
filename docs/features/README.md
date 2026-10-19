@@ -16,12 +16,14 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Events & webhooks | [events-webhooks.md](events-webhooks.md) | `crates/server/src/{webhook,events}.rs`; delivery-log routes live in `routes/triggers.rs`, the `pumper_webhook_*` gauges in `routes/meta.rs` |
 | Reactive pipelines (triggers) | [triggers.md](triggers.md) | `crates/server/src/triggers.rs`, migration 0014 |
 | Trigger plugins (sandboxed WASM hooks) | [trigger-plugins.md](trigger-plugins.md) | `crates/server/src/triggers.rs`, `crates/engine-wasm/`, `plugins-src/{trigger-gate,delta-slim}/` |
+| Workflow runs (declared multi-step DAGs) | [workflows.md](workflows.md) | `crates/server/src/workflow.rs`, `crates/server/src/routes/workflows.rs`, migration 0051 |
 | HTTP API | [http-api.md](http-api.md) | `crates/server/src/routes/` |
+| Identity & tenancy (scoped API keys) | [auth.md](auth.md) | `crates/server/src/auth.rs`, `crates/server/src/routes/principals.rs`, migration 0048 |
 | Observability (logging, error reporting, metrics) | [observability.md](observability.md) | `crates/server/src/main.rs`, `crates/server/src/routes/health.rs` |
 | Data-source catalog | [catalog.md](catalog.md) | `catalog/`, `crates/core/src/catalog.rs` |
-| DataHub metadata emitter | [datahub.md](datahub.md) | `crates/server/src/datahub.rs` |
-| TypeScript consumer SDK (`@pumper/sync`) | [sdk-typescript.md](sdk-typescript.md) | `clients/typescript/` |
-| Dataset peering (mirror another node) | [peering.md](peering.md) | `crates/apps/peer/`, consuming `crates/server/src/routes/datasets.rs` § changes feed |
+| Lineage bridge (DataHub + OpenLineage) | [datahub.md](datahub.md) | `crates/server/src/datahub.rs`, `crates/server/src/lineage.rs` |
+| Consumer SDKs and CLI (`@pumper/sync`, `pumper-sync`, `@pumper/cli`) | [sdks.md](sdks.md) | `clients/` |
+| Pumper mesh (signed peer sync of datasets, host weather and recipes) | [mesh.md](mesh.md) | `crates/apps/peer/`, `crates/server/src/node.rs`, `crates/server/src/routes/mesh.rs`, consuming `crates/server/src/routes/datasets.rs` § changes feed + manifest |
 | App fleet & domain datasets | [apps.md](apps.md) | `crates/apps/*` |
 
 ## Operations

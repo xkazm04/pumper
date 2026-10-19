@@ -101,7 +101,7 @@ pub(crate) struct ProposalsQuery {
     path = "/provisioner/proposals",
     tag = "provisioner",
     params(ProposalsQuery),
-    responses((status = 200, description = "Dual-mode: bare `[ProposalSummary]` array, or `{items, next_cursor}` when `cursor` is present. Each summary: `key, prompt, status` (planned|validated|failed|promoted), `expired` (computed against `[provisioner] proposal_max_age_secs`; only a still-`planned` proposal can be flagged), the frozen compile-time `verdict`/`accepted`, `catalog_confidence`, the sampled `engine`/`url`, `intended_dataset`, and `age_secs`."))
+    responses((status = 200, description = "Dual-mode: bare `[ProposalSummary]` array, or `{items, next_cursor}` when `cursor` is present. Each summary: `key, prompt, status` (planned|validated|failed|promoted), `expired` (computed against `[provisioner] proposal_max_age_secs`; only a still-`planned` proposal can be flagged), the frozen compile-time `verdict`/`accepted`, `catalog_confidence`, the sampled `engine`/`url`, `intended_dataset`, and `age_secs`.", body = crate::routes::dto::ProposalsResponse))
 )]
 pub(crate) async fn list_proposals(
     State(state): State<AppState>,
@@ -161,9 +161,9 @@ fn fresh_validate_request(url: &str) -> FetchRequest {
     tag = "provisioner",
     params(("key" = String, Path, description = "Proposal key")),
     responses(
-        (status = 200, description = "`{key, status, validation}` — `status` is `validated` or `failed`; `validation` carries the fresh `sample` (fetch tier, body field, byte count, per-tier trace) and the `dry_run` report (same shape as the compile-time `sample_stats`), plus `checked_at`."),
-        (status = 404, description = "No proposal with this key", body = Object),
-        (status = 400, description = "The stored rule_set no longer parses, the catalog_row has no url, the fresh fetch failed, or it yielded no sampleable body", body = Object),
+        (status = 200, description = "`{key, status, validation}` — `status` is `validated` or `failed`; `validation` carries the fresh `sample` (fetch tier, body field, byte count, per-tier trace) and the `dry_run` report (same shape as the compile-time `sample_stats`), plus `checked_at`.", body = crate::routes::dto::ProposalValidation),
+        (status = 404, description = "No proposal with this key", body = crate::routes::dto::ErrorEnvelope),
+        (status = 400, description = "The stored rule_set no longer parses, the catalog_row has no url, the fresh fetch failed, or it yielded no sampleable body", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn validate_proposal(
@@ -237,10 +237,10 @@ pub(crate) async fn validate_proposal(
     tag = "provisioner",
     params(("key" = String, Path, description = "Proposal key")),
     responses(
-        (status = 200, description = "`{key, status: \"promoted\", catalog_toml}` — the fragment to paste into catalog/data-sources.toml after finishing ONBOARDING.md Path B (app crate + registry entry). Writes nothing to the catalog file itself."),
-        (status = 404, description = "No proposal with this key", body = Object),
-        (status = 409, description = "The proposal's best evidence says its rule set does not bind (a failed re-validation, or a rejected compile-time verdict that was never re-validated) — promoting it would hand out a fragment for a draft already known not to work", body = Object),
-        (status = 400, description = "The stored catalog_row no longer parses", body = Object),
+        (status = 200, description = "`{key, status: \"promoted\", catalog_toml}` — the fragment to paste into catalog/data-sources.toml after finishing ONBOARDING.md Path B (app crate + registry entry). Writes nothing to the catalog file itself.", body = crate::routes::dto::ProposalPromotion),
+        (status = 404, description = "No proposal with this key", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "The proposal's best evidence says its rule set does not bind (a failed re-validation, or a rejected compile-time verdict that was never re-validated) — promoting it would hand out a fragment for a draft already known not to work", body = crate::routes::dto::ErrorEnvelope),
+        (status = 400, description = "The stored catalog_row no longer parses", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn promote_proposal(

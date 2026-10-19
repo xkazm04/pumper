@@ -1,11 +1,11 @@
-# DataHub bridge (metadata emitter + governance pull)
+# Lineage bridge (DataHub emitter + governance pull + OpenLineage)
 
-Two directions over one connection to a [DataHub](https://datahub.com) instance:
+Two directions over one connection to a [DataHub](https://datahub.com) instance, and — since N24 — a **second, vendor-neutral writer** that speaks [OpenLineage](https://openlineage.io) to Marquez, Dagster, Airflow, Atlan or OpenMetadata. Both writers render one internal model; see [Vendor-neutral lineage](#vendor-neutral-lineage-lineage).
 
 1. **Push** — a **metadata shadow** of the dataset store: dataset entities, inferred schema, table- and column-level lineage, pipeline topology (schedules/runs), and per-run freshness events. Record data never leaves the local store; only metadata (a few KB of JSON per run) is emitted, over DataHub's plain OpenAPI ingestion surface (`POST {gms}/openapi/entities/v1/`, bearer token; no Python SDK, no Kafka).
 2. **Pull** — an opt-in **governance actuator**: DataHub state (deprecation, `cost:pause` tags, failing assertions) is read back and *acts on this Pumper instance* — disabling schedules, zeroing budgets, enqueueing syncs. This half writes to your job queue; read [Governance actuator](#governance-actuator-govern--true) before enabling it.
 
-Implementation: `crates/server/src/datahub.rs`; config: `[datahub]` in `crates/core/src/config.rs`; wire tests: `crates/server/src/e2e/datahub_bridge.rs`.
+Implementation: `crates/server/src/datahub.rs` (the DataHub writer + governance) and `crates/server/src/lineage.rs` (the model + the OpenLineage writer); config: `[datahub]` and `[lineage]` in `crates/core/src/config.rs`; wire tests: `crates/server/src/e2e/datahub_bridge.rs`.
 
 ## Config (`[datahub]`, disabled by default)
 
@@ -37,7 +37,7 @@ Per dataset:
   - *trigger edges* (`emit_flows`, on `POST /datahub/sync`): every enabled dataset trigger becomes source-app → target-app dataset edges, so the reactive DAG renders as a graph.
 
   Because aspect upserts replace wholesale, the emitter first reads the dataset's existing upstreams back (`GET /openapi/v3/entity/dataset/{urn}?aspects=upstreamLineage`) and emits the union, so a multi-writer dataset accumulates one edge per source instead of each writer wiping the others.
-- **`upstreamLineage.fineGrainedLineages`** (column level, `emit_flows`, job emissions) — emitted **only** when the job's params carry a declarative `rules` RuleSet, which makes field provenance mechanical: one entry per column with the rule as `transformOperation` (`css:h1`, `regex:\d+#1`, `json:/a/b`, `each:.card` + `parent.child` for nested fields) and `upstreamType: NONE` (the upstream is the fetched page, not a dataset — claiming otherwise would be a lie). Apps whose extraction is code, not rules, are honestly skipped.
+- **`upstreamLineage.fineGrainedLineages`** (column level, `emit_flows`, job emissions) — emitted **only** when the job's params carry a declarative `rules` RuleSet, which makes field provenance mechanical: one entry per column with the rule as `transformOperation` (`css:h1`, `regex:\d+#1`, `json:/a/b`, `each:.card` + `parent.child` for nested fields) and `upstreamType: NONE` (the upstream is the fetched page, not a dataset — claiming otherwise would be a lie). Under `[lineage] emit_sources` the upstream IS modelled and each entry becomes `upstreamType: FIELD_SET` pointing at the source's `schemaField`. Apps whose extraction is code, not rules, are honestly skipped.
 
 Per pipeline (`emit_flows`):
 
@@ -50,6 +50,7 @@ Per pipeline (`emit_flows`):
 - **`POST /datahub/sync`** — one-shot backfill walking `list_all_datasets()` (entity + properties + profile/schema, plus schedule flows and trigger lineage under `emit_flows`). Returns `{kind: "sync", at, ok, datasets, flows, trigger_edges, entities?|error?}`. **409** while `[datahub]` is disabled, **and 409 while another full sync is already running** (one at a time: the backfill is idempotent, so rejecting beats queueing, and two parallel lineage read-merges can lose edges). Run once after connecting a fresh instance.
 - **Governance poll** (`govern = true`), piggybacked on the scheduler tick — see below.
 - **`GET /datahub/status`** — config view (`enabled`, `gms_url`, `env`, `token_set`, `emit_schema`, `emit_profile`, `emit_flows`) plus:
+  - `lineage` — `{namespace, emit_sources, emit_quality, writers[]}`. One entry per writer (`datahub`, `openlineage`) with `enabled`, `url`, and its **own** `emissions` block. Deliberately not merged: two writers double the failure surface, and a single aggregate is exactly how a healthy DataHub would hide a Marquez that has been refusing every post for a day.
   - `emissions.ok` / `emissions.failed` — monotonic counters since boot, so a *flapping* bridge is visible without a log dive.
   - `emissions.last_success` / `emissions.last_error` — kept **separately**: a success seconds after a failure no longer erases it (the old single-slot `last_emission` did, which made a bridge failing half its emissions look healthy).
   - `emissions.last` — the newest entry of either kind; mirrored as the back-compat top-level `last_emission`.
@@ -143,6 +144,50 @@ Now the pause set has a shelf life. When no poll has succeeded for `govern_pause
 - `govern_pause_max_stale_secs = 0` opts out (freeze until governance can see again).
 - Direction of the trade: expiring is fail-open on **spend**, which is the same direction the module already leaned (a restart cleared the pause set anyway, in-memory as it is). Keeping a $0 budget indefinitely on the strength of a tag nobody can re-read is enforcement without observation; a paused app that resumes normal budgets still runs its own configured budget cap.
 
+## Vendor-neutral lineage (`[lineage]`)
+
+The emitter used to build DataHub's v1 ingestion envelope *directly* at every call site, so supporting a second catalog meant writing a second emitter that re-derived the same facts from the same tables. It now gathers one **`LineageEvent`** — run, job, inputs, outputs, facets, in nobody's vocabulary — and each writer is a pure render of it:
+
+- `DatahubEntities: From<&LineageEvent>` — the entity list above, aspect for aspect and in the same order (pinned by whole-value golden tests in `datahub.rs`, written *before* the extraction so it is provably a pure refactor).
+- `lineage::run_event` — an OpenLineage 2.x `RunEvent`.
+
+### Config
+
+| key | default | what |
+| --- | --- | --- |
+| `openlineage_url` | unset | Base URL of an OpenLineage HTTP receiver (Marquez: `http://localhost:5000`). Unset means the writer is off and posts nothing. The standard transport path `/api/v1/lineage` is appended unless the URL already ends in `/lineage`. |
+| `namespace` | `pumper` | OpenLineage job/dataset namespace for this node. |
+| `api_key` | unset | Bearer token; falls back to `OPENLINEAGE_API_KEY` from the environment / `.env`. |
+| `emit_sources` | `false` | Model each catalog `[[source]]` as an external upstream: an OpenLineage input in the `web` namespace, a DataHub dataset URN on `urn:li:dataPlatform:web`, and a real upstream for column lineage. |
+| `emit_quality` | `false` | Push Pumper's own verdicts: contract verdicts as assertions, extraction-health state + trust tier as tags. |
+
+**Every key is off by default and the defaults are load-bearing.** With no `[lineage]` section the DataHub emitter produces byte-for-byte the entity set it produced before N24.
+
+### The RunEvent
+
+`eventType` is `COMPLETE` (from the fan-out's success hook) or `FAIL` (from `finalize`, when a job exhausts its attempts). Facets:
+
+- **`schema`** — the same inferred field list as `schemaMetadata`.
+- **`columnLineage`** — one entry per column, the rule as `transformationDescription`, and the catalog source as the `inputFields` entry when `emit_sources` is on.
+- **`outputStatistics`** (output facet) — `rowCount` (new + changed), `newRows`, `changedRows`, `removedRows`, and `datasetRowCount` (**`null`** when the count read failed — a zero would be indistinguishable from an empty dataset).
+- **`dataQualityAssertions`** / **`tags`** (`emit_quality`).
+- **`pumper`** (custom) — `jobId`, `app`, `attempts`, `flowKind`, `scheduleId`, `triggerId`, `workflowRunId`, `rootId` (the N03 chain root, read from the jobs row), `costUsd` (the job's metered spend). Absent facts are `null`, never omitted, so a consumer can tell "not part of a chain" from "this build does not know about chains".
+- **`parent`** — present when the job carries a chain root, so a workflow's steps render as one story instead of N unrelated runs.
+- **`errorMessage`** — on `FAIL` only.
+
+`FAIL` is **OpenLineage-only**: a failed run refreshed no dataset, so writing DataHub aspects there would restate a successful run's shape with a failure's timestamp.
+
+### Quality push (`emit_quality`)
+
+The governance poll reads `health[].type == ASSERTIONS` back from DataHub — assertions somebody else wrote. This is the other half:
+
+- **Contract verdicts** (`[source.contract]`, evaluated at the worker's publish choke point) become one `pumper.data_contract` assertion per dataset: an OpenLineage `dataQualityAssertions` entry, and in DataHub an `assertion` entity with `assertionInfo` plus a timeseries `assertionRunEvent` (`SUCCESS`/`FAILURE`, violations as `nativeResults.message`, this run's job id as `runId`). The verdict map is keyed by `<app>/<dataset>` and overwritten by whichever run judged the pair last, so a verdict is published **only when it belongs to this run** — otherwise Pumper would stamp another job's verdict onto this run's assertion result.
+- **Extraction health + trust tier** become `health:<state>` and `trust:<tier>` tags (`globalTags` in DataHub, the `tags` facet in OpenLineage). `healthy` is stamped too: "we looked and it is fine" is a different fact from "nobody looked". The tag reports the ladder's `state`, not `enforced_state` — soak mode (`[resilience] enforce = false`) does not make a degraded source healthy, it only means nothing is gated on it.
+
+### Source entities (`emit_sources`)
+
+Each `[[source]]` in `catalog/data-sources.toml` becomes `urn:li:dataset:(urn:li:dataPlatform:web,<source id>,<env>)` with the row's `url`/`cadence`/`access`/`category` as custom properties (fields the row leaves blank are **not** stamped — an empty `cadence` means "not declared", and writing an empty string would put a fact-shaped blank into someone else's catalog), plus an OpenLineage input in the `web` namespace carrying a `dataSource` facet. A dataset is attributed to the row naming its exact `(app, dataset)` pair, falling back to the app's catch-all row.
+
 ## Verified against a live instance (quickstart v1.6, 2026-07-23)
 
 The v1 ingestion envelope accepts all emitted aspects **including the timeseries ones** (`operation`, `datasetProfile`) — no v3 route needed. Full backfill (15 datasets / 60 entities), per-run emission, and three-source accumulated lineage on `grants.unified` (`grants-gov` + `ca-grants` + `eu-sedia` → unified) all confirmed via GMS readback.
@@ -154,5 +199,9 @@ The v1 ingestion envelope accepts all emitted aspects **including the timeseries
 - Emitting all own-namespace datasets on success slightly over-claims freshness for apps whose runs deliberately touch only a subset of their datasets.
 - The lineage read-merge is not concurrency-safe across *writers* (two jobs finishing at once could interleave read-then-write on the same derived dataset). The full-sync overlap guard removes the sync-vs-sync case only.
 - A deprecation-driven schedule disable is not undone by un-deprecating (the preview and the audit trail make it visible; they do not reverse it).
-- External upstream sources (`catalog/data-sources.toml`) are not modeled as DataHub entities — lineage starts at Pumper's own datasets.
 - Column lineage requires a declarative RuleSet in job params; code-driven apps get table-level lineage only.
+- **No `START` event.** There is no emitter call site at job start — the only metadata hook on the success path is the fan-out's — and adding one would put a network post on the scrape permit's path. Consumers see `COMPLETE`/`FAIL` only, which still materialises the run; the builder is written and tested, the wiring is a worker change.
+- **The OpenLineage writer has not been verified against a live receiver.** The DataHub half was checked against a quickstart GMS (above); the RunEvent shape is proven only by golden tests. To verify: `docker run -p 5000:5000 marquezproject/marquez`, set `openlineage_url = "http://localhost:5000"`, run one job, and read the run back at `GET /api/v1/namespaces/pumper/jobs/<flow_id>/runs`.
+- A backfill (`POST /datahub/sync`) emits **no** OpenLineage event: a catalog sweep is not a run, and minting a synthetic run id for one would put a fiction in the run history.
+- Source entities are only as good as the catalog: a `[[source]]` row with no `app` (or an app with no row) contributes nothing, and column lineage falls back to `upstreamType: NONE`.
+- An `index_datasets` entry naming the job's **own** app for a dataset with no stored records no longer contributes an output edge (it previously contributed an edge to a dataset that had no entity).

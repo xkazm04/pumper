@@ -141,8 +141,13 @@ Zero runtime dependencies (global `fetch` + WebStreams; Node ≥ 20).
   `upsert_many` chunk (up to 500 revisions), not one revision. The watermark is
   now the keyset position `<created_at>|<rowid>`. See
   [docs/features/sdk-typescript.md](../../docs/features/sdk-typescript.md).
-- **Wire types are hand-written**, mirroring `crates/core/src/datasets.rs`. If
-  the record/revision shapes change, regenerate against `GET /openapi.json`.
+- **Wire types are generated**, not hand-written: `src/generated.ts` is
+  `openapi-typescript` output over `clients/openapi.json`, the document the
+  server's router produces, and `src/types.ts` aliases into it. Regenerate with
+  `just clients` (or `just openapi && just clients` if the server changed); CI
+  fails on drift. The two places the aliases deliberately differ from the
+  generator are `data`/`payload` (which stay your `T`) and `Required<>`, which
+  re-imposes the presence utoipa drops when it renders a Rust `Option<T>`.
 - **No built-in retry/backoff** on a failed page — a throw aborts the run. The
   pages that already landed keep their checkpoint, so the next run resumes at
   the failed page rather than at the top of the feed. Wrap `.run()` in your

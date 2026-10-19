@@ -69,6 +69,12 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // migration (with provenance stamping) is banked in the vault
     // (hackernews-teaches-current-idioms, r11). Reviewed, not endorsed.
     ("crates/apps/hackernews/src/lib.rs::ctx.engines.http", 1),
+    // Four small key-free codebook JSON documents, one GET each — the same
+    // one-fetch verbatim-rows shape as mpsv-ispv below, and cloned from it on
+    // purpose (N36). Nothing here is a rendered page: there is no thin-content
+    // escalation to make, and the run is judged all-or-nothing before any
+    // write, so the tiered ladder has nothing to contribute.
+    ("crates/apps/mpsv-ciselniky/src/lib.rs::ctx.engines.http", 1),
     ("crates/apps/mpsv-ispv/src/lib.rs::ctx.engines.http", 1),
     // ~188 MB bulk feed: `no_cache` + a per-request 300s timeout, plus an ARES
     // company lookup. Both are APIs.
@@ -77,6 +83,17 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // feed. The tiered `FetchRequest` carries no validator, so routing this
     // through `ctx.fetch` would silently drop the 304 path a mirror walks on.
     ("crates/apps/peer/src/lib.rs::ctx.engines.http", 1),
+    // Mesh pulls (N16): the two signed-bundle/manifest GETs the peer app makes
+    // against another node — `{peer}/host-weather/export`, `{peer}/recipes/export`
+    // (one shared helper) and `{peer}/datasets/{app}/{ds}/manifest`. Same class
+    // as the change-feed row above and for the same reasons, plus one of its
+    // own: these carry an `x-pumper-key` credential header for the peer's own
+    // `[auth]` layer, and `FetchRequest` has no header seam. They are also
+    // `no_cache` by construction — a bundle is live intelligence and the TTL
+    // cache must not serve yesterday's — so the tiered fetcher's cache and
+    // escalation ladder have nothing to contribute. Cost is $0 (the HTTP tier
+    // is free) and the streams are peer-to-peer control traffic, not scraping.
+    ("crates/apps/peer/src/mesh.rs::ctx.engines.http", 2),
     (
         "crates/apps/smlouvy-dump-watch/src/lib.rs::ctx.engines.http",
         1,
@@ -95,8 +112,13 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // would defeat the point of reading history.
     ("crates/apps/extractor/src/lib.rs::ctx.engines.http", 2),
     // A transact flow is a browser *session* (form fill, evidence capture),
-    // not a fetch; there is no `FetchOutcome` to meter or record.
-    ("crates/apps/transact/src/lib.rs::ctx.engines.browser", 1),
+    // not a fetch; there is no `FetchOutcome` to meter or record. TWO sites
+    // since N01: `transact` stages the flow and `commit` performs the approved
+    // irreversible action. Both still report through `ctx.meter`, so the run
+    // appears in the job's cost trail even though neither is a tiered fetch —
+    // and `commit` deliberately must NOT be routable through the fetch ladder,
+    // which would let a cache or an archive tier answer for a live submission.
+    ("crates/apps/transact/src/lib.rs::ctx.engines.browser", 2),
     // ── Jobless server-side callers: no AppContext exists ────────────────────
     // Materialized-view refresher: a background server task, not a job run.
     ("crates/server/src/refresher.rs::state.engines.http", 1),

@@ -1,5 +1,23 @@
 # CLAUDE.md
 
+> **This file is canonical.** Two `CLAUDE.md` files exist in this repo and they
+> do not overlap, so which one you opened used to decide what you knew. The
+> split is by audience, not by accident:
+>
+> | file | what only it has | authority |
+> | --- | --- | --- |
+> | **`CLAUDE.md`** (this one) | commands table, architecture map, the dependency rule, where every other doc is | **canonical** — read it first, and read it whole |
+> | [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | the `context-map.json` protocol, the same-session documentation-sync rule, the "bug fixes ship as extracted, tested functions" doctrine | **binding policy** — read it before editing code |
+>
+> Neither supersedes the other wholesale. On **policy** (doc-sync, context-map,
+> the shape a bug fix ships in) `.claude/CLAUDE.md` wins; on **facts** (commands,
+> architecture, layout) this file wins. Precedence past those two:
+> `ONBOARDING.md`, then `README.md`. When docs disagree with each other, trust
+> the code, then fix whichever doc is stale — in the same change.
+>
+> This is declared machine-readably as `guidance.canonical` in
+> [`.ai/manifest.yaml`](.ai/manifest.yaml); keep the two in sync.
+
 Pumper is a **local-first scraping service**: one Rust binary that exposes an HTTP
 API, runs a durable job queue on SQLite (WAL), and scrapes through pluggable
 engines. Cargo workspace, edition 2021, `resolver = "2"`.
@@ -27,7 +45,17 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just mcp-gate-parity` | the MCP gated-tool vocabulary as a gate: one spelling at all three sites; 0 clean / 2 drift / **3 cannot check**. `just inventory` only ever ran its fixtures |
 | `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
 | `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
-| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just pin-check` / `just pin-report` | the action-pinning register as a gate — every workflow `uses:` must be a 40-hex SHA or be registered in `.github/unpinned-actions.json` with a reason, an owner and a ceiling that only moves down; 0 clean / 2 findings / **3 cannot check** / the burn-down list |
+| `just protection-check` / `protection-report` / `protection-apply` | the branch-protection rule as a versioned declaration (`.github/branch-protection.json`) — the gate reconciles every required check against the jobs that produce it (matrix legs expanded) and fails when a workflow job is neither required nor excused; 0 clean / 2 findings / **3 cannot check**. `protection-apply` installs it via `gh` (needs admin). Part of `just inventory`, so `just ci` blocks on it |
+| `just sbom [--out F]` | a deterministic CycloneDX 1.6 SBOM from `Cargo.lock` — no network, no cargo, no dependencies. `just sbom-summary` for the counts |
+| `just supply-chain` | the pinning verdict plus both supply-chain fixture suites (the gates that prove pinning and the SBOM can still go red). Part of `just ci` |
+| `just hooks-install` / `hooks-status` / `hooks-uninstall` | point `core.hooksPath` at the versioned hooks in `.githooks/` (pre-commit `fmt-check` + `pin-check` + `protection-check`, `commit-msg` conventional shape, pre-push `lint`). **Auto-installed** by the private `_hooks-auto` prerequisite on the first `just` recipe you run in a clone — it only writes an UNSET `core.hooksPath`, `PUMPER_NO_HOOKS=1` opts out, `PUMPER_SKIP_HOOKS=1` / `--no-verify` bypass a single run |
+| `just commit-lint [args]` | the conventional-commit rule as a gate — the same `scripts/ci/commit-lint.mjs` the `commit-msg` hook delegates to and CI runs over a PR's commits. 0 clean / 2 findings / **3 cannot check**; `--report` prints the rule |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity supply-chain flake-check harness-test disk-check`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
+| `just openapi` | regenerates `clients/openapi.json` from the **router** (needs cargo). A `cargo test` asserts the committed copy matches, so skipping this fails the Rust suite rather than shipping stale clients |
+| `just clients` | regenerates every client's wire types from that document — TypeScript, the CLI's copy, and the Python TypedDicts. Node only, seconds |
+| `just clients-check` | the same generation, diffed against what is committed: exit 1 on drift. Part of `sdk`, so `just ci` blocks on it |
+| `just sdk` | `clients-check`, then typecheck + test `@pumper/sync`, `@pumper/cli`, and `pumper-sync` (Python) — what the `Consumer clients` CI job runs |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |
@@ -43,6 +71,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just doctor [port]` | `GET /datasets/doctor` — read-only store integrity report (server RUNNING) |
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
 | `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |
+| `just graph-indegree [port]` | `POST /derived` — creates the whole-corpus in-degree spec over `crawl/edges` (`group_by $.to_url` + `count` → `crawl/in_degree`); no new code, no job (server RUNNING). PageRank/drift is `mode: "graph"` — see `docs/features/crawling.md` |
 | `just datahub-preview [port]` | `GET /datahub/governance/preview` — what the DataHub governance poll would do right now, writes nothing (server RUNNING) |
 | `just quality` | the whole posture in one run — `node scripts/ci/quality-report.mjs`: every gate in `scripts/ci/gates.json` in its **non-mutating** mode, one table of gate / verdict / finding / **remedy**, and a footer counting clean / findings / **cannot-check** / not wired in four separate columns. Continues past every red row (`just ci` aborts at the first), exits with the worst verdict, mutates nothing. `--markdown` is what the CI step summary publishes |
 | `just smoke [args]` | `pwsh -File scripts/smoke.ps1` — boots the real binary against a scratch config, drives one real job end-to-end, and curls the doctor/retention/enforcement-preview/openapi/receipt surfaces; PASS/FAIL/SKIP per check, tears down after itself |
@@ -98,7 +127,8 @@ crates/
                    webhooks + triggers + SSE + datahub
 plugins-src/       example WASM plugins (Rust -> wasm32), built separately
 catalog/           data-sources.toml — the machine-readable pipeline registry
-clients/typescript @pumper/sync consumer SDK
+clients/          generated consumer plane: openapi.json (the contract) +
+                  typescript (@pumper/sync), python (pumper-sync), cli (@pumper/cli)
 ```
 
 **Dependency rule (README.md §Architecture):** apps depend only on `core` (plus
@@ -125,6 +155,11 @@ Do not let a hard-won fact live only in the transcript.
   the `context-map.json` protocol, the same-session documentation-sync rule, and
   the "bug fixes ship as extracted, tested functions" doctrine. Read it before
   editing code. Not duplicated here.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how a change gets from a working tree
+  into `master`: setup and the auto-installed hooks, the verify loop and the
+  0/2/**3-is-not-a-pass** exit-code convention, the commit rule, the required
+  checks by their exact names, branch protection, and the four edits that add a
+  second maintainer.
 - **[ONBOARDING.md](ONBOARDING.md)** — the agent-facing contract: engine choice,
   extension seams, invariants (§7), verification loop (§8), the continuous-
   development charter (§9), the catalog rule (§10).

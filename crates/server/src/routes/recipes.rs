@@ -6,16 +6,22 @@
 //! (`AppContext::xray`, `pumper_core::recipes`) and stay `state: "candidate"`
 //! until a successful replay proves them. The fetcher's pre-HTTP "api_recipe"
 //! tier that consumes them IS wired (`Fetcher::try_recipe`, opt-in via
-//! `[recipes] enabled` or `FetchRequest.use_recipes`). What is NOT wired is
-//! discovery: no app calls `xray` yet, so this table stays empty until a
-//! discovery caller ships.
+//! `[recipes] enabled`, `[fetcher] xray` or `FetchRequest.use_recipes`).
+//!
+//! The discovery caller ships with N14: the `extractor` runs the heuristic over
+//! the JSON calls an *escalated* render observed, scored against the records it
+//! extracted from that same page (`[fetcher] xray`, default OFF — with it off
+//! nothing captures and this table stays empty).
 //!
 //! ## Read by default, writes explicit and gated
 //!
-//! The list is the read surface and it now shows the *strikes* — `state`,
-//! `consecutive_failures`, `last_failure_at` — because an operator who can see
-//! that a recipe is failing is the only one who can act on it. The two actions
-//! are separate verbs on separate paths:
+//! The list is the read surface and it shows the *strikes* — `state`,
+//! `consecutive_failures`, `last_failure_at` — and the last replay verdict —
+//! `validation_reason`, `validated_at` — because an operator who can see that a
+//! recipe is failing, and why, is the only one who can act on it. A candidate
+//! nothing has tried yet (`validation_reason: null`) reads differently from one
+//! that was tried and refused. The two actions are separate verbs on separate
+//! paths:
 //!
 //! - `POST /recipes/{id}/retire` — take it out of selection now, without
 //!   waiting for `[recipes] retire_after` live strikes to accumulate.
@@ -27,15 +33,21 @@
 //! costs a fetch nothing (it is invisible to `best_for_host`) while its strike
 //! count survives as the evidence for the revive decision.
 
+// One implementation of the bundle shape, in core, shared with the puller that
+// consumes it (`app-peer`). Two copies of "what a recipe looks like on the wire"
+// is how an export and an import drift apart without either side changing.
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use pumper_core::mesh::{exportable_recipe, importable_recipe, open_envelope, SCHEMA_RECIPES_V1};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::IntoParams;
 
 use pumper_core::recipes::RecipeState;
 
 use crate::routes::error::ApiError;
+use crate::routes::mesh::trust_for;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -81,8 +93,8 @@ fn parse_state_filter(raw: Option<&str>) -> Result<Option<RecipeState>, ApiError
     responses(
         (status = 200, description = "`{recipes: [{id, host, url_template, params, json_paths, \
             score, validated, state, consecutive_failures, last_failure_at, retired_at, \
-            discovered_at, last_seen_at}]}`"),
-        (status = 400, description = "Unknown `state` value", body = Object),
+            validation_reason, validated_at, discovered_at, last_seen_at}]}`", body = crate::routes::dto::RecipeListResponse),
+        (status = 400, description = "Unknown `state` value", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_recipes(
@@ -100,6 +112,152 @@ pub(crate) async fn list_recipes(
     Ok(Json(json!({ "recipes": recipes })))
 }
 
+// ── mesh export / import (N16) ──────────────────────────────────────────────
+
+/// Ceiling on recipes carried in one bundle. Host-level intelligence, not a
+/// data channel — the same rule the weather bundle follows.
+const MAX_RECIPE_BUNDLE: usize = 5_000;
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub(crate) struct RecipeExportQuery {
+    /// Export only recipes a local replay has PROVEN (`validated = true`).
+    /// Default true: an unproven candidate is this node's guess, and shipping
+    /// guesses around a fleet multiplies them instead of the knowledge.
+    #[serde(default = "default_validated_only")]
+    validated_only: bool,
+    /// Max recipes in the bundle (default 500, cap 5000).
+    limit: Option<i64>,
+}
+
+fn default_validated_only() -> bool {
+    true
+}
+
+/// Exports discovered API recipes as a signed mesh bundle.
+#[utoipa::path(
+    get,
+    path = "/recipes/export",
+    tag = "recipes",
+    params(RecipeExportQuery),
+    responses((status = 200, description = "Signed envelope `{schema: \"pumper.recipes/1\", \
+        node_id, legacy_id, generated_at, sig, payload: {entries: [{host, url_template, params, \
+        json_paths, score, validated_at_origin}]}}`.", body = crate::routes::dto::SignedBundle))
+)]
+pub(crate) async fn export_recipes(
+    State(state): State<AppState>,
+    Query(query): Query<RecipeExportQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query
+        .limit
+        .unwrap_or(500)
+        .clamp(1, MAX_RECIPE_BUNDLE as i64);
+    let rows = state.storage.recipes().list(None, None, limit).await?;
+    let entries: Vec<Value> = rows
+        .iter()
+        // A retired recipe is out of selection here (0046 lifecycle); handing it
+        // to a peer would put back into play what this node took out of it.
+        .filter(|r| r.get("state").and_then(Value::as_str) != Some("retired"))
+        .filter(|r| {
+            !query.validated_only || r.get("validated").and_then(Value::as_bool) == Some(true)
+        })
+        .filter_map(exportable_recipe)
+        .collect();
+    let id = crate::node::identity(&state).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("node identity unavailable: {e}"),
+        )
+    })?;
+    Ok(Json(id.seal(
+        SCHEMA_RECIPES_V1,
+        json!({
+            "validated_only": query.validated_only,
+            "entries": entries,
+        }),
+    )))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub(crate) struct RecipeImportQuery {
+    /// Write the import. DEFAULT FALSE — the same dry-run-by-default shape the
+    /// weather bundle has.
+    #[serde(default)]
+    apply: bool,
+}
+
+/// Imports a recipe bundle. Dry-run by default (`?apply=true` to write).
+#[utoipa::path(
+    post,
+    path = "/recipes/import",
+    tag = "recipes",
+    params(RecipeImportQuery),
+    request_body = Object,
+    responses(
+        (status = 200, description = "`{applied, source_node_id, verified, considered, \
+            imported, skipped, notes: [..]}` — every imported recipe lands \
+            `validated: false` regardless of what the origin claimed.", body = crate::routes::dto::RecipeImportResponse),
+        (status = 400, description = "Unknown schema, refused signature, or an oversized bundle",
+            body = crate::routes::dto::ErrorEnvelope),
+    )
+)]
+pub(crate) async fn import_recipes(
+    State(state): State<AppState>,
+    Query(query): Query<RecipeImportQuery>,
+    Json(raw): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let claimed_node = raw.get("node_id").and_then(Value::as_str);
+    let trust = trust_for(&state.config.peer, claimed_node);
+    let opened = open_envelope(&raw, SCHEMA_RECIPES_V1, None, &trust)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let entries = opened
+        .payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if entries.len() > MAX_RECIPE_BUNDLE {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "bundle has {} recipes; the import ceiling is {MAX_RECIPE_BUNDLE}",
+                entries.len()
+            ),
+        ));
+    }
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+    for entry in &entries {
+        match importable_recipe(entry) {
+            Ok(recipe) => {
+                if query.apply {
+                    state.storage.recipes().upsert(&recipe).await?;
+                }
+                imported += 1;
+            }
+            Err(why) => {
+                skipped += 1;
+                // Bounded: a hostile bundle must not turn one response into a
+                // megabyte of complaints.
+                if notes.len() < 20 {
+                    notes.push(why);
+                }
+            }
+        }
+    }
+    Ok(Json(json!({
+        "applied": query.apply,
+        "source_node_id": opened.node_id,
+        "verified": opened.verified,
+        "considered": entries.len(),
+        "imported": imported,
+        "skipped": skipped,
+        "notes": notes,
+        "validated": false,
+    })))
+}
+
 /// Retires a recipe: out of selection now, reversible by `revive`.
 #[utoipa::path(
     post,
@@ -107,7 +265,7 @@ pub(crate) async fn list_recipes(
     tag = "recipes",
     params(("id" = String, Path, description = "Recipe id")),
     responses(
-        (status = 200, description = "The refreshed row (`state: \"retired\"`)"),
+        (status = 200, description = "The refreshed row (`state: \"retired\"`)", body = crate::routes::dto::RecipeDto),
         (status = 404, description = "Recipe not found", body = Object),
     )
 )]
@@ -133,7 +291,7 @@ pub(crate) async fn retire_recipe(
     params(("id" = String, Path, description = "Recipe id")),
     responses(
         (status = 200, description = "The refreshed row (`state: \"candidate\"`, \
-            `consecutive_failures: 0`)"),
+            `consecutive_failures: 0`)", body = crate::routes::dto::RecipeDto),
         (status = 404, description = "Recipe not found", body = Object),
     )
 )]

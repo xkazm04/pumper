@@ -1,0 +1,93 @@
+{
+  "schema": "lighttrack-use-cases/1",
+  "project": "pumper",
+  "generated_at": "2026-09-05",
+  "note": "Declared LLM call sites. Registered into LightTrack via `lt use-cases register`; the gap between this declaration and observed events.name is the coverage report.",
+  "use_cases": [
+    {
+      "key": "research.web_agent",
+      "name": "Multi-step web research agent",
+      "description": "Runs an open-ended, multi-turn web research session to answer a query, resuming the same model session across steps until the answer converges or the budget is spent.",
+      "kind": "agent",
+      "status": "active",
+      "component": "crates/apps/research/src/lib.rs:627-641",
+      "expected_models": ["claude-sonnet-5", "claude-opus-4-8"],
+      "owner": "pumper"
+    },
+    {
+      "key": "connector.change_summary",
+      "name": "Connector API diff summarizer",
+      "description": "Summarizes an added/removed-lines diff of a watched API's public documentation into a developer-facing change summary with tags and severity.",
+      "kind": "summarization",
+      "status": "active",
+      "component": "crates/apps/connector-api-watch/src/lib.rs:413-431",
+      "expected_models": ["claude-sonnet-5"],
+      "owner": "pumper"
+    },
+    {
+      "key": "homewyse.pricing_extract",
+      "name": "Homewyse pricing extraction",
+      "description": "Extracts structured trade job pricing bands (low/median/high by locality and unit) from web research into a fixed pricing schema.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/homewyse-pricing/src/lib.rs:190-206",
+      "owner": "pumper"
+    },
+    {
+      "key": "provisioner.source_discovery",
+      "name": "Data source discovery",
+      "description": "Identifies the best public web pages that carry the data needed for a provisioning goal, along with expected fields and update cadence.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/provisioner/src/lib.rs:1016-1028",
+      "expected_models": ["claude-sonnet-5"],
+      "owner": "pumper"
+    },
+    {
+      "key": "provisioner.draft_proposal",
+      "name": "Provisioning rule set drafting",
+      "description": "Drafts (and revises, on dry-run failure) a full data-source rule set proposal as structured JSON, resuming the same session across revisions.",
+      "kind": "generation",
+      "status": "active",
+      "component": "crates/apps/provisioner/src/lib.rs:1152-1155",
+      "expected_models": ["claude-sonnet-5"],
+      "owner": "pumper"
+    },
+    {
+      "key": "state_licensing.extract",
+      "name": "State contractor licensing extraction",
+      "description": "Extracts structured state-by-state contractor licensing requirements (bonds, fees, thresholds) for a given trade into a fixed licensing schema.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/state-licensing/src/lib.rs:259-273",
+      "owner": "pumper"
+    },
+    {
+      "key": "state_tax.extract",
+      "name": "State tax rate extraction",
+      "description": "Extracts structured state income tax rates and top-bracket thresholds for all 50 states + DC into a fixed tax schema.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/state-tax/src/lib.rs:229-243",
+      "owner": "pumper"
+    },
+    {
+      "key": "trade_wages.extract",
+      "name": "Trade wage extraction",
+      "description": "Extracts structured entry/experienced hourly and annual wage figures per trade, and proposes new trade-label mappings against existing trades.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/trade-wages/src/lib.rs:179-193, crates/apps/trade-wages/src/lib.rs:447-459",
+      "owner": "pumper"
+    },
+    {
+      "key": "valuation_multiples.extract",
+      "name": "Business valuation multiples extraction",
+      "description": "Extracts structured SDE and revenue valuation multiples per trade into a fixed multiples schema.",
+      "kind": "extraction",
+      "status": "active",
+      "component": "crates/apps/valuation-multiples/src/lib.rs:156-170",
+      "owner": "pumper"
+    }
+  ]
+}

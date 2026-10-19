@@ -6,8 +6,14 @@
 //! consumed read-only — subscribe + replay, never refactored): every SSE event
 //! carries the bus's monotonic sequence as its wire id, so a client that
 //! reconnects with `Last-Event-ID` is replayed the gap it missed, or is sent a
-//! `notifications/pumper/reset` when the gap has already fallen out of the
-//! ring. Buffering is bounded twice over — the broadcast channel and the replay
+//! `notifications/pumper/reset` when the gap is unrecoverable.
+//!
+//! Since N05 the gap is looked for in the durable log when the ring has already
+//! evicted it — through the SAME [`crate::routes::replay_or_log`] the plain
+//! `/events` feed uses, so an agent and a browser reconnecting at the same
+//! sequence are told the same thing. `reset` is consequently rare: it now means
+//! the log was pruned past the cursor (or is off), not merely that 1024 events
+//! went by. Buffering is bounded twice over — the broadcast channel and the replay
 //! ring both have fixed capacities — so a slow consumer can never block the
 //! bus: it *lags*, gets a warning log, and is recovered from the ring (or told
 //! to reset) instead of stalling emitters.
@@ -23,7 +29,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::events::{JobEvent, Replay};
+use crate::events::JobEvent;
 use crate::state::AppState;
 
 /// JSON-RPC method carried by every bridged bus event.
@@ -37,7 +43,8 @@ pub(crate) struct LiveFilter {
     /// Only events emitted by this app (exact match on the event's `app`).
     app: Option<String>,
     /// Comma-separated event kinds to keep — job statuses (`queued`,
-    /// `running`, `succeeded`, `failed`, `cancelled`) and/or `external`.
+    /// `running`, `waiting`, `succeeded`, `failed`, `cancelled`) and/or
+    /// `external`.
     kind: Option<String>,
 }
 
@@ -73,7 +80,7 @@ pub(crate) async fn handle_get(
     // "read the ring" and "listen live"; the overlap is deduped by `last_seq`.
     let mut rx = state.events.subscribe();
     let shutdown = state.shutdown.clone();
-    let (initial, mut last_seq) = replay_backlog(&state, after, &filter);
+    let (initial, mut last_seq) = replay_backlog(&state, after, &filter).await;
     let stream = async_stream::stream! {
         for ev in initial {
             yield Ok(ev);
@@ -108,7 +115,7 @@ pub(crate) async fn handle_get(
                         "slow MCP notification consumer lagged the event bus; \
                          recovering from the replay ring"
                     );
-                    for ev in recover(&state, &mut last_seq, &filter) {
+                    for ev in recover(&state, &mut last_seq, &filter).await {
                         yield Ok(ev);
                     }
                 }
@@ -130,16 +137,17 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
 /// Connect-time replay for a resuming client: buffered events it missed
 /// (post-filter), preceded by a reset notification when the gap is too old.
 /// Returns the events plus the highest sequence id now delivered.
-fn replay_backlog(state: &AppState, after: Option<u64>, filter: &LiveFilter) -> (Vec<Event>, u64) {
+async fn replay_backlog(
+    state: &AppState,
+    after: Option<u64>,
+    filter: &LiveFilter,
+) -> (Vec<Event>, u64) {
     let Some(after) = after else {
         return (Vec::new(), 0);
     };
-    match state.events.replay(after) {
-        Replay::Reset => {
-            let latest = state.events.latest_seq();
-            (vec![reset_event(latest)], latest)
-        }
-        Replay::Events(events) => {
+    match crate::routes::replay_or_log(state, after).await {
+        Err(latest) => (vec![reset_event(latest)], latest),
+        Ok(events) => {
             let mut last = after;
             let mut out = Vec::new();
             for (seq, event) in events {
@@ -155,14 +163,13 @@ fn replay_backlog(state: &AppState, after: Option<u64>, filter: &LiveFilter) -> 
 
 /// Recovers a lagged live subscriber from the replay ring, advancing
 /// `last_seq`, or emits a single reset notification when the gap is gone.
-fn recover(state: &AppState, last_seq: &mut u64, filter: &LiveFilter) -> Vec<Event> {
-    match state.events.replay(*last_seq) {
-        Replay::Reset => {
-            let latest = state.events.latest_seq();
+async fn recover(state: &AppState, last_seq: &mut u64, filter: &LiveFilter) -> Vec<Event> {
+    match crate::routes::replay_or_log(state, *last_seq).await {
+        Err(latest) => {
             *last_seq = latest;
             vec![reset_event(latest)]
         }
-        Replay::Events(events) => {
+        Ok(events) => {
             let mut out = Vec::new();
             for (seq, event) in events {
                 *last_seq = seq;
@@ -222,7 +229,7 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
     // and the listen loop cannot be missed.
     let mut rx = state.events.subscribe();
     let job = fetch(state, id).await?;
-    if job.status.is_terminal() {
+    if wait_settles_on(job.status) {
         let status = job.status.as_str().to_string();
         return Ok(finished(job, &status));
     }
@@ -235,14 +242,14 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
                 // The terminal transition may be among the dropped events —
                 // storage is the truth, so re-check it instead of the ring.
                 let job = fetch(state, id).await?;
-                if job.status.is_terminal() {
+                if wait_settles_on(job.status) {
                     let status = job.status.as_str().to_string();
                     return Ok(finished(job, &status));
                 }
             }
             Ok(Ok((_seq, event))) => {
                 if event.job_id == id
-                    && JobStatus::parse(event.status.as_str()).is_some_and(|s| s.is_terminal())
+                    && JobStatus::parse(event.status.as_str()).is_some_and(wait_settles_on)
                 {
                     let job = fetch(state, id).await?;
                     return Ok(finished(job, &event.status));
@@ -269,6 +276,63 @@ async fn fetch(state: &AppState, id: uuid::Uuid) -> Result<pumper_core::Job, Str
         .ok_or_else(|| format!("unknown job '{id}'"))
 }
 
+/// Pure: the statuses that END a `wait_job` call.
+///
+/// Terminal statuses, **plus `waiting`** (N02). A parked job is not terminal —
+/// its stream stays open, its schedule slot stays held — but it is the one
+/// non-terminal state where continuing to wait is provably useless: the job is
+/// blocked on the caller. Returning here is what turns MCP's fire-and-poll loop
+/// into a conversation: the agent gets `input_request`, answers with
+/// `resume_job`, and waits again.
+///
+/// The anti-pattern it replaces, and why this is a named predicate rather than
+/// three inline `matches!`: `wait_job` asked "is it terminal?" in three places
+/// (the pre-read, the lag re-read, the event match). A parked job satisfied none
+/// of them, so an agent that asked a question through a job blocked until its
+/// own `wait_job_max_secs` cap and then reported `timed_out` — the deadlock the
+/// feature exists to remove.
+fn wait_settles_on(status: JobStatus) -> bool {
+    status.is_terminal() || status == JobStatus::Waiting
+}
+
 fn finished(job: pumper_core::Job, status: &str) -> Value {
-    json!({ "timed_out": false, "status": status, "job": job })
+    // `input_request` is lifted to the top level (it also rides `job`) because it
+    // is the actionable half of a `waiting` answer and the agent must not have to
+    // know the job row's shape to find it. Absent on every other status — an
+    // omitted field, never a `null` that reads as "asked for nothing".
+    let input_request = job.input_request.clone();
+    let mut body = json!({ "timed_out": false, "status": status, "job": job });
+    if let (Some(request), Value::Object(map)) = (input_request, &mut body) {
+        map.insert("input_request".into(), request);
+        map.insert(
+            "note".into(),
+            json!(
+                "this job is PARKED, not finished: it is asking for the input in \
+                 `input_request`. Answer it with the resume_job tool (or POST \
+                 /jobs/{id}/resume), then call wait_job again."
+            ),
+        );
+    }
+    body
+}
+
+#[cfg(test)]
+mod wait_settles_tests {
+    use super::wait_settles_on;
+    use pumper_core::JobStatus;
+
+    /// A parked job must end the wait. Before N02 `wait_job` settled only on a
+    /// terminal status, so a job asking its own caller a question blocked that
+    /// caller for the full `wait_job_max_secs` window and then answered
+    /// `timed_out` — with the question sitting unread in the row.
+    #[test]
+    fn waiting_settles_the_wait_not_only_terminal_statuses() {
+        assert!(wait_settles_on(JobStatus::Waiting));
+        assert!(wait_settles_on(JobStatus::Succeeded));
+        assert!(wait_settles_on(JobStatus::Failed));
+        assert!(wait_settles_on(JobStatus::Cancelled));
+        // And the states where waiting longer really is the right answer.
+        assert!(!wait_settles_on(JobStatus::Queued));
+        assert!(!wait_settles_on(JobStatus::Running));
+    }
 }

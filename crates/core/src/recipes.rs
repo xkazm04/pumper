@@ -137,6 +137,36 @@ pub fn payload_overlaps(json_paths: &[String], payload: &Value) -> bool {
     json_paths.iter().any(|p| present.contains(p.as_str()))
 }
 
+/// The verdict of one recipe replay, as a short reason string: `None` = the
+/// replay proved the recipe (success status, JSON body, the expected field
+/// paths still present), `Some(reason)` = it did not, and why.
+///
+/// THE ANTI-PATTERN THIS CLOSES (`replay_reason_not_inferred_from_validated`):
+/// the fetcher computed this reason inline and threw it away into a prose trail
+/// line, so `GET /recipes` could only show a bare `validated: false` — which
+/// reads identically for "discovered a minute ago, never tried" and "tried, and
+/// the endpoint returned HTML". The one renderer feeds both the trail and the
+/// stored [`RecipeSource::record_failure`] verdict, so they cannot drift.
+pub fn replay_reason(
+    is_success: bool,
+    parsed: Option<&Value>,
+    json_paths: &[String],
+) -> Option<&'static str> {
+    match parsed {
+        _ if !is_success => Some("non-success status"),
+        None => Some("non-JSON payload"),
+        Some(v) if !payload_overlaps(json_paths, v) => {
+            Some("payload lost the expected field paths")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The stored verdict of a replay that DID prove the recipe — the positive half
+/// of [`replay_reason`], so both halves of the `validation_reason` column have
+/// exactly one writer.
+pub const VALIDATED_REASON: &str = "replay matched the expected field paths";
+
 // ── the lifecycle: candidate → validated → candidate → retired → candidate ──
 
 /// Shipping `[recipes] retire_after`, and the threshold migration 0046's
@@ -245,7 +275,9 @@ pub fn strike_verdict(
 pub trait RecipeSource: Send + Sync {
     /// Best recipe for `host`: validated recipes first, then best score. With
     /// `include_unvalidated = false` (the `auto_validate`-OFF fetcher default)
-    /// only validated recipes are returned.
+    /// only validated recipes are returned; with it on, an unvalidated
+    /// candidate is offered for one proving replay until `retire_after`
+    /// strikes retire it. A retired recipe is never returned.
     async fn best_for_host(
         &self,
         host: &str,
@@ -253,15 +285,21 @@ pub trait RecipeSource: Send + Sync {
     ) -> crate::Result<Option<ApiRecipe>>;
 
     /// A successful overlapping replay: resets the consecutive-failure counter,
-    /// and with `validate = true` (the `auto_validate` path) also marks the
-    /// recipe validated.
+    /// stamps the [`VALIDATED_REASON`] verdict, and with `validate = true` (the
+    /// `auto_validate` path) also marks the recipe validated.
     async fn record_success(&self, id: &str, validate: bool) -> crate::Result<()>;
 
-    /// A failed/thin replay: increments the consecutive-failure counter.
-    /// Returns `true` when this strike crossed `unvalidate_after` and a
-    /// validated recipe was demoted back to unvalidated (counter reset so the
-    /// next validation attempt starts clean).
-    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool>;
+    /// A failed/thin replay: increments the consecutive-failure counter and
+    /// stores `reason` (from [`replay_reason`]) as the recipe's standing
+    /// validation verdict. Returns `true` when this strike crossed
+    /// `unvalidate_after` and a validated recipe was demoted back to
+    /// unvalidated (counter reset so the next validation attempt starts clean).
+    async fn record_failure(
+        &self,
+        id: &str,
+        unvalidate_after: u32,
+        reason: &str,
+    ) -> crate::Result<bool>;
 }
 
 /// Normalizes a leaf value for overlap comparison: strings are trimmed +
@@ -457,7 +495,7 @@ impl RecipeStore {
 
     /// Inserts or refreshes one discovered recipe. Returns the stored id.
     pub async fn upsert(&self, recipe: &ApiRecipe) -> crate::Result<String> {
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = now_stamp();
         let id = if recipe.id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -492,8 +530,10 @@ impl RecipeStore {
     }
 
     /// Lists recipes, best score first, optionally filtered by host and by
-    /// [`RecipeState`]. An unparseable state never reaches here — the route
-    /// turns it into a 400 (see [`RecipeState::parse`]).
+    /// [`RecipeState`]. Carries the last replay verdict too (`validation_reason`,
+    /// `validated_at`), so a reader can tell "never tried" from "tried and
+    /// refused". An unparseable state never reaches here — the route turns it
+    /// into a 400 (see [`RecipeState::parse`]).
     pub async fn list(
         &self,
         host: Option<&str>,
@@ -503,7 +543,7 @@ impl RecipeStore {
         let rows: Vec<RecipeRow> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated, \
                         discovered_at, last_seen_at, consecutive_failures, \
-                        retired_at, last_failure_at \
+                        retired_at, last_failure_at, validation_reason, validated_at \
                  FROM api_recipes \
                  WHERE (?1 IS NULL OR host = ?1) \
                    AND (?2 IS NULL \
@@ -527,7 +567,7 @@ impl RecipeStore {
         let row: Option<RecipeRow> = sqlx::query_as(
             "SELECT id, host, url_template, params, json_paths, score, validated, \
                     discovered_at, last_seen_at, consecutive_failures, \
-                    retired_at, last_failure_at \
+                    retired_at, last_failure_at, validation_reason, validated_at \
              FROM api_recipes WHERE id = ?1",
         )
         .bind(id)
@@ -594,7 +634,7 @@ impl RecipeStore {
     }
 }
 
-/// The twelve columns `GET /recipes` serves, as one row type so `list` and
+/// The fourteen columns `GET /recipes` serves, as one row type so `list` and
 /// `get` cannot drift into two different wire shapes.
 #[cfg(feature = "storage")]
 type RecipeRow = (
@@ -610,6 +650,8 @@ type RecipeRow = (
     i64,            // consecutive_failures
     Option<String>, // retired_at
     Option<String>, // last_failure_at
+    Option<String>, // validation_reason
+    Option<String>, // validated_at
 );
 
 /// One stored row as the wire shape. `state` is derived here and nowhere else.
@@ -628,6 +670,8 @@ fn recipe_row_json(row: RecipeRow) -> Value {
         failures,
         retired_at,
         last_failure_at,
+        validation_reason,
+        validated_at,
     ) = row;
     serde_json::json!({
         "id": id,
@@ -641,6 +685,10 @@ fn recipe_row_json(row: RecipeRow) -> Value {
         "consecutive_failures": failures,
         "last_failure_at": last_failure_at,
         "retired_at": retired_at,
+        // Null until a replay has actually judged this recipe — honest
+        // absence, not a fabricated "not validated yet".
+        "validation_reason": validation_reason,
+        "validated_at": validated_at,
         "discovered_at": disc,
         "last_seen_at": seen,
     })
@@ -694,25 +742,36 @@ impl RecipeSource for RecipeStore {
             "UPDATE api_recipes \
              SET consecutive_failures = 0, \
                  last_failure_at = NULL, \
-                 validated = CASE WHEN ?2 THEN 1 ELSE validated END \
+                 validated = CASE WHEN ?2 THEN 1 ELSE validated END, \
+                 validation_reason = ?3, \
+                 validated_at = ?4 \
              WHERE id = ?1",
         )
         .bind(id)
         .bind(validate)
+        .bind(VALIDATED_REASON)
+        .bind(now_stamp())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool> {
+    async fn record_failure(
+        &self,
+        id: &str,
+        unvalidate_after: u32,
+        reason: &str,
+    ) -> crate::Result<bool> {
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE api_recipes \
-             SET consecutive_failures = consecutive_failures + 1, last_failure_at = ?2 \
+             SET consecutive_failures = consecutive_failures + 1, last_failure_at = ?2, \
+                 validation_reason = ?3, validated_at = ?2 \
              WHERE id = ?1 \
              RETURNING consecutive_failures, validated",
         )
         .bind(id)
         .bind(now_stamp())
+        .bind(reason)
         .fetch_optional(&self.pool)
         .await?;
         let Some((failures, validated)) = row else {
@@ -767,6 +826,42 @@ mod tests {
             content_type: "application/json".into(),
             body,
         }
+    }
+
+    /// N14. `validated: false` alone cannot distinguish "never tried" from
+    /// "tried, and the endpoint served HTML" — the reason is computed once and
+    /// stored, so `GET /recipes` shows the verdict instead of implying one.
+    #[test]
+    fn replay_reason_names_why_a_replay_was_refused() {
+        let paths = vec!["$.items[*].title".to_string()];
+        let good = json!({"items": [{"title": "Alpha Grant"}]});
+
+        // The proving replay: success, JSON, expected paths still present.
+        assert_eq!(replay_reason(true, Some(&good), &paths), None);
+
+        // A non-success status is the FIRST thing said about the replay, even
+        // when the body happens to parse — an error page that mentions the
+        // right fields must never validate a recipe.
+        assert_eq!(
+            replay_reason(false, Some(&good), &paths),
+            Some("non-success status")
+        );
+        assert_eq!(
+            replay_reason(false, None, &paths),
+            Some("non-success status")
+        );
+        // A 200 that is not JSON at all (an HTML login wall, typically).
+        assert_eq!(replay_reason(true, None, &paths), Some("non-JSON payload"));
+        // A 200 of valid JSON whose shape no longer carries the data.
+        assert_eq!(
+            replay_reason(true, Some(&json!({"items": [{"name": "Alpha"}]})), &paths),
+            Some("payload lost the expected field paths")
+        );
+        // A recipe with no expected paths cannot be proven by anything.
+        assert_eq!(
+            replay_reason(true, Some(&good), &[]),
+            Some("payload lost the expected field paths")
+        );
     }
 
     #[test]
@@ -1017,18 +1112,33 @@ mod tests {
         recipes.set_validated(&id, true).await.unwrap();
 
         // Two strikes under a threshold of 3: still validated.
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
         let r = recipes.best_for_host("example.com", false).await.unwrap();
         assert!(r.is_some_and(|r| r.validated), "2 strikes must not demote");
 
         // A success in between resets the counter...
         recipes.record_success(&id, false).await.unwrap();
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
-        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
+        assert!(!recipes
+            .record_failure(&id, 3, "non-JSON payload")
+            .await
+            .unwrap());
         // ...so it takes 3 fresh consecutive failures to demote.
         assert!(
-            recipes.record_failure(&id, 3).await.unwrap(),
+            recipes
+                .record_failure(&id, 3, "non-JSON payload")
+                .await
+                .unwrap(),
             "third consecutive strike must un-validate"
         );
         assert!(
@@ -1040,7 +1150,10 @@ mod tests {
             "a demoted recipe is invisible to validated-only lookups"
         );
         // Unknown id: no panic, no demotion signal.
-        assert!(!recipes.record_failure("nope", 3).await.unwrap());
+        assert!(!recipes
+            .record_failure("nope", 3, "replay failed")
+            .await
+            .unwrap());
     }
 
     #[cfg(feature = "test-support")]

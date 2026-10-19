@@ -71,8 +71,8 @@ async fn run_dead(state: &AppState) -> uuid::Uuid {
     job
 }
 
-async fn backdate(state: &AppState, sql: &str, days_ago: i64) {
-    sqlx::query(sql)
+async fn backdate(state: &AppState, sql: String, days_ago: i64) {
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(pumper_core::datasets::ts(
             Utc::now() - chrono::Duration::days(days_ago),
         ))
@@ -96,17 +96,22 @@ async fn auto_retirement_sends_source_retired_through_the_run_path() {
 
     // Three dead weekly runs; the first two are moved into the past.
     let first = run_dead(&state).await;
-    backdate(&state, "UPDATE sources SET state_since = ?1", 30).await;
     backdate(
         &state,
-        &format!("UPDATE source_runs SET created_at = ?1 WHERE job_id = '{first}'"),
+        "UPDATE sources SET state_since = ?1".to_string(),
+        30,
+    )
+    .await;
+    backdate(
+        &state,
+        format!("UPDATE source_runs SET created_at = ?1 WHERE job_id = '{first}'"),
         14,
     )
     .await;
     let second = run_dead(&state).await;
     backdate(
         &state,
-        &format!("UPDATE source_runs SET created_at = ?1 WHERE job_id = '{second}'"),
+        format!("UPDATE source_runs SET created_at = ?1 WHERE job_id = '{second}'"),
         7,
     )
     .await;

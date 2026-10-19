@@ -656,6 +656,9 @@ pub fn build_catalog_row(
         confidence: confidence_1_to_5(score_0_100),
         dataset: proposed_dataset(&key),
         notes: row_notes(prompt, dry, score_0_100),
+        // Only `engine = "wasm"` rows carry a module pin, and this app never
+        // proposes one (it proposes crawl/extractor sources).
+        module_sha256: String::new(),
         contract: None, // contracts are human-declared, never machine-proposed
     }
 }
@@ -1019,7 +1022,8 @@ impl ScrapeApp for Provisioner {
              \"cadence\": \"daily|weekly|monthly|quarterly|annual|on-demand\", \
              \"expected_fields\": string[]}}]}}"
             ))
-            .with_role("research");
+            .with_role("research")
+            .with_use_case("provisioner.source_discovery");
             discover.max_budget_usd = budget_usd;
             discover.json_schema = Some(discovery_schema);
             let out = ctx.research(discover).await?;
@@ -1146,7 +1150,9 @@ impl ScrapeApp for Provisioner {
                      Revise the rule set (same JSON shape, full object, all fields)."
                 ),
             };
-            let mut req = ResearchRequest::new(draft_prompt).with_role("research");
+            let mut req = ResearchRequest::new(draft_prompt)
+                .with_role("research")
+                .with_use_case("provisioner.draft_proposal");
             req.max_budget_usd = budget_usd;
             req.resume_session = session_id.clone();
             let out = ctx.research(req).await?;
@@ -1311,6 +1317,7 @@ mod tests {
             trace: Vec::new(),
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         }
     }
 
