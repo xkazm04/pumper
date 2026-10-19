@@ -5630,6 +5630,47 @@
           "evidence": "crates/server/src/e2e/budget_terminal.rs:80 Budget exhaustion earns distinct treatment because retry policy stops immediately, while a companion transient-error test requires requeueing."
         }
       ]
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/health-checks": {
+      "context": "core-resilience",
+      "subject": "health-checks",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-19",
+      "evaluatedTs": "2026-10-19T09:27:05.235Z",
+      "worker": "c7d08abb-4ca1-4340-9313-bc80941ef78a",
+      "techniques": [
+        {
+          "technique": "check-scheduling",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/doctor.rs:29 Doctor scans are explicitly on demand; resilience observation consumes extraction runs rather than launching probes on render."
+        },
+        {
+          "technique": "health-rollup",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:621 The invariant score aggregates only returned checks: invalid regex checks disappear from coverage, and an empty set contributes zero without an undetermined annotation."
+        },
+        {
+          "technique": "probe-caching",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/doctor.rs:122 Every doctor request gathers facts directly; the handler has no shared result cache or in-flight deduplication, so concurrent callers repeat full scans."
+        },
+        {
+          "technique": "probe-design",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/doctor.rs:189 The filesystem probe performs a full artifact walk and is awaited without a deadline or cancellation cleanup; the revision-count ceiling does not bound that walk."
+        },
+        {
+          "technique": "remediation-affordances",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/doctor.rs:227 Findings provide concrete instructions but lack the required structural per-check declaration of fixability or external action."
+        },
+        {
+          "technique": "three-state-outcomes",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/invariants.rs:221 Regex compilation failure silently skips the invariant instead of returning an unverifiable outcome with the probe failure reason."
+        }
+      ]
     }
   }
 }

@@ -1,0 +1,71 @@
+{
+ "schema": "conform-run/1",
+ "worker": "c7d08abb-4ca1-4340-9313-bc80941ef78a",
+ "subject": "health-checks",
+ "evaluatedAt": "2026-10-19T09:27:05.235785+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "health-checks",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/resilience/invariants.rs:221 An invariant whose regex cannot compile disappears from the results instead of reporting unverifiable, allowing incomplete checking to appear clean.",
+   "techniques": [
+    {
+     "technique": "check-scheduling",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/doctor.rs:29 Doctor scans are explicitly on demand; resilience observation consumes extraction runs rather than launching probes on render."
+    },
+    {
+     "technique": "health-rollup",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/resilience/detect.rs:621 The invariant score aggregates only returned checks: invalid regex checks disappear from coverage, and an empty set contributes zero without an undetermined annotation."
+    },
+    {
+     "technique": "probe-caching",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/doctor.rs:122 Every doctor request gathers facts directly; the handler has no shared result cache or in-flight deduplication, so concurrent callers repeat full scans."
+    },
+    {
+     "technique": "probe-design",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/doctor.rs:189 The filesystem probe performs a full artifact walk and is awaited without a deadline or cancellation cleanup; the revision-count ceiling does not bound that walk."
+    },
+    {
+     "technique": "remediation-affordances",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/doctor.rs:227 Findings provide concrete instructions but lack the required structural per-check declaration of fixability or external action."
+    },
+    {
+     "technique": "three-state-outcomes",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/resilience/invariants.rs:221 Regex compilation failure silently skips the invariant instead of returning an unverifiable outcome with the probe failure reason."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T09:27:05.235785+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "health-checks"
+   ],
+   "techniques": [
+    "check-scheduling",
+    "health-rollup",
+    "probe-caching",
+    "probe-design",
+    "remediation-affordances",
+    "three-state-outcomes"
+   ],
+   "deviations": 1,
+   "context": "core-resilience",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

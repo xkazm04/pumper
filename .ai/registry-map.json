@@ -3259,7 +3259,11 @@
           "revision": 11,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/invariants.rs:221 An invariant whose regex cannot compile disappears from the results instead of reporting unverifiable, allowing incomplete checking to appear clean.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:9254e4fb7feef6b1",
+          "evaluatedRevision": 11
         },
         {
           "subject": "cross-provider-benchmark-operations",
