@@ -1,0 +1,41 @@
+{
+  "schema": "conform-run/1",
+  "worker": "56e0e452-3979-46f2-a3fd-b69899fa22ae",
+  "subject": "plan-entitlements",
+  "evaluatedAt": "2026-10-19T22:36:11.107695+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "plan-entitlements",
+      "context": "pricing-valuation",
+      "reason": "withdrawn after review: reviewer (sonnet): All five anchors are incidental. homewyse-pricing:27 is a doc comment about the Claude CLI subscription, and it doesn't show that plan or tenant entitlements are absent. state-tax:202 is a vintage freshness gate, mpsv-vpm:375 is a schema description of a gap guard, and valuation-multiples:304 is a t"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-19T22:36:11.107695+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "plan-entitlements"
+      ],
+      "techniques": [
+        "capability-gate-predicates",
+        "deployment-mode-short-circuit",
+        "entitlement-lifecycle-revocation",
+        "id-vs-label-split",
+        "inherited-tier-not-cloned-tier",
+        "live-catalog-edit-is-a-lifecycle-event",
+        "price-book-authority",
+        "provider-publishes-state-not-decision",
+        "subtractive-entitlement",
+        "tier-model-single-source"
+      ],
+      "deviations": 0,
+      "context": "pricing-valuation",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
