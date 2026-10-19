@@ -4703,7 +4703,11 @@
           "revision": 9,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:633 Trigger hook evaluation resolves unhandled predicate failures and malformed outputs to fail-open execution by default rather than halting the pipeline.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:396bc727ea6bcf37",
+          "evaluatedRevision": 9
         },
         {
           "subject": "job-coordination",

@@ -1,0 +1,84 @@
+{
+ "schema": "conform-run/1",
+ "worker": "f4c4eb1e-37d4-48c4-b181-018651cec9a2",
+ "subject": "pipeline-dag",
+ "evaluatedAt": "2026-10-19T22:30:26.425712+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "pipeline-dag",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/triggers.rs:633 Trigger hook evaluation resolves unhandled predicate failures and malformed outputs to fail-open execution by default rather than halting the pipeline.",
+   "techniques": [
+    {
+     "technique": "conditional-edges",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:384 Predicate plugin hooks default to fail-open (fire) on error or malformed output rather than halting or routing to an error branch."
+    },
+    {
+     "technique": "graph-validation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:51 Acyclicity is not verified statically at authoring time; cycle detection is deferred to runtime by checking a provenance chain during hop execution."
+    },
+    {
+     "technique": "node-execution-model",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:1394 Unfired trigger branches do not produce skipped node executions in a graph run; non-matching conditions merely record a ledger row and continue."
+    },
+    {
+     "technique": "composite-condition-verdicts",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:934 Payload filters evaluate only local in-memory JSON data without remote calls or timeouts; compound condition trees with external leaves are not present."
+    },
+    {
+     "technique": "pause-and-gate-nodes",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:517 Triggers support only synchronous plugin hook slots without pause-and-gate nodes or durable suspension awaiting human or external approval."
+    },
+    {
+     "technique": "deterministic-vs-model-nodes",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:1543 Spend budget and attempt limits are passed to enqueue options, but node classes do not declare determinism or effect contracts."
+    },
+    {
+     "technique": "external-adapter-nodes",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:940 Triggers handle inbound ingress events rather than outbound network adapter calls leaving the system boundary."
+    },
+    {
+     "technique": "valid-but-degraded-plans",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:222 Triggers are individually authored reactive edges rather than graphs synthesized by an automated planner."
+    }
+   ],
+   "registryProposal": "The pipeline-dag standard states that agent chaining through event subscriptions is a distinct subject where topology emerges from subscriptions rather than an authored graph document (lines 34-39). The standard should clarify whether event-driven reactive trigger chains (edge-list DAGs) are governed by pipeline-dag or belong to an event-routing/chaining standard."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T22:30:26.425712+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "pipeline-dag"
+   ],
+   "techniques": [
+    "composite-condition-verdicts",
+    "conditional-edges",
+    "deterministic-vs-model-nodes",
+    "external-adapter-nodes",
+    "graph-validation",
+    "node-execution-model",
+    "pause-and-gate-nodes",
+    "valid-but-degraded-plans"
+   ],
+   "deviations": 1,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:agy",
+   "model": "gemini-3.8-flash-high"
+  }
+ ]
+}
