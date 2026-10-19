@@ -5824,6 +5824,22 @@
           "evidence": "crates/apps/homewyse-pricing/src/lib.rs:388 Missing or unmeasured price units map to explicit JSON Null rather than coercing to a default string or zero value."
         }
       ]
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/observability-telemetry": {
+      "context": "api-platform-ops",
+      "subject": "observability-telemetry",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-19",
+      "evaluatedTs": "2026-10-19T22:10:36.825Z",
+      "worker": "de3a7735-9e74-4c0b-bce6-06947d7167a9",
+      "techniques": [
+        {
+          "technique": "log-architecture",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/events.rs:235 The error value is interpolated into the message rather than recorded as a machine-queryable field."
+        }
+      ]
     }
   }
 }

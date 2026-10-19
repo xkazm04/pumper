@@ -1117,7 +1117,11 @@
           "revision": 6,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/events.rs:235 The replay handler embeds the error in prose instead of a structured field, making error-specific queries depend on message parsing.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:5f1eca73a0e27036",
+          "evaluatedRevision": 6
         },
         {
           "subject": "credential-vault",

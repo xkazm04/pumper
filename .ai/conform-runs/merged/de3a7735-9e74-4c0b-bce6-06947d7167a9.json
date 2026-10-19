@@ -1,0 +1,41 @@
+{
+ "schema": "conform-run/1",
+ "worker": "de3a7735-9e74-4c0b-bce6-06947d7167a9",
+ "subject": "observability-telemetry",
+ "evaluatedAt": "2026-10-19T22:10:36.825719+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "api-platform-ops",
+   "subject": "observability-telemetry",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/events.rs:235 The replay handler embeds the error in prose instead of a structured field, making error-specific queries depend on message parsing.",
+   "techniques": [
+    {
+     "technique": "log-architecture",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/events.rs:235 The error value is interpolated into the message rather than recorded as a machine-queryable field."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T22:10:36.825719+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "observability-telemetry"
+   ],
+   "techniques": [
+    "log-architecture"
+   ],
+   "deviations": 1,
+   "context": "api-platform-ops",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
