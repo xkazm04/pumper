@@ -1,0 +1,40 @@
+{
+  "schema": "conform-run/1",
+  "worker": "5ad9728c-38f5-4fc7-8501-97f4aa424e27",
+  "subject": "invariant-placement",
+  "evaluatedAt": "2026-10-19T09:59:32.699650+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "invariant-placement",
+      "context": "ci-quality-gates",
+      "reason": "withdrawn after review: reviewer (sonnet): Line 303 does emit `criteria: []` on the missing-artifact branch, but the verdict's own technique anchors (491, 187, 374) say the invariant-placement technique excludes runtime-sourced, runtime-gated checks like this one. The README (.lanes/README.md:22,33) never requires criteria on cannot-see or c"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-19T09:59:32.699650+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "invariant-placement"
+      ],
+      "techniques": [
+        "build-time-evaluation-of-cross-value-invariants",
+        "completeness-at-emission",
+        "constraint-deletion-is-silent",
+        "consumption-bounds-at-most-once",
+        "derived-properties-cannot-be-forged",
+        "initialization-proof-tokens",
+        "placement-precedes-gate",
+        "repairing-check-erases-its-evidence",
+        "shape-with-a-not-applicable-member"
+      ],
+      "deviations": 1,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}

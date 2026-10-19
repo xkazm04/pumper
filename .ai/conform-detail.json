@@ -5671,6 +5671,67 @@
           "evidence": "crates/core/src/resilience/invariants.rs:221 Regex compilation failure silently skips the invariant instead of returning an unverifiable outcome with the probe failure reason."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/invariant-placement": {
+      "context": "ci-quality-gates",
+      "subject": "invariant-placement",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-19",
+      "evaluatedTs": "2026-10-19T09:59:32.699Z",
+      "techniques": [
+        {
+          "technique": "build-time-evaluation-of-cross-value-invariants",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:491 Certification bounds are file-sourced at runtime and evaluated against runtime measurements; the technique explicitly excludes runtime-sourced inputs."
+        },
+        {
+          "technique": "completeness-at-emission",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:303 The missing-artifact branch replaces declared criteria with an empty array; main subsequently serializes that result without a completeness check, although .lanes/README.md requires criteria to accompany verdicts."
+        },
+        {
+          "technique": "constraint-deletion-is-silent",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:187 Required-field enforcement is a runtime gate check, with negative runtime fixtures, rather than a structural value constraint replacing validation tests."
+        },
+        {
+          "technique": "consumption-bounds-at-most-once",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-certify.mjs:374 Run recording intentionally accumulates repeatable observations; no single-use in-process capability or consumption obligation was identified."
+        },
+        {
+          "technique": "derived-properties-cannot-be-forged",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-check.mjs:338 Flaky labels are derived from transition summaries rather than manually asserted; the moving-window test verifies automatic label removal."
+        },
+        {
+          "technique": "initialization-proof-tokens",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-record.mjs:144 Subprocess creation and use are local, and the child can subsequently fail; this does not establish a durable readiness fact suitable for a proof token."
+        },
+        {
+          "technique": "placement-precedes-gate",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:67 Manifest coverage spans repository artifacts and CI definitions, so the arrangement rule appropriately lives in a gate rather than a single-value encoding."
+        },
+        {
+          "technique": "repairing-check-erases-its-evidence",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:93 Argument fallback and cache pruning are expressly specified interface behavior; no defensive clamp contradicting a stated strict output contract was established."
+        },
+        {
+          "technique": "shape-with-a-not-applicable-member",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/flake-id.mjs:130 The target resolver represents unresolved ownership outside the target object, using null rather than adding an absence member to the target vocabulary."
+        }
+      ],
+      "withdrawn": {
+        "worker": "5ad9728c-38f5-4fc7-8501-97f4aa424e27",
+        "state": "deviation",
+        "at": "2026-10-19T10:00:15.363860+00:00",
+        "reason": "reviewer (sonnet): Line 303 does emit `criteria: []` on the missing-artifact branch, but the verdict's own technique anchors (491, 187, 374) say the invariant-placement technique excludes runtime-sourced, runtime-gated checks like this one. The README (.lanes/README.md:22,33) never requires criteria on cannot-see or c"
+      }
     }
   }
 }
