@@ -3797,7 +3797,11 @@
           "revision": 6,
           "changedAt": "2026-08-31",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/ingress_gates.rs:4 These tests exercise an externally callable HTTP API, outside the standard's lockstep IPC scope, and searches across the context directory and repository found none of the listed IPC identifiers.",
+          "evaluatedAt": "2026-10-19",
+          "evaluatedAgainst": "sha256-b2:c9cce81ffdd6456a",
+          "evaluatedRevision": 6
         },
         {
           "subject": "quality-gates",

@@ -1,0 +1,77 @@
+{
+ "schema": "conform-run/1",
+ "worker": "db563a3b-32c2-42ff-aa53-26d5f9b61343",
+ "subject": "ipc-contract",
+ "evaluatedAt": "2026-10-19T21:14:19.716549+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "e2e-api-contract",
+   "subject": "ipc-contract",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/e2e/ingress_gates.rs:4 These tests exercise an externally callable HTTP API, outside the standard's lockstep IPC scope, and searches across the context directory and repository found none of the listed IPC identifiers.",
+   "techniques": [
+    {
+     "technique": "call-wrapping",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/error_contract.rs:25 This directly drives an HTTP router in a Rust test; it is not a crossing call between co-shipped language layers."
+    },
+    {
+     "technique": "casing-and-naming",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/router.rs:55 The asserted names belong to the HTTP response contract, which the golden path excludes from its IPC scope."
+    },
+    {
+     "technique": "command-registration",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/mod.rs:247 The router exercised by this context registers HTTP operations through OpenApiRouter rather than a lockstep IPC command surface."
+    },
+    {
+     "technique": "drift-gates",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/mod.rs:381 This context consumes the HTTP router derived alongside OpenAPI; generated public API artifacts do not establish the subject's IPC precondition."
+    },
+    {
+     "technique": "error-shape-mapping",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/request_panics.rs:76 The test verifies an HTTP panic envelope; that overlapping practice does not bring the excluded API boundary into IPC scope."
+    },
+    {
+     "technique": "generated-type-contracts",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/enqueue_door_parity.rs:72 The HTTP test decodes JSON within Rust rather than consuming generated declarations across a co-shipped language boundary."
+    }
+   ],
+   "absenceTerms": [
+    "invoke_handler",
+    "generate_handler!",
+    "ts_rs",
+    "#[tauri::command]"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T21:14:19.716549+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "ipc-contract"
+   ],
+   "techniques": [
+    "call-wrapping",
+    "casing-and-naming",
+    "command-registration",
+    "drift-gates",
+    "error-shape-mapping",
+    "generated-type-contracts"
+   ],
+   "deviations": 0,
+   "context": "e2e-api-contract",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

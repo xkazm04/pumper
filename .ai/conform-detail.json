@@ -5732,6 +5732,47 @@
         "at": "2026-10-19T10:00:15.363860+00:00",
         "reason": "reviewer (sonnet): Line 303 does emit `criteria: []` on the missing-artifact branch, but the verdict's own technique anchors (491, 187, 374) say the invariant-placement technique excludes runtime-sourced, runtime-gated checks like this one. The README (.lanes/README.md:22,33) never requires criteria on cannot-see or c"
       }
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/ipc-contract": {
+      "context": "e2e-api-contract",
+      "subject": "ipc-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-19",
+      "evaluatedTs": "2026-10-19T21:14:19.716Z",
+      "worker": "db563a3b-32c2-42ff-aa53-26d5f9b61343",
+      "techniques": [
+        {
+          "technique": "call-wrapping",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/error_contract.rs:25 This directly drives an HTTP router in a Rust test; it is not a crossing call between co-shipped language layers."
+        },
+        {
+          "technique": "casing-and-naming",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/router.rs:55 The asserted names belong to the HTTP response contract, which the golden path excludes from its IPC scope."
+        },
+        {
+          "technique": "command-registration",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/mod.rs:247 The router exercised by this context registers HTTP operations through OpenApiRouter rather than a lockstep IPC command surface."
+        },
+        {
+          "technique": "drift-gates",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/mod.rs:381 This context consumes the HTTP router derived alongside OpenAPI; generated public API artifacts do not establish the subject's IPC precondition."
+        },
+        {
+          "technique": "error-shape-mapping",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/request_panics.rs:76 The test verifies an HTTP panic envelope; that overlapping practice does not bring the excluded API boundary into IPC scope."
+        },
+        {
+          "technique": "generated-type-contracts",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/enqueue_door_parity.rs:72 The HTTP test decodes JSON within Rust rather than consuming generated declarations across a co-shipped language boundary."
+        }
+      ]
     }
   }
 }
