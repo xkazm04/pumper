@@ -1,0 +1,95 @@
+{
+ "schema": "conform-run/1",
+ "worker": "cccd296b-83cf-4025-835a-0ca96fac655e",
+ "subject": "embedded-db",
+ "evaluatedAt": "2026-10-19T07:24:47.650873+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [
+  {
+   "context": "core-http-cache",
+   "subject": "embedded-db",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/cache.rs:343 Cache eviction executes destructive deletions directly on the database without dry-run safety rails, usage accounting, or an observable prune ledger.",
+   "techniques": [
+    {
+     "technique": "storage-accounting-and-pruning",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:307 Cache purge deletes expired entries immediately without a default dry-run mode, usage accounting, or an observable prune ledger."
+    },
+    {
+     "technique": "db-self-instrumentation",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:113 Cache reads query the pool directly without recording latency into bounded rings or reporting slow operation counts."
+    },
+    {
+     "technique": "connection-pooling",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:300 Cache writes acquire pooled connections anonymously without measuring acquisition latency, tracking caller labels, or detecting pool contention."
+    },
+    {
+     "technique": "derived-capacity-limits",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:28 Eviction per-pass limit is chosen as a fixed magic number rather than derived from engine page size, memory budget, or lock duration."
+    },
+    {
+     "technique": "quiet-window-maintenance",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:27 Cache eviction is designed for fixed hourly passes rather than being gated by an activity gauge and yielding between chunks."
+    },
+    {
+     "technique": "single-writer-holder-discipline",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/backup.rs:149 Backup retention prunes exclusively by the tool's own prefix marker, safely preserving operator copies and sibling databases."
+    },
+    {
+     "technique": "journal-and-durability-modes",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/backup.rs:239 Pre-migration backup uses SQLite's native VACUUM INTO to produce a consistent single-file snapshot capturing committed WAL state without risking torn sidecars."
+    },
+    {
+     "technique": "corruption-class-response",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/backup.rs:221 Backup failures do not classify corruption or quarantine the handle, continuing migrations despite potential storage failure."
+    },
+    {
+     "technique": "analytical-reads-off-the-serving-store",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:230 Cache queries are point lookups and bounded log folds that do not justify a separate column-oriented analytics engine."
+    },
+    {
+     "technique": "extension-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:39 The HTTP cache operates entirely on standard SQLite features without loading in-process extensions or registering custom collations."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-19T07:24:47.650873+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "embedded-db"
+   ],
+   "techniques": [
+    "analytical-reads-off-the-serving-store",
+    "connection-pooling",
+    "corruption-class-response",
+    "db-self-instrumentation",
+    "derived-capacity-limits",
+    "extension-lifecycle",
+    "journal-and-durability-modes",
+    "quiet-window-maintenance",
+    "single-writer-holder-discipline",
+    "storage-accounting-and-pruning"
+   ],
+   "deviations": 1,
+   "context": "core-http-cache",
+   "via": "curator-multi:agy",
+   "model": "gemini-3.8-flash-high"
+  }
+ ]
+}
