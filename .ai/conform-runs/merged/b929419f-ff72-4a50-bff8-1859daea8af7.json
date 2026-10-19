@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b929419f-ff72-4a50-bff8-1859daea8af7",
+ "subject": "read-serving-replicas",
+ "evaluatedAt": "2026-10-19T22:54:26.613158+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "read-serving-replicas",
+   "context": "core-job-queue",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
