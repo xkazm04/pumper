@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "53e73bd7-9b6d-4767-bdfb-d348b0d6e25e",
+ "subject": "native-shell-integration",
+ "evaluatedAt": "2026-10-19T22:00:09.547881+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "native-shell-integration",
+   "context": "grants-intelligence",
+   "reason": "The subject 'native-shell-integration' governs multi-platform client-side desktop shells wrapping a web/document presentation layer inside a native host process (window focus custody, overlays, accessibility tree queries, OS permission gates, input chord synthesis). Context 'grants-intelligence' is a suite of headless backend scraping and data ingestion crates (grants-common, grants-gov, ca-grants, eu-sedia, cordis) with no client UI, windowing runtime, or native desktop shell integration. Per seat instructions prohibiting not-applicable, the pair is declined."
+  }
+ ],
+ "consults": []
+}
