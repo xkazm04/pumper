@@ -5999,6 +5999,57 @@
           "evidence": "crates/server/src/scheduler.rs:1302 The decision evaluates a cron firing time, not whether an agent's judgment warrants human attention."
         }
       ]
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/public-claim-provenance": {
+      "context": "pricing-valuation",
+      "subject": "public-claim-provenance",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-19",
+      "evaluatedTs": "2026-10-19T22:48:43.353Z",
+      "techniques": [
+        {
+          "technique": "build-time-derivation-off-the-client-bundle",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:745 Heavy-feed aggregation produces persisted labour-market datasets; no public product counter or reader-side bundle was found."
+        },
+        {
+          "technique": "degraded-never-claims-live",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:161 Fetch completeness is reported in a scraper job result; no public counter with a liveness badge was found."
+        },
+        {
+          "technique": "derived-numerator-authored-denominator",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-tax/src/lib.rs:385 The denominator describes a jurisdiction roster for extraction completeness, rather than a hand-authored product goal on a public progress surface."
+        },
+        {
+          "technique": "no-data-source-labelled-inline",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:342 Pricing figures are research-derived dataset records; no hand-authored public product figure requiring the technique's inline label was found."
+        },
+        {
+          "technique": "presentation-invariants-on-derived-values",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/valuation-multiples/src/lib.rs:192 Coverage compares observed records with a domain roster; no rendered progress bar or mixed-provenance public target was found."
+        },
+        {
+          "technique": "promise-only-what-ships",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/transact/src/lib.rs:167 The confirmation construct probes an external browser workflow; it is not public success-panel copy promising a follow-up."
+        },
+        {
+          "technique": "provenance-as-a-build-gate",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-licensing/src/lib.rs:144 The manifest describes operational cost telemetry; no public claim-formatting surface requiring a provenance lint gate was found."
+        }
+      ],
+      "withdrawn": {
+        "worker": "cd847111-3819-4511-bc26-593dc457e554",
+        "state": "not-applicable",
+        "at": "2026-10-19T22:49:02.026365+00:00",
+        "reason": "reviewer (sonnet): The anchor at homewyse-pricing/src/lib.rs:10 is a doc-comment line about locality selection, so it doesn't show that a public claim surface is absent. The 'no hit' rests on three narrow search terms (roadmap, marketing, badge). I didn't find evidence that transact and valuation-multiples have no pub"
+      }
     }
   }
 }

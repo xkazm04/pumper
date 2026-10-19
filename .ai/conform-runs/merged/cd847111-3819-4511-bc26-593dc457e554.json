@@ -1,0 +1,38 @@
+{
+  "schema": "conform-run/1",
+  "worker": "cd847111-3819-4511-bc26-593dc457e554",
+  "subject": "public-claim-provenance",
+  "evaluatedAt": "2026-10-19T22:48:43.353294+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "public-claim-provenance",
+      "context": "pricing-valuation",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor at homewyse-pricing/src/lib.rs:10 is a doc-comment line about locality selection, so it doesn't show that a public claim surface is absent. The 'no hit' rests on three narrow search terms (roadmap, marketing, badge). I didn't find evidence that transact and valuation-multiples have no pub"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-19T22:48:43.353294+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "public-claim-provenance"
+      ],
+      "techniques": [
+        "build-time-derivation-off-the-client-bundle",
+        "degraded-never-claims-live",
+        "derived-numerator-authored-denominator",
+        "no-data-source-labelled-inline",
+        "presentation-invariants-on-derived-values",
+        "promise-only-what-ships",
+        "provenance-as-a-build-gate"
+      ],
+      "deviations": 0,
+      "context": "pricing-valuation",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
