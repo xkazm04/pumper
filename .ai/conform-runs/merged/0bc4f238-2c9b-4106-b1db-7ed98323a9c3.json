@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0bc4f238-2c9b-4106-b1db-7ed98323a9c3",
+ "subject": "index-free-random-access",
+ "evaluatedAt": "2026-10-19T09:45:28.579332+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "index-free-random-access",
+   "context": "api-data-access",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
