@@ -1,0 +1,81 @@
+{
+ "schema": "conform-run/1",
+ "worker": "fde078da-02ee-4dc5-8a86-75637d36a250",
+ "subject": "transactions-over-a-replicated-log",
+ "evaluatedAt": "2026-10-20T21:32:21.674467+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "core-job-queue",
+   "subject": "transactions-over-a-replicated-log",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/storage.rs:545 The queue executes SQL directly against SQLite WAL, and searches of the context and repository found no consensus, replicated_log, applied_index, or log_index, so the replicated-log precondition does not hold.",
+   "techniques": [
+    {
+     "technique": "capture-index-before-snapshot",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:1071 The queue fences stale workers by job attempt number; it does not capture an applied-log index alongside a transaction snapshot."
+    },
+    {
+     "technique": "compose-then-conform",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/store_instrument.rs:610 The instrument measures a closure receiving a SQLite connection; it does not implement a transactional storage interface with its own transaction handles."
+    },
+    {
+     "technique": "list-verification-by-present-keys",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:1460 Job listing queries the pool directly, without a transaction write buffer, reconciled key list, or apply-time verification hash."
+    },
+    {
+     "technique": "live-file-is-the-snapshot",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 The durable engine uses SQLite WAL directly, without a consensus library requesting state-machine snapshots."
+    },
+    {
+     "technique": "no-writes-no-log",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:1452 The job read executes directly against the pool; there is no buffered transaction commit that could propose an empty replicated entry."
+    },
+    {
+     "technique": "same-value-still-conflicts",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:1080 Completion uses an SQL status-and-attempt fence, rather than optimistic snapshot hashes checked when applying a replicated transaction."
+    },
+    {
+     "technique": "snapshot-read-plus-verify-log",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:853 Claiming mutates the queue through one atomic SQL statement, without a consensus round trip or a verification-and-write log entry."
+    }
+   ],
+   "absenceTerms": [
+    "consensus",
+    "applied_index"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-20T21:32:21.674467+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "transactions-over-a-replicated-log"
+   ],
+   "techniques": [
+    "capture-index-before-snapshot",
+    "compose-then-conform",
+    "list-verification-by-present-keys",
+    "live-file-is-the-snapshot",
+    "no-writes-no-log",
+    "same-value-still-conflicts",
+    "snapshot-read-plus-verify-log"
+   ],
+   "deviations": 0,
+   "context": "core-job-queue",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}

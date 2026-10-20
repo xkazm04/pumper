@@ -2888,7 +2888,11 @@
           "revision": 2,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:545 The queue executes SQL directly against SQLite WAL, and searches of the context and repository found no consensus, replicated_log, applied_index, or log_index, so the replicated-log precondition does not hold.",
+          "evaluatedAt": "2026-10-20",
+          "evaluatedAgainst": "sha256-b2:230a37319e1dd059",
+          "evaluatedRevision": 2
         },
         {
           "subject": "test-harness",
