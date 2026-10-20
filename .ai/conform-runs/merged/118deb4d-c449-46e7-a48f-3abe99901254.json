@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "118deb4d-c449-46e7-a48f-3abe99901254",
+ "subject": "terminal-multiplexing",
+ "evaluatedAt": "2026-10-20T21:17:45.848657+00:00",
+ "provider": "agy",
+ "model": "gemini-3.8-flash-high",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "terminal-multiplexing",
+   "context": "api-platform-ops",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
