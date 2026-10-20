@@ -266,7 +266,7 @@ jobs:
       # 3.11 for `typing.NotRequired`, which the generated TypedDicts use to say
       # "the server may omit this key". No install step and no dependencies: the
       # package is stdlib-only, so `unittest` over the checkout is the whole run.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: ${{ !cancelled() }}
         with:
           python-version: "3.12"

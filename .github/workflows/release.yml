@@ -102,12 +102,12 @@ jobs:
           cat "SHA256SUMS-${{ matrix.target }}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/pumper-${{ matrix.target }}${{ matrix.ext }}
 
       - name: Attest the SBOM against that exact binary
-        uses: actions/attest-sbom@v2
+        uses: actions/attest-sbom@v4
         with:
           subject-path: dist/pumper-${{ matrix.target }}${{ matrix.ext }}
           sbom-path: dist/pumper-${{ matrix.target }}.cdx.json
