@@ -1,0 +1,88 @@
+{
+ "schema": "conform-run/1",
+ "worker": "9b270d71-24af-41f8-a36f-25a88409fa6a",
+ "subject": "windowed-inference-over-oversized-inputs",
+ "evaluatedAt": "2026-10-21T21:00:08.184014+00:00",
+ "provider": "codex",
+ "model": "gpt-6.1-sol",
+ "pairs": [
+  {
+   "context": "job-scheduler",
+   "subject": "windowed-inference-over-oversized-inputs",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/scheduler.rs:586 The scheduler enqueues durable scrape jobs rather than assembling model predictions, and searches for tensor, accelerator, and stitching found no matches in the context directories or repository implementation files.",
+   "techniques": [
+    {
+     "technique": "axis-buffered-writeback",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:586 The firing writes a queued job; there are no accelerator predictions or host stitching transfers to buffer."
+    },
+    {
+     "technique": "failure-driven-memory-degradation",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:571 This configures job attempts, not retries of an inference canvas after accelerator allocation failure."
+    },
+    {
+     "technique": "overlap-weighted-stitching",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1173 Overlap means an outstanding scheduled job holding its slot, with no overlapping predictions to blend."
+    },
+    {
+     "technique": "resolution-decoupled-window-mapping",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1357 The scheduler resolves JSON app parameters; no model window outputs or spatial coordinate mapping were found."
+    },
+    {
+     "technique": "schedule-parity-by-realized-cut",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1129 The schedule describes cron firing times, not separate offline and serving cuts of model input."
+    },
+    {
+     "technique": "split-device-inference-and-stitching",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:286 The execution path traverses stored schedules; no inference device or prediction canvas allocation was found."
+    },
+    {
+     "technique": "step-synchronous-windows",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:330 A step reconciles one cron schedule rather than advancing an iterative model window from shared canvas state."
+    },
+    {
+     "technique": "strictly-positive-blend-weights",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/job_budget_floor.rs:42 The numeric floor tests concern spend ceilings; no tapered blend weights or normalization canvas were found."
+    }
+   ],
+   "absenceTerms": [
+    "tensor",
+    "accelerator",
+    "stitching"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-21T21:00:08.184014+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "windowed-inference-over-oversized-inputs"
+   ],
+   "techniques": [
+    "axis-buffered-writeback",
+    "failure-driven-memory-degradation",
+    "overlap-weighted-stitching",
+    "resolution-decoupled-window-mapping",
+    "schedule-parity-by-realized-cut",
+    "split-device-inference-and-stitching",
+    "step-synchronous-windows",
+    "strictly-positive-blend-weights"
+   ],
+   "deviations": 0,
+   "context": "job-scheduler",
+   "via": "curator-multi:codex",
+   "model": "gpt-6.1-sol"
+  }
+ ]
+}
