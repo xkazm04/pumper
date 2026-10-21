@@ -1,0 +1,38 @@
+{
+  "schema": "conform-run/1",
+  "worker": "d52d70b9-2b67-4d57-98cb-36d073f67ae2",
+  "subject": "trust-base",
+  "evaluatedAt": "2026-10-21T22:10:42.262074+00:00",
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "trust-base",
+      "context": "census-economic-data",
+      "reason": "withdrawn after review: reviewer (sonnet): The searches I re-ran over the eight crates (unsafe, set_var, remove_var, UnsafeCell, external_body, verus) found no hits, so the claim is probably true. But none of the cited anchors shows the precondition is absent. Cargo.toml:6 is only `publish = false`. lib.rs:26 is a doc comment on ZIP/CSV layo"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-21T22:10:42.262074+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "trust-base"
+      ],
+      "techniques": [
+        "assumptions-are-build-errors",
+        "census-counts-unmarked-members",
+        "leaf-spec-states-what-callers-read",
+        "marker-impl-names-its-exclusion",
+        "soundness-argument-names-its-dependencies",
+        "trusted-leaf-gets-an-outside-test",
+        "verifier-footprint-stays-contained"
+      ],
+      "deviations": 0,
+      "context": "census-economic-data",
+      "via": "curator-multi:codex",
+      "model": "gpt-6.1-sol"
+    }
+  ]
+}
