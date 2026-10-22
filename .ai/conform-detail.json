@@ -6146,6 +6146,15 @@
           "verdict": "not-applicable",
           "evidence": "crates/server/src/e2e/job_budget_floor.rs:42 The numeric floor tests concern spend ceilings; no tapered blend weights or normalization canvas were found."
         }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1 is a DB-backed cron scheduler that enqueues scrape jobs; the subject requires a fixed-input-size model run over an input exceeding accelerator memory, and no crate in the workspace runs a model",
+          "evaluatedAt": "2026-10-21T20:58:13.000Z",
+          "worker": "eafe11f1-056a-4f48-b4ff-5eb476ec53a5",
+          "reason": "older than the verdict the map holds"
+        }
       ]
     },
     "a41cd753-ab89-4c34-a749-ce9287417ca1/trust-base": {
