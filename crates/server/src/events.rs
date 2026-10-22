@@ -47,6 +47,9 @@ use uuid::Uuid;
 /// large-result events regardless of the count capacity.
 pub const DEFAULT_MAX_RING_BYTES: usize = 32 * 1024 * 1024;
 
+/// The log `kind` of a progress sample, the one droppable class on the pending queue.
+const PROGRESS_KIND: &str = "job.progress";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEvent {
     pub job_id: Uuid,
@@ -223,6 +226,10 @@ pub struct EventBus {
     /// Reported by the next [`EventBus::persist_pending`] and never reset — a
     /// process that lost events should keep saying so.
     dropped_before_persist: AtomicU64,
+    /// The share of `dropped_before_persist` that was a lifecycle event (anything but
+    /// `progress`). A dropped progress sample is a policy outcome; a dropped transition is
+    /// a subscriber that will never hear the job ended, and must not be graded alike.
+    lifecycle_dropped_before_persist: AtomicU64,
 }
 
 /// Approximate an event's memory cost by its serialized `result` length (the
@@ -259,6 +266,7 @@ impl EventBus {
             pending: None,
             pending_capacity: 0,
             dropped_before_persist: AtomicU64::new(0),
+            lifecycle_dropped_before_persist: AtomicU64::new(0),
         }
     }
 
@@ -301,6 +309,13 @@ impl EventBus {
     /// Events dropped before their log write because the queue was full.
     pub fn dropped_before_persist(&self) -> u64 {
         self.dropped_before_persist.load(Ordering::Relaxed)
+    }
+
+    /// Lifecycle events (not `progress`) dropped before their log write. Nonzero means a
+    /// subscription lost a transition for good: see `queue_for_log`.
+    pub fn lifecycle_dropped_before_persist(&self) -> u64 {
+        self.lifecycle_dropped_before_persist
+            .load(Ordering::Relaxed)
     }
 
     /// Writes every queued event to the durable log in one transaction.
@@ -351,14 +366,30 @@ impl EventBus {
             // that the event happened and why its body is missing.
             Err(e) => serde_json::json!({ "unserializable": e.to_string() }),
         };
+        let kind = event_kind(event);
+        let is_progress = kind == PROGRESS_KIND;
         let mut q = queue.lock().unwrap();
+        // A full queue sheds by class, not by age: a progress sample is one of thousands and the
+        // next one supersedes it, while a transition (queued, succeeded, failed, cancelled) is
+        // the only carrier of that fact. Evict the oldest progress sample first; the oldest
+        // lifecycle event goes only when no progress is left to give, and an incoming progress
+        // sample never evicts a transition.
         while q.len() >= self.pending_capacity {
-            q.pop_front();
+            if let Some(i) = q.iter().position(|e| e.kind == PROGRESS_KIND) {
+                q.remove(i);
+            } else if is_progress {
+                self.dropped_before_persist.fetch_add(1, Ordering::Relaxed);
+                return;
+            } else {
+                q.pop_front();
+                self.lifecycle_dropped_before_persist
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.dropped_before_persist.fetch_add(1, Ordering::Relaxed);
         }
         q.push_back(NewEvent {
             seq: seq as i64,
-            kind: event_kind(event),
+            kind,
             app: event.app.clone(),
             subject_id: event_subject(event),
             payload,
@@ -619,5 +650,57 @@ mod tests {
         }
         assert_eq!(bus.pending_len(), 4, "the queue is bounded");
         assert_eq!(bus.dropped_before_persist(), 6, "and says how much it lost");
+    }
+
+    /// A wedged store with a progress flood: the bounded queue sheds progress samples before it
+    /// sheds a transition, and counts the transitions it could not keep separately.
+    #[test]
+    fn a_full_pending_queue_sheds_progress_before_transitions() {
+        let bus = EventBus::new(64, 64).with_log(8);
+        for _ in 0..4 {
+            bus.emit(ev("queued"));
+        }
+        for _ in 0..20 {
+            bus.emit(ev("progress"));
+        }
+        for _ in 0..4 {
+            bus.emit(ev("succeeded"));
+        }
+        let kinds: Vec<String> = bus
+            .pending
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "job.queued").count(), 4);
+        assert_eq!(kinds.iter().filter(|k| *k == "job.succeeded").count(), 4);
+        assert_eq!(
+            bus.dropped_before_persist(),
+            20,
+            "every progress sample was shed"
+        );
+        assert_eq!(bus.lifecycle_dropped_before_persist(), 0);
+    }
+
+    /// When nothing but transitions is left, the oldest transition goes and is counted as one.
+    #[test]
+    fn transitions_are_dropped_only_when_nothing_cheaper_remains() {
+        let bus = EventBus::new(64, 64).with_log(4);
+        for _ in 0..6 {
+            bus.emit(ev("running"));
+        }
+        assert_eq!(bus.pending_len(), 4);
+        assert_eq!(bus.dropped_before_persist(), 2);
+        assert_eq!(bus.lifecycle_dropped_before_persist(), 2);
+        bus.emit(ev("progress"));
+        assert_eq!(
+            bus.pending_len(),
+            4,
+            "a progress sample never evicts a transition"
+        );
+        assert_eq!(bus.lifecycle_dropped_before_persist(), 2);
     }
 }

@@ -323,6 +323,13 @@ pub async fn drain(state: &AppState) {
             return;
         }
     }
+    let lifecycle_dropped = state.events.lifecycle_dropped_before_persist();
+    if lifecycle_dropped > 0 {
+        tracing::error!(
+            lifecycle_dropped,
+            "event log: job TRANSITIONS were dropped before their log write (the pending queue              held nothing but transitions at `[events] pending_capacity`) — a subscription will              never learn those jobs changed state"
+        );
+    }
     let dropped = state.events.dropped_before_persist();
     if dropped > 0 {
         warn!(
