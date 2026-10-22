@@ -1,0 +1,30 @@
+{
+  "schema": "conform-run/1",
+  "worker": "eafe11f1-056a-4f48-b4ff-5eb476ec53a5",
+  "subject": "windowed-inference-over-oversized-inputs",
+  "evaluatedAt": "2026-10-21T20:58:13Z",
+  "pairs": [
+    {
+      "context": "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4",
+      "subject": "windowed-inference-over-oversized-inputs",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/scheduler.rs:1 is a DB-backed cron scheduler that enqueues scrape jobs; the subject requires a fixed-input-size model run over an input exceeding accelerator memory, and no crate in the workspace runs a model",
+      "techniques": [
+        {"technique": "overlap-weighted-stitching", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:42 'overlap' is the guard holding a due firing while a prior job runs, not overlapping window predictions blended into a canvas"},
+        {"technique": "schedule-parity-by-realized-cut", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:2 the schedule is a cron firing time, not a window size and hop cutting an input; there is no training-vs-serving segmentation to keep in parity"},
+        {"technique": "strictly-positive-blend-weights", "verdict": "not-applicable", "evidence": "crates/server/src/e2e/quiet_window.rs:1 'window' is a quiet-time gate on activity; there is no blend weight or normaliser canvas"},
+        {"technique": "split-device-inference-and-stitching", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:1 no accelerator, model or stitched canvas exists in this context"},
+        {"technique": "failure-driven-memory-degradation", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:1 no inference call that can fail out-of-memory exists in this context"},
+        {"technique": "resolution-decoupled-window-mapping", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:1 no model head emits output at a different resolution than it consumes"},
+        {"technique": "axis-buffered-writeback", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:1 no device-to-host per-window transfer exists"},
+        {"technique": "step-synchronous-windows", "verdict": "not-applicable", "evidence": "crates/server/src/scheduler.rs:1 no iterative or sampling model runs over windows"}
+      ],
+      "registryProposal": "Matcher false positive (vocabulary resonance, not a hole): use_when grounding matched 'window', 'schedule', 'overlap' from a cron scheduler's quiet-window gate and overlap guard. The subject's precondition is model inference over an input exceeding accelerator memory, which none of these words carry; consider requiring a model/accelerator/inference term before this subject pairs."
+    }
+  ],
+  "declined": [],
+  "consults": [
+    {"ts": "2026-10-21T20:58:13Z", "bundle": "software-engineering", "subjects": ["windowed-inference-over-oversized-inputs"], "techniques": [], "deviations": 0}
+  ]
+}
