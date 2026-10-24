@@ -983,7 +983,11 @@
           "revision": 6,
           "changedAt": "2026-10-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/runtime.rs:346 POST /plugins/reload swaps in every module in place and takes each new describe().capabilities as the grant. Nothing compares it with what was granted before, so a `kv` capability added in an update, or an `http.hosts` list widened under operator `*`, takes effect with no widening verdict and no re-consent.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:a23407994bc4b9db",
+          "evaluatedRevision": 6
         },
         {
           "subject": "quality-gates",
@@ -2256,7 +2260,11 @@
           "revision": 6,
           "changedAt": "2026-10-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/core/src/config.rs:2881 The isolated WASM dynamic-app tier gets the same AppContext seams as compiled apps and stays off by default. The context's own files realize the techniques whose preconditions hold here; several others do not apply, because code arrives only through an operator-written directory, not an admin UI.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:a23407994bc4b9db",
+          "evaluatedRevision": 6
         },
         {
           "subject": "adaptive-fidelity-tiers",

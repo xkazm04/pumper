@@ -1,0 +1,118 @@
+{
+ "schema": "conform-run/1",
+ "worker": "50bad842-eafb-4a84-95a3-7a080f6641e0",
+ "subject": "untrusted-extension-host",
+ "evaluatedAt": "2026-10-24T06:05:53.690315+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-engine-contract",
+   "subject": "untrusted-extension-host",
+   "bundle": "software-engineering",
+   "state": "conformant",
+   "evidence": "crates/core/src/config.rs:2881 The isolated WASM dynamic-app tier gets the same AppContext seams as compiled apps and stays off by default. The context's own files realize the techniques whose preconditions hold here; several others do not apply, because code arrives only through an operator-written directory, not an admin UI.",
+   "techniques": [
+    {
+     "technique": "isolation-tier-independent-extension-api",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/config.rs:2881 Dynamic WASM apps get the same metered AppContext seams as compiled apps: one context object for both tiers, not a reduced second API."
+    },
+    {
+     "technique": "canonicalizable-privilege-declaration",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/config.rs:1938 The operator half never widens empty to unrestricted, and line 1942 says `*` comes only from operator config, never from a manifest. Canonical sorting, hashing and a consent record are not in this context's files (see notes)."
+    },
+    {
+     "technique": "per-callback-failure-policy",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/config.rs:1981 Enrichers only add entity kinds (line 1984), so this is an observe-and-augment surface where the technique's boundary section calls a uniform non-fatal policy correct. Whether a dead enricher is kept from running again was not verified."
+    },
+    {
+     "technique": "two-tier-extension-format",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/config.rs:2886 Running third-party WASM is an operator opt-in over modules the operator placed on disk. No product interface installs code, so the shorter-UI-ceremony and channel-refusal rules have nothing to govern."
+    },
+    {
+     "technique": "capability-subtraction-sandbox",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/app.rs:90 The host has a real isolate (wasmtime with fuel and memory caps), and this technique applies only when an embedded scripting runtime is the sole isolation."
+    },
+    {
+     "technique": "pluggable-isolation-runner",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/app.rs:91 There is one isolation runner (wasmtime) on one deployment target. The trait exists because of the dependency rule, not because there are several runners."
+    },
+    {
+     "technique": "safe-mode-registration",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/config.rs:1916 Extensions are re-read from an operator-owned directory and config on every start, so the fix is the same edit that installed them. The technique's 'when not to use it' case covers this."
+    }
+   ],
+   "registryProposal": "The golden path assumes code is installed from the product's admin UI. This repo has a real isolate whose code arrives only through an operator directory plus a hot-reload API. The subject does not say which of its techniques still bind in that hybrid; at minimum grant-change-consent on hot-swap and canonicalization seem to. A short paragraph on operator-installed but isolated extensions would stop seats from guessing."
+  },
+  {
+   "context": "api-job-management",
+   "subject": "untrusted-extension-host",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/runtime.rs:346 POST /plugins/reload swaps in every module in place and takes each new describe().capabilities as the grant. Nothing compares it with what was granted before, so a `kv` capability added in an update, or an `http.hosts` list widened under operator `*`, takes effect with no widening verdict and no re-consent.",
+   "techniques": [
+    {
+     "technique": "grant-change-consent",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/runtime.rs:346 Updates happen in place (the 'Hot-swap' comment at line 332) and take capabilities straight from the new manifest. There is no structural diff, no polarity rule, no consented hash, and KV has no operator gate."
+    },
+    {
+     "technique": "isolation-tier-independent-extension-api",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/jobs.rs:104 A dynamic app that cannot run is skipped loudly: it is listed as runnable:false, and enqueuing it returns a 409 with the reason, not an empty success."
+    },
+    {
+     "technique": "per-callback-failure-policy",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/error.rs:135 A plugin failure is reported as a host fault without exposing foreign trap text (bounded reason, tested at line 817), and its typed PluginFailure class travels to the ledger and job result. This anchor does not show refusal-vs-failure typing."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T06:05:53.690315+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "untrusted-extension-host"
+   ],
+   "techniques": [
+    "canonicalizable-privilege-declaration",
+    "capability-subtraction-sandbox",
+    "isolation-tier-independent-extension-api",
+    "per-callback-failure-policy",
+    "pluggable-isolation-runner",
+    "safe-mode-registration",
+    "two-tier-extension-format"
+   ],
+   "deviations": 0,
+   "context": "core-engine-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T06:05:53.690315+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "untrusted-extension-host"
+   ],
+   "techniques": [
+    "grant-change-consent",
+    "isolation-tier-independent-extension-api",
+    "per-callback-failure-policy"
+   ],
+   "deviations": 1,
+   "context": "api-job-management",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
