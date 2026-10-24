@@ -1863,7 +1863,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:962 Research findings are keyed by their position in the model's output, so a reordered report re-keys every finding and makes up changed revisions. dedup-and-datasets names row position as a key that must never be used. hackernews also serializes rank, points and comments straight into the change hash (:341).",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "session-continuation",

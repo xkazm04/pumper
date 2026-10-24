@@ -1,0 +1,86 @@
+{
+ "schema": "conform-run/1",
+ "worker": "7cf7fd64-a370-407d-b5c7-6a95083829e9",
+ "subject": "web-scraping",
+ "evaluatedAt": "2026-10-24T03:00:49.190896+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "content-monitoring",
+   "subject": "web-scraping",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/research/src/lib.rs:962 Research findings are keyed by their position in the model's output, so a reordered report re-keys every finding and makes up changed revisions. dedup-and-datasets names row position as a key that must never be used. hackernews also serializes rank, points and comments straight into the change hash (:341).",
+   "techniques": [
+    {
+     "technique": "dedup-and-datasets",
+     "verdict": "deviation",
+     "evidence": "crates/apps/research/src/lib.rs:962 Index-based key. hackernews keys by HN id (good) but hashes the whole story, including positional rank and volatile counts, with no declared compared-field set."
+    },
+    {
+     "technique": "extraction-rule-dsl",
+     "verdict": "deviation",
+     "evidence": "crates/apps/hackernews/src/lib.rs:387 Extraction is written as per-site code with inline selectors rather than as a RuleSet with declared failure semantics. The repo has a rule DSL, but this app does not use it."
+    },
+    {
+     "technique": "dry-run-preview",
+     "verdict": "conformant",
+     "evidence": "crates/apps/watch/src/lib.rs:246 watch preview: a live fetch (cache bypassed), the same production judge, no writes, and a writes receipt"
+    },
+    {
+     "technique": "shape-change-detection",
+     "verdict": "conformant",
+     "evidence": "crates/apps/watch/src/lib.rs:194 An empty extraction fails the job instead of reporting zero-change success. hackernews :323 does the same. Both lump drift and soft blocks into one error and do not classify which it was."
+    },
+    {
+     "technique": "llm-assisted-rule-authoring",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/research/src/lib.rs:3 The model runs as an agentic synthesizer over heterogeneous sources, which the technique allows. No rule authoring happens here."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "web-scraping",
+   "context": "core-change-detection",
+   "reason": "evidence leans on core/extract.rs, which is not a tracked file"
+  },
+  {
+   "subject": "web-scraping",
+   "context": "web-scraping-engines",
+   "reason": "evidence leans on core/cache.rs, which is not a tracked file"
+  },
+  {
+   "subject": "web-scraping",
+   "context": "e2e-data-integrity",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "web-scraping",
+   "context": "ai-extraction-engines",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T03:00:49.190896+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "web-scraping"
+   ],
+   "techniques": [
+    "dedup-and-datasets",
+    "dry-run-preview",
+    "extraction-rule-dsl",
+    "llm-assisted-rule-authoring",
+    "shape-change-detection"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

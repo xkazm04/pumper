@@ -6893,6 +6893,42 @@
           "evidence": "crates/apps/state-tax/tests/partial_run_cannot_delete.rs:120 App write-path invariants (a partial run cannot tombstone) are tested against a real migrated SQLite."
         }
       ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/web-scraping": {
+      "context": "content-monitoring",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:00:49.190Z",
+      "worker": "7cf7fd64-a370-407d-b5c7-6a95083829e9",
+      "techniques": [
+        {
+          "technique": "dedup-and-datasets",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:962 Index-based key. hackernews keys by HN id (good) but hashes the whole story, including positional rank and volatile counts, with no declared compared-field set."
+        },
+        {
+          "technique": "extraction-rule-dsl",
+          "verdict": "deviation",
+          "evidence": "crates/apps/hackernews/src/lib.rs:387 Extraction is written as per-site code with inline selectors rather than as a RuleSet with declared failure semantics. The repo has a rule DSL, but this app does not use it."
+        },
+        {
+          "technique": "dry-run-preview",
+          "verdict": "conformant",
+          "evidence": "crates/apps/watch/src/lib.rs:246 watch preview: a live fetch (cache bypassed), the same production judge, no writes, and a writes receipt"
+        },
+        {
+          "technique": "shape-change-detection",
+          "verdict": "conformant",
+          "evidence": "crates/apps/watch/src/lib.rs:194 An empty extraction fails the job instead of reporting zero-change success. hackernews :323 does the same. Both lump drift and soft blocks into one error and do not classify which it was."
+        },
+        {
+          "technique": "llm-assisted-rule-authoring",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:3 The model runs as an agentic synthesizer over heterogeneous sources, which the technique allows. No rule authoring happens here."
+        }
+      ]
     }
   }
 }
