@@ -7356,6 +7356,32 @@
           "evidence": "scripts/docs/feature-doc-map.json:32 The coupled doc sits in the same tree as the source, and the technique itself says not to build this in that case."
         }
       ]
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/multi-provider-gateway-plane": {
+      "context": "e2e-api-contract",
+      "subject": "multi-provider-gateway-plane",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T05:55:57.374Z",
+      "worker": "95fa43d9-687a-49f5-9740-b497017a96d0",
+      "techniques": [
+        {
+          "technique": "policy-verdict-in-the-status-space",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/error_contract.rs:1 Refusals use conventional statuses with a body `code` that clients branch on. This is the technique's own 'every consumer can parse the body' exclusion, and no candidate list sits behind it."
+        },
+        {
+          "technique": "router-versus-candidate-failure",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:1 This is a retry decision for a single job (the retry-backoff neighbour's territory). No candidate set exists in these files, so there is no fallback loop to attribute failures across."
+        },
+        {
+          "technique": "caller-scoped-normalization-strictness",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/ingress_gates.rs:152 The response is pumper's own vocabulary. No upstream-native payload is translated or collapsed, so there is no strictness switch to judge."
+        }
+      ]
     }
   }
 }

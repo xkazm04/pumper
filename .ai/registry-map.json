@@ -3853,7 +3853,11 @@
           "revision": 9,
           "changedAt": "2026-09-09",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/router.rs:1 These files test pumper's own HTTP API: error envelope, ingress gates, body limit, budget handling, panic containment and cursor paging. None of them selects a candidate, fails over, normalizes or frames a stream. A case-insensitive search of crates/server/src/e2e/ found 0 hits for provider, normaliz, load_balance and stream_framing. The 'router' here is the axum HTTP router, not a candidate router.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:f268193750c0a517",
+          "evaluatedRevision": 9
         },
         {
           "subject": "prompt-assembly",
