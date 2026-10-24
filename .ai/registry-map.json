@@ -2838,7 +2838,11 @@
           "revision": 28,
           "changedAt": "2026-10-15",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/storage.rs:1890 reap_stale and the boot sweep pass a silent job to fail() with only a Text reason, so the row ends up queued or failed with requeue_reason and cause_kind identical to a self-reported text failure, and the sweeper's inference can be told from a reported error only by parsing the prose of the error column.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:93bd71853ab468b1",
+          "evaluatedRevision": 28
         },
         {
           "subject": "transactions-over-a-replicated-log",
@@ -4852,7 +4856,11 @@
           "revision": 28,
           "changedAt": "2026-10-15",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/worker.rs:1657 The lease reaper turns \"we stopped hearing from this job\" into a permanent failure and runs the normal failure finalize (callback and terminal triggers), so whatever watches the fleet cannot tell a job the sweeper declared dead from one that reported its own error.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:93bd71853ab468b1",
+          "evaluatedRevision": 28
         },
         {
           "subject": "admission-queue",

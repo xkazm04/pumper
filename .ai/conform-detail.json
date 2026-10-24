@@ -6941,6 +6941,139 @@
           "evidence": "crates/apps/research/src/lib.rs:3 The model runs as an agentic synthesizer over heterogeneous sources, which the technique allows. No rule authoring happens here."
         }
       ]
+    },
+    "6a152014-f86c-4ad6-8b65-6ab5ed484ea5/fleet-orchestration": {
+      "context": "job-worker",
+      "subject": "fleet-orchestration",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:31:42.170Z",
+      "worker": "d177aa0b-939f-47c4-9a51-f3c7b4dcb75e",
+      "techniques": [
+        {
+          "technique": "lifecycle-signals",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/worker.rs:1657 The sweeper's verdict goes out as an ordinary failure through finalize. There is no 'lost' outcome separate from a self-reported failure."
+        },
+        {
+          "technique": "parallel-dispatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:24 One global slot cap is enforced at the single claim loop, and a per-app cap sits on top of it (blocked_apps). Slots are released through an RAII permit."
+        },
+        {
+          "technique": "session-registry",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1297 The attempt number works as a generation token. A stale incarnation that was reset or reaped cannot act for the job it lost."
+        },
+        {
+          "technique": "hibernation-and-resume",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:284 The drain suspends in-flight jobs to their checkpoint under the same job id instead of killing them. The suspend is told apart from a user cancel (CancelKind)."
+        },
+        {
+          "technique": "durable-fleet-state",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:306 Whatever is still running at the drain deadline gets the same recovery verdict as the boot sweep, and the requeued, failed and skipped counts are reported separately."
+        },
+        {
+          "technique": "substrate-reconciliation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:64 Local runs are in-process tokio tasks, so process exit is the reaper and there is no external substrate to converge."
+        }
+      ]
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/fleet-orchestration": {
+      "context": "pricing-valuation",
+      "subject": "fleet-orchestration",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:31:42.170Z",
+      "techniques": [
+        {
+          "technique": "soft-budget-under-the-hard-cap",
+          "verdict": "deviation",
+          "evidence": "crates/apps/state-tax/src/lib.rs:197 Only a hard cap exists. The prompt (lines 213-228) states no soft budget and no conditions for stopping early. valuation-multiples (25) and state-licensing (30) follow the same pattern."
+        },
+        {
+          "technique": "worker-trajectory-anatomy",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:234 The step budget is set at dispatch and the runtime enforces it."
+        },
+        {
+          "technique": "completion-claim-verification",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:337 The parent checks the agent's answer in code against a fixed roster of 51 jurisdictions and per-field rate validation. A shortfall is 'suspect' and suppresses tombstoning rather than passing."
+        },
+        {
+          "technique": "result-harvest",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:342 A 'done' that comes back with no usable records is turned into a failure, not counted as an empty success. The shape is also constrained by json_schema at line 247."
+        },
+        {
+          "technique": "brief-carries-the-session",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/src/lib.rs:226 The brief spells out the roster, the closed vocabulary for income_tax_type and the units, instead of assuming the worker knows them."
+        },
+        {
+          "technique": "heterogeneous-model-panels",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/state-tax/src/lib.rs:233 This is a single-model extraction task, not a decision-shaped question, so no panel is owed."
+        }
+      ],
+      "withdrawn": {
+        "worker": "d177aa0b-939f-47c4-9a51-f3c7b4dcb75e",
+        "state": "deviation",
+        "at": "2026-10-24T03:32:10.563133+00:00",
+        "reason": "reviewer (sonnet): The 30-turn default at state-tax lib.rs:197 and a prompt with no soft budget are confirmed, but I found nothing in the code that shows a cap-fired run is 'the ordinary way a long run ends' or how the parent handles a cap hit, so the deviation rests on an unconfirmed claim."
+      }
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/fleet-orchestration": {
+      "context": "core-job-queue",
+      "subject": "fleet-orchestration",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:31:42.170Z",
+      "worker": "d177aa0b-939f-47c4-9a51-f3c7b4dcb75e",
+      "techniques": [
+        {
+          "technique": "lifecycle-signals",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1890 The tier-two sweeper writes a self-reported-failure state, not an honest 'lost' state."
+        },
+        {
+          "technique": "session-registry",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/job.rs:54 The vocabulary is closed and single-sourced, but its terminal set has no 'lost' member, so 'lost' and 'failed' are merged."
+        },
+        {
+          "technique": "absent-status-passthrough",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:4546 An unrecognized stored status is an error, never defaulted to a plausible state."
+        },
+        {
+          "technique": "hibernation-and-resume",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/job.rs:13 'waiting' is a first-class parked state: the slot is released and the identity kept. Resume goes back to queued, and the pending input survives in input_request/resumed_input."
+        },
+        {
+          "technique": "parallel-dispatch",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/job.rs:80 target_key declares collision domains and the claim keeps them disjoint."
+        },
+        {
+          "technique": "durable-fleet-state",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:1823 The boot sweep and the lease reaper share one verdict function. It is bounded, idempotent, and reports per-class counts."
+        },
+        {
+          "technique": "outbound-compute-plane",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:876 Executors claim by polling outbound, with an allow-list. The lease holder is stamped in the same statement that claims the job, and heartbeats are fenced on executor_id."
+        }
+      ]
     }
   }
 }

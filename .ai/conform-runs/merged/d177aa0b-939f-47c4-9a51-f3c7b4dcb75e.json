@@ -1,0 +1,165 @@
+{
+  "schema": "conform-run/1",
+  "worker": "d177aa0b-939f-47c4-9a51-f3c7b4dcb75e",
+  "subject": "fleet-orchestration",
+  "evaluatedAt": "2026-10-24T03:31:42.170128+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "job-worker",
+      "subject": "fleet-orchestration",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/worker.rs:1657 The lease reaper turns \"we stopped hearing from this job\" into a permanent failure and runs the normal failure finalize (callback and terminal triggers), so whatever watches the fleet cannot tell a job the sweeper declared dead from one that reported its own error.",
+      "techniques": [
+        {
+          "technique": "lifecycle-signals",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/worker.rs:1657 The sweeper's verdict goes out as an ordinary failure through finalize. There is no 'lost' outcome separate from a self-reported failure."
+        },
+        {
+          "technique": "parallel-dispatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:24 One global slot cap is enforced at the single claim loop, and a per-app cap sits on top of it (blocked_apps). Slots are released through an RAII permit."
+        },
+        {
+          "technique": "session-registry",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1297 The attempt number works as a generation token. A stale incarnation that was reset or reaped cannot act for the job it lost."
+        },
+        {
+          "technique": "hibernation-and-resume",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:284 The drain suspends in-flight jobs to their checkpoint under the same job id instead of killing them. The suspend is told apart from a user cancel (CancelKind)."
+        },
+        {
+          "technique": "durable-fleet-state",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:306 Whatever is still running at the drain deadline gets the same recovery verdict as the boot sweep, and the requeued, failed and skipped counts are reported separately."
+        },
+        {
+          "technique": "substrate-reconciliation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:64 Local runs are in-process tokio tasks, so process exit is the reaper and there is no external substrate to converge."
+        }
+      ]
+    },
+    {
+      "context": "core-job-queue",
+      "subject": "fleet-orchestration",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/storage.rs:1890 reap_stale and the boot sweep pass a silent job to fail() with only a Text reason, so the row ends up queued or failed with requeue_reason and cause_kind identical to a self-reported text failure, and the sweeper's inference can be told from a reported error only by parsing the prose of the error column.",
+      "techniques": [
+        {
+          "technique": "lifecycle-signals",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1890 The tier-two sweeper writes a self-reported-failure state, not an honest 'lost' state."
+        },
+        {
+          "technique": "session-registry",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/job.rs:54 The vocabulary is closed and single-sourced, but its terminal set has no 'lost' member, so 'lost' and 'failed' are merged."
+        },
+        {
+          "technique": "absent-status-passthrough",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:4546 An unrecognized stored status is an error, never defaulted to a plausible state."
+        },
+        {
+          "technique": "hibernation-and-resume",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/job.rs:13 'waiting' is a first-class parked state: the slot is released and the identity kept. Resume goes back to queued, and the pending input survives in input_request/resumed_input."
+        },
+        {
+          "technique": "parallel-dispatch",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/job.rs:80 target_key declares collision domains and the claim keeps them disjoint."
+        },
+        {
+          "technique": "durable-fleet-state",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:1823 The boot sweep and the lease reaper share one verdict function. It is bounded, idempotent, and reports per-class counts."
+        },
+        {
+          "technique": "outbound-compute-plane",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:876 Executors claim by polling outbound, with an allow-list. The lease holder is stamped in the same statement that claims the job, and heartbeats are fenced on executor_id."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "fleet-orchestration",
+      "context": "api-server-core",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "fleet-orchestration",
+      "context": "pricing-valuation",
+      "reason": "withdrawn after review: reviewer (sonnet): The 30-turn default at state-tax lib.rs:197 and a prompt with no soft budget are confirmed, but I found nothing in the code that shows a cap-fired run is 'the ordinary way a long run ends' or how the parent handles a cap hit, so the deviation rests on an unconfirmed claim."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-24T03:31:42.170128+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "fleet-orchestration"
+      ],
+      "techniques": [
+        "durable-fleet-state",
+        "hibernation-and-resume",
+        "lifecycle-signals",
+        "parallel-dispatch",
+        "session-registry",
+        "substrate-reconciliation"
+      ],
+      "deviations": 1,
+      "context": "job-worker",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T03:31:42.170128+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "fleet-orchestration"
+      ],
+      "techniques": [
+        "brief-carries-the-session",
+        "completion-claim-verification",
+        "heterogeneous-model-panels",
+        "result-harvest",
+        "soft-budget-under-the-hard-cap",
+        "worker-trajectory-anatomy"
+      ],
+      "deviations": 1,
+      "context": "pricing-valuation",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T03:31:42.170128+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "fleet-orchestration"
+      ],
+      "techniques": [
+        "absent-status-passthrough",
+        "durable-fleet-state",
+        "hibernation-and-resume",
+        "lifecycle-signals",
+        "outbound-compute-plane",
+        "parallel-dispatch",
+        "session-registry"
+      ],
+      "deviations": 1,
+      "context": "core-job-queue",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}
