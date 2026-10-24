@@ -7230,6 +7230,38 @@
       "evaluatedTs": "2026-10-24T04:38:50.402Z",
       "worker": "6923a468-2e38-49ff-8ccf-4f2a3116f6d3",
       "techniques": []
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/table": {
+      "context": "pumper-sync-sdk",
+      "subject": "table",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T04:54:09.728Z",
+      "worker": "8d31a7c3-a401-4d8b-bc71-9436afc4304e",
+      "techniques": [
+        {
+          "technique": "pagination",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/src/watermark.ts:62 Keyset with an identity tiebreak (rule 1) is met, but the cursor is a transparent tuple that the client builds and parses, with no sort order encoded in it, so rule 3 fails."
+        },
+        {
+          "technique": "client-server-split",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/client.ts:42 Filter and window both run on the server; the client never filters or reorders a partial copy."
+        },
+        {
+          "technique": "export-escapes-for-its-consumer",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/src/client.ts:57 The SDK only consumes NDJSON and never writes CSV for a spreadsheet."
+        },
+        {
+          "technique": "sorting",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/watermark.ts:12 The feed order is total: chunk-shared created_at stamps are tie-broken by rowid, so a resume neither skips nor repeats rows at the boundary."
+        }
+      ],
+      "registryProposal": "The pagination technique's opacity rule (rule 3) does not say what to do when a first-party SDK has to persist and migrate cursors across versions, as this one does with legacy RFC3339 watermarks. It could say whether a versioned, server-validated transparent token is an acceptable alternative to sealing."
     }
   }
 }

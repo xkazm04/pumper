@@ -5217,7 +5217,11 @@
           "revision": 14,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/src/sync.ts:250 The SDK builds feed cursors itself as a plain `<created_at>|<rowid>` string (and rewrites legacy instants into that form). Pagination rule 3 says the cursor is opaque to the client and tied to the order it was minted under. Here the server cannot change the encoding without breaking every stored mirror watermark, and a position taken from a newest-first (desc) page could be replayed against the oldest-first (asc) drain.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:c587a204413d5373",
+          "evaluatedRevision": 14
         },
         {
           "subject": "docs-sync",

@@ -1,0 +1,66 @@
+{
+ "schema": "conform-run/1",
+ "worker": "8d31a7c3-a401-4d8b-bc71-9436afc4304e",
+ "subject": "table",
+ "evaluatedAt": "2026-10-24T04:54:09.728340+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "table",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/src/sync.ts:250 The SDK builds feed cursors itself as a plain `<created_at>|<rowid>` string (and rewrites legacy instants into that form). Pagination rule 3 says the cursor is opaque to the client and tied to the order it was minted under. Here the server cannot change the encoding without breaking every stored mirror watermark, and a position taken from a newest-first (desc) page could be replayed against the oldest-first (asc) drain.",
+   "techniques": [
+    {
+     "technique": "pagination",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/src/watermark.ts:62 Keyset with an identity tiebreak (rule 1) is met, but the cursor is a transparent tuple that the client builds and parses, with no sort order encoded in it, so rule 3 fails."
+    },
+    {
+     "technique": "client-server-split",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/client.ts:42 Filter and window both run on the server; the client never filters or reorders a partial copy."
+    },
+    {
+     "technique": "export-escapes-for-its-consumer",
+     "verdict": "not-applicable",
+     "evidence": "clients/typescript/src/client.ts:57 The SDK only consumes NDJSON and never writes CSV for a spreadsheet."
+    },
+    {
+     "technique": "sorting",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/watermark.ts:12 The feed order is total: chunk-shared created_at stamps are tie-broken by rowid, so a resume neither skips nor repeats rows at the boundary."
+    }
+   ],
+   "registryProposal": "The pagination technique's opacity rule (rule 3) does not say what to do when a first-party SDK has to persist and migrate cursors across versions, as this one does with legacy RFC3339 watermarks. It could say whether a versioned, server-validated transparent token is an acceptable alternative to sealing."
+  }
+ ],
+ "declined": [
+  {
+   "subject": "table",
+   "context": "webhook-event-delivery",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T04:54:09.728340+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "table"
+   ],
+   "techniques": [
+    "client-server-split",
+    "export-escapes-for-its-consumer",
+    "pagination",
+    "sorting"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
