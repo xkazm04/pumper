@@ -3509,7 +3509,11 @@
           "revision": 11,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/migrations/0021_ingress.sql:9 The ingress source's HMAC secret is stored as a single plaintext column inline in the subscription row. NOT NULL makes the scheme fail closed, but there is no credential-store indirection and no previous-secret slot for overlap rotation.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:42ae9b9486b8352d",
+          "evaluatedRevision": 11
         },
         {
           "subject": "engine-host-contract",
@@ -6026,7 +6030,11 @@
           "revision": 11,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/webhook.rs:1232 The one inbound verifier, verify_signature, takes exactly one secret and treats the timestamp context as optional, so rotating a secret causes an outage and the bare GitHub-style base has no replay window.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:42ae9b9486b8352d",
+          "evaluatedRevision": 11
         },
         {
           "subject": "realtime-events",

@@ -1,0 +1,100 @@
+{
+ "schema": "conform-run/1",
+ "worker": "8a04a21a-4fb4-4385-bae4-97d173901022",
+ "subject": "webhook-ingestion",
+ "evaluatedAt": "2026-10-24T06:18:02.812641+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "webhook-event-delivery",
+   "subject": "webhook-ingestion",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/webhook.rs:1232 The one inbound verifier, verify_signature, takes exactly one secret and treats the timestamp context as optional, so rotating a secret causes an outage and the bare GitHub-style base has no replay window.",
+   "techniques": [
+    {
+     "technique": "sender-authentication",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/webhook.rs:1232 The good parts hold: it is one shared verifier over the raw body bytes, and the comparison is constant-time (mac.verify_slice, line 1245). The gaps: the verifier takes a single secret, so there is no current-plus-previous set and rotation cannot overlap. The `context = None` bare base (line 1241 branch) also has no signed timestamp, so a captured GitHub-scheme delivery verifies forever."
+    },
+    {
+     "technique": "duplicate-and-replay-dedup",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/events.rs:124 Dedup is handed to downstream trigger idempotency, not checked at the mint. Every redelivery is emitted again as a new bus/SSE event with a fresh seq (ingress.rs:358). There is no duplicate verdict, no per-source duplicate counter and no bounded mark store."
+    },
+    {
+     "technique": "payload-bounds",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/ingress.rs:289 This is off-context: the endpoint lives in the HTTP API context and is cited once here. The 256 KiB ingress cap is checked only after the body has been buffered (up to the global 1 MiB DefaultBodyLimit) and after a DB source lookup. There is no content-type allowlist. Refusals carry detail (404 'source not found' vs 401 'signature verification failed' vs 'timestamp outside skew window'), which works as an oracle."
+    },
+    {
+     "technique": "delivery-logging-and-replay",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/ingress.rs:338 This context's delivery log and replay (webhook_deliveries, re-sign with the current secret) cover OUTBOUND deliveries only. An inbound rejection returns without writing any record, so there is no verbatim redacted record, no verdict taxonomy, and no inbound replay or export."
+    }
+   ],
+   "registryProposal": "The subject assumes one ingress module. Here the verifier sits in the outbound-webhook module so that both directions share sign()'s base and cannot drift. The standard could say whether reusing the outbound signing scheme for inbound counts as 'one verifier', and how a shared sign/verify base should handle a sender-optional timestamp (downgrade to the bare scheme)."
+  },
+  {
+   "context": "core-schema-migrations",
+   "subject": "webhook-ingestion",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/migrations/0021_ingress.sql:9 The ingress source's HMAC secret is stored as a single plaintext column inline in the subscription row. NOT NULL makes the scheme fail closed, but there is no credential-store indirection and no previous-secret slot for overlap rotation.",
+   "techniques": [
+    {
+     "technique": "sender-authentication",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0021_ingress.sql:9 Fail-closed: the NOT NULL means every source has a secret. Two deviations remain: the secret is stored inline and in plaintext in the subscription row, and there is one secret per source, so rotation is impossible without an outage. No later migration in 0001-0025 adds rotation."
+    },
+    {
+     "technique": "delivery-logging-and-replay",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0010_webhook_deliveries.sql:1 The only delivery-record table is outbound. Migrations 0001-0025 have no inbound delivery table (headers, raw body, verdict, rejection reason), so rejected inbound deliveries leave no trace."
+    },
+    {
+     "technique": "duplicate-and-replay-dedup",
+     "verdict": "deviation",
+     "evidence": "crates/core/migrations/0011_idempotency.sql:4 The mark is a uniqueness-enforced write, which is good: there is no read-then-write gap. But it sits on jobs, downstream of the mint, with no delivery-identity table, no age bound or expiry, and no record of which key kind deduplicated a delivery."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T06:18:02.812641+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "webhook-ingestion"
+   ],
+   "techniques": [
+    "delivery-logging-and-replay",
+    "duplicate-and-replay-dedup",
+    "payload-bounds",
+    "sender-authentication"
+   ],
+   "deviations": 1,
+   "context": "webhook-event-delivery",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T06:18:02.812641+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "webhook-ingestion"
+   ],
+   "techniques": [
+    "delivery-logging-and-replay",
+    "duplicate-and-replay-dedup",
+    "sender-authentication"
+   ],
+   "deviations": 1,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

@@ -4387,33 +4387,33 @@
       "context": "webhook-event-delivery",
       "subject": "webhook-ingestion",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-15",
-      "evaluatedTs": "2026-10-15T22:50:52.618Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T06:18:02.812Z",
+      "worker": "8a04a21a-4fb4-4385-bae4-97d173901022",
       "techniques": [
         {
           "technique": "sender-authentication",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:999 verify_signature accepts only a single secret slice instead of supporting a plurality of active secrets for zero-downtime rotation, and early-returns on hex decode failure at line 1004."
-        },
-        {
-          "technique": "delivery-logging-and-replay",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:581 Delivery logging and replay in webhook.rs apply solely to outbound HTTP dispatches; inbound deliveries are neither logged nor replayable."
+          "evidence": "crates/server/src/webhook.rs:1232 The good parts hold: it is one shared verifier over the raw body bytes, and the comparison is constant-time (mac.verify_slice, line 1245). The gaps: the verifier takes a single secret, so there is no current-plus-previous set and rotation cannot overlap. The `context = None` bare base (line 1241 branch) also has no signed timestamp, so a captured GitHub-scheme delivery verifies forever."
         },
         {
           "technique": "duplicate-and-replay-dedup",
           "verdict": "deviation",
-          "evidence": "crates/server/src/events.rs:58 JobEvent::external mints inbound events directly to the event bus without checking a deduplication store."
+          "evidence": "crates/server/src/events.rs:124 Dedup is handed to downstream trigger idempotency, not checked at the mint. Every redelivery is emitted again as a new bus/SSE event with a fresh seq (ingress.rs:358). There is no duplicate verdict, no per-source duplicate counter and no bounded mark store."
+        },
+        {
+          "technique": "payload-bounds",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/ingress.rs:289 This is off-context: the endpoint lives in the HTTP API context and is cited once here. The 256 KiB ingress cap is checked only after the body has been buffered (up to the global 1 MiB DefaultBodyLimit) and after a DB source lookup. There is no content-type allowlist. Refusals carry detail (404 'source not found' vs 401 'signature verification failed' vs 'timestamp outside skew window'), which works as an oracle."
+        },
+        {
+          "technique": "delivery-logging-and-replay",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/ingress.rs:338 This context's delivery log and replay (webhook_deliveries, re-sign with the current secret) cover OUTBOUND deliveries only. An inbound rejection returns without writing any record, so there is no verbatim redacted record, no verdict taxonomy, and no inbound replay or export."
         }
       ],
-      "registryProposal": "The standard should explicitly clarify boundary separation when signature verification primitives for ingress are housed within outbound delivery modules to prevent context-classification ambiguity.",
-      "withdrawn": {
-        "worker": "908290a8-cd76-4d8e-a34f-543612c6a452",
-        "state": "deviation",
-        "at": "2026-10-15T22:51:08.895706+00:00",
-        "reason": "reviewer (sonnet): Only the single-secret claim holds (ingress.rs:335 passes `source.secret.as_bytes()`). The hex-decode early return acts on the attacker-supplied digest, not the secret, so it is no constant-time deviation, and `Mac::verify_slice` does the comparison in constant time, as the doc comment at webhook.rs"
-      }
+      "registryProposal": "The subject assumes one ingress module. Here the verifier sits in the outbound-webhook module so that both directions share sign()'s base and cannot drift. The standard could say whether reusing the outbound signing scheme for inbound counts as 'one verifier', and how a shared sign/verify base should handle a sender-optional timestamp (downgrade to the bare scheme)."
     },
     "6a152014-f86c-4ad6-8b65-6ab5ed484ea5/admission-queue": {
       "context": "job-worker",
@@ -7453,6 +7453,32 @@
           "technique": "per-callback-failure-policy",
           "verdict": "conformant",
           "evidence": "crates/server/src/routes/error.rs:135 A plugin failure is reported as a host fault without exposing foreign trap text (bounded reason, tested at line 817), and its typed PluginFailure class travels to the ledger and job result. This anchor does not show refusal-vs-failure typing."
+        }
+      ]
+    },
+    "2d713bf8-16d5-4c0f-aa09-ce602aa575db/webhook-ingestion": {
+      "context": "core-schema-migrations",
+      "subject": "webhook-ingestion",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T06:18:02.812Z",
+      "worker": "8a04a21a-4fb4-4385-bae4-97d173901022",
+      "techniques": [
+        {
+          "technique": "sender-authentication",
+          "verdict": "deviation",
+          "evidence": "crates/core/migrations/0021_ingress.sql:9 Fail-closed: the NOT NULL means every source has a secret. Two deviations remain: the secret is stored inline and in plaintext in the subscription row, and there is one secret per source, so rotation is impossible without an outage. No later migration in 0001-0025 adds rotation."
+        },
+        {
+          "technique": "delivery-logging-and-replay",
+          "verdict": "deviation",
+          "evidence": "crates/core/migrations/0010_webhook_deliveries.sql:1 The only delivery-record table is outbound. Migrations 0001-0025 have no inbound delivery table (headers, raw body, verdict, rejection reason), so rejected inbound deliveries leave no trace."
+        },
+        {
+          "technique": "duplicate-and-replay-dedup",
+          "verdict": "deviation",
+          "evidence": "crates/core/migrations/0011_idempotency.sql:4 The mark is a uniqueness-enforced write, which is good: there is no read-then-write gap. But it sits on jobs, downstream of the mint, with no delivery-identity table, no age bound or expiry, and no record of which key kind deduplicated a delivery."
         }
       ]
     }
