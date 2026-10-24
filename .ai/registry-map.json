@@ -538,12 +538,11 @@
           "changedAt": "2026-10-18",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:24 The wasm describe() manifest only publishes extractor, predicate, or transform, and a search of engine-claude, engine-wasm, and engine-search for microphone, whisper, dictation, utterance, and recognizer found none, so Claude research and Tantivy indexing are not a voice pipeline.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
-          "evaluatedRevision": 20,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/engine-wasm/src/lib.rs:33 The WASM host only declares extractor, predicate, transform, sink and enricher plugin kinds; a search of engine-claude, engine-wasm and engine-search for microphone, whisper, dictation, speech and recognizer found nothing, so Claude extraction, plugins and Tantivy search have no voice direction.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:29f8b158c4d44054",
+          "evaluatedRevision": 23,
+          "revisionsBehind": 3
         },
         {
           "subject": "agent-memory",
@@ -2108,12 +2107,11 @@
           "changedAt": "2026-10-18",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:1177 The engine contract's HTTP trait is page and API fetching, and a search of crates/core for microphone, whisper, dictation, utterance, and recognizer found none, so the tiered fetcher has no listen or speak direction.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
-          "evaluatedRevision": 20,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/core/src/engine.rs:1229 The core engine contract is an HTTP fetch trait (plus Researcher and others) and has no speak or listen interface; a search of crates/core for microphone, whisper, dictation, speech and recognizer found nothing ('transcript' hits are recorded Claude research replays, and 'voice' hits are prose idioms in tests), so the tiered fetcher is not a voice engine abstraction.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:29f8b158c4d44054",
+          "evaluatedRevision": 23,
+          "revisionsBehind": 3
         },
         {
           "subject": "engine-host-contract",
@@ -3960,12 +3958,11 @@
           "changedAt": "2026-10-18",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The conformance battery asserts what every HttpClient owes when it fetches, and a search of crates/server/src/e2e for microphone, whisper, dictation, utterance, and recognizer found none, so these tests never exercise speech.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
-          "evaluatedRevision": 20,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:71 These e2e tests check fetch, dataset, VCR and search contracts; a search of crates/server/src/e2e for microphone, whisper, dictation, speech and recognizer found nothing (the only 'voice' hit, harness.rs, is the idiom 'a voice indistinguishable from success'), so no speech is exercised here.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:29f8b158c4d44054",
+          "evaluatedRevision": 23,
+          "revisionsBehind": 3
         },
         {
           "subject": "agent-memory",
@@ -5796,12 +5793,11 @@
           "changedAt": "2026-10-18",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "crates/engine-http/src/lib.rs:1069 HttpEngine::fetch returns an HTTP response for a page or API, and a search of engine-http, engine-browser, engine-archive, and engine-remote for microphone, whisper, dictation, utterance, and recognizer found none, so this context never captures or speaks.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
-          "evaluatedRevision": 20,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/engine-http/src/lib.rs:1069 The engine's job is fetching HTTP pages and APIs; a case-insensitive search of engine-http, engine-browser, engine-archive and engine-remote for microphone, whisper, dictation, speech and recognizer (also tts, audio, voice) found nothing, so this context has no capture or synthesis pipeline for voice-io to govern.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:29f8b158c4d44054",
+          "evaluatedRevision": 23,
+          "revisionsBehind": 3
         },
         {
           "subject": "agent-browser-control",
@@ -6037,12 +6033,11 @@
           "changedAt": "2026-10-18",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/server/src/webhook.rs:25 A watch delivers an HMAC-signed HTTP payload, and a search of crates/server for microphone, whisper, dictation, utterance, and recognizer found none, so webhooks, SSE job events, and DataHub metadata do not speak or listen.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:fa1c8ca716f872dc",
-          "evaluatedRevision": 20,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/server/src/webhook.rs:25 Delivery sinks are an HMAC-signed HTTP POST, Slack text and an NDJSON file, with no audio sink; a search of webhook.rs, events.rs, datahub.rs and their e2e files for microphone, whisper, dictation, speech and recognizer found nothing, so webhooks, SSE and DataHub never speak or listen.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:29f8b158c4d44054",
+          "evaluatedRevision": 23,
+          "revisionsBehind": 3
         },
         {
           "subject": "retry-backoff",

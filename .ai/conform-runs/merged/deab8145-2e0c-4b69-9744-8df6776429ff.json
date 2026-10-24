@@ -1,0 +1,148 @@
+{
+ "schema": "conform-run/1",
+ "worker": "deab8145-2e0c-4b69-9744-8df6776429ff",
+ "subject": "voice-io",
+ "evaluatedAt": "2026-10-24T01:28:05.720988+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-http/src/lib.rs:1069 The engine's job is fetching HTTP pages and APIs; a case-insensitive search of engine-http, engine-browser, engine-archive and engine-remote for microphone, whisper, dictation, speech and recognizer (also tts, audio, voice) found nothing, so this context has no capture or synthesis pipeline for voice-io to govern.",
+   "techniques": [],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "speech",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "e2e-data-integrity",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/e2e/engine_conformance.rs:71 These e2e tests check fetch, dataset, VCR and search contracts; a search of crates/server/src/e2e for microphone, whisper, dictation, speech and recognizer found nothing (the only 'voice' hit, harness.rs, is the idiom 'a voice indistinguishable from success'), so no speech is exercised here.",
+   "techniques": [],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "speech",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "ai-extraction-engines",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-wasm/src/lib.rs:33 The WASM host only declares extractor, predicate, transform, sink and enricher plugin kinds; a search of engine-claude, engine-wasm and engine-search for microphone, whisper, dictation, speech and recognizer found nothing, so Claude extraction, plugins and Tantivy search have no voice direction.",
+   "techniques": [],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "speech",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "core-engine-contract",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/engine.rs:1229 The core engine contract is an HTTP fetch trait (plus Researcher and others) and has no speak or listen interface; a search of crates/core for microphone, whisper, dictation, speech and recognizer found nothing ('transcript' hits are recorded Claude research replays, and 'voice' hits are prose idioms in tests), so the tiered fetcher is not a voice engine abstraction.",
+   "techniques": [],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "speech",
+    "recognizer"
+   ]
+  },
+  {
+   "context": "webhook-event-delivery",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/webhook.rs:25 Delivery sinks are an HMAC-signed HTTP POST, Slack text and an NDJSON file, with no audio sink; a search of webhook.rs, events.rs, datahub.rs and their e2e files for microphone, whisper, dictation, speech and recognizer found nothing, so webhooks, SSE and DataHub never speak or listen.",
+   "techniques": [],
+   "absenceTerms": [
+    "microphone",
+    "whisper",
+    "dictation",
+    "speech",
+    "recognizer"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T01:28:05.720988+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:28:05.720988+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "e2e-data-integrity",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:28:05.720988+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "ai-extraction-engines",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:28:05.720988+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-engine-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:28:05.720988+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "webhook-event-delivery",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
