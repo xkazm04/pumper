@@ -1245,12 +1245,11 @@
           "changedAt": "2026-10-15",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/mcp/mod.rs:330 The tools/call dispatch door admits callers without authentication tokens or scopes, and uses a hardcoded match statement rather than an authoritative registry.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
-          "evaluatedRevision": 31,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/server/src/mcp/mod.rs:741 tools/call dispatches through a hand-written match over tool names that is maintained separately from the server_tools listing, and nothing at this door reads a caller principal or scope: tools are gated only by global config switches, so the door neither resolves through one registry nor authorizes per caller.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ed8e615f51454325",
+          "evaluatedRevision": 34,
+          "revisionsBehind": 3
         },
         {
           "subject": "prompt-assembly",
@@ -2918,7 +2917,11 @@
           "revision": 34,
           "changedAt": "2026-10-15",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/plugin.rs:5 The context's plugin contract is in-process WASM loading, which the golden path explicitly excludes from this subject, and searching crates/core/src and crates/core/tests for tools/call, inputSchema, jsonrpc and tools/list found no hits; the MCP job-token half (agent_tools.rs) lives in the same crate but is not one of this context's files.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ed8e615f51454325",
+          "evaluatedRevision": 34
         },
         {
           "subject": "module-design",
@@ -3344,12 +3347,11 @@
           "changedAt": "2026-10-15",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/migrations/0001_init.sql:1 The core-schema-migrations context manages internal SQLite tables and has no MCP tool protocol or tool execution surface.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
-          "evaluatedRevision": 31,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/core/migrations/0001_init.sql:1 These migrations define SQLite storage tables only. Searching crates/core/migrations for tools/call, inputSchema, jsonrpc and tools/list found no hits, so no tool-protocol surface lives here ('mcp' appears only in a comment-bearing migration outside the listed range, 0050_job_waiting.sql, so it was not used as an absence term).",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ed8e615f51454325",
+          "evaluatedRevision": 34,
+          "revisionsBehind": 3
         },
         {
           "subject": "prompt-assembly",
@@ -4177,12 +4179,11 @@
           "changedAt": "2026-10-15",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/mcp.rs:103 The integration test suite exercises tool calls without caller tokens or authentication, asserting that unauthenticated execution succeeds.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:afba7a2b8c938ae1",
-          "evaluatedRevision": 31,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/server/src/e2e/mcp.rs:11 Every MCP test drives the anonymous handle_rpc entry point below the auth layer, and none of the context's MCP test files sends POST /mcp through with_auth in keys mode, so no test proves a tool call is refused without a credential or scope.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ed8e615f51454325",
+          "evaluatedRevision": 34,
+          "revisionsBehind": 3
         },
         {
           "subject": "test-harness",

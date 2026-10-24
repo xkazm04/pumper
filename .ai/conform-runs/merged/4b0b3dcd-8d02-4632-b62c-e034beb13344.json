@@ -1,0 +1,206 @@
+{
+ "schema": "conform-run/1",
+ "worker": "4b0b3dcd-8d02-4632-b62c-e034beb13344",
+ "subject": "mcp-tools",
+ "evaluatedAt": "2026-10-24T00:28:57.314068+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "mcp-tools",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/mcp/mod.rs:741 tools/call dispatches through a hand-written match over tool names that is maintained separately from the server_tools listing, and nothing at this door reads a caller principal or scope: tools are gated only by global config switches, so the door neither resolves through one registry nor authorizes per caller.",
+   "techniques": [
+    {
+     "technique": "authentication-and-scoping",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:72 The door treats every non-job-token caller as anonymous. Off-context, auth::required_scope classifies every POST /mcp as Admin in keys mode (and admits it unauthenticated in the default open mode). The existing enqueue:<app>/read scopes never decide which tools resolve, so a read key cannot even list and per-tool scoping from the key registry is not realized."
+    },
+    {
+     "technique": "server-composition",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:746 The gating predicate is restated in both server_tools (listing) and the dispatch match: two authorities for 'what exists'. The validator does read the listing's schema (good), but there is no registry entry carrying handler+scope, no door-level audit line, and panics are caught only by the HTTP-wide CatchPanicLayer (whole response 500, not an in-band isError)."
+    },
+    {
+     "technique": "transport-selection",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:61 Streamable HTTP on a local port (default host 127.0.0.1 in config.rs). No Origin validation was found anywhere in mcp/ or auth.rs, and the token requirement is opt-in ([auth] mode defaults to open), so enabling MCP alone ships an unauthenticated localhost listener. The technique requires these checks to be on unless deliberately removed."
+    },
+    {
+     "technique": "tool-schema-design",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:731 The published inputSchema is the enforced artifact at one door; schema violations are in-band isError results and an unknown tool is a protocol error. Residual: bare verb names 'search'/'fetch' are not namespaced (hosts usually prefix them)."
+    },
+    {
+     "technique": "caller-differentiated-capability",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:1656 The agent fetch surface subtracts exactly the strategy that breaks the no-recursion invariant and refuses it by name, naming this tool as the surface."
+    },
+    {
+     "technique": "write-freshness-gate",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:1412 approve_transaction requires the digest of the evidence the agent actually read, checked by approve_decision before the irreversible write."
+    },
+    {
+     "technique": "budgeted-partial-response",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/live.rs:262 wait_job has one clamped wall-clock budget and returns timed_out with the current snapshot rather than an empty success; wait_workflow mirrors it."
+    },
+    {
+     "technique": "fluent-syntax-bounded-grammar",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:891 The `$.path:op:value` filter notation is parsed by the server's own parser with a closed op set (eq|contains|gte|lte|numgte), shared with the HTTP surface."
+    },
+    {
+     "technique": "first-party-agent-is-a-principal",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:75 The product's own Claude subprocess reaches the tools through the same POST /mcp door, presenting a job token as a header; there is no in-process side door to the handlers."
+    },
+    {
+     "technique": "ambient-selection-is-not-an-argument",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/mod.rs:150 The server fronts a service, not a single-seat interactive application; no argument names a current selection."
+    },
+    {
+     "technique": "sanctioned-session-state",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/mod.rs:29 No affinity or session routing exists; POST is stateless and the SSE feed is not a session."
+    },
+    {
+     "technique": "sealed-continuation-state",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/mod.rs:332 Half-finished work lives in the server's durable store (checkpoint); the caller carries only a job id, so there is no caller-carried continuation to seal. The job id is not bound to a principal, which matters only once per-caller scoping exists."
+    }
+   ],
+   "registryProposal": "authentication-and-scoping could name the 'whole endpoint behind one coarse scope' shape (here every POST to the tool endpoint demands admin): it is closed rather than open, yet it still fails per-tool scoping and makes listing require the strongest grant. That is a distinct failure from the unauthenticated door."
+  },
+  {
+   "context": "e2e-integration",
+   "subject": "mcp-tools",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/mcp.rs:11 Every MCP test drives the anonymous handle_rpc entry point below the auth layer, and none of the context's MCP test files sends POST /mcp through with_auth in keys mode, so no test proves a tool call is refused without a credential or scope.",
+   "techniques": [
+    {
+     "technique": "authentication-and-scoping",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/mcp.rs:11 handle_rpc is the test-only anonymous entry point (McpCaller::anonymous); call authentication is never exercised."
+    },
+    {
+     "technique": "tool-schema-design",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/mcp.rs:620 Pins that a typo'd key and a missing required argument are in-band isError results naming the key, and that refused calls never reach the handler."
+    },
+    {
+     "technique": "budgeted-partial-response",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/mcp_live.rs:229 Proves a 999s wait is clamped to the server cap and reported as timed_out with the current status, not as a silent success."
+    }
+   ]
+  },
+  {
+   "context": "core-schema-migrations",
+   "subject": "mcp-tools",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/migrations/0001_init.sql:1 These migrations define SQLite storage tables only. Searching crates/core/migrations for tools/call, inputSchema, jsonrpc and tools/list found no hits, so no tool-protocol surface lives here ('mcp' appears only in a comment-bearing migration outside the listed range, 0050_job_waiting.sql, so it was not used as an absence term).",
+   "techniques": [],
+   "absenceTerms": [
+    "tools/call",
+    "inputSchema",
+    "jsonrpc",
+    "tools/list"
+   ]
+  },
+  {
+   "context": "core-platform-services",
+   "subject": "mcp-tools",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/plugin.rs:5 The context's plugin contract is in-process WASM loading, which the golden path explicitly excludes from this subject, and searching crates/core/src and crates/core/tests for tools/call, inputSchema, jsonrpc and tools/list found no hits; the MCP job-token half (agent_tools.rs) lives in the same crate but is not one of this context's files.",
+   "techniques": [],
+   "absenceTerms": [
+    "tools/call",
+    "inputSchema",
+    "jsonrpc",
+    "tools/list"
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "mcp-tools",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T00:28:57.314068+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "mcp-tools"
+   ],
+   "techniques": [
+    "ambient-selection-is-not-an-argument",
+    "authentication-and-scoping",
+    "budgeted-partial-response",
+    "caller-differentiated-capability",
+    "first-party-agent-is-a-principal",
+    "fluent-syntax-bounded-grammar",
+    "sanctioned-session-state",
+    "sealed-continuation-state",
+    "server-composition",
+    "tool-schema-design",
+    "transport-selection",
+    "write-freshness-gate"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T00:28:57.314068+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "mcp-tools"
+   ],
+   "techniques": [
+    "authentication-and-scoping",
+    "budgeted-partial-response",
+    "tool-schema-design"
+   ],
+   "deviations": 1,
+   "context": "e2e-integration",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T00:28:57.314068+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "mcp-tools"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T00:28:57.314068+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "mcp-tools"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-platform-services",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
