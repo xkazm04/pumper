@@ -2084,8 +2084,12 @@
           "revision": 31,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "state": "not-applicable",
+          "priorNotApplicable": 2,
+          "evidence": "crates/core/src/datasets.rs:1 These are dataset/simhash change-detection modules and their tests. Grepping crates/core for AGENTS.md, 'instruction file', GEMINI.md and .cursorrules found nothing, and these files have no claude/agent/instruction mentions, so the subject's precondition does not hold.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:25b61236a62604b0",
+          "evaluatedRevision": 31
         }
       ],
       "governance": "governed"
@@ -3723,8 +3727,12 @@
           "revision": 31,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "state": "deviation",
+          "priorNotApplicable": 2,
+          "evidence": "scripts/docs/check-doc-sync.mjs:238 The hook's reminder restates the Documentation Sync rule instead of citing it. Its copy has already lost the 'CLI-observable behavior' class that .claude/CLAUDE.md lists, so the agent is shown a narrower rule than the file states.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:25b61236a62604b0",
+          "evaluatedRevision": 31
         },
         {
           "subject": "conformance-checking",

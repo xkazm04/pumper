@@ -1593,83 +1593,91 @@
       "context": "docs-and-ops-scripts",
       "subject": "agent-instruction-files",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T02:05:23.384Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T06:29:58.912Z",
+      "worker": "a93f8a64-45b8-4671-b061-4a35f48ff36d",
       "techniques": [
+        {
+          "technique": "single-source-topology",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:238 The rule text is copied into the hook rather than pointed to, and the copy has already drifted from the canonical rule (it drops CLI-observable behavior)."
+        },
+        {
+          "technique": "instruction-freshness",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:211 The hook moved to per-entry satisfaction (line 220), but .claude/CLAUDE.md:25 still tells agents it stays silent when 'the turn touched any docs/features/*'. That is a confident stale line about a gate."
+        },
         {
           "technique": "enforcement-demotion",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:222 A program decides to speak from the edited-path set; the hook's own comment says it never blocks."
+          "evidence": "scripts/docs/check-doc-sync.mjs:2 The checkable half of the doc-sync rule (mapped source edited, doc not edited) runs as a Stop hook. The judgment half (is the change user-visible?) stays in prose with a one-sentence dismiss path."
         },
         {
           "technique": "capability-before-steering",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:29 Uniform silence was a transcript-shape gap; the repair is isToolResultEntry, not a sharper reminder."
-        },
-        {
-          "technique": "restraint-amplifier-balance",
-          "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:240 The update obligation is paired with an explicit dismiss outlet for internal-only edits."
+          "evidence": "scripts/docs/check-doc-sync.mjs:261 Exit 3 sends instrument failures to the human rather than steering the model, because the model cannot fix them. Cannot-comply is kept apart from would-not-comply."
         },
         {
           "technique": "inherited-default-ownership",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:285 Stop re-entry is pinned off in the hook so the harness does not deliver a second reminder."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:241 The hook depends on the harness's transcript envelope, which is a harness default. A canary test checks it against real transcripts, so a harness change fails a test instead of silencing the hook."
         },
         {
-          "technique": "instruction-freshness",
+          "technique": "restraint-amplifier-balance",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:286 The transcript-shape claim the hook trusts is re-checked against live transcripts and fails when that shape moves."
+          "evidence": "scripts/docs/check-doc-sync.mjs:240 The update obligation is paired with an explicit dismiss outlet for internal-only edits.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "line-earning",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:189 These files are a conditional hook, not the always-loaded instruction file line-earning admits into."
+          "evidence": "scripts/docs/check-doc-sync.mjs:189 These files are a conditional hook, not the always-loaded instruction file line-earning admits into.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "capability-coverage-contract",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:207 Unmapped silence is the source-to-doc map's scope; scripts/docs has no runtime tool or skill registry."
+          "evidence": "scripts/docs/check-doc-sync.mjs:207 Unmapped silence is the source-to-doc map's scope; scripts/docs has no runtime tool or skill registry.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "host-contract-compilation",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:11 One Stop wiring; scripts/docs has no second host contract or compiled render."
+          "evidence": "scripts/docs/check-doc-sync.mjs:11 One Stop wiring; scripts/docs has no second host contract or compiled render.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "machine-owned-regions",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/feature-doc-map.json:3 The map tells a person to edit the script; nothing marks a generator fence."
+          "evidence": "scripts/docs/feature-doc-map.json:3 The map tells a person to edit the script; nothing marks a generator fence.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "write-back-sink-class",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:18 Dismissal is a chat sentence; these files name no append-only agent log."
+          "evidence": "scripts/docs/check-doc-sync.mjs:18 Dismissal is a chat sentence; these files name no append-only agent log.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "workspace-ancestry-isolation",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:72 This resolves a repo root for path matching and does not place or load instruction files."
+          "evidence": "scripts/docs/check-doc-sync.mjs:72 This resolves a repo root for path matching and does not place or load instruction files.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "sibling-floor-ownership",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:272 The hook is repository Stop wiring, not an installed-capability catalog."
+          "evidence": "scripts/docs/check-doc-sync.mjs:272 The hook is repository Stop wiring, not an installed-capability catalog.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "substrate-coupled-expiry",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/fixtures/README.md:7 The only version pin is the fixture CLI that recorded the transcript shape, not a judgment rule's model generation."
+          "evidence": "scripts/docs/fixtures/README.md:7 The only version pin is the fixture CLI that recorded the transcript shape, not a judgment rule's model generation.",
+          "carriedFrom": "2026-10-13"
         }
-      ],
-      "registryProposal": "enforcement-demotion tells a conditional hook to carry the interaction contract, while single-source-topology forbids restating instruction content in any harness-required file; the doc-sync reminder does both and the standard does not say which rule wins.",
-      "withdrawn": {
-        "worker": "e76f0382-ddb0-491d-85e6-0d1b8482c64a",
-        "state": "conformant",
-        "at": "2026-10-13T02:06:49.165536+00:00",
-        "reason": "reviewer (sonnet): The technique claim that 'the hook's own comment says it never blocks' is not in the file. check-doc-sync.mjs has no such comment, and main() writes the reminder to stderr and calls process.exit(2) at line 315, which blocks the Stop event."
-      }
+      ]
     },
     "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/supply-chain": {
       "context": "ci-quality-gates",
@@ -7481,6 +7489,16 @@
           "evidence": "crates/core/migrations/0011_idempotency.sql:4 The mark is a uniqueness-enforced write, which is good: there is no read-then-write gap. But it sits on jobs, downstream of the mint, with no delivery-identity table, no age bound or expiry, and no record of which key kind deduplicated a delivery."
         }
       ]
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/agent-instruction-files": {
+      "context": "core-change-detection",
+      "subject": "agent-instruction-files",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T06:29:58.912Z",
+      "worker": "a93f8a64-45b8-4671-b061-4a35f48ff36d",
+      "techniques": []
     }
   }
 }

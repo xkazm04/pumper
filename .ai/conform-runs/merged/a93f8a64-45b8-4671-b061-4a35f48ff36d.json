@@ -1,0 +1,107 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a93f8a64-45b8-4671-b061-4a35f48ff36d",
+ "subject": "agent-instruction-files",
+ "evaluatedAt": "2026-10-24T06:29:58.912882+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "agent-instruction-files",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/docs/check-doc-sync.mjs:238 The hook's reminder restates the Documentation Sync rule instead of citing it. Its copy has already lost the 'CLI-observable behavior' class that .claude/CLAUDE.md lists, so the agent is shown a narrower rule than the file states.",
+   "techniques": [
+    {
+     "technique": "single-source-topology",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:238 The rule text is copied into the hook rather than pointed to, and the copy has already drifted from the canonical rule (it drops CLI-observable behavior)."
+    },
+    {
+     "technique": "instruction-freshness",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:211 The hook moved to per-entry satisfaction (line 220), but .claude/CLAUDE.md:25 still tells agents it stays silent when 'the turn touched any docs/features/*'. That is a confident stale line about a gate."
+    },
+    {
+     "technique": "enforcement-demotion",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.mjs:2 The checkable half of the doc-sync rule (mapped source edited, doc not edited) runs as a Stop hook. The judgment half (is the change user-visible?) stays in prose with a one-sentence dismiss path."
+    },
+    {
+     "technique": "capability-before-steering",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.mjs:261 Exit 3 sends instrument failures to the human rather than steering the model, because the model cannot fix them. Cannot-comply is kept apart from would-not-comply."
+    },
+    {
+     "technique": "inherited-default-ownership",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:241 The hook depends on the harness's transcript envelope, which is a harness default. A canary test checks it against real transcripts, so a harness change fails a test instead of silencing the hook."
+    }
+   ]
+  },
+  {
+   "context": "core-change-detection",
+   "subject": "agent-instruction-files",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/datasets.rs:1 These are dataset/simhash change-detection modules and their tests. Grepping crates/core for AGENTS.md, 'instruction file', GEMINI.md and .cursorrules found nothing, and these files have no claude/agent/instruction mentions, so the subject's precondition does not hold.",
+   "techniques": [],
+   "absenceTerms": [
+    "AGENTS.md",
+    "instruction file",
+    "GEMINI.md",
+    ".cursorrules"
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "agent-instruction-files",
+   "context": "core-engine-contract",
+   "reason": "evidence leans on data/pumper.db, which is not a tracked file"
+  },
+  {
+   "subject": "agent-instruction-files",
+   "context": "e2e-integration",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "agent-instruction-files",
+   "context": "core-platform-services",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T06:29:58.912882+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-instruction-files"
+   ],
+   "techniques": [
+    "capability-before-steering",
+    "enforcement-demotion",
+    "inherited-default-ownership",
+    "instruction-freshness",
+    "single-source-topology"
+   ],
+   "deviations": 1,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T06:29:58.912882+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-instruction-files"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
