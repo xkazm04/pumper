@@ -380,7 +380,10 @@ impl PendingCloses {
             taken
         };
         if !owed.is_empty() {
-            info!(count = owed.len(), "closing tabs deferred from a runtime-less drop");
+            info!(
+                count = owed.len(),
+                "closing tabs deferred from a runtime-less drop"
+            );
         }
         for page in owed {
             page.close().await;
@@ -2146,7 +2149,9 @@ mod tests {
         // is exercised directly; this is the same call it makes.
         pending.maybe_drain().await;
         assert_eq!(
-            rx.recv().await.expect("arm B must settle its debt at the checkpoint"),
+            rx.recv()
+                .await
+                .expect("arm B must settle its debt at the checkpoint"),
             "tab-closed"
         );
 
