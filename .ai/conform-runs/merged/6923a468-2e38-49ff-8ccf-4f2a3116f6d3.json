@@ -1,0 +1,98 @@
+{
+ "schema": "conform-run/1",
+ "worker": "6923a468-2e38-49ff-8ccf-4f2a3116f6d3",
+ "subject": "client-fetch-cache",
+ "evaluatedAt": "2026-10-24T04:38:50.402901+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-http-cache",
+   "subject": "client-fetch-cache",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/cache.rs:98 A cache miss just returns None and nothing tracks requests already in flight, so two concurrent identical fetches (several apps or workers hitting one endpoint, which the module header names as the cache's purpose) both miss and both go to the origin; the only caller, engine-http's fetch, adds no join either.",
+   "techniques": [
+    {
+     "technique": "in-flight-dedup",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:98 No map from key to pending result anywhere in HttpCache or ResearchCache, and grep found no single-flight or coalescing in engine-http's fetch or AppContext::research. Concurrent misses race and double the origin load. For ResearchCache that doubles real spend."
+    },
+    {
+     "technique": "cache-key-discipline",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:500 The ResearchCache key writes an absent optional field (append_system_prompt, role, model, effort) as the empty string, which a caller can also pass, so None and Some(\"\") produce the same key. The technique names this as a defect. HttpCache::key does the same for body and proxy (if-let with nothing hashed). Practical impact is probably low. Everything else conforms: one builder per cache, headers sorted for a canonical form (line 66), NUL delimiters, the implicit proxy axis is in the key, and CASSETTE_VERSION (vcr.rs:128) versions the cassette shape."
+    },
+    {
+     "technique": "plural-policy-claims",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/cache.rs:290 Believability is existential and correct: get() takes the reader's own max_age, so a short-TTL reader is never served a long-TTL writer's body (lines 93-97). But put (and refresh) overwrite expires_at with the latest writer's TTL. A later, shorter claim shortens the lifetime for every other reader, and purge_expired then deletes the entry. Eviction is last-writer-wins, not the monotonic maximum the technique requires."
+    },
+    {
+     "technique": "admission-hypothesis",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/cache.rs:2 The reuse bet is written down where the cache is built (re-runs, tiered escalation, several apps hitting one endpoint). Admission is limited to 2xx responses (line 279). The eviction axis is argued in writing: oldest-confirmed first on created_at, which refresh moves forward (lines 314-326), so it is not an inherited LRU default."
+    },
+    {
+     "technique": "swr-design",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/cache.rs:279 A failed fetch never overwrites the entry or stamps freshness. Only a 304 refreshes created_at and expires_at. There is a row cap (max_rows/evict_over_cap) and a sweep (purge_expired) that run independently of reads, and the TTL can be set per call (ttl_override). Caveat: there is one TTL number and no stale-serving zone. After expiry the read blocks on a conditional GET, which I accept as the consequence-justified exception because the reads feed change detection."
+    },
+    {
+     "technique": "similarity-keyed-admission",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:69 Both caches are identity keys (SHA-256 over canonicalized request fields), not resemblance keys, so this technique's precondition does not hold."
+    }
+   ],
+   "registryProposal": "swr-design frames the stale zone around a paint. A backend fetch cache whose reads feed change detection replaces that zone with conditional revalidation (ETag/Last-Modified, then 304, then refresh). That is a legitimate fourth zone the technique could name, so that one-number-plus-conditional-GET designs are not misread as a missing stale ceiling."
+  },
+  {
+   "context": "api-data-access",
+   "subject": "client-fetch-cache",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/remote.rs:197 These handlers are the authority-side read API over SQLite and hold no fetched responses past the call. The only outbound fetch, remote.rs's fetch-proxy, delegates to engines.http, whose cache belongs to core-http-cache. A grep of crates/server/src/routes for LruCache, memoize, in_flight, single_flight and HttpCache found no matches; 'cache' appears only as the response field cache_hit (provenance.rs:619, remote.rs:213).",
+   "techniques": [],
+   "absenceTerms": [
+    "LruCache",
+    "memoize",
+    "single_flight",
+    "HttpCache"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T04:38:50.402901+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "client-fetch-cache"
+   ],
+   "techniques": [
+    "admission-hypothesis",
+    "cache-key-discipline",
+    "in-flight-dedup",
+    "plural-policy-claims",
+    "similarity-keyed-admission",
+    "swr-design"
+   ],
+   "deviations": 1,
+   "context": "core-http-cache",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T04:38:50.402901+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "client-fetch-cache"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "api-data-access",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

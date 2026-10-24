@@ -890,7 +890,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/routes/remote.rs:197 These handlers are the authority-side read API over SQLite and hold no fetched responses past the call. The only outbound fetch, remote.rs's fetch-proxy, delegates to engines.http, whose cache belongs to core-http-cache. A grep of crates/server/src/routes for LruCache, memoize, in_flight, single_flight and HttpCache found no matches; 'cache' appears only as the response field cache_hit (provenance.rs:619, remote.rs:213).",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:20824426732ffb6a",
+          "evaluatedRevision": 15
         }
       ],
       "governance": "governed"
@@ -2530,7 +2534,11 @@
           "revision": 15,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/cache.rs:98 A cache miss just returns None and nothing tracks requests already in flight, so two concurrent identical fetches (several apps or workers hitting one endpoint, which the module header names as the cache's purpose) both miss and both go to the origin; the only caller, engine-http's fetch, adds no join either.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:20824426732ffb6a",
+          "evaluatedRevision": 15
         },
         {
           "subject": "test-harness",
