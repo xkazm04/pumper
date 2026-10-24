@@ -860,84 +860,108 @@
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T00:47:23.586Z",
+      "worker": "6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334",
       "techniques": [
         {
           "technique": "activation-is-a-separate-mutation",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:23 Build script in package.json shows static compilation of client TS code without dynamic extension install or activation mutations."
+          "evidence": "clients/typescript/package.json:23 Build script in package.json shows static compilation of client TS code without dynamic extension install or activation mutations.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:33 The only mid-process hook is a per-record data mapping transform rather than an agent call boundary receiving user input."
+          "evidence": "clients/typescript/src/sync.ts:33 The only mid-process hook is a per-record data mapping transform rather than an agent call boundary receiving user input.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:3 The package identity is a semver version string in package.json rather than an agent runtime assembly digest."
+          "evidence": "clients/typescript/package.json:3 The package identity is a semver version string in package.json rather than an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:45 The client exports dataset records via an async generator rather than tracking background agent tool tasks."
+          "evidence": "clients/typescript/src/client.ts:45 The client exports dataset records via an async generator rather than tracking background agent tool tasks.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/watermark.ts:2 Watermark persistence tracks keyset feed positions for database change feeds rather than conversation checkpoint modes."
+          "evidence": "clients/typescript/src/watermark.ts:2 Watermark persistence tracks keyset feed positions for database change feeds rather than conversation checkpoint modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:28 Filters are client-supplied query predicates pushed to SQL rather than agent safety guard containment rules."
+          "evidence": "clients/typescript/src/sync.ts:28 Filters are client-supplied query predicates pushed to SQL rather than agent safety guard containment rules.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/types.ts:97 The consumer interface defines only upsert and tombstone storage sink callbacks without an agent hook event registry."
+          "evidence": "clients/typescript/src/types.ts:97 The consumer interface defines only upsert and tombstone storage sink callbacks without an agent hook event registry.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:9 The client interacts with host HTTP routes via fixed baseUrl endpoints rather than mounting contributed route handlers."
+          "evidence": "clients/typescript/src/client.ts:9 The client interacts with host HTTP routes via fixed baseUrl endpoints rather than mounting contributed route handlers.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "nested-run-is-not-its-parent",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:21 PumperClient is a stateless HTTP client with no agent execution or nested subagent runs."
+          "evidence": "clients/typescript/src/client.ts:21 PumperClient is a stateless HTTP client with no agent execution or nested subagent runs.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:30 The sink contract provides consumer data persistence rather than dual observer and mutator agent extension registration surfaces."
+          "evidence": "clients/typescript/src/sync.ts:30 The sink contract provides consumer data persistence rather than dual observer and mutator agent extension registration surfaces.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "operator-tier-code-loading",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/http.ts:5 Configuration options are restricted to network transport parameters without an extension code-loading tier."
+          "evidence": "clients/typescript/src/http.ts:5 Configuration options are restricted to network transport parameters without an extension code-loading tier.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:204 Mapping transforms dataset record data on ingest rather than rewriting agent tool arguments before policy gates."
+          "evidence": "clients/typescript/src/sync.ts:204 Mapping transforms dataset record data on ingest rather than rewriting agent tool arguments before policy gates.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/index.ts:6 The package exports sync loop factory functions without model or tool hook chain composition."
+          "evidence": "clients/typescript/src/index.ts:6 The package exports sync loop factory functions without model or tool hook chain composition.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "session-scoped-capability",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/client.ts:18 Base URL resolution reads environment variables or config for HTTP connection without per-session agent capability rosters."
+          "evidence": "clients/typescript/src/client.ts:18 Base URL resolution reads environment variables or config for HTTP connection without per-session agent capability rosters.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:74 Dry-run mode simulates sink writes for change-feed preview rather than wrapping tool frames with cached or substituted agent results."
+          "evidence": "clients/typescript/src/sync.ts:74 Dry-run mode simulates sink writes for change-feed preview rather than wrapping tool frames with cached or substituted agent results.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "clients/typescript/package.json:4 Searching clients/typescript for agent runtime assembly terms confirmed that @pumper/sync is a TypeScript consumer client for dataset change feeds and watermark mirroring rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by 6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334"
         }
       ]
     },
@@ -946,89 +970,114 @@
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T00:47:23.586Z",
+      "worker": "6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334",
       "techniques": [
         {
           "technique": "activation-is-a-separate-mutation",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/title-extractor/Cargo.toml:11 Compiles to a standalone WASM cdylib without dynamic activation mutation or extension host registration."
+          "evidence": "plugins-src/title-extractor/Cargo.toml:11 Compiles to a standalone WASM cdylib without dynamic activation mutation or extension host registration.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:122 The WASM ABI takes a single static envelope per invocation with no mid-run additive input boundary."
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:122 The WASM ABI takes a single static envelope per invocation with no mid-run additive input boundary.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/title-extractor/src/lib.rs:74 The manifest reports only a static semver string rather than an agent runtime assembly digest."
+          "evidence": "plugins-src/title-extractor/src/lib.rs:74 The manifest reports only a static semver string rather than an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/busyloop/src/lib.rs:1 Long-running operations are bounded by host fuel budgets rather than an agent loop projecting external task handles."
+          "evidence": "plugins-src/busyloop/src/lib.rs:1 Long-running operations are bounded by host fuel budgets rather than an agent loop projecting external task handles.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/delta-slim/src/lib.rs:13 Delta trimming operates on trigger event payloads rather than conversation checkpoint modes."
+          "evidence": "plugins-src/delta-slim/src/lib.rs:13 Delta trimming operates on trigger event payloads rather than conversation checkpoint modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:106 The trigger gate reads batch thresholds from input params rather than reading agent guard containment policies."
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:106 The trigger gate reads batch thresholds from input params rather than reading agent guard containment policies.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/title-extractor/src/lib.rs:15 The exported ABI consists of fixed C-ABI memory allocation and extraction functions without an agent event hook registry."
+          "evidence": "plugins-src/title-extractor/src/lib.rs:15 The exported ABI consists of fixed C-ABI memory allocation and extraction functions without an agent event hook registry.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/delta-slim/src/lib.rs:21 Host-owned keys in trigger envelopes are protected by host re-stamping rather than HTTP route mounting precedence."
+          "evidence": "plugins-src/delta-slim/src/lib.rs:21 Host-owned keys in trigger envelopes are protected by host re-stamping rather than HTTP route mounting precedence.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "indeterminate-closure-on-interruption",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/busyloop/src/lib.rs:2 Fuel exhaustion triggers a WASM trap rather than recording an indeterminate status for interrupted agent tool calls."
+          "evidence": "plugins-src/busyloop/src/lib.rs:2 Fuel exhaustion triggers a WASM trap rather than recording an indeterminate status for interrupted agent tool calls.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "nested-run-is-not-its-parent",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/busyloop/Cargo.toml:6 The crate defines a leaf WASM execution module that cannot launch nested runs or subagents."
+          "evidence": "plugins-src/busyloop/Cargo.toml:6 The crate defines a leaf WASM execution module that cannot launch nested runs or subagents.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:141 The manifest declares a trigger predicate kind returning a boolean pass verdict rather than an agent observer/mutator surface."
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:141 The manifest declares a trigger predicate kind returning a boolean pass verdict rather than an agent observer/mutator surface.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "operator-tier-code-loading",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/delta-slim/Cargo.toml:6 The package builds a standalone WASM artifact loaded by file path without multi-tier code loading."
+          "evidence": "plugins-src/delta-slim/Cargo.toml:6 The package builds a standalone WASM artifact loaded by file path without multi-tier code loading.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/delta-slim/src/lib.rs:84 The transform shapes JSON trigger parameters rather than rewriting tool arguments before agent guardrails."
+          "evidence": "plugins-src/delta-slim/src/lib.rs:84 The transform shapes JSON trigger parameters rather than rewriting tool arguments before agent guardrails.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/trigger-gate/Cargo.toml:6 The trigger gate plugin is a standalone binary with no semantic depth placement in a model or tool call chain."
+          "evidence": "plugins-src/trigger-gate/Cargo.toml:6 The trigger gate plugin is a standalone binary with no semantic depth placement in a model or tool call chain.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "session-scoped-capability",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:87 Filtering checks dataset names from trigger params rather than session-scoped agent tool capabilities."
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:87 Filtering checks dataset names from trigger params rather than session-scoped agent tool capabilities.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "plugins-src/title-extractor/src/lib.rs:38 The extractor identifies its own output name in JSON rather than substituting tool execution results for an agent."
+          "evidence": "plugins-src/title-extractor/src/lib.rs:38 The extractor identifies its own output name in JSON rather than substituting tool execution results for an agent.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "plugins-src/title-extractor/src/lib.rs:75 Searching plugins-src/ for agent runtime assembly terms confirmed that wasm-plugins provides HTML extraction and trigger filtering WASM modules under the pumper-engine-wasm ABI rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by 6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334"
         }
       ]
     },
@@ -1218,90 +1267,116 @@
       "context": "docs-and-ops-scripts",
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
-      "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T00:47:23.586Z",
+      "worker": "6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334",
       "techniques": [
         {
           "technique": "activation-is-a-separate-mutation",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:40 Nothing compares the activation the repo declares (.claude/settings.json hooks.Stop) with what is actually registered. The tests exercise the hook body only, and no script under scripts/ reads settings.json."
+        },
+        {
+          "technique": "operator-tier-code-loading",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:270 An observational contribution's failure gets a diagnostic that names the hook, and it exits non-blocking (3), so the agent's chain carries on."
+        },
+        {
+          "technique": "guard-input-custody",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:263 The rule map is re-read from the agent's own working tree on every run, but the control is honestly labelled advisory (the weaker honest move the technique allows), and a missing map fails loudly (line 304) instead of degrading."
+        },
+        {
+          "technique": "nested-run-is-not-its-parent",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/check-doc-sync.mjs:292 The receiver resolves its session only from the payload's own transcript_path. An unbound session gives 'cannot check'; it is never guessed from cwd."
+        },
+        {
+          "technique": "rewriting-under-a-foreign-gate",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:11 The hook is registered statically in settings.json without runtime extension activation mutations."
+          "evidence": "scripts/docs/check-doc-sync.mjs:314 The hook only writes a reminder. It rewrites and approves nothing under the host's permission rules."
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:12 Scans offline JSONL session transcripts from disk rather than receiving additive mid-run inputs at an agent call boundary."
+          "evidence": "scripts/docs/check-doc-sync.mjs:12 Scans offline JSONL session transcripts from disk rather than receiving additive mid-run inputs at an agent call boundary.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/feature-doc-map.json:2 Maps source code paths to feature documentation paths rather than computing an agent runtime assembly digest."
+          "evidence": "scripts/docs/feature-doc-map.json:2 Maps source code paths to feature documentation paths rather than computing an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/fixtures/README.md:1 Fixtures store static recorded transcripts rather than managing in-loop bounded projections of external tasks."
+          "evidence": "scripts/docs/fixtures/README.md:1 Fixtures store static recorded transcripts rather than managing in-loop bounded projections of external tasks.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:56 Scans specific editor tool call records in transcripts rather than managing conversation checkpoint storage modes."
-        },
-        {
-          "technique": "guard-input-custody",
-          "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:76 Reads the path mapping config from the repo for linting rather than enforcing agent guard containment policies."
+          "evidence": "scripts/docs/check-doc-sync.mjs:56 Scans specific editor tool call records in transcripts rather than managing conversation checkpoint storage modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:15 Provides a manual dismissal instruction for developer acknowledgements rather than an agent hook registry with timeouts."
+          "evidence": "scripts/docs/check-doc-sync.mjs:15 Provides a manual dismissal instruction for developer acknowledgements rather than an agent hook registry with timeouts.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:58 Defines file path regexes to skip doc-sync checks rather than resolving host route shadowing."
+          "evidence": "scripts/docs/check-doc-sync.mjs:58 Defines file path regexes to skip doc-sync checks rather than resolving host route shadowing.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "indeterminate-closure-on-interruption",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:28 Inspects transcript tool result blocks rather than writing indeterminate closure records for interrupted tool calls."
-        },
-        {
-          "technique": "nested-run-is-not-its-parent",
-          "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:1 Executes as a Node.js test process without managing nested agent runs or subagents."
+          "evidence": "scripts/docs/check-doc-sync.mjs:28 Inspects transcript tool result blocks rather than writing indeterminate closure records for interrupted tool calls.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:18 Exits process with code 0 or 2 as a developer reminder rather than exposing observer/mutator agent surfaces."
-        },
-        {
-          "technique": "operator-tier-code-loading",
-          "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:71 Resolves repository root path from environment or current working directory rather than managing multi-tier code loading."
+          "evidence": "scripts/docs/check-doc-sync.mjs:18 Exits process with code 0 or 2 as a developer reminder rather than exposing observer/mutator agent surfaces.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/fixtures/README.md:13 Pins transcript format parsing for developer tooling rather than rewriting tool call arguments before policy gates."
+          "evidence": "scripts/docs/fixtures/README.md:13 Pins transcript format parsing for developer tooling rather than rewriting tool call arguments before policy gates.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:34 Classifies transcript message content shapes rather than composing a semantic hook placement chain."
+          "evidence": "scripts/docs/check-doc-sync.mjs:34 Classifies transcript message content shapes rather than composing a semantic hook placement chain.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "session-scoped-capability",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:72 Reads process environment variable for repo directory resolution rather than managing session-scoped tool capabilities."
+          "evidence": "scripts/docs/check-doc-sync.mjs:72 Reads process environment variable for repo directory resolution rather than managing session-scoped tool capabilities.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/fixtures/README.md:8 Test fixtures use synthetic transcript entries rather than attributing substituted tool frame results."
+          "evidence": "scripts/docs/fixtures/README.md:8 Test fixtures use synthetic transcript entries rather than attributing substituted tool frame results.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:2 Searching scripts/docs/ for agent runtime assembly terms confirmed that docs-and-ops-scripts implements a Claude Code developer stop hook for git documentation sync discipline rather than an LLM agent runtime assembly.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by 6fe9bfc0-6d97-4bfb-90d2-bb7ab13e9334"
         }
       ]
     },

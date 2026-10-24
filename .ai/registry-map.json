@@ -3610,13 +3610,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:2 Searching scripts/docs/ for agent runtime assembly terms confirmed that docs-and-ops-scripts implements a Claude Code developer stop hook for git documentation sync discipline rather than an LLM agent runtime assembly.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:40 check-doc-sync.mjs is a hook contributed to an agent runtime the repo does not own (the Claude Code Stop event). Its fixture suite copies the activation instead of reading it, so a removed or disabled Stop entry produces no output at all, which is how this hook went undetected for its whole life.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "eval-harness",
@@ -5310,12 +5309,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "clients/typescript/package.json:4 Searching clients/typescript for agent runtime assembly terms confirmed that @pumper/sync is a TypeScript consumer client for dataset change feeds and watermark mirroring rather than an LLM agent runtime assembly.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "clients/typescript/package.json:4 @pumper/sync is a dataset-mirroring client. Searching clients/typescript (node_modules and dist-test included) for tool_call, subagent, model_call and registerHook found nothing. Its 'checkpoint' hits are consumer watermarks, not conversation state, so there is no agent runtime or hook chain for the subject to govern.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "quality-gates",
@@ -5387,12 +5385,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "plugins-src/title-extractor/src/lib.rs:75 Searching plugins-src/ for agent runtime assembly terms confirmed that wasm-plugins provides HTML extraction and trigger filtering WASM modules under the pumper-engine-wasm ABI rather than an LLM agent runtime assembly.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:12 These crates are guest modules: pure functions over an input envelope under the pumper-engine-wasm ABI. Searching all of plugins-src (target dirs included) for tool_call, subagent, steer and prompt found no hits, so there is no agent loop, model call or runtime assembly to judge here. The host-side disciplines are judged where the host lives.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "quality-gates",
