@@ -679,14 +679,15 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:05.000Z",
-      "worker": "straighten-20261014T1720-pumper-w2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:22:32.401Z",
+      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
       "techniques": [
         {
           "technique": "recall-injection",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23"
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:23",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -696,6 +697,13 @@
           "evaluatedAt": "2026-10-12T23:01:40.578Z",
           "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
           "reason": "replaced by straighten-20261014T1720-pumper-w2"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The eight e2e files pin dataset read, delete, report, engine, VCR, exclusion, degraded-search and dynamic-app behavior, and the only memory hit is a wasm linear-memory export, so no agent memory pipeline is under test.",
+          "evaluatedAt": "2026-10-14T17:25:05.000Z",
+          "worker": "straighten-20261014T1720-pumper-w2",
+          "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
         }
       ]
     },
@@ -704,14 +712,15 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:05.000Z",
-      "worker": "straighten-20261014T1720-pumper-w2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:22:32.401Z",
+      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
       "techniques": [
         {
           "technique": "working-memory",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/watermark.ts:71"
+          "evidence": "clients/typescript/src/watermark.ts:71",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -721,6 +730,13 @@
           "evaluatedAt": "2026-10-12T23:01:40.578Z",
           "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
           "reason": "replaced by straighten-20261014T1720-pumper-w2"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "clients/typescript/README.md:27 The SDK is a stateless dataset client that owns transport, decode and a change-feed watermark and explicitly not persistence, and its only memory hit is an in-process watermark store for tests, so no agent memory exists here.",
+          "evaluatedAt": "2026-10-14T17:25:05.000Z",
+          "worker": "straighten-20261014T1720-pumper-w2",
+          "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
         }
       ]
     },
@@ -729,19 +745,21 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:05.000Z",
-      "worker": "straighten-20261014T1720-pumper-w2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:22:32.401Z",
+      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
       "techniques": [
         {
           "technique": "episodic-capture",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1"
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1",
+          "carriedFrom": "2026-10-14"
         },
         {
           "technique": "consolidation",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0009_research_cache.sql:1"
+          "evidence": "crates/core/migrations/0009_research_cache.sql:1",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -751,6 +769,13 @@
           "evaluatedAt": "2026-10-12T23:01:40.578Z",
           "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
           "reason": "replaced by straighten-20261014T1720-pumper-w2"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0047 the only memory table is a fetcher's per-host HTTP-versus-browser strike counter, and the nearby LLM table is a TTL cache of Claude research responses, so no episode, belief or recall store exists for the subject to govern.",
+          "evaluatedAt": "2026-10-14T17:25:05.000Z",
+          "worker": "straighten-20261014T1720-pumper-w2",
+          "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
         }
       ]
     },
@@ -759,19 +784,21 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:05.000Z",
-      "worker": "straighten-20261014T1720-pumper-w2",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:22:32.401Z",
+      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
       "techniques": [
         {
           "technique": "working-memory",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:2"
+          "evidence": "scripts/ci/flake-check.mjs:2",
+          "carriedFrom": "2026-10-14"
         },
         {
           "technique": "episodic-capture",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:2"
+          "evidence": "scripts/ci/flake-check.mjs:2",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -781,6 +808,13 @@
           "evaluatedAt": "2026-10-12T23:01:40.578Z",
           "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
           "reason": "replaced by straighten-20261014T1720-pumper-w2"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:2 The twelve CI gate scripts judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, and a search for memory, episodic, consolidation, belief, recall and distill finds no match, so no agent carries state forward here.",
+          "evaluatedAt": "2026-10-14T17:25:05.000Z",
+          "worker": "straighten-20261014T1720-pumper-w2",
+          "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
         }
       ]
     },

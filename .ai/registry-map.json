@@ -1559,12 +1559,11 @@
           "changedAt": "2026-10-15",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:2 The twelve CI gate scripts judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, and a search for memory, episodic, consolidation, belief, recall and distill finds no match, so no agent carries state forward here.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
-          "evaluatedRevision": 48,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "scripts/ci/flake-check.mjs:2 I searched scripts/ci for episod, belief, distill, consolidat and recall and got no hits; these gates judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, so nothing here is an agent carrying state forward.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:4f054116d66a9495",
+          "evaluatedRevision": 51,
+          "revisionsBehind": 3
         },
         {
           "subject": "agent-instruction-files",
@@ -3326,12 +3325,11 @@
           "changedAt": "2026-10-15",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 Across migrations 0001-0047 the only memory table is a fetcher's per-host HTTP-versus-browser strike counter, and the nearby LLM table is a TTL cache of Claude research responses, so no episode, belief or recall store exists for the subject to govern.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
-          "evaluatedRevision": 48,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 I searched all 56 migrations for episod, belief, distill, recall and consolidat and got no hits; every 'memory' hit is the fetcher's per-host strike/penalty table (0015, 0016, 0033), DataHub governance state (0037/0038) or the event bus (0055), and the one LLM table (0009 research_cache) is a TTL response cache, so there is no episode, belief or recall store for this subject to govern.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:4f054116d66a9495",
+          "evaluatedRevision": 51,
+          "revisionsBehind": 3
         },
         {
           "subject": "mcp-tools",
@@ -3969,12 +3967,11 @@
           "changedAt": "2026-10-15",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The eight e2e files pin dataset read, delete, report, engine, VCR, exclusion, degraded-search and dynamic-app behavior, and the only memory hit is a wasm linear-memory export, so no agent memory pipeline is under test.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
-          "evaluatedRevision": 48,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 I searched crates/server/src/e2e for episod, belief, distill and consolidat and got no hits; these eight files test dataset read/delete/report shapes, engine conformance, VCR, target exclusion, degraded search and dynamic apps, so no agent-memory pipeline is under test.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:4f054116d66a9495",
+          "evaluatedRevision": 51,
+          "revisionsBehind": 3
         },
         {
           "subject": "quality-gates",
@@ -5249,12 +5246,11 @@
           "changedAt": "2026-10-15",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "clients/typescript/README.md:27 The SDK is a stateless dataset client that owns transport, decode and a change-feed watermark and explicitly not persistence, and its only memory hit is an in-process watermark store for tests, so no agent memory exists here.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:7770d30ff5df3c25",
-          "evaluatedRevision": 48,
-          "revisionsBehind": 3,
-          "stale": true
+          "evidence": "clients/typescript/README.md:27 I searched clients/typescript (node_modules included) for episod, belief and distill and got no hits; the SDK is a stateless dataset mirror client that explicitly does not own persistence, and its only state is a sync watermark, so it carries no agent memory.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:4f054116d66a9495",
+          "evaluatedRevision": 51,
+          "revisionsBehind": 3
         },
         {
           "subject": "bounded-enumeration",
