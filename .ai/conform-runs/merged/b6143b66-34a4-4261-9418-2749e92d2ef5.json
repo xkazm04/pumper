@@ -1,0 +1,181 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-10-24T00:07:06.120442+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "content-monitoring",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The test's doc comment says it pins the app's provenance stamp, but its body builds a `Provenance` by hand and never runs `ConnectorApiWatch` (the real stamp is built at crates/apps/connector-api-watch/src/lib.rs:296-299), so dropping `artifact_sha` or inventing a `rules_hash` in the app would leave it green.",
+   "techniques": [
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "deviation",
+     "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The name and the doc comment claim the app's stamp is checked, but the assertions only check a struct the test built itself. The decision in lib.rs:298 is never reached. Elsewhere the context does this well: Dead engines rule out a re-derived answer (adoption.rs:32), and the plugin stub counts calls (run_door.rs:47)."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:69 The regression test names its control as the revert of the guard: unguarded, the empty body upserts as `changed`."
+    },
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:24 The remote exchange is a single canned 200 body, small enough to fake honestly, which is the technique's own 'when not to use it' case."
+    },
+    {
+     "technique": "approval-snapshots-with-guarded-update",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/research/tests/result_contract.rs:15 The rich output is checked by diffing a real run against the published declaration. Nothing is recorded, so there is no record mode that could be left on."
+    }
+   ]
+  },
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Each fixture copy (and each throwaway repo root at line 189) is a fresh temp directory that nothing deletes. The file has no rmSync and no after/afterEach hook, so the per-test copy has no named reaper and every run leaves directories in the OS temp dir.",
+   "techniques": [
+    {
+     "technique": "fixture-economics",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Build once, cheap copy per test, which is right. But the technique requires the harness to name the copy's reaper (creation-names-reaper), and there is none."
+    },
+    {
+     "technique": "derived-selection-must-be-measured",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:222 The hook's membership is derived from map globs. A map that loads with zero entries is refused as cannot-check (check-doc-sync.mjs:307) instead of passing every turn."
+    },
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:241 The fixtures are redacted recordings of Claude Code's transcript format. A canary re-checks their shape against the real transcripts on the machine, and skips visibly when there are none."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:182 The cannot-check regression tests record the pre-fix behaviour (exit 0) as their control. Each asserts a spawned process exits with 3."
+    },
+    {
+     "technique": "live-app-harness",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:40 The shipped hook is driven as a separate process through its real stdin contract, not just imported."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:171 Uses the fixture that otherwise exits 2, so a status of 0 can only come from the stop_hook_active branch. The asserted value has one possible producer."
+    }
+   ]
+  },
+  {
+   "context": "core-engine-contract",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/governor.rs:383 The governor's parallelism claim (32 hosts did not serialize) is a wall-clock upper bound. That bound is what flips on a loaded machine, so the test is quarantined, and the fix (observe the sharded map's state instead) is still only an exit plan in the register.",
+   "techniques": [
+    {
+     "technique": "assert-the-schedule-not-the-stopwatch",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/governor.rs:383 Overlap is proved with a stopwatch rather than an in-flight count or a barrier. This is the technique's measured failure, and it has landed in the flake register as the technique predicts."
+    },
+    {
+     "technique": "flake-lifecycle",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/governor.rs:339 The .flake/register.json entry has an owner, entry date, expiry (2026-10-26), cause, evidence, exit plan and a written reason for skipped over muted. The test still runs nightly in long-lanes."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/fetch_chokepoint.rs:231 The needle is a receiver-qualified field access, comment lines are dropped, wrapped chains are joined, and the inventory is checked both ways (line 283), which also makes an empty walk go red."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/fetch_chokepoint.rs:153 The inventory explains a raw-engine row by the decision it keeps reachable: routing through ctx.fetch would assert the default arm."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/host_memory_honesty.rs:28 A second host acts as a control, so a pass that wipes everything cannot satisfy the zombie-penalty test."
+    }
+   ],
+   "registryProposal": "flake-lifecycle prefers muted over skipped, but libtest has no in-process muted form. This repo works around it by running the skipped set through a recorder on a nightly leg. The technique could name that as the accepted substitute for runners with no mute."
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "web-crawl-extraction",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T00:07:06.120442+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "approval-snapshots-with-guarded-update",
+    "negative-control-tests",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T00:07:06.120442+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "derived-selection-must-be-measured",
+    "fixture-economics",
+    "live-app-harness",
+    "negative-control-tests",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T00:07:06.120442+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "assert-the-schedule-not-the-stopwatch",
+    "flake-lifecycle",
+    "negative-control-tests",
+    "pin-the-call-not-the-name",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "core-engine-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

@@ -1707,7 +1707,11 @@
           "revision": 26,
           "changedAt": "2026-10-06",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The test's doc comment says it pins the app's provenance stamp, but its body builds a `Provenance` by hand and never runs `ConnectorApiWatch` (the real stamp is built at crates/apps/connector-api-watch/src/lib.rs:296-299), so dropping `artifact_sha` or inventing a `rules_hash` in the app would leave it green.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "prompt-assembly",
@@ -2206,7 +2210,11 @@
           "revision": 26,
           "changedAt": "2026-10-06",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/governor.rs:383 The governor's parallelism claim (32 hosts did not serialize) is a wall-clock upper bound. That bound is what flips on a loaded machine, so the test is quarantined, and the fix (observe the sharded map's state instead) is still only an exit plan in the register.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "agent-instruction-files",
@@ -3537,7 +3545,11 @@
           "revision": 26,
           "changedAt": "2026-10-06",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Each fixture copy (and each throwaway repo root at line 189) is a fresh temp directory that nothing deletes. The file has no rmSync and no after/afterEach hook, so the per-test copy has no named reaper and every run leaves directories in the OS temp dir.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "quality-gates",
