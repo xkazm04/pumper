@@ -1,0 +1,37 @@
+{
+ "schema": "conform-run/1",
+ "worker": "344c45e9-2f74-4fa6-9f89-b8a82fd7cf87",
+ "subject": "supply-chain",
+ "evaluatedAt": "2026-10-24T02:40:14.506073+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "supply-chain",
+   "context": "web-scraping-engines",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "supply-chain",
+   "context": "core-platform-services",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "supply-chain",
+   "context": "ci-quality-gates",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "supply-chain",
+   "context": "web-crawl-extraction",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "supply-chain",
+   "context": "grants-intelligence",
+   "reason": "The grants apps' sources contain no supply-chain construct. I searched for zip/tar/unpack/decompress/sha256/checksum/secret, and the only hits were the closing-soon 'digest' feature and year 'tokens'. They fetch JSON through the shared engines and parse it with serde. I cannot prove a not-applicable verdict, because each crate's Cargo.toml in the context directories names dependencies that the subject's terms would hit, and I found nothing in-context to judge."
+  }
+ ],
+ "consults": []
+}
