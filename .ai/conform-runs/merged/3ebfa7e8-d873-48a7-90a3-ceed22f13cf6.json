@@ -1,0 +1,93 @@
+{
+ "schema": "conform-run/1",
+ "worker": "3ebfa7e8-d873-48a7-90a3-ceed22f13cf6",
+ "subject": "module-design",
+ "evaluatedAt": "2026-10-24T03:13:41.639338+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "module-design",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/src/http.ts:79 The one transport door asserts that a parsed body is the caller's `T`. There is no named marker and no written invariant at the cast (the same holds at http.ts:105 and :110 for ndjson lines), so the type guarantee every SDK caller relies on is asserted, not checked, and cannot be audited by grep.",
+   "techniques": [
+    {
+     "technique": "marked-unverifiable-region",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/src/http.ts:79 The region is enclosed: all reads go through getJson/streamNdjson. It is not marked, and it carries no invariant stating why the body is a T (for example, 'the server emits the generated schema'). A bare `as T` is indistinguishable from an ordinary cast."
+    },
+    {
+     "technique": "io-free-core",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/sync.ts:101 The per-page apply/stall/dedupe decision is a pure function from revisions to a plan. The async PumperSync loop is the driver, and the tests call planPage directly with no fetch double."
+    },
+    {
+     "technique": "seams-and-adapters",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/http.ts:6 The network is the seam. Tests substitute fetch through the config (conformance.test.ts fakeFetch/fetchSpy), and all reads pass through http.ts. sinkFor (sync.ts:158) is a single substitution point for dry runs."
+    },
+    {
+     "technique": "module-depth",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/types.ts:61 The SDK narrows the generated open `change: string` to a closed union, so consumers can switch exhaustively. That moves the accepted-value set into the checked half of the interface."
+    },
+    {
+     "technique": "locality-and-leverage",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/sync.ts:361 Callers learn two verbs and get snapshot vs. incremental, paging, checkpointing and tombstoning. The PumperSync class stays private, which is high leverage."
+    },
+    {
+     "technique": "declarative-or-sequential",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/sync.ts:118 One pass builds the latest-per-key map and the skip counters together, with an early stall return. That is the multiple-outputs case, where an explicit loop is the right form."
+    },
+    {
+     "technique": "concurrency-at-the-edge",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/src/sync.ts:301 The async driver calls a synchronous core. The flow-control model (await) stays in the loop and never enters the decision logic."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "module-design",
+   "context": "core-change-detection",
+   "reason": "evidence leans on resilience/mod.rs, which is not a tracked file"
+  },
+  {
+   "subject": "module-design",
+   "context": "core-resilience",
+   "reason": "evidence leans on store.rs/preview.rs, which is not a tracked file"
+  },
+  {
+   "subject": "module-design",
+   "context": "core-schema-migrations",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T03:13:41.639338+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "module-design"
+   ],
+   "techniques": [
+    "concurrency-at-the-edge",
+    "declarative-or-sequential",
+    "io-free-core",
+    "locality-and-leverage",
+    "marked-unverifiable-region",
+    "module-depth",
+    "seams-and-adapters"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

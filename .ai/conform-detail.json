@@ -2620,67 +2620,79 @@
       "subject": "module-design",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T10:28:44.015Z",
-      "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:13:41.639Z",
+      "worker": "3ebfa7e8-d873-48a7-90a3-ceed22f13cf6",
       "techniques": [
         {
-          "technique": "module-depth",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/src/watermark.ts:18 Callers learn a feed position, not the chunk-boundary rule that makes a bare instant skip siblings."
-        },
-        {
-          "technique": "seams-and-adapters",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/src/sync.ts:159 Dry-run and the product sink are two adapters of SyncSink, chosen at one point."
-        },
-        {
-          "technique": "borrowed-surface",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/src/http.ts:16 PumperHttpError stays an Error and names the field callers must branch on."
+          "technique": "marked-unverifiable-region",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/src/http.ts:79 The region is enclosed: all reads go through getJson/streamNdjson. It is not marked, and it carries no invariant stating why the body is a T (for example, 'the server emits the generated schema'). A bare `as T` is indistinguishable from an ordinary cast."
         },
         {
           "technique": "io-free-core",
           "verdict": "conformant",
-          "evidence": "clients/typescript/src/sync.ts:86 planPage decides upserts, tombstones, and stalls from the page alone; the drain applies the result afterward."
+          "evidence": "clients/typescript/src/sync.ts:101 The per-page apply/stall/dedupe decision is a pure function from revisions to a plan. The async PumperSync loop is the driver, and the tests call planPage directly with no fetch double."
         },
         {
-          "technique": "concurrency-at-the-edge",
+          "technique": "seams-and-adapters",
           "verdict": "conformant",
-          "evidence": "clients/typescript/src/sync.ts:101 The page decision is synchronous; async stays on the fetch and sink driver."
+          "evidence": "clients/typescript/src/http.ts:6 The network is the seam. Tests substitute fetch through the config (conformance.test.ts fakeFetch/fetchSpy), and all reads pass through http.ts. sinkFor (sync.ts:158) is a single substitution point for dry runs."
+        },
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/types.ts:61 The SDK narrows the generated open `change: string` to a closed union, so consumers can switch exhaustively. That moves the accepted-value set into the checked half of the interface."
         },
         {
           "technique": "locality-and-leverage",
           "verdict": "conformant",
-          "evidence": "clients/typescript/src/client.ts:1 One-off reads and the watermark loop are separate modules because they change for different reasons."
+          "evidence": "clients/typescript/src/sync.ts:361 Callers learn two verbs and get snapshot vs. incremental, paging, checkpointing and tombstoning. The PumperSync class stays private, which is high leverage."
         },
         {
           "technique": "declarative-or-sequential",
           "verdict": "conformant",
-          "evidence": "clients/typescript/src/sync.ts:137 One pass fills several results, so the page planner is an explicit loop rather than a single pipeline."
+          "evidence": "clients/typescript/src/sync.ts:118 One pass builds the latest-per-key map and the skip counters together, with an early stall return. That is the multiple-outputs case, where an explicit loop is the right form."
         },
         {
-          "technique": "marked-unverifiable-region",
-          "verdict": "deviation",
-          "evidence": "clients/typescript/src/http.ts:79 The cast is not a named construct and states no invariant; the same assertion is also used in the conformance fixture loader."
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/sync.ts:301 The async driver calls a synchronous core. The flow-control model (await) stays in the loop and never enters the decision logic."
+        },
+        {
+          "technique": "borrowed-surface",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/src/http.ts:16 PumperHttpError stays an Error and names the field callers must branch on.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "mirror-type-at-the-edge",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:93 Tests construct Response and the feed JSON directly, so the host input is not unconstructible."
+          "evidence": "clients/typescript/test/conformance.test.ts:93 Tests construct Response and the feed JSON directly, so the host input is not unconstructible.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "state-carrier-decides-the-lane",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/sync.ts:313 The sink receives a plan built for that call; counters stay on the caller and are not copied into the message."
+          "evidence": "clients/typescript/src/sync.ts:313 The sink receives a plan built for that call; counters stay on the caller and are not copied into the message.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "host-primitive-facade",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/src/http.ts:2 The listed hosts share the web fetch and timer primitives; the file does not target two hosts that disagree about spawn or sleep."
+          "evidence": "clients/typescript/src/http.ts:2 The listed hosts share the web fetch and timer primitives; the file does not target two hosts that disagree about spawn or sleep.",
+          "carriedFrom": "2026-10-13"
         }
       ],
-      "registryProposal": "marked-unverifiable-region lists a cast the checker cannot prove, but it does not say whether a TypeScript `as T` on JSON.parse is that region or ordinary typed I/O; this seat treated an unannotated cast, also present outside the transport, as missing the mark and the invariant."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "clients/typescript/src/http.ts:79 The transport asserts a parsed body is the caller's type, with no named marker and no invariant written at the cast.",
+          "evaluatedAt": "2026-10-13T10:28:44.015Z",
+          "worker": "8354f254-c097-4fda-92ba-f1d00bbc05b0",
+          "reason": "replaced by 3ebfa7e8-d873-48a7-90a3-ceed22f13cf6"
+        }
+      ]
     },
     "fc25f145-0e20-4ffc-801f-4c2dfb7780ee/module-design": {
       "context": "core-engine-contract",

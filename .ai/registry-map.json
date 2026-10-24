@@ -5228,12 +5228,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "clients/typescript/src/http.ts:79 The transport asserts a parsed body is the caller's type, with no named marker and no invariant written at the cast.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:a33adfb4a8edc0eb",
-          "evaluatedRevision": 17,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "clients/typescript/src/http.ts:79 The one transport door asserts that a parsed body is the caller's `T`. There is no named marker and no written invariant at the cast (the same holds at http.ts:105 and :110 for ndjson lines), so the type guarantee every SDK caller relies on is asserted, not checked, and cannot be audited by grep.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-memory",
