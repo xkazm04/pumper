@@ -1799,146 +1799,178 @@
       "subject": "data-access",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T08:04:02.947Z",
-      "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T01:50:11.497Z",
+      "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
       "techniques": [
-        {
-          "technique": "batching-and-n-plus-one",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/routes/provenance.rs:85 A provenance chain of up to 500 revisions calls storage.get once per distinct job id; the loop dedupes, it does not batch."
-        },
-        {
-          "technique": "capability-declared-in-the-type",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/routes/search.rs:182 These handlers call one search client; they do not host a family of store implementations."
-        },
-        {
-          "technique": "cross-driver-invariant-parity",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/routes/search.rs:125 The index is a derived follower with lag, which this technique treats as staleness rather than a second repository driver."
-        },
         {
           "technique": "existence-authority-written-last",
           "verdict": "deviation",
-          "evidence": "crates/server/src/routes/datasets.rs:448 The export file is fsynced before the SQL delete, but the search-index delete after it is allowed to fail into a reader-visible ghost."
+          "evidence": "crates/server/src/routes/datasets.rs:449 The authority is removed first, which is the right order, but the dependent reader (/search) acts on the half-state silently. It gets neither an authority join nor a sweep; backfill purges only tombstoned rows, and a hard-deleted dataset has none."
+        },
+        {
+          "technique": "batching-and-n-plus-one",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1246 grants_for_profile loops over a page of fits and issues one Datasets::get per fit. The surface offers only fetch-one (datasets.rs:2377 get) with no set-shaped lookup, so the N+1 is bounded by page size but structural."
         },
         {
           "technique": "layering-rules",
           "verdict": "conformant",
-          "evidence": "crates/server/src/routes/derived.rs:5 Routes call named store operations and do not assemble SQL or hold a connection."
-        },
-        {
-          "technique": "operator-defined-tables",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/routes/derived.rs:4 Derived specs are projections recomputed into the existing dataset store, not runtime DDL for a new record type."
-        },
-        {
-          "technique": "query-construction",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/routes/search.rs:94 Sort is a closed two-value vocabulary and an unknown token is a 400; filter ops are a match, and values are passed as JsonFilter data."
-        },
-        {
-          "technique": "read-models-and-projections",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/routes/search.rs:143 An empty search page is marked degraded and names the backfill that rebuilds the index, so zero hits are not reported as missing records."
-        },
-        {
-          "technique": "repo-testing",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/routes/provenance.rs:636 The rederive test drives storage.enqueue, claim_next, and datasets.history; headless_state opens a TempStore and runs the real migration chain."
-        },
-        {
-          "technique": "row-mapping",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/routes/datasets.rs:510 The pre-delete export substitutes {} for a failed serialization, while append_row in the same file counts that failure and writes nothing."
-        },
-        {
-          "technique": "sequence-token-write-ordering",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/routes/datasets.rs:279 Keyset order is the store timestamp plus key on one SQLite table, which is the case this technique says needs no extra token."
+          "evidence": "crates/server/src/routes/derived.rs:180 A grep of all eight route files for sqlx/query_as/query_scalar found no SQL. Handlers call named store operations only."
         },
         {
           "technique": "transactions-and-units-of-work",
           "verdict": "conformant",
-          "evidence": "crates/server/src/routes/datasets.rs:412 The route calls delete_dataset_mode, whose count and DELETE share one BEGIN IMMEDIATE, instead of opening a second boundary around a single statement."
+          "evidence": "crates/server/src/routes/datasets.rs:412 The confirm-count invariant is re-checked inside the store-owned delete transaction (delete_dataset_mode Execute), not by the handler. The handler does not open a transaction."
+        },
+        {
+          "technique": "query-construction",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/query.rs:1039 The filter token is mapped through a closed vocabulary, and an unknown value is a 400 that names the allowed set rather than a pass-through."
+        },
+        {
+          "technique": "capability-declared-in-the-type",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/search.rs:182 These handlers call one search client; they do not host a family of store implementations.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "cross-driver-invariant-parity",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/search.rs:125 The index is a derived follower with lag, which this technique treats as staleness rather than a second repository driver.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "operator-defined-tables",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/derived.rs:4 Derived specs are projections recomputed into the existing dataset store, not runtime DDL for a new record type.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/search.rs:143 An empty search page is marked degraded and names the backfill that rebuilds the index, so zero hits are not reported as missing records.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "repo-testing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/provenance.rs:636 The rederive test drives storage.enqueue, claim_next, and datasets.history; headless_state opens a TempStore and runs the real migration chain.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "row-mapping",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:510 The pre-delete export substitutes {} for a failed serialization, while append_row in the same file counts that failure and writes nothing.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "sequence-token-write-ordering",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:279 Keyset order is the store timestamp plus key on one SQLite table, which is the case this technique says needs no extra token.",
+          "carriedFrom": "2026-10-13"
         }
       ],
-      "registryProposal": "operator-defined-tables does not say whether a fixed records table plus a JSON payload is the universal-store failure or an ordinary blob column when new datasets still ship as developer apps; derived specs sit in that gap."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:448 Dataset delete removes the SQLite rows first and then best-effort-deletes the search index, so a failed index delete leaves a hit for a record the dataset API no longer has, and this route does not join or sweep that half-state.",
+          "evaluatedAt": "2026-10-13T08:04:02.947Z",
+          "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+          "reason": "replaced by 6928bafa-c16d-4262-8b4b-371b6ae0268f"
+        }
+      ]
     },
     "05b680d3-a634-4401-ae6b-de54d48ca753/data-access": {
       "context": "core-platform-services",
       "subject": "data-access",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T08:04:02.947Z",
-      "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T01:50:11.497Z",
+      "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
       "techniques": [
         {
-          "technique": "batching-and-n-plus-one",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/costs.rs:475 A job's events are one ordered query, not a fetch per event."
+          "technique": "row-mapping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/recipes.rs:729 Serialized payload columns are silently defaulted on decode. The table is decoded positionally in two separate places (tuple at 713, RecipeRow at 640), which gives parallel copies of one shape."
         },
         {
           "technique": "capability-declared-in-the-type",
           "verdict": "deviation",
-          "evidence": "crates/core/src/search.rs:258 NoSearch.query and index return Ok(empty) or Ok(()); NoPlugins in the same context refuses with PluginFailure::Disabled, which is the typed refusal this technique requires."
-        },
-        {
-          "technique": "cross-driver-invariant-parity",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/costs.rs:429 CostLedger and RecipeStore each hold one SQLite pool; there is no second repository driver in these files."
-        },
-        {
-          "technique": "existence-authority-written-last",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/costs.rs:454 Ledger and recipe writes are single-table SQLite inserts; catalog.toml is read as a file, not written beside a row."
-        },
-        {
-          "technique": "layering-rules",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/recipes.rs:470 api_recipes and cost_events statements live on RecipeStore and CostLedger, which are the modules that own those tables."
-        },
-        {
-          "technique": "localized-record-identity",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/process_env.rs:56 The only locale wording here is a child-process env allowlist, not a per-language record identity."
-        },
-        {
-          "technique": "operator-defined-tables",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/recipes.rs:425 Recipe and cost tables are fixed migration shapes; nothing here creates a table from an operator definition."
+          "evidence": "crates/core/src/search.rs:457 NoSearch is a stub whose query returns empty success and whose index does nothing. The disabled capability lives in config, not on the type, so callers other than run_search (which consults config.search.enabled) cannot tell 'disabled' from 'no matches'."
         },
         {
           "technique": "query-construction",
-          "verdict": "deviation",
-          "evidence": "crates/core/tests/migrations.rs:40 Production inserts bind every value, but this helper interpolates a table name into the statement with no allowlist."
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:548 Optional predicates are written as static SQL with bound parameters. The state filter binds RecipeState::as_str from a closed enum."
         },
         {
-          "technique": "read-models-and-projections",
+          "technique": "transactions-and-units-of-work",
           "verdict": "conformant",
-          "evidence": "crates/core/src/costs.rs:543 The spend rollup is a GROUP BY over cost_events at read time, not a stored total that can be written back."
+          "evidence": "crates/core/src/recipes.rs:513 The re-discovery invariant (keep the id and validated flag, refresh the shape) is one atomic upsert inside a single repository operation."
         },
         {
           "technique": "repo-testing",
           "verdict": "conformant",
-          "evidence": "crates/core/src/testing.rs:61 TempStore builds each test database by the production connect-and-migrate path; webhook tests create deliveries through storage.create_delivery and use raw SQL only to backdate clocks."
+          "evidence": "crates/core/src/testing.rs:88 Tests run against a real migrated SQLite in a per-test temp dir (TempStore), not a mock; for example saved_search_views.rs:35."
         },
         {
-          "technique": "row-mapping",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/recipes.rs:636 A recipe row whose params or json_paths JSON does not parse is returned as Null, with no skip record; CostEvent does the honest thing and maps an unknown certainty to Unknown."
+          "technique": "batching-and-n-plus-one",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/costs.rs:475 A job's events are one ordered query, not a fetch per event.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "cross-driver-invariant-parity",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/costs.rs:429 CostLedger and RecipeStore each hold one SQLite pool; there is no second repository driver in these files.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "existence-authority-written-last",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/costs.rs:454 Ledger and recipe writes are single-table SQLite inserts; catalog.toml is read as a file, not written beside a row.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "layering-rules",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:470 api_recipes and cost_events statements live on RecipeStore and CostLedger, which are the modules that own those tables.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "localized-record-identity",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/process_env.rs:56 The only locale wording here is a child-process env allowlist, not a per-language record identity.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "operator-defined-tables",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/recipes.rs:425 Recipe and cost tables are fixed migration shapes; nothing here creates a table from an operator definition.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/costs.rs:543 The spend rollup is a GROUP BY over cost_events at read time, not a stored total that can be written back.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "sequence-token-write-ordering",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/costs.rs:475 Same line as the batching anchor is not reused: order of one SQLite table by its id is the engine sequence this technique says not to duplicate."
-        },
+          "evidence": "crates/core/src/costs.rs:475 Same line as the batching anchor is not reused: order of one SQLite table by its id is the engine sequence this technique says not to duplicate.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "transactions-and-units-of-work",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/recipes.rs:730 record_failure increments consecutive_failures in one statement and applies unvalidate or retire in a second execute on the pool, so the counter commits if the second write fails."
+          "state": "deviation",
+          "evidence": "crates/core/src/search.rs:258 NoSearch implements query by returning an empty success, so a disabled index looks like no matches unless a caller separately interprets doc_count.",
+          "evaluatedAt": "2026-10-13T08:04:02.947Z",
+          "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+          "reason": "replaced by 6928bafa-c16d-4262-8b4b-371b6ae0268f"
         }
       ]
     },
@@ -1947,105 +1979,141 @@
       "subject": "data-access",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T08:04:02.947Z",
-      "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T01:50:11.497Z",
       "techniques": [
         {
           "technique": "query-construction",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0011_idempotency.sql:3 Statements are static SQL literals; there is no host-language choice between a bound value and an identifier."
+          "evidence": "crates/core/migrations/0011_idempotency.sql:3 Statements are static SQL literals; there is no host-language choice between a bound value and an identifier.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "cross-driver-invariant-parity",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0021_ingress.sql:14 The chain is one SQLite dialect, including the table-rebuild used because SQLite cannot alter a CHECK."
+          "evidence": "crates/core/migrations/0021_ingress.sql:14 The chain is one SQLite dialect, including the table-rebuild used because SQLite cannot alter a CHECK.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "localized-record-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0002_platform.sql:24 Record identity is app, dataset, and key; a search of every migration for language, locale, translation, and i18n found no hits."
+          "evidence": "crates/core/migrations/0002_platform.sql:24 Record identity is app, dataset, and key; a search of every migration for language, locale, translation, and i18n found no hits.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "operator-defined-tables",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0002_platform.sql:20 data is a payload column on a table developers change by shipping another migration file, which is the case this technique says to leave in the build."
+          "evidence": "crates/core/migrations/0002_platform.sql:20 data is a payload column on a table developers change by shipping another migration file, which is the case this technique says to leave in the build.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "sequence-token-write-ordering",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0005_change_intelligence.sql:9 Per-record order is an integer in the one engine, not a token minted above two stores."
+          "evidence": "crates/core/migrations/0005_change_intelligence.sql:9 Per-record order is an integer in the one engine, not a token minted above two stores.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "existence-authority-written-last",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0021_ingress.sql:36 The triggers rebuild copies rows inside one database; it does not write a file or a second store."
+          "evidence": "crates/core/migrations/0021_ingress.sql:36 The triggers rebuild copies rows inside one database; it does not write a file or a second store.",
+          "carriedFrom": "2026-10-13"
         }
-      ]
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0002_platform.sql:15 This directory is SQLite DDL and in-database backfill; a search of crates/core/migrations for sqlx, QueryBuilder, FromRow, and push_bind found no host-language repository, row mapper, or query builder.",
+          "evaluatedAt": "2026-10-13T08:04:02.947Z",
+          "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+          "reason": "replaced by 6928bafa-c16d-4262-8b4b-371b6ae0268f"
+        }
+      ],
+      "withdrawn": {
+        "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
+        "state": "not-applicable",
+        "at": "2026-10-24T01:50:43.417275+00:00",
+        "reason": "reviewer (sonnet): The anchor 0002_platform.sql:15 is just a CREATE TABLE records line, so it doesn't show that a repository surface is absent. The claim also leans on UNIQUE (host, url_template) in 0025, which isn't among the context's listed files."
+      }
     },
     "e070c6d1-28bc-4b66-bdac-e9a46f152f10/data-access": {
       "context": "core-http-cache",
       "subject": "data-access",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T08:04:02.947Z",
-      "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T01:50:11.497Z",
+      "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
       "techniques": [
+        {
+          "technique": "row-mapping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:118 Single-record read: a corrupt serialized column becomes an empty default instead of failing loud. get_stale (line 144) repeats the same decode by hand, so there are two positional decoders for one shape."
+        },
         {
           "technique": "batching-and-n-plus-one",
           "verdict": "conformant",
-          "evidence": "crates/core/src/cache.rs:231 Freshness folds every key from one bounded join, not one query per key."
-        },
-        {
-          "technique": "capability-declared-in-the-type",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/cache.rs:99 Disabled is a flag on the single HttpCache type, not a second backend behind a store interface."
-        },
-        {
-          "technique": "cross-driver-invariant-parity",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/cache.rs:31 The cache has one SQLite pool; the LRU helper is an in-memory deque, not a second engine for the same repository."
-        },
-        {
-          "technique": "existence-authority-written-last",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/cache.rs:107 The response body is a column of the cache row, not a file written beside it."
-        },
-        {
-          "technique": "layering-rules",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/cache.rs:271 Cache statements are named methods on HttpCache; this context has no HTTP handler assembling SQL."
+          "evidence": "crates/core/src/cache.rs:231 freshness reads revalidations joined to cache rows in one bounded query and folds per key, with no per-key lookup loop."
         },
         {
           "technique": "query-construction",
           "verdict": "conformant",
-          "evidence": "crates/core/src/cache.rs:287 Inserts, lookups, and VACUUM INTO bind their values; backup_before_migrations binds the destination path as ?1."
-        },
-        {
-          "technique": "read-models-and-projections",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/cache.rs:227 Per-key freshness is folded from the revalidation log on each call and is not written back as a stored fact."
+          "evidence": "crates/core/src/cache.rs:108 Static statement; every value, including the optional max-age bound, is a bound parameter."
         },
         {
           "technique": "repo-testing",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/cache.rs:23 The TTL test runs HttpCache against a temp SQLite opened through the real migration chain."
+          "evidence": "crates/core/tests/cache.rs:23 Cache tests run against a real temp SQLite per test. No corrupt-row drill exists for the headers column."
         },
         {
-          "technique": "row-mapping",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/cache.rs:118 get and get_stale both turn unreadable headers into an empty map and still return the row; freshness also continues past a timestamp that does not parse."
+          "technique": "capability-declared-in-the-type",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:99 Disabled is a flag on the single HttpCache type, not a second backend behind a store interface.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "cross-driver-invariant-parity",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:31 The cache has one SQLite pool; the LRU helper is an in-memory deque, not a second engine for the same repository.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "existence-authority-written-last",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:107 The response body is a column of the cache row, not a file written beside it.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "layering-rules",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/cache.rs:271 Cache statements are named methods on HttpCache; this context has no HTTP handler assembling SQL.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/cache.rs:227 Per-key freshness is folded from the revalidation log on each call and is not written back as a stored fact.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "sequence-token-write-ordering",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/cache.rs:344 Eviction order is created_at plus key inside one SQLite table."
+          "evidence": "crates/core/src/cache.rs:344 Eviction order is created_at plus key inside one SQLite table.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "transactions-and-units-of-work",
           "verdict": "deviation",
-          "evidence": "crates/core/src/cache.rs:335 evict_over_cap reads the count, then deletes that many oldest keys as a second statement, so the read that decides the write is not in the same boundary."
+          "evidence": "crates/core/src/cache.rs:335 evict_over_cap reads the count, then deletes that many oldest keys as a second statement, so the read that decides the write is not in the same boundary.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/cache.rs:118 A cache hit whose headers JSON does not parse is returned as an empty header map, so a corrupt row and a row that stored no headers look the same.",
+          "evaluatedAt": "2026-10-13T08:04:02.947Z",
+          "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
+          "reason": "replaced by 6928bafa-c16d-4262-8b4b-371b6ae0268f"
         }
       ]
     },
@@ -6728,6 +6796,32 @@
           "technique": "chokepoint-tag-registry",
           "verdict": "not-applicable",
           "evidence": "crates/core/tests/store_instrument_chokepoint.rs:6 The store chokepoint is declared a partial measurement census (StoreOp::ALL), not a routing invariant. It deliberately makes no claim that every statement passes through it, so the bijection precondition does not hold."
+        }
+      ]
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/data-access": {
+      "context": "pricing-valuation",
+      "subject": "data-access",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T01:50:11.497Z",
+      "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
+      "techniques": [
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "deviation",
+          "evidence": "crates/apps/state-tax/src/lib.rs:203 Whole aggregates are loaded to render one number, and the available count projection is bypassed."
+        },
+        {
+          "technique": "layering-rules",
+          "verdict": "deviation",
+          "evidence": "crates/apps/transact/src/lib.rs:333 The app holds the raw SqlitePool handle exported by Datasets::pool and passes it to core ledger functions (stage_pending/by_key). The statements stay in core, but the raw handle is exported past the data layer, which the technique names as the leak."
+        },
+        {
+          "technique": "repo-testing",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/tests/partial_run_cannot_delete.rs:120 App write-path invariants (a partial run cannot tombstone) are tested against a real migrated SQLite."
         }
       ]
     }

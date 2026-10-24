@@ -1,0 +1,221 @@
+{
+  "schema": "conform-run/1",
+  "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
+  "subject": "data-access",
+  "evaluatedAt": "2026-10-24T01:50:11.497614+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "api-data-access",
+      "subject": "data-access",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/routes/datasets.rs:449 The hard delete removes the SQLite records first and then deletes the search docs best-effort, logging any failure as a warning only. GET /search serves Tantivy hits without joining back to the dataset store, and search-backfill walks only stored records, so a hard-deleted dataset whose index cleanup failed leaves ghost hits that nothing joins away or sweeps.",
+      "techniques": [
+        {
+          "technique": "existence-authority-written-last",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/datasets.rs:449 The authority is removed first, which is the right order, but the dependent reader (/search) acts on the half-state silently. It gets neither an authority join nor a sweep; backfill purges only tombstoned rows, and a hard-deleted dataset has none."
+        },
+        {
+          "technique": "batching-and-n-plus-one",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1246 grants_for_profile loops over a page of fits and issues one Datasets::get per fit. The surface offers only fetch-one (datasets.rs:2377 get) with no set-shaped lookup, so the N+1 is bounded by page size but structural."
+        },
+        {
+          "technique": "layering-rules",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/derived.rs:180 A grep of all eight route files for sqlx/query_as/query_scalar found no SQL. Handlers call named store operations only."
+        },
+        {
+          "technique": "transactions-and-units-of-work",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/datasets.rs:412 The confirm-count invariant is re-checked inside the store-owned delete transaction (delete_dataset_mode Execute), not by the handler. The handler does not open a transaction."
+        },
+        {
+          "technique": "query-construction",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/query.rs:1039 The filter token is mapped through a closed vocabulary, and an unknown value is a 400 that names the allowed set rather than a pass-through."
+        }
+      ]
+    },
+    {
+      "context": "core-platform-services",
+      "subject": "data-access",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/recipes.rs:729 A single-record read (best_for_host) decodes a corrupt params/json_paths column as Null/empty instead of failing loud, and the same table has a second hand-written positional decoder (recipe_row_json) that does the same thing. Corrupt recipes therefore look like recipes with no parameters.",
+      "techniques": [
+        {
+          "technique": "row-mapping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/recipes.rs:729 Serialized payload columns are silently defaulted on decode. The table is decoded positionally in two separate places (tuple at 713, RecipeRow at 640), which gives parallel copies of one shape."
+        },
+        {
+          "technique": "capability-declared-in-the-type",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/search.rs:457 NoSearch is a stub whose query returns empty success and whose index does nothing. The disabled capability lives in config, not on the type, so callers other than run_search (which consults config.search.enabled) cannot tell 'disabled' from 'no matches'."
+        },
+        {
+          "technique": "query-construction",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:548 Optional predicates are written as static SQL with bound parameters. The state filter binds RecipeState::as_str from a closed enum."
+        },
+        {
+          "technique": "transactions-and-units-of-work",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:513 The re-discovery invariant (keep the id and validated flag, refresh the shape) is one atomic upsert inside a single repository operation."
+        },
+        {
+          "technique": "repo-testing",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/testing.rs:88 Tests run against a real migrated SQLite in a per-test temp dir (TempStore), not a mock; for example saved_search_views.rs:35."
+        }
+      ]
+    },
+    {
+      "context": "core-http-cache",
+      "subject": "data-access",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/cache.rs:118 A cache hit whose headers JSON does not parse is served as a response with an empty header map, and the freshness collection read silently skips rows with unparseable timestamps. Corruption looks like a row with no headers or no history.",
+      "techniques": [
+        {
+          "technique": "row-mapping",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/cache.rs:118 Single-record read: a corrupt serialized column becomes an empty default instead of failing loud. get_stale (line 144) repeats the same decode by hand, so there are two positional decoders for one shape."
+        },
+        {
+          "technique": "batching-and-n-plus-one",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/cache.rs:231 freshness reads revalidations joined to cache rows in one bounded query and folds per key, with no per-key lookup loop."
+        },
+        {
+          "technique": "query-construction",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/cache.rs:108 Static statement; every value, including the optional max-age bound, is a bound parameter."
+        },
+        {
+          "technique": "repo-testing",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/cache.rs:23 Cache tests run against a real temp SQLite per test. No corrupt-row drill exists for the headers column."
+        }
+      ]
+    },
+    {
+      "context": "pricing-valuation",
+      "subject": "data-access",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/apps/state-tax/src/lib.rs:203 The vintage-skip path loads up to 200 full records just to report a count, even though Datasets::record_count exists (datasets.rs:2354). list does not filter removed_at, so the reported 'records' figure includes tombstoned rows and silently caps at 200.",
+      "techniques": [
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "deviation",
+          "evidence": "crates/apps/state-tax/src/lib.rs:203 Whole aggregates are loaded to render one number, and the available count projection is bypassed."
+        },
+        {
+          "technique": "layering-rules",
+          "verdict": "deviation",
+          "evidence": "crates/apps/transact/src/lib.rs:333 The app holds the raw SqlitePool handle exported by Datasets::pool and passes it to core ledger functions (stage_pending/by_key). The statements stay in core, but the raw handle is exported past the data layer, which the technique names as the leak."
+        },
+        {
+          "technique": "repo-testing",
+          "verdict": "conformant",
+          "evidence": "crates/apps/state-tax/tests/partial_run_cannot_delete.rs:120 App write-path invariants (a partial run cannot tombstone) are tested against a real migrated SQLite."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "data-access",
+      "context": "core-schema-migrations",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor 0002_platform.sql:15 is just a CREATE TABLE records line, so it doesn't show that a repository surface is absent. The claim also leans on UNIQUE (host, url_template) in 0025, which isn't among the context's listed files."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-10-24T01:50:11.497614+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [
+        "batching-and-n-plus-one",
+        "existence-authority-written-last",
+        "layering-rules",
+        "query-construction",
+        "transactions-and-units-of-work"
+      ],
+      "deviations": 1,
+      "context": "api-data-access",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T01:50:11.497614+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [
+        "capability-declared-in-the-type",
+        "query-construction",
+        "repo-testing",
+        "row-mapping",
+        "transactions-and-units-of-work"
+      ],
+      "deviations": 1,
+      "context": "core-platform-services",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T01:50:11.497614+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "core-schema-migrations",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T01:50:11.497614+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [
+        "batching-and-n-plus-one",
+        "query-construction",
+        "repo-testing",
+        "row-mapping"
+      ],
+      "deviations": 1,
+      "context": "core-http-cache",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-10-24T01:50:11.497614+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [
+        "layering-rules",
+        "read-models-and-projections",
+        "repo-testing"
+      ],
+      "deviations": 1,
+      "context": "pricing-valuation",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}
