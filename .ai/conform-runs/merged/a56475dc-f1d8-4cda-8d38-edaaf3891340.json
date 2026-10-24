@@ -1,0 +1,204 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+ "subject": "quality-gates",
+ "evaluatedAt": "2026-10-24T01:11:54.935870+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/test/conformance.test.ts:61 When the spec is missing, the conformance test tells the reader to run `just clients`. That recipe is `node scripts/gen/generate-clients.mjs`, which reads clients/openapi.json and itself exits 2 with \"clients/openapi.json is missing\". The remedy, applied as worded, cannot clear the check; the real producer is `just openapi`.",
+   "techniques": [
+    {
+     "technique": "refusal-names-a-reachable-remedy",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/test/conformance.test.ts:61 Names a recipe that consumes the missing file instead of producing it. scripts/gen/generate-clients.mjs:213-218 names the correct producer (UPDATE_OPENAPI=1 cargo test ... spec_snapshot, i.e. `just openapi`)."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "deviation",
+     "evidence": "clients/typescript/test/conformance.test.ts:70 A schema with no direct properties (e.g. one reshaped into allOf/$ref) yields zero required fields, and assertFixtureCoversSchema then passes having checked nothing. Nothing asserts the property set is non-empty. Latent: today RecordDto/RevisionDto/RevisionPageDto have 7/13/2 properties."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/test/conformance.test.ts:80 Required fields come from the served openapi.json, not a hand-typed list, so a field added on the server side reddens the test. The intermediate document is itself pinned to the live router by a Rust test."
+    },
+    {
+     "technique": "instrument-answers-only-its-own-question",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/test/conformance.test.ts:13 The header states the one question this instrument answers (fixture shape agreement) and explicitly disclaims the end-to-end HTTP wiring question."
+    }
+   ]
+  },
+  {
+   "context": "core-platform-services",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/catalog.rs:344 Contract range checks drop any record whose ranged field is non-numeric before comparing. A contract that declares `ranges` without a matching `types` entry passes such values with no violation and no skip count. The test at catalog.rs:1328 pins that silent pass.",
+   "techniques": [
+    {
+     "technique": "unmeasurable-criteria",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/catalog.rs:344 A record the range condition cannot evaluate is silently excluded, neither failed nor reported as a counted skip. The design delegates to `types` (line 251), but nothing announces how many records went unevaluated."
+    },
+    {
+     "technique": "severity-by-construction",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/catalog.rs:673 Warn vs Block is decided by the enforce flag in ContractVerdict::from_violations, and the status surface says in words when the label gates nothing."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/lane_artifact/mod.rs:20 A lane that failed to write its artifact panics, so it cannot read as a lane that passed."
+    },
+    {
+     "technique": "vacuous-by-evaluation",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/catalog.rs:421 A misspelled cadence used to be evaluated into 'no freshness expectation', making the rule unfireable. It is now refused at parse time by vocabulary_findings."
+    },
+    {
+     "technique": "policy-projection",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/catalog.rs:213 One freshness_window_secs function feeds both /catalog/health and /sources, so the two surfaces cannot judge staleness differently."
+    }
+   ]
+  },
+  {
+   "context": "core-job-queue",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/tests/error_cause_chain.rs:64 The cause-flattening guard compares only the count of found sites (keyed `path:line`) against the length of EXPECTED_FLATTENED, whose entries are prose labels never matched against those keys. Fixing one waived extract.rs site while adding a new flattening site elsewhere keeps the count equal and stays green.",
+   "techniques": [
+    {
+     "technique": "waiver-names-its-finding",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/error_cause_chain.rs:64 The waivers are a count, not identities. No entry is matched to a found site, so substituting one finding for another passes, and a mistyped entry is never reported."
+    },
+    {
+     "technique": "renameable-detector-keys",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/error_cause_chain.rs:228 The detector keys on the binding name. Renaming `e` to `x` keeps the flattening and clears the check, and the verdict does not state that limit."
+    },
+    {
+     "technique": "unparseable-form-is-a-finding",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/error_cause_chain.rs:192 A call the matcher cannot balance is skipped with `continue`, not reported. Alternative spellings (aliased imports, whitespace before the paren) are neither recognised nor banned, in a tree the repo owns."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/error_cause_chain.rs:82 A paired positive-control floor proves the same scanner still finds sites, so an empty walk or an unreadable crate cannot pass as clean."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/error_cause_chain.rs:189 Comment lines naming the banned shape are normalised out, so prose cannot satisfy or trip the matcher. Partial: string literals and inline block comments are not blanked."
+    },
+    {
+     "technique": "refusal-names-a-reachable-remedy",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/error_cause_chain.rs:70 The failure names an in-tree constructor and the in-file allowlist, both reachable from where the reader stands."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/error_cause_chain.rs:12 The 'attach the cause' convention is mechanised as a test rather than left as prose."
+    },
+    {
+     "technique": "decidable-in-a-window",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/error_cause_chain.rs:227 The rule is local to one call expression, so a window-sized pattern can decide it without a call graph."
+    },
+    {
+     "technique": "severity-by-construction",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/error.rs:1669 Terminal classification is an exhaustive match, so a new variant fails compilation. Its blocking status comes from construction, not from a label."
+    },
+    {
+     "technique": "chokepoint-tag-registry",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/tests/store_instrument_chokepoint.rs:6 The store chokepoint is declared a partial measurement census (StoreOp::ALL), not a routing invariant. It deliberately makes no claim that every statement passes through it, so the bijection precondition does not hold."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "quality-gates",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "quality-gates",
+   "context": "e2e-api-contract",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T01:11:54.935870+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "gate-liveness",
+    "instrument-answers-only-its-own-question",
+    "match-the-resolved-artifact",
+    "refusal-names-a-reachable-remedy"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:11:54.935870+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "gate-liveness",
+    "policy-projection",
+    "severity-by-construction",
+    "unmeasurable-criteria",
+    "vacuous-by-evaluation"
+   ],
+   "deviations": 1,
+   "context": "core-platform-services",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T01:11:54.935870+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "chokepoint-tag-registry",
+    "decidable-in-a-window",
+    "gate-liveness",
+    "match-the-resolved-artifact",
+    "prose-rule-drift",
+    "refusal-names-a-reachable-remedy",
+    "renameable-detector-keys",
+    "severity-by-construction",
+    "unparseable-form-is-a-finding",
+    "waiver-names-its-finding"
+   ],
+   "deviations": 1,
+   "context": "core-job-queue",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

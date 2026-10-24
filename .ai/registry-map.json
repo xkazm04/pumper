@@ -2734,7 +2734,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/error_cause_chain.rs:64 The cause-flattening guard compares only the count of found sites (keyed `path:line`) against the length of EXPECTED_FLATTENED, whose entries are prose labels never matched against those keys. Fixing one waived extract.rs site while adding a new flattening site elsewhere keeps the count equal and stays green.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54
         },
         {
           "subject": "concurrency-guards",
@@ -3001,7 +3005,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/catalog.rs:344 Contract range checks drop any record whose ranged field is non-numeric before comparing. A contract that declares `ranges` without a matching `types` entry passes such values with no violation and no skip count. The test at catalog.rs:1328 pins that silent pass.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54
         },
         {
           "subject": "agent-instruction-files",
@@ -5329,7 +5337,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:61 When the spec is missing, the conformance test tells the reader to run `just clients`. That recipe is `node scripts/gen/generate-clients.mjs`, which reads clients/openapi.json and itself exits 2 with \"clients/openapi.json is missing\". The remedy, applied as worded, cannot clear the check; the real producer is `just openapi`.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
+          "evaluatedRevision": 54
         },
         {
           "subject": "agent-instruction-files",
