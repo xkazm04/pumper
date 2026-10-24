@@ -1,0 +1,96 @@
+{
+ "schema": "conform-run/1",
+ "worker": "107d6b64-3e4a-46c6-b7df-7f2571053113",
+ "subject": "conformance-checking",
+ "evaluatedAt": "2026-10-24T21:12:55.764898+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "conformance-checking",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/docs/feature-doc-map.json:199 The sdks.md rule's `scripts/gen/**` glob can never fire because `^scripts/` is in SKIP_PATTERNS and is applied before the map lookup. The map's `_inert` note doesn't mention it, and no harness goes through the 23 map entries to prove each one can fire, so a dead rule sits in the registry undetected. A read-only replay over `git ls-files` found 6 such dead globs; only the catalog/plugins-src ones are declared.",
+   "techniques": [
+    {
+     "technique": "rule-registry-enumerated-fixtures",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/feature-doc-map.json:199 The map is a registry of 23 independent glob-to-doc rules, but the test harness never goes through it. Only the datasets.md entry is asserted (test.mjs:121-123). This glob is shadowed by SKIP_PATTERNS and is undeclared, which is exactly the 'rule nobody has proved can fire' that the enumeration is meant to turn into a red build."
+    },
+    {
+     "technique": "derived-expectation-needs-an-evidence-floor",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:312 The edited set is derived from the transcript, and an empty derivation passes. main() throws away evaluateEditedFiles' `reason`, so 'no-edits' (derived nothing) and 'docs-touched' (derived and matched) give the same silent exit 0. That is the shape that hid this hook's lifetime of zero detections. No count is published and no floor is set over the recorded population. The shape canary (test.mjs:241) does pin the derivation's input contract, which covers one of the four sub-rules."
+    },
+    {
+     "technique": "declared-then-proven",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:256 The check is presence-rung only: the mapped doc path appears in the edited set (line 220). The doc's content is not inspected. Yet the documented meaning of exit 0 claims the turn is 'consistent', which overstates the rung. The rung is not labelled anywhere in the output."
+    },
+    {
+     "technique": "fixture-repo-testing",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.test.mjs:161 Fixtures are driven through the real stdin entry point and exit codes 2/3 are asserted, which is good. But the conformant-shape end-to-end tests (lines 155-169) assert only status 0, with no assertion that the instrument ran. A collector returning an empty set would keep them green. Also, materialize() (line 34) and runHookWithMap() (line 189) call mkdtempSync, and nothing in the file removes those temp trees (no rmSync or after hook), so the created fixtures have nothing that cleans them up."
+    },
+    {
+     "technique": "declared-deviation-register",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/feature-doc-map.json:3 The hook deliberately doesn't enforce couplings its own map declares. The record of that is a single header note, not one entry per site. It has no motivation stated as a cost and no date or reconciliation state. It is also incomplete: `scripts/gen/**` (line 199) is inert for the same reason and isn't listed."
+    },
+    {
+     "technique": "finding-severity-ladder",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.mjs:266 One closed vocabulary with its exit-code projection: 0 means consistent, 2 means finding, 3 means could not check. Cannot-check is a first-class return for a missing transcript, an unreadable map, or a map with zero entries, and tests assert it against a spawned process."
+    },
+    {
+     "technique": "checker-false-positive-discipline",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/check-doc-sync.mjs:220 Each entry is satisfied by editing the doc it names. This removes the 'finding the owner cannot act on' (a nag that editing the named doc couldn't clear) and the cross-doc false pass. Findings ship their evidence (doc <- files, line 230), and the misfire rate was measured by replay."
+    },
+    {
+     "technique": "claim-write-back",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/check-doc-sync.mjs:314 The hook runs no declared command and stamps nothing. Its only output is a stderr reminder plus an exit code, so there is no proof to write back."
+    },
+    {
+     "technique": "pass-ratio-comparability",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/check-doc-sync.mjs:311 The verdict is a boolean plus a list of docs per turn. No percentage or composite is emitted."
+    },
+    {
+     "technique": "edition-stratified-conformance",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/check-doc-sync.mjs:76 The standard is a single map owned in this repo. There is no upstream suite with editions; the technique's 'you own the suite' exclusion applies."
+    }
+   ],
+   "registryProposal": "derived-expectation-needs-an-evidence-floor assumes the run covers a population. A per-turn hook like this sees exactly one case per run, so the floor can only live in an offline replay harness over recorded transcripts. The technique could say where the floor goes when the checker is per-event."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T21:12:55.764898+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "conformance-checking"
+   ],
+   "techniques": [
+    "checker-false-positive-discipline",
+    "claim-write-back",
+    "declared-deviation-register",
+    "declared-then-proven",
+    "derived-expectation-needs-an-evidence-floor",
+    "edition-stratified-conformance",
+    "finding-severity-ladder",
+    "fixture-repo-testing",
+    "pass-ratio-comparability",
+    "rule-registry-enumerated-fixtures"
+   ],
+   "deviations": 1,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

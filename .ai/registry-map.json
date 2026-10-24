@@ -3752,7 +3752,11 @@
           "revision": 10,
           "changedAt": "2026-09-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/docs/feature-doc-map.json:199 The sdks.md rule's `scripts/gen/**` glob can never fire because `^scripts/` is in SKIP_PATTERNS and is applied before the map lookup. The map's `_inert` note doesn't mention it, and no harness goes through the 23 map entries to prove each one can fire, so a dead rule sits in the registry undetected. A read-only replay over `git ls-files` found 6 such dead globs; only the catalog/plugins-src ones are declared.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:58a3b7c0b9efb42c",
+          "evaluatedRevision": 10
         }
       ],
       "governance": "governed"
