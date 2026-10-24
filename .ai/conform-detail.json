@@ -7262,6 +7262,48 @@
         }
       ],
       "registryProposal": "The pagination technique's opacity rule (rule 3) does not say what to do when a first-party SDK has to persist and migrate cursors across versions, as this one does with legacy RFC3339 watermarks. It could say whether a versioned, server-validated transparent token is an acceptable alternative to sealing."
+    },
+    "571c7935-fe1d-4818-bced-5005f04ecf96/billing-revenue-normalization": {
+      "context": "webhook-event-delivery",
+      "subject": "billing-revenue-normalization",
+      "bundle": "llm-observability",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T05:29:03.930Z",
+      "worker": "4ffc8b8a-86f8-4e6d-8ac9-afb81c267f2a",
+      "techniques": [
+        {
+          "technique": "signature-is-the-auth",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:1231 There is a constant-time HMAC check for inbound ingress, but it protects trigger inputs, not a ledger. This verdict is only about the subject's precondition, not about whether the scheme is sound."
+        },
+        {
+          "technique": "idempotent-revenue-upsert",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:6 The delivery log is an outbound DLQ, not records persisted from provider deliveries."
+        }
+      ]
+    },
+    "2d713bf8-16d5-4c0f-aa09-ce602aa575db/billing-revenue-normalization": {
+      "context": "core-schema-migrations",
+      "subject": "billing-revenue-normalization",
+      "bundle": "llm-observability",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T05:29:03.930Z",
+      "worker": "4ffc8b8a-86f8-4e6d-8ac9-afb81c267f2a",
+      "techniques": [
+        {
+          "technique": "deterministic-external-ids",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0007_cost_ledger.sql:5 Cost events are generated internally, not copies of external billing objects, so a generated id is the technique's own stated non-fit."
+        },
+        {
+          "technique": "static-auditable-fx-book",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0007_cost_ledger.sql:10 Single-currency cost column; there is no multi-currency revenue to convert."
+        }
+      ]
     }
   }
 }

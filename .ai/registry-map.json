@@ -3418,7 +3418,11 @@
           "revision": 5,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0007_cost_ledger.sql:1 The schema has the cost half of unit economics (cost_events in USD) but no revenue table, currency column or FX book: searching crates/core/migrations for revenue, invoice, fx_rate, minor_unit and stripe found nothing, so there are no billing records whose identity, kind, minor units or contract version this subject could govern.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:5016479d8228da36",
+          "evaluatedRevision": 5
         },
         {
           "subject": "settings",
@@ -5982,7 +5986,11 @@
           "revision": 5,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/webhook.rs:1 This context sends job/dataset-change webhooks out and verifies generic HMAC ingress into triggers. It never takes in a billing provider's deliveries as revenue records: a case-insensitive search of crates/server for revenue, invoice, stripe, fx_rate and minor_unit found nothing, so this subject's precondition (a revenue ledger fed by webhooks) does not hold.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:5016479d8228da36",
+          "evaluatedRevision": 5
         },
         {
           "subject": "webhook-ingestion",
