@@ -7074,6 +7074,98 @@
           "evidence": "crates/core/src/storage.rs:876 Executors claim by polling outbound, with an allow-list. The lease holder is stamped in the same statement that claims the job, and heartbeats are fenced on executor_id."
         }
       ]
+    },
+    "6a152014-f86c-4ad6-8b65-6ab5ed484ea5/concurrency-guards": {
+      "context": "job-worker",
+      "subject": "concurrency-guards",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:51:03.411Z",
+      "worker": "4562374c-1400-4f92-89b9-507a5c046aef",
+      "techniques": [
+        {
+          "technique": "release-guarantees",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/refresher.rs:78 The release covers the error and shutdown paths but not the panic path, which is the 'leak with a delay fuse' the technique names. By contrast fanout.rs:76 (Ticket's Drop) and worker.rs:81 (the RAII activity gauge) get release right."
+        },
+        {
+          "technique": "attempt-attribution",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1054 complete(job.id, job.attempts, ..) is fenced on the attempt number. A stale finish is discarded with a visible log and no side effects. Heartbeat (897), cancel_running and await_input carry the same fence."
+        },
+        {
+          "technique": "guard-key-design",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:74 The cancel registry keys on job id plus attempt, chosen on purpose so an overlapping re-claim neither clobbers nor is clobbered (comment at 66-68). Cleanup at 87 removes the entry only when the attempt matches."
+        },
+        {
+          "technique": "cross-process-exclusion",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:44 Work is claimed by a compare-and-swap UPDATE…RETURNING on the shared SQLite row (storage.rs:853). The dead-holder story is the heartbeat lease plus the reaper (reap_once), and drain falls back to recover_stuck."
+        },
+        {
+          "technique": "preparation-is-the-staleness-window",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1065 Outbound effects (webhooks, alerts, index) run only after the attempt-conditioned complete() returns Ok(true). The store-side condition is the last check before any effect leaves the system."
+        },
+        {
+          "technique": "critical-section-across-a-suspension",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:438 The intent mark and the token fire stay inside one critical section with a declared lock order. The section was deliberately not split, so the fire→mark race is closed."
+        },
+        {
+          "technique": "single-flight-primitives",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/refresher.rs:59 The second caller's outcome is a designed refuse-and-skip, logged separately from a failure. It is the only static AtomicBool guard in the repo (grep), so N bespoke flags have not multiplied. The release flaw is judged under release-guarantees."
+        },
+        {
+          "technique": "renewal-deadline-two-thirds-ttl",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:897 This heartbeat is a per-job lease, which job-coordination's lease-renewal owns. There is no cluster-wide active-node lease here."
+        }
+      ]
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/concurrency-guards": {
+      "context": "core-platform-services",
+      "subject": "concurrency-guards",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T03:51:03.411Z",
+      "worker": "4562374c-1400-4f92-89b9-507a5c046aef",
+      "techniques": [
+        {
+          "technique": "preparation-is-the-staleness-window",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/recipes.rs:789 The verdict comes from a value read one await earlier, and the write has no WHERE condition on that value even though the store owns the state."
+        },
+        {
+          "technique": "idempotency-by-design",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/recipes.rs:513 A natural-key upsert makes re-discovery harmless. crawl.rs:1511 likewise relies on the sink upserting a twice-emitted page idempotently."
+        },
+        {
+          "technique": "attempt-attribution",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/checkpoints.rs:36 A test pins the checkpoint write behind the same attempt-lineage fence as complete()."
+        },
+        {
+          "technique": "cross-process-exclusion",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/webhook_deliveries.rs:103 A test proves the delivery-retry claim is a compare-and-swap on the shared row."
+        },
+        {
+          "technique": "release-guarantees",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/webhook_deliveries.rs:182 A test pins that a delivery whose sender died gets reclaimed instead of wedging in 'pending' forever."
+        },
+        {
+          "technique": "critical-section-across-a-suspension",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/search.rs:306 Slow enrichment that touches no shared invariant is kept outside the writer lock. Nothing transactional is split."
+        }
+      ]
     }
   }
 }

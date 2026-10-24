@@ -1,0 +1,152 @@
+{
+ "schema": "conform-run/1",
+ "worker": "4562374c-1400-4f92-89b9-507a5c046aef",
+ "subject": "concurrency-guards",
+ "evaluatedAt": "2026-10-24T03:51:03.411550+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-worker",
+   "subject": "concurrency-guards",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/refresher.rs:78 The refresher's overlap guard is a static AtomicBool released by a plain statement after the select, so a panic inside run_pass unwinds the spawned task past this line (the workspace uses unwind, not abort, and refresher.rs has no catch_unwind) and RUNNING stays true for the life of the process: every later tick logs 'previous pass still running' and the refresher never runs again.",
+   "techniques": [
+    {
+     "technique": "release-guarantees",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/refresher.rs:78 The release covers the error and shutdown paths but not the panic path, which is the 'leak with a delay fuse' the technique names. By contrast fanout.rs:76 (Ticket's Drop) and worker.rs:81 (the RAII activity gauge) get release right."
+    },
+    {
+     "technique": "attempt-attribution",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:1054 complete(job.id, job.attempts, ..) is fenced on the attempt number. A stale finish is discarded with a visible log and no side effects. Heartbeat (897), cancel_running and await_input carry the same fence."
+    },
+    {
+     "technique": "guard-key-design",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:74 The cancel registry keys on job id plus attempt, chosen on purpose so an overlapping re-claim neither clobbers nor is clobbered (comment at 66-68). Cleanup at 87 removes the entry only when the attempt matches."
+    },
+    {
+     "technique": "cross-process-exclusion",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:44 Work is claimed by a compare-and-swap UPDATE\u2026RETURNING on the shared SQLite row (storage.rs:853). The dead-holder story is the heartbeat lease plus the reaper (reap_once), and drain falls back to recover_stuck."
+    },
+    {
+     "technique": "preparation-is-the-staleness-window",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:1065 Outbound effects (webhooks, alerts, index) run only after the attempt-conditioned complete() returns Ok(true). The store-side condition is the last check before any effect leaves the system."
+    },
+    {
+     "technique": "critical-section-across-a-suspension",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:438 The intent mark and the token fire stay inside one critical section with a declared lock order. The section was deliberately not split, so the fire\u2192mark race is closed."
+    },
+    {
+     "technique": "single-flight-primitives",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/refresher.rs:59 The second caller's outcome is a designed refuse-and-skip, logged separately from a failure. It is the only static AtomicBool guard in the repo (grep), so N bespoke flags have not multiplied. The release flaw is judged under release-guarantees."
+    },
+    {
+     "technique": "renewal-deadline-two-thirds-ttl",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/worker.rs:897 This heartbeat is a per-job lease, which job-coordination's lease-renewal owns. There is no cluster-wide active-node lease here."
+    }
+   ]
+  },
+  {
+   "context": "core-platform-services",
+   "subject": "concurrency-guards",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/recipes.rs:789 record_failure decides to un-validate from the counter its atomic increment returned, then writes the demotion without conditioning on that counter or on validated. A concurrent record_success (which resets consecutive_failures and may set validated = 1) that lands between the two statements is silently overwritten. The Retired branch at 801-802 does condition its write (retired_at IS NULL).",
+   "techniques": [
+    {
+     "technique": "preparation-is-the-staleness-window",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/recipes.rs:789 The verdict comes from a value read one await earlier, and the write has no WHERE condition on that value even though the store owns the state."
+    },
+    {
+     "technique": "idempotency-by-design",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/recipes.rs:513 A natural-key upsert makes re-discovery harmless. crawl.rs:1511 likewise relies on the sink upserting a twice-emitted page idempotently."
+    },
+    {
+     "technique": "attempt-attribution",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/checkpoints.rs:36 A test pins the checkpoint write behind the same attempt-lineage fence as complete()."
+    },
+    {
+     "technique": "cross-process-exclusion",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/webhook_deliveries.rs:103 A test proves the delivery-retry claim is a compare-and-swap on the shared row."
+    },
+    {
+     "technique": "release-guarantees",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/webhook_deliveries.rs:182 A test pins that a delivery whose sender died gets reclaimed instead of wedging in 'pending' forever."
+    },
+    {
+     "technique": "critical-section-across-a-suspension",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/search.rs:306 Slow enrichment that touches no shared invariant is kept outside the writer lock. Nothing transactional is split."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "concurrency-guards",
+   "context": "e2e-data-integrity",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "concurrency-guards",
+   "context": "e2e-integration",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T03:51:03.411550+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "concurrency-guards"
+   ],
+   "techniques": [
+    "attempt-attribution",
+    "critical-section-across-a-suspension",
+    "cross-process-exclusion",
+    "guard-key-design",
+    "preparation-is-the-staleness-window",
+    "release-guarantees",
+    "renewal-deadline-two-thirds-ttl",
+    "single-flight-primitives"
+   ],
+   "deviations": 1,
+   "context": "job-worker",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T03:51:03.411550+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "concurrency-guards"
+   ],
+   "techniques": [
+    "attempt-attribution",
+    "critical-section-across-a-suspension",
+    "cross-process-exclusion",
+    "idempotency-by-design",
+    "preparation-is-the-staleness-window",
+    "release-guarantees"
+   ],
+   "deviations": 1,
+   "context": "core-platform-services",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

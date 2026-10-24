@@ -3075,7 +3075,11 @@
           "revision": 16,
           "changedAt": "2026-10-15",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/recipes.rs:789 record_failure decides to un-validate from the counter its atomic increment returned, then writes the demotion without conditioning on that counter or on validated. A concurrent record_success (which resets consecutive_failures and may set validated = 1) that lands between the two statements is silently overwritten. The Retired branch at 801-802 does condition its write (retired_at IS NULL).",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ccc991958e998a93",
+          "evaluatedRevision": 16
         }
       ],
       "governance": "governed"
@@ -4908,7 +4912,11 @@
           "revision": 16,
           "changedAt": "2026-10-15",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/refresher.rs:78 The refresher's overlap guard is a static AtomicBool released by a plain statement after the select, so a panic inside run_pass unwinds the spawned task past this line (the workspace uses unwind, not abort, and refresher.rs has no catch_unwind) and RUNNING stays true for the life of the process: every later tick logs 'previous pass still running' and the refresher never runs again.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ccc991958e998a93",
+          "evaluatedRevision": 16
         },
         {
           "subject": "engine-host-contract",
