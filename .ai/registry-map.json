@@ -1636,7 +1636,11 @@
           "revision": 14,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:68 The doc-sync hook drops every path under scripts/ before it looks anything up in the map, and no reason is recorded for that. So a change to these gates' documented CLI contract (exit codes 0/2/3, `--no-prune`, recipe behaviour, all restated in CLAUDE.md) never creates a doc obligation, and the area is left out of coupling coverage altogether.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:fd96220db75846a1",
+          "evaluatedRevision": 14
         },
         {
           "subject": "prompt-assembly",
@@ -1928,7 +1932,11 @@
           "revision": 14,
           "changedAt": "2026-09-25",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/datasets.rs:792 Literal constants of this context (UPSERT_CHUNK=500, MAX_DUP_PAIRS=10_000, MAX_BACKFILL_BATCH=1000) are restated word-for-word in docs/features/datasets.md (\"chunks of 500\", \"MAX_DUP_PAIRS=10,000\", \"1..=1000\"). No test or script reads the doc, so changing a constant leaves a stale copy that nothing reports.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:fd96220db75846a1",
+          "evaluatedRevision": 14
         },
         {
           "subject": "delivery-analytics",

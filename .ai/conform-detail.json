@@ -7304,6 +7304,58 @@
           "evidence": "crates/core/migrations/0007_cost_ledger.sql:10 Single-currency cost column; there is no multi-currency revenue to convert."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/docs-sync": {
+      "context": "ci-quality-gates",
+      "subject": "docs-sync",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T05:49:14.831Z",
+      "worker": "5b5a1b04-e4e3-4e74-9f35-f84435e95422",
+      "techniques": [
+        {
+          "technique": "source-doc-mapping",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:68 The whole scripts/ tree, these gates included, is blanket-skipped and no map entry claims it. The standard asks for an explicit, reasoned allowlist; this one gives no reason, and the map's _comment only says skip patterns 'live inside the script'."
+        },
+        {
+          "technique": "coupled-surface-inventory",
+          "verdict": "deviation",
+          "evidence": "CLAUDE.md:63 The disk-check flag and exit-code contract (disk-check.mjs:391, :72-73) is restated in CLAUDE.md, and the same goes for flake-check at CLAUDE.md:42. That prose surface is not listed as owed by any change to these scripts, and no check compares the two."
+        }
+      ]
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/docs-sync": {
+      "context": "core-change-detection",
+      "subject": "docs-sync",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T05:49:14.831Z",
+      "worker": "5b5a1b04-e4e3-4e74-9f35-f84435e95422",
+      "techniques": [
+        {
+          "technique": "source-doc-mapping",
+          "verdict": "conformant",
+          "evidence": "scripts/docs/feature-doc-map.json:34 datasets.rs, and simhash.rs at :37, are declared couplings to a named doc. The hook skips this context's tests/ files by its skip patterns, which is correct because they are test-only."
+        },
+        {
+          "technique": "named-duplication-points",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/datasets.rs:792 These copies are literal, so the technique calls for a mechanical assertion. A grep for any test or script reading docs/ (include_str!/read_to_string of docs) found nothing."
+        },
+        {
+          "technique": "doc-rot-detection",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/datasets.rs:1373 Code and doc point at each other by section name and test name (datasets.md:103 names this test; datasets.rs:1169 names § Conventions). Both resolve today, but no scanner checks the 'broken' rung, so a rename on either side would go unnoticed."
+        },
+        {
+          "technique": "cross-repo-drift-detection",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/feature-doc-map.json:32 The coupled doc sits in the same tree as the source, and the technique itself says not to build this in that case."
+        }
+      ]
     }
   }
 }

@@ -1,0 +1,93 @@
+{
+ "schema": "conform-run/1",
+ "worker": "5b5a1b04-e4e3-4e74-9f35-f84435e95422",
+ "subject": "docs-sync",
+ "evaluatedAt": "2026-10-24T05:49:14.831046+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "ci-quality-gates",
+   "subject": "docs-sync",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/docs/check-doc-sync.mjs:68 The doc-sync hook drops every path under scripts/ before it looks anything up in the map, and no reason is recorded for that. So a change to these gates' documented CLI contract (exit codes 0/2/3, `--no-prune`, recipe behaviour, all restated in CLAUDE.md) never creates a doc obligation, and the area is left out of coupling coverage altogether.",
+   "techniques": [
+    {
+     "technique": "source-doc-mapping",
+     "verdict": "deviation",
+     "evidence": "scripts/docs/check-doc-sync.mjs:68 The whole scripts/ tree, these gates included, is blanket-skipped and no map entry claims it. The standard asks for an explicit, reasoned allowlist; this one gives no reason, and the map's _comment only says skip patterns 'live inside the script'."
+    },
+    {
+     "technique": "coupled-surface-inventory",
+     "verdict": "deviation",
+     "evidence": "CLAUDE.md:63 The disk-check flag and exit-code contract (disk-check.mjs:391, :72-73) is restated in CLAUDE.md, and the same goes for flake-check at CLAUDE.md:42. That prose surface is not listed as owed by any change to these scripts, and no check compares the two."
+    }
+   ]
+  },
+  {
+   "context": "core-change-detection",
+   "subject": "docs-sync",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/datasets.rs:792 Literal constants of this context (UPSERT_CHUNK=500, MAX_DUP_PAIRS=10_000, MAX_BACKFILL_BATCH=1000) are restated word-for-word in docs/features/datasets.md (\"chunks of 500\", \"MAX_DUP_PAIRS=10,000\", \"1..=1000\"). No test or script reads the doc, so changing a constant leaves a stale copy that nothing reports.",
+   "techniques": [
+    {
+     "technique": "source-doc-mapping",
+     "verdict": "conformant",
+     "evidence": "scripts/docs/feature-doc-map.json:34 datasets.rs, and simhash.rs at :37, are declared couplings to a named doc. The hook skips this context's tests/ files by its skip patterns, which is correct because they are test-only."
+    },
+    {
+     "technique": "named-duplication-points",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/datasets.rs:792 These copies are literal, so the technique calls for a mechanical assertion. A grep for any test or script reading docs/ (include_str!/read_to_string of docs) found nothing."
+    },
+    {
+     "technique": "doc-rot-detection",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/datasets.rs:1373 Code and doc point at each other by section name and test name (datasets.md:103 names this test; datasets.rs:1169 names \u00a7 Conventions). Both resolve today, but no scanner checks the 'broken' rung, so a rename on either side would go unnoticed."
+    },
+    {
+     "technique": "cross-repo-drift-detection",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/feature-doc-map.json:32 The coupled doc sits in the same tree as the source, and the technique itself says not to build this in that case."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T05:49:14.831046+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "docs-sync"
+   ],
+   "techniques": [
+    "coupled-surface-inventory",
+    "source-doc-mapping"
+   ],
+   "deviations": 1,
+   "context": "ci-quality-gates",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T05:49:14.831046+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "docs-sync"
+   ],
+   "techniques": [
+    "cross-repo-drift-detection",
+    "doc-rot-detection",
+    "named-duplication-points",
+    "source-doc-mapping"
+   ],
+   "deviations": 1,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
