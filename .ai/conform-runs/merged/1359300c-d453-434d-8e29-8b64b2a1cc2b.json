@@ -1,0 +1,131 @@
+{
+ "schema": "conform-run/1",
+ "worker": "1359300c-d453-434d-8e29-8b64b2a1cc2b",
+ "subject": "prompt-assembly",
+ "evaluatedAt": "2026-10-24T02:07:06.748335+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/mcp/mod.rs:741 The MCP capability vocabulary has two hand-maintained authorities: the advertised tool list in `server_tools` and this dispatch match. `scripts/ci/mcp-gate-parity.mjs` only checks that the gated subset is spelled the same at three sites; the vocabulary is still not rendered from one registry.",
+   "techniques": [
+    {
+     "technique": "capability-documentation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:741 The dispatch arms are written separately from the json! tool definitions in server_tools (line 167). The static `instructions` doctrine at line 150 also names tools such as enqueue_job and approve_transaction, and no sync check resolves those mentions against what is actually listed."
+    }
+   ]
+  },
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "scripts/docs/check-doc-sync.mjs:314 The hook only writes a fixed reminder to stderr, and the external Claude Code harness decides where that text lands in the model's context. Searching scripts/docs found no system prompt, token budget, cache-control or compaction code, so this context owns no prompt assembler.",
+   "techniques": [],
+   "absenceTerms": [
+    "system_prompt",
+    "systemPrompt",
+    "max_tokens",
+    "cache_control",
+    "compaction"
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/provisioner/src/lib.rs:1016 Provisioner, research and connector-api-watch each build model-facing prose with inline format! calls inside run() or a helper, so no single assembler enforces section order, trust classification, a total budget or a fingerprint.",
+   "techniques": [
+    {
+     "technique": "layered-composition",
+     "verdict": "deviation",
+     "evidence": "crates/apps/provisioner/src/lib.rs:1016 Prompt text is born at the call site in run(); there is no assembler per prompt family. This is the sprawl failure."
+    },
+    {
+     "technique": "variable-interpolation",
+     "verdict": "deviation",
+     "evidence": "crates/apps/provisioner/src/lib.rs:1144 An untrusted scraped page body is interpolated straight into the task text, with no declared trust class and no fenced insertion point."
+    },
+    {
+     "technique": "context-budgeting",
+     "verdict": "deviation",
+     "evidence": "crates/apps/connector-api-watch/src/lib.rs:443 clamp() silently drops diff lines past the cap, and the prompt never says how many ADDED/REMOVED lines were omitted, so the model sees a partial view that looks complete."
+    },
+    {
+     "technique": "task-envelope",
+     "verdict": "deviation",
+     "evidence": "crates/apps/research/src/lib.rs:612 The task layer opens with role priming. It does carry a done criterion (the JSON shape), but the opening line is spent on a role claim."
+    },
+    {
+     "technique": "context-ownership-regimes",
+     "verdict": "conformant",
+     "evidence": "crates/apps/research/src/lib.rs:633 This is the agent-held regime: the Claude CLI session holds the transcript and the app sends only a delta prompt, with no client-side compaction running in parallel."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "prompt-assembly",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "prompt-assembly",
+   "context": "pumper-sync-sdk",
+   "reason": "evidence leans on src/generated.ts, which is not a tracked file"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-10-24T02:07:06.748335+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [
+    "capability-documentation"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T02:07:06.748335+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T02:07:06.748335+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [
+    "context-budgeting",
+    "context-ownership-regimes",
+    "layered-composition",
+    "task-envelope",
+    "variable-interpolation"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

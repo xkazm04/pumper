@@ -1385,14 +1385,23 @@
       "subject": "prompt-assembly",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T01:11:05.706Z",
-      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:07:06.748Z",
+      "worker": "1359300c-d453-434d-8e29-8b64b2a1cc2b",
       "techniques": [
         {
           "technique": "capability-documentation",
           "verdict": "deviation",
-          "evidence": "crates/server/src/mcp/mod.rs:144 server_tools manually enumerates names and descriptions at lines 141–319; tools_call separately enumerates handlers at lines 361–376, rather than rendering documentation from a registry containing dispatch bindings."
+          "evidence": "crates/server/src/mcp/mod.rs:741 The dispatch arms are written separately from the json! tool definitions in server_tools (line 167). The static `instructions` doctrine at line 150 also names tools such as enqueue_job and approve_transaction, and no sync check resolves those mentions against what is actually listed."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:144 The server maintains handwritten MCP tool definitions separately from its dispatch match, leaving two authorities for the capability vocabulary.",
+          "evaluatedAt": "2026-10-13T01:11:05.706Z",
+          "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+          "reason": "replaced by 1359300c-d453-434d-8e29-8b64b2a1cc2b"
         }
       ]
     },
@@ -1401,14 +1410,24 @@
       "subject": "prompt-assembly",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T01:11:05.706Z",
-      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:07:06.748Z",
+      "worker": "1359300c-d453-434d-8e29-8b64b2a1cc2b",
       "techniques": [
         {
           "technique": "layered-composition",
           "verdict": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:314 This hook contributes reminder text to an assembler it does not control, which the golden path distinguishes from owning prompt assembly."
+          "evidence": "scripts/docs/check-doc-sync.mjs:314 This hook contributes reminder text to an assembler it does not control, which the golden path distinguishes from owning prompt assembly.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:314 Context and repository searches found transcript inspection and a Stop-hook reminder delivered through stderr, with complete model prompt assembly owned by the external coding harness.",
+          "evaluatedAt": "2026-10-13T01:11:05.706Z",
+          "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+          "reason": "replaced by 1359300c-d453-434d-8e29-8b64b2a1cc2b"
         }
       ]
     },
@@ -1417,39 +1436,55 @@
       "subject": "prompt-assembly",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T01:11:05.706Z",
-      "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T02:07:06.748Z",
+      "worker": "1359300c-d453-434d-8e29-8b64b2a1cc2b",
       "techniques": [
-        {
-          "technique": "context-budgeting",
-          "verdict": "deviation",
-          "evidence": "crates/apps/connector-api-watch/src/lib.rs:429 The diff drops added lines at this cap, and clamp() later drops further lines at MAX_DIFF_CHARS; the assembled ADDED/REMOVED sections give no omission notice or dropped count."
-        },
-        {
-          "technique": "context-ownership-regimes",
-          "verdict": "conformant",
-          "evidence": "crates/apps/research/src/lib.rs:526 The research app delegates conversation continuation to the stateful CLI agent using its session identifier; it does not maintain or compact a client message list."
-        },
-        {
-          "technique": "continuation-prompts",
-          "verdict": "deviation",
-          "evidence": "crates/apps/provisioner/src/lib.rs:1145 The repair branch sends only feedback and a revision instruction even when session_id is None; that fresh session receives neither the original goal nor the sampled page and rule contract."
-        },
-        {
-          "technique": "fingerprinting-and-cache-keys",
-          "verdict": "deviation",
-          "evidence": "crates/apps/research/src/lib.rs:126 Checkpoint admission checks state version and spend sanity before resuming, but RunState carries no standing-prompt, capability-set, or model fingerprint to compare against current configuration."
-        },
         {
           "technique": "layered-composition",
           "verdict": "deviation",
-          "evidence": "crates/apps/provisioner/src/lib.rs:1013 Discovery prose is constructed at the execution call site; drafting and repair prose are likewise formatted inside run(), without independently rendered sections or a sealed assembled artifact."
+          "evidence": "crates/apps/provisioner/src/lib.rs:1016 Prompt text is born at the call site in run(); there is no assembler per prompt family. This is the sprawl failure."
         },
         {
           "technique": "variable-interpolation",
           "verdict": "deviation",
-          "evidence": "crates/apps/provisioner/src/lib.rs:1142 Scraped page content enters an ordinary formatting slot with no template-level declaration of its untrusted class or mechanically enforced insertion-point policy."
+          "evidence": "crates/apps/provisioner/src/lib.rs:1144 An untrusted scraped page body is interpolated straight into the task text, with no declared trust class and no fenced insertion point."
+        },
+        {
+          "technique": "context-budgeting",
+          "verdict": "deviation",
+          "evidence": "crates/apps/connector-api-watch/src/lib.rs:443 clamp() silently drops diff lines past the cap, and the prompt never says how many ADDED/REMOVED lines were omitted, so the model sees a partial view that looks complete."
+        },
+        {
+          "technique": "task-envelope",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:612 The task layer opens with role priming. It does carry a done criterion (the JSON shape), but the opening line is spent on a role claim."
+        },
+        {
+          "technique": "context-ownership-regimes",
+          "verdict": "conformant",
+          "evidence": "crates/apps/research/src/lib.rs:633 This is the agent-held regime: the Claude CLI session holds the transcript and the app sends only a delta prompt, with no client-side compaction running in parallel."
+        },
+        {
+          "technique": "continuation-prompts",
+          "verdict": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:1145 The repair branch sends only feedback and a revision instruction even when session_id is None; that fresh session receives neither the original goal nor the sampled page and rule contract.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "fingerprinting-and-cache-keys",
+          "verdict": "deviation",
+          "evidence": "crates/apps/research/src/lib.rs:126 Checkpoint admission checks state version and spend sanity before resuming, but RunState carries no standing-prompt, capability-set, or model fingerprint to compare against current configuration.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/apps/provisioner/src/lib.rs:1013 Provisioner constructs model-facing prose directly inside run(), bypassing an owned assembler that could enforce section contracts, trust classification, total context budget, and fingerprinting.",
+          "evaluatedAt": "2026-10-13T01:11:05.706Z",
+          "worker": "77fff494-9dbc-489a-b1d6-3af8bad53241",
+          "reason": "replaced by 1359300c-d453-434d-8e29-8b64b2a1cc2b"
         }
       ]
     },

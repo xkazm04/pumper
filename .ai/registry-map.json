@@ -1264,12 +1264,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/mcp/mod.rs:144 The server maintains handwritten MCP tool definitions separately from its dispatch match, leaving two authorities for the capability vocabulary.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:7436fd55a7cb2500",
-          "evaluatedRevision": 43,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/mcp/mod.rs:741 The MCP capability vocabulary has two hand-maintained authorities: the advertised tool list in `server_tools` and this dispatch match. `scripts/ci/mcp-gate-parity.mjs` only checks that the gated subset is spelled the same at three sites; the vocabulary is still not rendered from one registry.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-memory",
@@ -1725,12 +1724,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/apps/provisioner/src/lib.rs:1013 Provisioner constructs model-facing prose directly inside run(), bypassing an owned assembler that could enforce section contracts, trust classification, total context budget, and fingerprinting.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:7436fd55a7cb2500",
-          "evaluatedRevision": 43,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/apps/provisioner/src/lib.rs:1016 Provisioner, research and connector-api-watch each build model-facing prose with inline format! calls inside run() or a helper, so no single assembler enforces section order, trust classification, a total budget or a fingerprint.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44,
+          "revisionsBehind": 1
         },
         {
           "subject": "mcp-tools",
@@ -3588,12 +3586,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "scripts/docs/check-doc-sync.mjs:314 Context and repository searches found transcript inspection and a Stop-hook reminder delivered through stderr, with complete model prompt assembly owned by the external coding harness.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:7436fd55a7cb2500",
-          "evaluatedRevision": 43,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "scripts/docs/check-doc-sync.mjs:314 The hook only writes a fixed reminder to stderr, and the external Claude Code harness decides where that text lands in the model's context. Searching scripts/docs found no system prompt, token budget, cache-control or compaction code, so this context owns no prompt assembler.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-runtime-assembly",
