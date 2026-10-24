@@ -3675,62 +3675,61 @@
       "context": "job-triggers-pipeline",
       "subject": "job-coordination",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T12:33:03.216Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T04:07:02.792Z",
+      "worker": "b57df81c-ad75-4f3a-a705-1219aa2e1cb5",
       "techniques": [
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:1362 This is post-terminal work with no position of its own and no mover of last resort. The only caller is the in-memory finalize fan-out, and the ledger records hops that happened, not hops that are still owed."
+        },
         {
           "technique": "job-state-machines",
           "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:77 The any-status filter uses JobStatus::is_terminal rather than a second terminal list. Specific on_status values are still raw string equality."
-        },
-        {
-          "technique": "lease-renewal",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:1346 A hop is one enqueue, not a hold long enough to need a renewed lease."
-        },
-        {
-          "technique": "liveness-proof-reclaim",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:49 Cycle and depth are a pure function of params. There is no process identity to probe."
+          "evidence": "crates/server/src/triggers.rs:77 The on_status filter parses strictly (an unknown string matches nothing) and goes through the single is_terminal authority rather than a local terminal list."
         },
         {
           "technique": "step-position-and-resumability",
           "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:553 Each hop's dedup identity is trigger id plus source job id (dataset and batch added for dataset hops), so a re-fired hop is refused by the queue."
-        },
-        {
-          "technique": "in-flight-is-a-position",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:1420 The queue honours the key, so a second fire records dedup instead of needing an in-flight marker. The third position value is not required for this keyed enqueue."
-        },
-        {
-          "technique": "no-unrestorable-state-at-a-suspension-point",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:1391 The dedup key is part of the single enqueue. A crash after that insert leaves a durable job; a crash before it leaves nothing taken."
-        },
-        {
-          "technique": "terminal-state-recovery",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/triggers.rs:855 fire_terminal_triggers runs against an already-final job. eval_set_error returns after one ledger row. Nothing here selects succeeded jobs whose hops were never enqueued."
-        },
-        {
-          "technique": "job-observability",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:2312 Hook outcomes must sit in the published allowlist, both directions. The ledger is the decision trail, not a live lease view, because a fire is not a leased executor."
+          "evidence": "crates/server/src/triggers.rs:827 Firing a hop is a keyed step: the dedup identity is built from the trigger id and the source job id (never minted per attempt), and enqueue_dedup refuses duplicates, so a re-run does nothing at the destination."
         },
         {
           "technique": "terms-travel-permission-does-not",
           "verdict": "conformant",
-          "evidence": "crates/server/src/triggers.rs:204 restamp_host_owned writes lineage and work-scope keys back over a transform. budget_usd, max_attempts and params are copied onto the hop at enqueue, which is that hop's submission."
+          "evidence": "crates/server/src/triggers.rs:1776 Each hop's terms (params, max_attempts, priority, budget, trigger_id, source_job_id) are frozen into the target job's record at enqueue, so the target never re-derives them from the live trigger."
+        },
+        {
+          "technique": "in-flight-is-a-position",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1785 The effect lands on the job table, which honours the idempotency key, so the precondition (a far side that deduplicates nothing) does not hold for hop emission."
+        },
+        {
+          "technique": "lease-renewal",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:1346 A hop is one enqueue, not a hold long enough to need a renewed lease.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:49 Cycle and depth are a pure function of params. There is no process identity to probe.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "no-unrestorable-state-at-a-suspension-point",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:1391 The dedup key is part of the single enqueue. A crash after that insert leaves a durable job; a crash before it leaves nothing taken.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "job-observability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:2312 Hook outcomes must sit in the published allowlist, both directions. The ledger is the decision trail, not a live lease view, because a fire is not a leased executor.",
+          "carriedFrom": "2026-10-13"
         }
-      ],
-      "withdrawn": {
-        "worker": "4015d87f-6d7a-48b4-bcf6-6652a48f0580",
-        "state": "deviation",
-        "at": "2026-10-13T12:36:45.232012+00:00",
-        "reason": "reviewer (sonnet): triggers.rs:855 does show a fail-open ledger write after the hop (the hop itself is deduped by an enqueue key, not the ledger), but I found no support for the deviation's claim that nothing replays a source job whose fan-out never ran, since fan-out lives in worker.rs `finalize_fanout` and I did not"
-      }
+      ]
     },
     "cce276df-d2da-4c20-a3ea-30f2f78316b7/job-coordination": {
       "context": "api-job-management",
@@ -7164,6 +7163,61 @@
           "technique": "critical-section-across-a-suspension",
           "verdict": "conformant",
           "evidence": "crates/core/src/search.rs:306 Slow enrichment that touches no shared invariant is kept outside the writer lock. Nothing transactional is split."
+        }
+      ]
+    },
+    "6a152014-f86c-4ad6-8b65-6ab5ed484ea5/job-coordination": {
+      "context": "job-worker",
+      "subject": "job-coordination",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T04:07:02.792Z",
+      "worker": "b57df81c-ad75-4f3a-a705-1219aa2e1cb5",
+      "techniques": [
+        {
+          "technique": "lease-renewal",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/worker.rs:901 The renewal is timer-driven and the beat is spawned so it never queues behind the work (good), but it is fire-and-forget: a renewal that matched zero rows never reaches the work loop to stop it. The terminal writes are attempt-fenced, so the zombie's writes become no-ops, but its effects before the finish line are not."
+        },
+        {
+          "technique": "terminal-state-recovery",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/worker.rs:1075 After complete() writes 'succeeded', the indexing, webhooks, terminal triggers and workflow barriers run on an in-memory pool (fanout.rs) that has no durable position and no sweep. A crash inside that window leaves a row that looks correctly terminal while its effects are half delivered. The shutdown drain counts what it loses, but nothing counts losses from a crash."
+        },
+        {
+          "technique": "job-state-machines",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:1029 Every verdict the worker writes (complete, fail, cancel_running, await_input) goes through a storage-side door fenced on (status, attempts), and a stale result is dropped (:1054). The closed enum and its single is_terminal authority are in crates/core/src/job.rs."
+        },
+        {
+          "technique": "step-position-and-resumability",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:489 A newly claimed attempt resumes from the durable checkpoint row, with no help from the previous executor. A poisoned checkpoint is discarded after max_resume_failures, which is an explicit restart, though its reason only reaches the log, not the job's lineage."
+        },
+        {
+          "technique": "terms-travel-permission-does-not",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:804 The budget and params frozen into the record at submission travel with the job. The DataHub cost:pause, which can only narrow the work, is read live at execution."
+        },
+        {
+          "technique": "liveness-proof-reclaim",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:865 The executor runs a renewal loop, so the expiry family applies and the precondition (a holder that cannot renew) does not hold."
+        },
+        {
+          "technique": "no-wall-clock-in-the-advance-contract",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:858 The wall-clock timeout bounds the app future the worker polls itself. The worker is the executor that owns the work, not a durable-runtime advance call that bounds work it does not execute."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/worker.rs:862 discards the renewal result (`let _ = state.storage.heartbeat(..)`) although crates/core/src/storage.rs:1308 fences it on (status, attempts) and returns whether it landed; a reaped executor never learns it lost its lease and keeps spending and emitting effects beside its successor. Realized: job-state-machines (crates/core/src/job.rs:8 closed enum, :42 the single is_terminal authority), lease-renewal sizing (crates/core/src/config.rs:1170 stale_after 120s over heartbeat_secs 30s, with crates/core/src/config.rs:749 refusing a config where they invert), atomic claim + attempt fencing (crates/core/src/storage.rs:608), terminal-state-recovery (crates/core/src/storage.rs:1274 issue_recovery_verdicts, one verdict function for the boot sweep and the reaper).",
+          "evaluatedAt": "2026-09-22",
+          "worker": null,
+          "reason": "replaced by b57df81c-ad75-4f3a-a705-1219aa2e1cb5"
         }
       ]
     }

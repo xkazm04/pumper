@@ -4788,7 +4788,11 @@
           "revision": 17,
           "changedAt": "2026-10-06",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:1362 Terminal-job hops are emitted only from worker::finalize_with_stages, after the terminal verdict is already written. Hop keys make a re-run safe, but nothing re-runs it: no record or sweep exists for this post-verdict work, so a crash between the verdict and this call silently drops downstream hops.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17
         },
         {
           "subject": "scheduling",
@@ -4950,18 +4954,17 @@
           ],
           "grounding": "use_when",
           "state": "deviation",
-          "evidence": "crates/server/src/worker.rs:862 discards the renewal result (`let _ = state.storage.heartbeat(..)`) although crates/core/src/storage.rs:1308 fences it on (status, attempts) and returns whether it landed; a reaped executor never learns it lost its lease and keeps spending and emitting effects beside its successor. Realized: job-state-machines (crates/core/src/job.rs:8 closed enum, :42 the single is_terminal authority), lease-renewal sizing (crates/core/src/config.rs:1170 stale_after 120s over heartbeat_secs 30s, with crates/core/src/config.rs:749 refusing a config where they invert), atomic claim + attempt fencing (crates/core/src/storage.rs:608), terminal-state-recovery (crates/core/src/storage.rs:1274 issue_recovery_verdicts, one verdict function for the boot sweep and the reaper).",
+          "evidence": "crates/server/src/worker.rs:901 The worker throws away the renewal result, even though Storage::heartbeat is fenced on (status='running', attempts) and returns whether it landed, so an executor that was reaped or reset never finds out it lost the job and keeps fetching, spending and checkpointing beside its successor until its own completion write is fenced off at :1054.",
           "confidence": "strong",
-          "evaluatedAt": "2026-09-22",
-          "evaluatedAgainst": "sha256-b2:2bd472ebca7609ca",
-          "evaluatedRevision": 16,
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:68f09609d1498e88",
+          "evaluatedRevision": 17,
           "digest": "sha256-b2:68f09609d1498e88",
           "revision": 17,
           "changedAt": "2026-10-06",
           "source": "conform",
           "adoptedFrom": "f5e841e6-df86-4ce0-8270-e3610d5581d1",
-          "revisionsBehind": 1,
-          "stale": true
+          "revisionsBehind": 1
         }
       ],
       "governance": "governed"

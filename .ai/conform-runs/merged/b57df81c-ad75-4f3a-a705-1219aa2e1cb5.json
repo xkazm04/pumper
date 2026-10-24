@@ -1,0 +1,129 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b57df81c-ad75-4f3a-a705-1219aa2e1cb5",
+ "subject": "job-coordination",
+ "evaluatedAt": "2026-10-24T04:07:02.792956+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-worker",
+   "subject": "job-coordination",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/worker.rs:901 The worker throws away the renewal result, even though Storage::heartbeat is fenced on (status='running', attempts) and returns whether it landed, so an executor that was reaped or reset never finds out it lost the job and keeps fetching, spending and checkpointing beside its successor until its own completion write is fenced off at :1054.",
+   "techniques": [
+    {
+     "technique": "lease-renewal",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/worker.rs:901 The renewal is timer-driven and the beat is spawned so it never queues behind the work (good), but it is fire-and-forget: a renewal that matched zero rows never reaches the work loop to stop it. The terminal writes are attempt-fenced, so the zombie's writes become no-ops, but its effects before the finish line are not."
+    },
+    {
+     "technique": "terminal-state-recovery",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/worker.rs:1075 After complete() writes 'succeeded', the indexing, webhooks, terminal triggers and workflow barriers run on an in-memory pool (fanout.rs) that has no durable position and no sweep. A crash inside that window leaves a row that looks correctly terminal while its effects are half delivered. The shutdown drain counts what it loses, but nothing counts losses from a crash."
+    },
+    {
+     "technique": "job-state-machines",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:1029 Every verdict the worker writes (complete, fail, cancel_running, await_input) goes through a storage-side door fenced on (status, attempts), and a stale result is dropped (:1054). The closed enum and its single is_terminal authority are in crates/core/src/job.rs."
+    },
+    {
+     "technique": "step-position-and-resumability",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:489 A newly claimed attempt resumes from the durable checkpoint row, with no help from the previous executor. A poisoned checkpoint is discarded after max_resume_failures, which is an explicit restart, though its reason only reaches the log, not the job's lineage."
+    },
+    {
+     "technique": "terms-travel-permission-does-not",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/worker.rs:804 The budget and params frozen into the record at submission travel with the job. The DataHub cost:pause, which can only narrow the work, is read live at execution."
+    },
+    {
+     "technique": "liveness-proof-reclaim",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/worker.rs:865 The executor runs a renewal loop, so the expiry family applies and the precondition (a holder that cannot renew) does not hold."
+    },
+    {
+     "technique": "no-wall-clock-in-the-advance-contract",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/worker.rs:858 The wall-clock timeout bounds the app future the worker polls itself. The worker is the executor that owns the work, not a durable-runtime advance call that bounds work it does not execute."
+    }
+   ]
+  },
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "job-coordination",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/triggers.rs:1362 Terminal-job hops are emitted only from worker::finalize_with_stages, after the terminal verdict is already written. Hop keys make a re-run safe, but nothing re-runs it: no record or sweep exists for this post-verdict work, so a crash between the verdict and this call silently drops downstream hops.",
+   "techniques": [
+    {
+     "technique": "terminal-state-recovery",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:1362 This is post-terminal work with no position of its own and no mover of last resort. The only caller is the in-memory finalize fan-out, and the ledger records hops that happened, not hops that are still owed."
+    },
+    {
+     "technique": "job-state-machines",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:77 The on_status filter parses strictly (an unknown string matches nothing) and goes through the single is_terminal authority rather than a local terminal list."
+    },
+    {
+     "technique": "step-position-and-resumability",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:827 Firing a hop is a keyed step: the dedup identity is built from the trigger id and the source job id (never minted per attempt), and enqueue_dedup refuses duplicates, so a re-run does nothing at the destination."
+    },
+    {
+     "technique": "terms-travel-permission-does-not",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:1776 Each hop's terms (params, max_attempts, priority, budget, trigger_id, source_job_id) are frozen into the target job's record at enqueue, so the target never re-derives them from the live trigger."
+    },
+    {
+     "technique": "in-flight-is-a-position",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:1785 The effect lands on the job table, which honours the idempotency key, so the precondition (a far side that deduplicates nothing) does not hold for hop emission."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T04:07:02.792956+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "job-coordination"
+   ],
+   "techniques": [
+    "job-state-machines",
+    "lease-renewal",
+    "liveness-proof-reclaim",
+    "no-wall-clock-in-the-advance-contract",
+    "step-position-and-resumability",
+    "terminal-state-recovery",
+    "terms-travel-permission-does-not"
+   ],
+   "deviations": 1,
+   "context": "job-worker",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-10-24T04:07:02.792956+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "job-coordination"
+   ],
+   "techniques": [
+    "in-flight-is-a-position",
+    "job-state-machines",
+    "step-position-and-resumability",
+    "terminal-state-recovery",
+    "terms-travel-permission-does-not"
+   ],
+   "deviations": 1,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
