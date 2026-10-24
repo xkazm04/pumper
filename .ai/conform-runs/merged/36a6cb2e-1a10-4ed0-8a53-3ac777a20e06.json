@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "36a6cb2e-1a10-4ed0-8a53-3ac777a20e06",
+ "subject": "admission-queue",
+ "evaluatedAt": "2026-10-24T05:11:34.478599+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "admission-queue",
+   "context": "job-worker",
+   "reason": "evidence leans on routes/meta.rs, which is not a tracked file"
+  }
+ ],
+ "consults": []
+}
