@@ -7510,6 +7510,48 @@
       "evaluatedTs": "2026-10-24T06:29:58.912Z",
       "worker": "a93f8a64-45b8-4671-b061-4a35f48ff36d",
       "techniques": []
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/convergence-loop-and-requeue": {
+      "context": "core-job-queue",
+      "subject": "convergence-loop-and-requeue",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T21:26:02.767Z",
+      "techniques": [
+        {
+          "technique": "error-policy-as-a-separate-function",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:297 There is no convergence pass here. Still, the seam the technique describes exists for job retries: a pure policy over a typed error, with give-up recorded on the row via requeue_reason and jitter applied upward. It is well formed, but this subject does not govern it."
+        },
+        {
+          "technique": "per-key-exclusion-under-a-global-cap",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:171 Something close exists: per-target exclusion is built into the atomic claim, separate from the per-app blocked cap, and has its own held_by_target gauge. But it guards durable jobs, not passes of a converger, and apps opt in (None opts out), so the subject's 'exclusion has no knob' rule does not govern it."
+        },
+        {
+          "technique": "keyed-queue-with-earliest-wins",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:384 Dedup turns away a second enqueue and returns the original job. Nothing moves a time earlier, because each job is a distinct unit of work, and the technique itself says a job queue 'belongs to a different subject entirely'."
+        },
+        {
+          "technique": "drain-a-derived-queue",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:340 Drain here gives a verdict on still-running durable rows through the recovery sweep. It does not drop a derived queue, because this queue is not derived."
+        },
+        {
+          "technique": "told-that-not-why",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:388 Jobs carry their params and their trigger lineage as the work item itself. No pass takes a key and reads the whole world, so the rule about erasing the reason has nothing to apply to."
+        }
+      ],
+      "registryProposal": "The error-policy-as-a-separate-function seam (pure policy over a typed error, give-up recorded on the record, one re-entry path) is realised cleanly in a durable job queue here. The technique could note that its seam carries over to durable queues unchanged, and point to retry-backoff/durable-retries for that case, so judges don't misfile durable-queue code under this subject.",
+      "withdrawn": {
+        "worker": "bf4866b3-f31a-4666-ab3d-0a254adc28b6",
+        "state": "not-applicable",
+        "at": "2026-10-24T21:26:27.763777+00:00",
+        "reason": "reviewer (sonnet): The not-applicable rests on a vocabulary search that left out 'reconcile', and storage.rs (in this context) also holds the scheduler's reconcile-loop state: schedule_runs, the mark_schedule_pass heartbeat and schedule_pass_heartbeat (storage.rs:2113-2198), described as 'the reconcile loop completed "
+      }
     }
   }
 }
