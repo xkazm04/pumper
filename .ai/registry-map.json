@@ -2284,7 +2284,11 @@
           "revision": 4,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/fetcher.rs:154 The tiers in this context are server-side fetch engines (ApiRecipe/Archive/Http/Browser/Claude), escalated per request by content sufficiency, not client-rendered visual fidelity levels; a search of crates/ for requestAnimationFrame, prefers-reduced-motion, reduced_motion, requestIdleCallback, frame_time and matchMedia found no hits, and the repository has no rendering surface with optional visual effects for this subject to govern.",
+          "evaluatedAt": "2026-10-24",
+          "evaluatedAgainst": "sha256-b2:02a551a058d8874c",
+          "evaluatedRevision": 5
         },
         {
           "subject": "sidecar-provisioning",

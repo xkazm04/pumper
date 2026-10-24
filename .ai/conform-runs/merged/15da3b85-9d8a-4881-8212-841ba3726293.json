@@ -1,0 +1,78 @@
+{
+ "schema": "conform-run/1",
+ "worker": "15da3b85-9d8a-4881-8212-841ba3726293",
+ "subject": "adaptive-fidelity-tiers",
+ "evaluatedAt": "2026-10-24T06:38:52.335273+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-engine-contract",
+   "subject": "adaptive-fidelity-tiers",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/fetcher.rs:154 The tiers in this context are server-side fetch engines (ApiRecipe/Archive/Http/Browser/Claude), escalated per request by content sufficiency, not client-rendered visual fidelity levels; a search of crates/ for requestAnimationFrame, prefers-reduced-motion, reduced_motion, requestIdleCallback, frame_time and matchMedia found no hits, and the repository has no rendering surface with optional visual effects for this subject to govern.",
+   "techniques": [
+    {
+     "technique": "measured-not-declared-capability",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/fetcher.rs:154 No frame-time measurement or device-capability tier exists; FetchTier picks a scraping engine, not a visual fidelity level."
+    },
+    {
+     "technique": "asymmetric-tier-transitions",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/tiers.rs:2 The tier movement here is fetch-engine escalation per host, not fidelity tiers that move with rendering frames."
+    },
+    {
+     "technique": "measurement-settle-budget",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/fetcher.rs:154 No per-frame sampler exists."
+    },
+    {
+     "technique": "probe-deferral-to-idle",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/fetcher.rs:154 No capability probe or idle scheduling; Rust backend."
+    },
+    {
+     "technique": "per-tier-budget-tables",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/fetcher.rs:154 No visual effects with cost knobs."
+    },
+    {
+     "technique": "preference-short-circuits-measurement",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/fetcher.rs:154 No reduced-motion preference or user quality setting exists in this context."
+    }
+   ],
+   "absenceTerms": [
+    "requestAnimationFrame",
+    "prefers-reduced-motion",
+    "requestIdleCallback",
+    "frame_time",
+    "reduced_motion"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-24T06:38:52.335273+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "adaptive-fidelity-tiers"
+   ],
+   "techniques": [
+    "asymmetric-tier-transitions",
+    "measured-not-declared-capability",
+    "measurement-settle-budget",
+    "per-tier-budget-tables",
+    "preference-short-circuits-measurement",
+    "probe-deferral-to-idle"
+   ],
+   "deviations": 0,
+   "context": "core-engine-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

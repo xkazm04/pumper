@@ -5369,47 +5369,42 @@
       "context": "core-engine-contract",
       "subject": "adaptive-fidelity-tiers",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-17",
-      "evaluatedTs": "2026-10-17T02:45:32.398Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-24",
+      "evaluatedTs": "2026-10-24T06:38:52.335Z",
+      "worker": "15da3b85-9d8a-4881-8212-841ba3726293",
       "techniques": [
-        {
-          "technique": "asymmetric-tier-transitions",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/tiers.rs:120 Transitions remember host fetch outcomes; they do not change a device's visual fidelity."
-        },
         {
           "technique": "measured-not-declared-capability",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/fetcher.rs:552 This measures response sufficiency, with no device rendering-capability decision."
+          "evidence": "crates/core/src/fetcher.rs:154 No frame-time measurement or device-capability tier exists; FetchTier picks a scraping engine, not a visual fidelity level."
+        },
+        {
+          "technique": "asymmetric-tier-transitions",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/tiers.rs:2 The tier movement here is fetch-engine escalation per host, not fidelity tiers that move with rendering frames."
         },
         {
           "technique": "measurement-settle-budget",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/config.rs:1688 The recurring host-memory work persists politeness penalties; no frame sampler requires a settle deadline."
-        },
-        {
-          "technique": "per-tier-budget-tables",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/app.rs:407 Exhausting a monetary job budget disables paid research; this is neither visual-effect scaling nor a tier configuration dividing a shared hard allocation."
-        },
-        {
-          "technique": "preference-short-circuits-measurement",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/fetcher.rs:1218 The explicit choice selects a fetching strategy; there is no visual quality preference or capability probe to short-circuit."
+          "evidence": "crates/core/src/fetcher.rs:154 No per-frame sampler exists."
         },
         {
           "technique": "probe-deferral-to-idle",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/fetcher.rs:655 Rendering retrieves a requested page through the headless browser; it does not initiate a client frame-capability probe."
+          "evidence": "crates/core/src/fetcher.rs:154 No capability probe or idle scheduling; Rust backend."
+        },
+        {
+          "technique": "per-tier-budget-tables",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/fetcher.rs:154 No visual effects with cost knobs."
+        },
+        {
+          "technique": "preference-short-circuits-measurement",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/fetcher.rs:154 No reduced-motion preference or user quality setting exists in this context."
         }
-      ],
-      "withdrawn": {
-        "worker": "20b94e65-a163-48d2-874b-d5a82fc2534f",
-        "state": "not-applicable",
-        "at": "2026-10-17T02:45:48.703978+00:00",
-        "reason": "reviewer (sonnet): The anchor fetcher.rs:60 is the FetchStrategy enum, which does not show that the subject's precondition is absent. It is an escalation ladder (Http, Browser, Auto, AutoWithResearch) that degrades when content is thin or the budget is spent (app.rs:407). That is a close analogue of adaptive tiers, so"
-      }
+      ]
     },
     "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/agent-browser-control": {
       "context": "web-scraping-engines",
