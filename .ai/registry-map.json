@@ -5984,7 +5984,11 @@
           "revision": 3,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:289 Best-effort work (`evaluate`, network-body pulls) runs under the same render deadline as the DOM capture it is meant to enhance. When it eats the whole budget, the following `require(\"capturing the DOM\", page.content())` at line 930 polls an already-elapsed deadline and fails. So a hung `evaluate` throws the page away, despite the doc comment's claim that the render \"carries on with what it already has\", and the error names the wrong stage. CAPTURE_RESERVE only shields the sleep waits.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:a59e479b7cea486b",
+          "evaluatedRevision": 3
         },
         {
           "subject": "mcp-tools",

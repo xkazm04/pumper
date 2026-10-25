@@ -4735,37 +4735,58 @@
       "context": "web-scraping-engines",
       "subject": "guest-execution-bounding",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-16",
-      "evaluatedTs": "2026-10-16T22:44:06.687Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T22:58:00.494Z",
+      "worker": "ff79f517-a82e-487f-9c59-34e12ee4b7e9",
       "techniques": [
         {
-          "technique": "back-edge-iteration-counter",
+          "technique": "budget-tier-from-observed-output",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:289 Optional enhancement work and the essential output share one budget tier. `attempt` reuses the full render deadline instead of a shorter one, so optional work can use up all the time the essential capture needs. The reserve (CAPTURE_RESERVE, line 93) applies only to settle/wait_ms."
+        },
+        {
+          "technique": "terminate-from-outside-when-you-cannot-count",
+          "verdict": "conformant",
+          "evidence": "crates/engine-browser/src/lib.rs:403 Chrome is a third-party engine and the host cannot instrument its loop. When the budget times out, the render future drops and RenderScope closes the tab through CDP Page.close, the engine's own published handle, so the work stops and is not left detached. Comments at 332-343 name the earlier 'await, not the work' leak. Known gap: a renderer stuck in JS may not answer within TAB_CLOSE_TIMEOUT, and the recycle relaunch is then the backstop (comment at 396-398)."
+        },
+        {
+          "technique": "nested-liveness-ceilings",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/config.rs:1637 Inside the engine the ladder exists. Stages are clamped by the budget (stage_deadline, `own.min(end)`), the escape each rung closes is written down (lines 166-176), and the rung is named in the error (budget_exhausted). But nothing at startup checks that render_budget_secs stays below [worker] job_timeout_secs; config validation checks only job_timeout vs stale_after (config.rs:928-938). Setting render_budget_secs above 900 inverts the ladder, and the job timeout then hides which rung fired."
+        },
+        {
+          "technique": "one-terminator-many-armed-slots",
+          "verdict": "conformant",
+          "evidence": "crates/engine-browser/src/lib.rs:673 Every render arms its own deadline on tokio's shared timer: no thread per call and no single slot that a second render could overwrite. No armed/fired counters are exported per caller."
+        },
+        {
+          "technique": "uncatchable-limit-errors",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-browser/src/lib.rs:46 This adapter delegates execution to Chrome through CDP and owns no guest compiler in which to emit iteration counters."
+          "evidence": "crates/engine-browser/src/lib.rs:226 The breach is raised in the Rust host, outside any page-JS handler, so the guest has no way to intercept it. The host owns no interpreter failure type. Retryability is decided by error variant (`is_terminal_for_job`), not by matching the message."
+        },
+        {
+          "technique": "grace-for-the-uninterruptible-host-call",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:863 Calls go only from host to guest (evaluate over CDP). The engine exposes no host functions to page JS: searching for addBinding/expose_function found nothing. So no deadline can fire inside a host-provided call."
         },
         {
           "technique": "cost-budget-cooperative-yield",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-browser/src/lib.rs:526 JavaScript executes in the launched Chrome process, rather than in an interpreter dispatch loop on the Rust executor."
+          "evidence": "crates/engine-browser/src/lib.rs:1 The guest runs in an out-of-process Chrome whose dispatch loop the host does not own. Nothing is counted, so there is nothing to yield on."
         },
         {
-          "technique": "terminate-from-outside-when-you-cannot-count",
-          "verdict": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:319 The adapter attempts tab closure, but a stalled close is abandoned after five seconds without terminating execution or killing the retained browser process."
+          "technique": "back-edge-iteration-counter",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:46 Third-party engine, so the host has no compiler and no back-edges to count."
         },
         {
-          "technique": "uncatchable-limit-errors",
-          "verdict": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:227 Render-budget exhaustion becomes the same Browser error class used for other browser failures; the host must parse text to identify the ceiling breach."
+          "technique": "count-host-reentry-in-recursion-depth",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:503 The only in-engine ceiling is V8's own heap cap, set through engine flags on the engine's own terms. The host counts no frames, so no re-entry accounting applies."
         }
       ],
-      "withdrawn": {
-        "worker": "1b78423a-7c5e-4992-b28d-18112163e1e7",
-        "state": "deviation",
-        "at": "2026-10-16T22:44:29.315333+00:00",
-        "reason": "reviewer (sonnet): Claiming 'no enforced termination backstop' is contradicted by the code: lib.rs:226-279 enforces a 180s render_budget_secs timeout over the whole render, lib.rs:153 and :397 recycle Chrome after N renders, and :643 kills it on drop (kill_on_drop). The cited line 324 only shows that a stalled close i"
-      }
+      "registryProposal": "budget-tier-from-observed-output frames the problem as choosing a short or long budget from an observation. The pattern found here is a neighbouring failure: the host already labels work as essential or best-effort (require/attempt) but gives both the same deadline. Best-effort work can then exhaust the budget the essential step needs, and the essential step fails at an already-elapsed deadline under the wrong stage name. A decision rule worth adding: best-effort work runs under a deadline that holds back a reserve for the essential step after it, even when the classification is supplied rather than observed."
     },
     "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/media-playback": {
       "context": "web-scraping-engines",
