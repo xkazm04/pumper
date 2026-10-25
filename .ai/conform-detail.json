@@ -7552,6 +7552,28 @@
         "at": "2026-10-24T21:26:27.763777+00:00",
         "reason": "reviewer (sonnet): The not-applicable rests on a vocabulary search that left out 'reconcile', and storage.rs (in this context) also holds the scheduler's reconcile-loop state: schedule_runs, the mark_schedule_pass heartbeat and schedule_pass_heartbeat (storage.rs:2113-2198), described as 'the reconcile loop completed "
       }
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/docs-content-model": {
+      "context": "docs-and-ops-scripts",
+      "subject": "docs-content-model",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T22:17:47.082Z",
+      "worker": "76c64095-a63b-4684-b562-2be17bb3cbcd",
+      "techniques": [
+        {
+          "technique": "catalog-referential-invariants",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/feature-doc-map.json:6 Docs are addressed by file path, which is the files-on-disk substrate. Nothing splits a topic record from a body module, so there is no bijection to assert."
+        },
+        {
+          "technique": "per-topic-freshness-metadata",
+          "verdict": "not-applicable",
+          "evidence": "scripts/docs/feature-doc-map.json:7 The nearest thing to 'watched sources' is the per-doc sourceGlobs list. It lives in the docs-sync coupling map, which the golden path assigns to the docs-synchronization subject, not on a topic record. There is no review date and no checked-against version anywhere."
+        }
+      ],
+      "registryProposal": "The golden path's seam with docs-synchronization could say what happens on the files-on-disk substrate. There, the 'watched sources' field this subject gives a typed home has no record to live on, and it ends up as globs in the drift gate's coupling map (here: source globs keyed by doc path). A sentence saying whether that counts as the field's legitimate home on that substrate, or as a gap, would stop graders from splitting on it."
     }
   }
 }

@@ -3715,7 +3715,11 @@
           "revision": 2,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/docs/check-doc-sync.mjs:6 The repo's only docs surface is a directory of markdown files (docs/features/), checked by a docs-sync drift hook. There is no typed topic/category/body catalog, no rendered docs site, and no navigation or draft state, so the subject's precondition (docs modelled as a typed catalog on a product surface) does not hold. A case-insensitive grep of scripts/docs for topic, sidebar, draft, lastReviewed and frontmatter found nothing, and git ls-files shows no docusaurus, mkdocs, vitepress or book.toml docs site in the repo.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:74839e7c9eeb3728",
+          "evaluatedRevision": 4
         },
         {
           "subject": "agent-instruction-files",

@@ -1,0 +1,55 @@
+{
+ "schema": "conform-run/1",
+ "worker": "76c64095-a63b-4684-b562-2be17bb3cbcd",
+ "subject": "docs-content-model",
+ "evaluatedAt": "2026-10-25T22:17:47.082479+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "docs-content-model",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "scripts/docs/check-doc-sync.mjs:6 The repo's only docs surface is a directory of markdown files (docs/features/), checked by a docs-sync drift hook. There is no typed topic/category/body catalog, no rendered docs site, and no navigation or draft state, so the subject's precondition (docs modelled as a typed catalog on a product surface) does not hold. A case-insensitive grep of scripts/docs for topic, sidebar, draft, lastReviewed and frontmatter found nothing, and git ls-files shows no docusaurus, mkdocs, vitepress or book.toml docs site in the repo.",
+   "techniques": [
+    {
+     "technique": "catalog-referential-invariants",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/feature-doc-map.json:6 Docs are addressed by file path, which is the files-on-disk substrate. Nothing splits a topic record from a body module, so there is no bijection to assert."
+    },
+    {
+     "technique": "per-topic-freshness-metadata",
+     "verdict": "not-applicable",
+     "evidence": "scripts/docs/feature-doc-map.json:7 The nearest thing to 'watched sources' is the per-doc sourceGlobs list. It lives in the docs-sync coupling map, which the golden path assigns to the docs-synchronization subject, not on a topic record. There is no review date and no checked-against version anywhere."
+    }
+   ],
+   "absenceTerms": [
+    "topic",
+    "sidebar",
+    "draft",
+    "lastReviewed",
+    "frontmatter"
+   ],
+   "registryProposal": "The golden path's seam with docs-synchronization could say what happens on the files-on-disk substrate. There, the 'watched sources' field this subject gives a typed home has no record to live on, and it ends up as globs in the drift gate's coupling map (here: source globs keyed by doc path). A sentence saying whether that counts as the field's legitimate home on that substrate, or as a gap, would stop graders from splitting on it."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-25T22:17:47.082479+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "docs-content-model"
+   ],
+   "techniques": [
+    "catalog-referential-invariants",
+    "per-topic-freshness-metadata"
+   ],
+   "deviations": 0,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
