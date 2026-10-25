@@ -7720,6 +7720,37 @@
           "evidence": "crates/apps/grants-gov/src/lib.rs:118 A batch scrape job run by the server worker. There is no window or view whose backgrounding could throttle a stream."
         }
       ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/node-boot-and-declarative-bootstrap": {
+      "context": "content-monitoring",
+      "subject": "node-boot-and-declarative-bootstrap",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T23:43:01.271Z",
+      "techniques": [
+        {
+          "technique": "ordered-boot-dag",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/peer/src/mesh.rs:303 The only 'boot' in this context is this comment about the server's boot; the apps add no startup steps."
+        },
+        {
+          "technique": "reload-partition",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/plugin/tests/common/mod.rs:121 The only 'reload' is a test double for the core Plugins trait, not a config-reload handler. These apps read per-job params, not node config keys."
+        },
+        {
+          "technique": "config-objects-are-api-immutable",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/plugin/src/lib.rs:1996 Plugin loading and registration are owned by the server/engine-wasm host. This app only consumes loaded plugins and creates no config-born devices."
+        }
+      ],
+      "withdrawn": {
+        "worker": "4f327981-e91c-4b12-bd22-2152e37235e1",
+        "state": "not-applicable",
+        "at": "2026-10-25T23:43:34.056454+00:00",
+        "reason": "reviewer (sonnet): The not-applicable anchors are incidental. mesh.rs:300 is a doc comment about one governor-import gap in the peer app. plugin/src/lib.rs:1996 is a test assertion about an empty plugin host, and does not say loading is owned by the server. plugin/tests/common/mod.rs:121 is just a test double's reload"
+      }
     }
   }
 }
