@@ -1,0 +1,77 @@
+{
+ "schema": "conform-run/1",
+ "worker": "69be0d85-7f7d-42df-b182-c86ed5cb80d1",
+ "subject": "embedded-preview",
+ "evaluatedAt": "2026-10-25T22:35:35.010730+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-server-core",
+   "subject": "embedded-preview",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/main.rs:368 The bootstrap serves a headless axum JSON/SSE API and hosts no second live application in a frame. A case-insensitive grep of all of crates/server/src for iframe, postMessage, devserver, dev_server, targetOrigin and frame-ancestors found zero hits, so the subject's precondition (a guest app behind its own server, embedded and bridged) does not hold.",
+   "techniques": [
+    {
+     "technique": "dev-server-registry",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/registry.rs:7 registry.rs is a name\u2192ScrapeApp table compiled into the binary. It never spawns a guest dev server, so there is no port or process-tree lifecycle to own."
+    },
+    {
+     "technique": "preview-checkpoints",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/progress.rs:103 Checkpoints here are scrape-job resume blobs, not per-turn snapshots of a mutated guest project."
+    },
+    {
+     "technique": "cross-frame-protocol",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/mcp/live.rs:1 The only server\u2192client channel is SSE/JSON-RPC to an MCP client, not a cross-frame bridge to an embedded guest."
+    },
+    {
+     "technique": "origin-validation",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/main.rs:362 The server is a plain HTTP listener. No frame message channel exists, so there are no inbound or outbound message origins to validate."
+    },
+    {
+     "technique": "injected-instrumentation-with-fallback",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/main.rs:366 No guest application exists to inject an instrumentation agent into."
+    },
+    {
+     "technique": "convention-discovery",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/main.rs:727 'preview' in this context means a retention dry-run report. No guest route tree is scanned."
+    }
+   ],
+   "absenceTerms": [
+    "iframe",
+    "postMessage",
+    "devserver",
+    "targetOrigin"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-25T22:35:35.010730+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "embedded-preview"
+   ],
+   "techniques": [
+    "convention-discovery",
+    "cross-frame-protocol",
+    "dev-server-registry",
+    "injected-instrumentation-with-fallback",
+    "origin-validation",
+    "preview-checkpoints"
+   ],
+   "deviations": 0,
+   "context": "api-server-core",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

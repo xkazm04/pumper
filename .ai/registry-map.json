@@ -1373,7 +1373,11 @@
           "revision": 2,
           "changedAt": "2026-09-15",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/main.rs:368 The bootstrap serves a headless axum JSON/SSE API and hosts no second live application in a frame. A case-insensitive grep of all of crates/server/src for iframe, postMessage, devserver, dev_server, targetOrigin and frame-ancestors found zero hits, so the subject's precondition (a guest app behind its own server, embedded and bridged) does not hold.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:a6e12ae70d42efcc",
+          "evaluatedRevision": 2
         },
         {
           "subject": "fleet-orchestration",

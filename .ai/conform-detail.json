@@ -7574,6 +7574,47 @@
         }
       ],
       "registryProposal": "The golden path's seam with docs-synchronization could say what happens on the files-on-disk substrate. There, the 'watched sources' field this subject gives a typed home has no record to live on, and it ends up as globs in the drift gate's coupling map (here: source globs keyed by doc path). A sentence saying whether that counts as the field's legitimate home on that substrate, or as a gap, would stop graders from splitting on it."
+    },
+    "571cf8b4-4f98-4205-b9c7-270fce8277e1/embedded-preview": {
+      "context": "api-server-core",
+      "subject": "embedded-preview",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T22:35:35.010Z",
+      "worker": "69be0d85-7f7d-42df-b182-c86ed5cb80d1",
+      "techniques": [
+        {
+          "technique": "dev-server-registry",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/registry.rs:7 registry.rs is a name→ScrapeApp table compiled into the binary. It never spawns a guest dev server, so there is no port or process-tree lifecycle to own."
+        },
+        {
+          "technique": "preview-checkpoints",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/progress.rs:103 Checkpoints here are scrape-job resume blobs, not per-turn snapshots of a mutated guest project."
+        },
+        {
+          "technique": "cross-frame-protocol",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/mcp/live.rs:1 The only server→client channel is SSE/JSON-RPC to an MCP client, not a cross-frame bridge to an embedded guest."
+        },
+        {
+          "technique": "origin-validation",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/main.rs:362 The server is a plain HTTP listener. No frame message channel exists, so there are no inbound or outbound message origins to validate."
+        },
+        {
+          "technique": "injected-instrumentation-with-fallback",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/main.rs:366 No guest application exists to inject an instrumentation agent into."
+        },
+        {
+          "technique": "convention-discovery",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/main.rs:727 'preview' in this context means a retention dry-run report. No guest route tree is scanned."
+        }
+      ]
     }
   }
 }
