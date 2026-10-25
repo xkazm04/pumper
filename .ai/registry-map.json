@@ -4477,7 +4477,11 @@
           "revision": 4,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/grants-gov/src/lib.rs:6 The grants apps are headless library crates (`impl ScrapeApp`) that do JSON/HTML fetches and normalisation inside a server binary, with no native wrapper, presentation layer, overlay, input synthesis or OS permission. I searched the five context crates for tauri, webview, always_on_top, target_os, keyboard, electron, set_focus and accessibility and got zero hits; the only 'overlay' hits are `overlay_amounts`, which merges data and has nothing to do with windows. So the subject's precondition (a native process holding capabilities the presentation layer cannot reach) is not met.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:9034ad02704d9c88",
+          "evaluatedRevision": 5
         }
       ],
       "governance": "governed"

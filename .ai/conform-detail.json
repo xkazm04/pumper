@@ -7699,6 +7699,27 @@
           "evidence": "crates/apps/extractor/src/lib.rs:2 The extractor writes rule-extracted records to a dataset. There are no entity-graph nodes and no vector index of node descriptions. The optional index_datasets search fan-out indexes records, not model-merged nodes."
         }
       ]
+    },
+    "d757edd3-47f7-4e38-850b-62b56a7c6740/native-shell-integration": {
+      "context": "grants-intelligence",
+      "subject": "native-shell-integration",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T23:35:31.728Z",
+      "worker": "6492e060-6208-4e9d-8e4f-5a89c681e3ea",
+      "techniques": [
+        {
+          "technique": "capability-presence-contract",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/grants-gov/Cargo.toml:9 Depends only on core, serde_json, chrono and grants-common. There are no platform-specific capabilities and no cfg(target_os) gating."
+        },
+        {
+          "technique": "native-owned-stream",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/grants-gov/src/lib.rs:118 A batch scrape job run by the server worker. There is no window or view whose backgrounding could throttle a stream."
+        }
+      ]
     }
   }
 }
