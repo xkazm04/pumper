@@ -7668,6 +7668,37 @@
           "evidence": "crates/server/src/routes/datasets.rs:867 Lookups by key go through the database's own indexed keyset query. No code bisects sorted bytes with approximate positioning."
         }
       ]
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/llm-extracted-entity-graph": {
+      "context": "web-crawl-extraction",
+      "subject": "llm-extracted-entity-graph",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T23:29:25.928Z",
+      "worker": "46bc383c-9998-4e66-a6c0-8ce7f70958d4",
+      "techniques": [
+        {
+          "technique": "surface-form-identity-and-its-risk",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/crawl/src/link_graph.rs:28 Node identity is a canonicalized URL, an identifier that exists outside the text. No node is keyed by a name a model produced."
+        },
+        {
+          "technique": "accumulate-then-threshold-merge",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/crawl/src/link_graph.rs:29 Edges upsert in place by key through store change detection. No node descriptions are built up from passages, so there is nothing to merge at a threshold."
+        },
+        {
+          "technique": "recall-passes-with-a-declared-cap",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:3 Rule induction is pure-Rust heuristics with no model extraction pass, so there is no recall loop to cap."
+        },
+        {
+          "technique": "recoverable-fan-out-write",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:2 The extractor writes rule-extracted records to a dataset. There are no entity-graph nodes and no vector index of node descriptions. The optional index_datasets search fan-out indexes records, not model-merged nodes."
+        }
+      ]
     }
   }
 }

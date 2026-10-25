@@ -5826,7 +5826,11 @@
           "revision": 2,
           "changedAt": "2026-09-16",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/crawl/src/link_graph.rs:4 The only graph in this context is a hyperlink graph keyed by canonical URLs (an external identifier), and the extractor runs declarative or statistically induced rule sets with no LLM. No model ever proposes an entity or relation from prose, so the subject's precondition does not hold; a search of crates/apps/crawl and crates/apps/extractor for embedding, vector_index, extract_entities, gleaning and description_fragments found nothing (\"entity\" matches only inside \"identity\").",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:906ab379a7b1e8f5",
+          "evaluatedRevision": 3
         },
         {
           "subject": "prompt-assembly",
