@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "70c7ea39-bb1b-4e08-8975-d787b8162a29",
+ "subject": "delivery-analytics",
+ "evaluatedAt": "2026-10-25T22:01:23.121362+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "delivery-analytics",
+   "context": "core-change-detection",
+   "reason": "absence contradicted: crates/core/src/config.rs:802 contains 'revert' (2 hit(s) in the context's directories)"
+  }
+ ],
+ "consults": []
+}
