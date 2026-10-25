@@ -1684,7 +1684,11 @@
           "revision": 9,
           "changedAt": "2026-09-21",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/ci/flake-check.mjs:273 loadRuns silently skips any run record that fails to parse or lacks `tests`/`startedAt`, and nothing counts the skips: the transitions predicate (line 321) reports only the survivors, and a schema drift in flake-record that empties every record is printed as 'NONE RECORDED YET'. The repair erases the evidence that records were dropped.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:c6563834f502429c",
+          "evaluatedRevision": 9
         }
       ],
       "governance": "governed"

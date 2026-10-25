@@ -6150,62 +6150,73 @@
       "context": "ci-quality-gates",
       "subject": "invariant-placement",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-19",
-      "evaluatedTs": "2026-10-19T09:59:32.699Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T23:23:09.119Z",
+      "worker": "252632d0-2268-4992-88e5-b5c2f7508670",
       "techniques": [
         {
-          "technique": "build-time-evaluation-of-cross-value-invariants",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-certify.mjs:491 Certification bounds are file-sourced at runtime and evaluated against runtime measurements; the technique explicitly excludes runtime-sourced inputs."
+          "technique": "repairing-check-erases-its-evidence",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/flake-check.mjs:273 Swallow-and-continue repair that is expected to fire, but no firing count is emitted and no test covers it; the predicate counts survivors only. Contrast: disk-check's self-heal does print what it pruned and a test asserts /Pruned/ (disk-check.test.mjs:316), and --no-prune keeps the pure verdict."
+        },
+        {
+          "technique": "shape-with-a-not-applicable-member",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/flake-id.mjs:301 When the resolver (targetForRunningPath) returns null, the caller writes a sentinel into the test-identity space. Unresolved tests from different binaries that share a module path then merge into one history key, which the module's own header calls 'worse than having none'. The docstring (lines 271-273) says these records carry `target: null`, but the code emits no target field, and no test exercises this path. lane-certify's cannot-see/cannot-run verdicts are honest members: they have producers and consumers that act on them differently."
         },
         {
           "technique": "completeness-at-emission",
           "verdict": "deviation",
-          "evidence": "scripts/ci/lane-certify.mjs:303 The missing-artifact branch replaces declared criteria with an empty array; main subsequently serializes that result without a completeness check, although .lanes/README.md requires criteria to accompany verdicts."
+          "evidence": "scripts/ci/flake-record.mjs:197 The emitted run record defaults an absent branch to the plausible string 'unknown', while the next field (sha) correctly uses null. transitions() filters on branch === 'master', so such a record silently drops out of history. Positive counterpart: lane-certify sends every verdict through one `emit` door (lane-certify.mjs:283) and writes measurement, criteria and verdict together."
+        },
+        {
+          "technique": "build-time-evaluation-of-cross-value-invariants",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/lane-certify.test.mjs:402 The cross-file invariant (canary constant PLANTED in lane-canary.mjs vs the `max` in .lanes/criteria.json) is computed rather than left to the 'by construction' comment, on the fast harness rung rather than only in the nightly lane."
         },
         {
           "technique": "constraint-deletion-is-silent",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-check.mjs:187 Required-field enforcement is a runtime gate check, with negative runtime fixtures, rather than a structural value constraint replacing validation tests."
-        },
-        {
-          "technique": "consumption-bounds-at-most-once",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-certify.mjs:374 Run recording intentionally accumulates repeatable observations; no single-use in-process capability or consumption obligation was identified."
+          "verdict": "conformant",
+          "evidence": "scripts/ci/lane-certify.test.mjs:315 The canary inversion was raised from four call sites into one emit door. Negative tests whose pass condition is a refusal cover its no-artifact, pass and missing-metric exits, and mcp-gate-parity.test guards its mutation fixtures against going vacuous (`mutation did not apply — fixture is stale`). The canary no-criteria path is untested."
         },
         {
           "technique": "derived-properties-cannot-be-forged",
           "verdict": "conformant",
-          "evidence": "scripts/ci/flake-check.mjs:338 Flaky labels are derived from transition summaries rather than manually asserted; the moving-window test verifies automatic label removal."
-        },
-        {
-          "technique": "initialization-proof-tokens",
-          "verdict": "not-applicable",
-          "evidence": "scripts/ci/flake-record.mjs:144 Subprocess creation and use are local, and the child can subsequently fail; this does not establish a durable readiness fact suitable for a proof token."
+          "evidence": "scripts/ci/flake-check.mjs:328 The 'flaky' label is computed from same-commit transitions on every run, never declared. labels.json is a regenerated cache, not a second source."
         },
         {
           "technique": "placement-precedes-gate",
           "verdict": "conformant",
-          "evidence": "scripts/ci/ship-inventory.test.mjs:67 Manifest coverage spans repository artifacts and CI definitions, so the arrangement rule appropriately lives in a gate rather than a single-value encoding."
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:41 The checker names the altitude the rule belongs at (one authority) and declares itself the interim floor (line 42). The three hand-written copies themselves live in crates/server/src/mcp/mod.rs, outside this context."
         },
         {
-          "technique": "repairing-check-erases-its-evidence",
+          "technique": "occurrence-is-not-a-type",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/disk-check.mjs:93 Argument fallback and cache pruning are expressly specified interface behavior; no defensive clamp contradicting a stated strict output contract was established."
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:27 The context's checker rules are arrangement/vocabulary-parity rules (MCP sites, register-vs-tree reconciliation), not terms about identity, capture time, consumption or read set."
         },
         {
-          "technique": "shape-with-a-not-applicable-member",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/flake-id.mjs:130 The target resolver represents unresolved ownership outside the target object, using null rather than adding an absence member to the target vocabulary."
+          "technique": "initialization-proof-tokens",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:388 Bring-up (register read, scanner liveness) has exactly one caller, main(). The technique's own exception says to assert the precondition there, and the code does, exiting 3."
+        },
+        {
+          "technique": "consumption-bounds-at-most-once",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:462 There is no single-use value. The only once-per-key obligation (one size sample per day) is per-identity, and it is enforced at the store write, as the technique prescribes."
+        },
+        {
+          "technique": "paired-sites-localize-the-fault",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:271 Writer (flake-record, or the Rust lane harness) and reader (flake-check, lane-certify) are separate processes or languages. The technique excludes that case as a contract, not a pair of checks."
+        },
+        {
+          "technique": "indistinguishable-members-do-not-rise",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:263 Untyped JS with no structural checker, and no encoding claims to make a state unrepresentable. Same-typed budget members are passed by named key rather than position."
         }
       ],
-      "withdrawn": {
-        "worker": "5ad9728c-38f5-4fc7-8501-97f4aa424e27",
-        "state": "deviation",
-        "at": "2026-10-19T10:00:15.363860+00:00",
-        "reason": "reviewer (sonnet): Line 303 does emit `criteria: []` on the missing-artifact branch, but the verdict's own technique anchors (491, 187, 374) say the invariant-placement technique excludes runtime-sourced, runtime-gated checks like this one. The README (.lanes/README.md:22,33) never requires criteria on cannot-see or c"
-      }
+      "registryProposal": "shape-with-a-not-applicable-member is framed around exhaustiveness compelling consumers to write arms. Dynamic-language code has a sibling form with a different harm: a sentinel segment written into a composite string key (`unknown::unknown::<name>`). No arms are compelled; instead, unrelated values merge under one key. The technique could name this variant and its audit (enumerate the producers of the sentinel, then check whether any consumer aggregates by that key)."
     },
     "1d1816ea-080a-422a-b9c3-1f304338e4e3/ipc-contract": {
       "context": "e2e-api-contract",
