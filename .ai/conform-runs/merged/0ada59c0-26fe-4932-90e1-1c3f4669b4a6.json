@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0ada59c0-26fe-4932-90e1-1c3f4669b4a6",
+ "subject": "dynamic-secret-lifecycle",
+ "evaluatedAt": "2026-10-25T22:46:46.488285+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "dynamic-secret-lifecycle",
+   "context": "e2e-data-integrity",
+   "reason": "absence contradicted: crates/server/src/e2e/auth_gate.rs:50 contains 'credential' (68 hit(s) in the context's directories)"
+  }
+ ],
+ "consults": []
+}
