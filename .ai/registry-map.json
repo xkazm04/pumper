@@ -874,7 +874,11 @@
           "revision": 2,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:831 The routes never open a large file and start reading partway through it: every read, export included, goes through the SQLite-backed `state.datasets` store using keyset pagination (`list_records_view` with an `after` cursor), so the subject's precondition of addressing a seekable local file by byte offset is never met; searches of the routes directory for SeekFrom, binary_search, partition_point, mmap and head_sample found nothing.",
+          "evaluatedAt": "2026-10-25",
+          "evaluatedAgainst": "sha256-b2:95ffb5e82166138c",
+          "evaluatedRevision": 2
         },
         {
           "subject": "client-fetch-cache",

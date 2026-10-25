@@ -7636,6 +7636,27 @@
           "evidence": "crates/server/src/main.rs:727 'preview' in this context means a retention dry-run report. No guest route tree is scanned."
         }
       ]
+    },
+    "6fb74ed1-c2ac-4e2e-99b4-5415a68bc3d2/index-free-random-access": {
+      "context": "api-data-access",
+      "subject": "index-free-random-access",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-25",
+      "evaluatedTs": "2026-10-25T23:07:27.110Z",
+      "worker": "99f0625b-21c4-4369-a7b1-1a16722c8e3c",
+      "techniques": [
+        {
+          "technique": "reversible-encoding-buys-tail-recovery",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:915 The CSV export escapes by doubling quotes (RFC-4180), but the stream is only ever written to an HTTP response. Nothing reads its tail back or resumes from it, so tail recovery is never needed here."
+        },
+        {
+          "technique": "sorted-data-as-a-read-only-index",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/datasets.rs:867 Lookups by key go through the database's own indexed keyset query. No code bisects sorted bytes with approximate positioning."
+        }
+      ]
     }
   }
 }
