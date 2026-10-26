@@ -79,7 +79,7 @@ reqwest = { version = "0.13", features = ["json", "cookies", "gzip", "brotli", "
 # Already in the tree as reqwest's own cookie store — this is a direct edge, not
 # a new dependency.
 cookie_store = "0.22"
-scraper = "0.27"
+scraper = "0.29"
 # HTML/text charset decoding (windows-1250 etc.). Already in the tree as
 # reqwest's own body decoder — this promotes it to a direct edge for the
 # streamed-body path, which bypasses reqwest's `.text()` charset handling.
