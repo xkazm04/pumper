@@ -7866,6 +7866,32 @@
           "evidence": "crates/server/src/e2e/mcp.rs:484 The only size reduction exercised is limit/offset paging, which the consumer chooses itself. The technique's 'when not to use it' section excludes reductions the consumer asked for, and no harness transform exists that would need a floor."
         }
       ]
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/terminal-multiplexing": {
+      "context": "api-platform-ops",
+      "subject": "terminal-multiplexing",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:42:36.517Z",
+      "worker": "b0a62fa9-18c3-486f-bfc1-1f62f7cc953b",
+      "techniques": [
+        {
+          "technique": "bounded-replay-buffers",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/events.rs:30 Bounded replay exists, but it covers structured job events counted per event. It is not a byte-bounded terminal tail replayed into an emulator."
+        },
+        {
+          "technique": "multi-client-fan-out",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/events.rs:51 This is a broadcast fan-out of JSON job events to SSE clients. No terminal frames, window size or keyboard needs arbitrating."
+        },
+        {
+          "technique": "attach-detach-lifecycle",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/events.rs:107 Here 'terminal' means the job's final state. There is no attached/parked/detached ladder for terminal sessions."
+        }
+      ]
     }
   }
 }

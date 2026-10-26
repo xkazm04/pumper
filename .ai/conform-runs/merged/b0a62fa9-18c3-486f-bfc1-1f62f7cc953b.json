@@ -1,0 +1,60 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b0a62fa9-18c3-486f-bfc1-1f62f7cc953b",
+ "subject": "terminal-multiplexing",
+ "evaluatedAt": "2026-10-26T22:42:36.517815+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-platform-ops",
+   "subject": "terminal-multiplexing",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/events.rs:32 The only streaming surface in this context is an SSE feed of job status transitions with Last-Event-ID resume, not a terminal session; searching crates/server for tmux/xterm/conpty/portable_pty/keystroke found nothing, and a repo-wide search for pty/openpty/pseudo-terminal found only an unrelated 'extermin' alias in trades-common, so the subject's precondition (hosting many PTY-backed interactive terminal sessions) does not hold.",
+   "techniques": [
+    {
+     "technique": "bounded-replay-buffers",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/events.rs:30 Bounded replay exists, but it covers structured job events counted per event. It is not a byte-bounded terminal tail replayed into an emulator."
+    },
+    {
+     "technique": "multi-client-fan-out",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/events.rs:51 This is a broadcast fan-out of JSON job events to SSE clients. No terminal frames, window size or keyboard needs arbitrating."
+    },
+    {
+     "technique": "attach-detach-lifecycle",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/events.rs:107 Here 'terminal' means the job's final state. There is no attached/parked/detached ladder for terminal sessions."
+    }
+   ],
+   "absenceTerms": [
+    "tmux",
+    "xterm",
+    "conpty",
+    "portable_pty",
+    "keystroke"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:42:36.517815+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "terminal-multiplexing"
+   ],
+   "techniques": [
+    "attach-detach-lifecycle",
+    "bounded-replay-buffers",
+    "multi-client-fan-out"
+   ],
+   "deviations": 0,
+   "context": "api-platform-ops",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
