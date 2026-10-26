@@ -1791,8 +1791,8 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "priorNotApplicable": 2,
+          "state": "unknown"
         },
         {
           "subject": "quality-gates",
@@ -4120,8 +4120,12 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "state": "not-applicable",
+          "priorNotApplicable": 2,
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:1 These files are deterministic end-to-end tests (a fixed battery, scripted engines, single-pass assertions) and do not score non-deterministic model output; case-insensitive searches for eval_harness, pass_rate, benchmark, rubric and golden_set across crates/server/src/e2e found 0 hits, so the eval-harness precondition does not hold here.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:7ccead00b7f92aba",
+          "evaluatedRevision": 37
         },
         {
           "subject": "web-scraping",
@@ -4324,8 +4328,12 @@
           "revision": 37,
           "changedAt": "2026-09-29",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "state": "not-applicable",
+          "priorNotApplicable": 2,
+          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:134 The cross-system tests reach the Claude tier only through a scripted researcher, and they assert routing and budget behaviour (call_count) rather than scoring model output, so there is no non-deterministic lane to evaluate; searches for eval_harness, pass_rate, benchmark, rubric and golden_set across crates/server/src/e2e found 0 hits.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:7ccead00b7f92aba",
+          "evaluatedRevision": 37
         },
         {
           "subject": "prompt-assembly",

@@ -2576,27 +2576,24 @@
       "context": "e2e-data-integrity",
       "subject": "eval-harness",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:47:49.107Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:48:47.984Z",
+      "worker": "a237072d-8a08-4b42-b5d4-2b665309900d",
       "techniques": [
         {
           "technique": "comparison-modes",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:9 The matrix varies deterministic API read parameters; it does not compare model candidates or sampled quality outcomes."
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:9 The matrix varies deterministic API read parameters; it does not compare model candidates or sampled quality outcomes.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "judge-stability",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:31 The conformance battery uses typed mechanical outcomes rather than model judgments."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:31 The conformance battery uses typed mechanical outcomes rather than model judgments.",
+          "carriedFrom": "2026-10-13"
         }
-      ],
-      "withdrawn": {
-        "worker": "76204384-2fce-4a87-8179-9f0c7a468d70",
-        "state": "not-applicable",
-        "at": "2026-10-13T09:48:26.683899+00:00",
-        "reason": "reviewer (sonnet): The primary anchor engine_conformance.rs:289 is a doc comment opening a Browser-stub description, so it does not itself show that model-quality measurement is absent; only the technique anchors (lines 31 and dataset_reads.rs:9) carry the claim, and the other listed e2e files (vcr_attempts, search_de"
-      }
+      ]
     },
     "05b680d3-a634-4401-ae6b-de54d48ca753/module-design": {
       "context": "core-platform-services",
@@ -7891,6 +7888,31 @@
           "evidence": "crates/server/src/routes/events.rs:107 Here 'terminal' means the job's final state. There is no attached/parked/detached ladder for terminal sessions."
         }
       ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/eval-harness": {
+      "context": "content-monitoring",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:48:47.984Z",
+      "techniques": [],
+      "withdrawn": {
+        "worker": "a237072d-8a08-4b42-b5d4-2b665309900d",
+        "state": "not-applicable",
+        "at": "2026-10-26T22:49:42.007538+00:00",
+        "reason": "reviewer (sonnet): The evidence itself says the apps call Claude in production (research, readable escalation, connector-api-watch severity), so the eval-harness precondition holds; the scripted-stub tests show no evals exist, which is an absence finding and not a not-applicable."
+      }
+    },
+    "b6cad188-6215-4135-aa56-8f84711e4744/eval-harness": {
+      "context": "e2e-integration",
+      "subject": "eval-harness",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:48:47.984Z",
+      "worker": "a237072d-8a08-4b42-b5d4-2b665309900d",
+      "techniques": []
     }
   }
 }
