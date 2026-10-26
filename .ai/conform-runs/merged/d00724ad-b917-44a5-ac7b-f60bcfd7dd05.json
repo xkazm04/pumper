@@ -1,0 +1,59 @@
+{
+ "schema": "conform-run/1",
+ "worker": "d00724ad-b917-44a5-ac7b-f60bcfd7dd05",
+ "subject": "session-continuation",
+ "evaluatedAt": "2026-10-26T22:33:18.608574+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "session-continuation",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/triggers.rs:3 The trigger pipeline is server-side job chaining: a completed job enqueues a downstream job, limited by cycle and depth guards. There is no coding-agent session, turn boundary, continuation record or compaction anywhere in it. I searched triggers.rs, the 7 e2e files and all of crates/server/src for compaction, PreCompact, transcript, turn boundary and continuation mode and found 0 hits, so the subject's precondition does not hold. This looping belongs to background-jobs and pipeline-dag.",
+   "techniques": [
+    {
+     "technique": "advisory-guard-fail-mode",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:381 Plugin predicate hooks do fail open, which looks like this technique, but they are hooks on job-pipeline edges, not interceptors at an agent turn boundary."
+    },
+    {
+     "technique": "stuck-loop-detection",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:15 Hop chains are bounded by cycle and depth guards on provenance. This is not an agent repeating its own failed fix."
+    },
+    {
+     "technique": "continuation-as-state",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/triggers.rs:8 Triggers fire from worker hooks when a job completes. No model tries to yield, and no keep-working record exists."
+    }
+   ],
+   "absenceTerms": [
+    "compaction",
+    "PreCompact",
+    "transcript",
+    "turn boundary"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:33:18.608574+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "session-continuation"
+   ],
+   "techniques": [
+    "advisory-guard-fail-mode",
+    "continuation-as-state",
+    "stuck-loop-detection"
+   ],
+   "deviations": 0,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

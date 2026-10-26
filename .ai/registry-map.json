@@ -4909,7 +4909,11 @@
           "revision": 8,
           "changedAt": "2026-10-09",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 The trigger pipeline is server-side job chaining: a completed job enqueues a downstream job, limited by cycle and depth guards. There is no coding-agent session, turn boundary, continuation record or compaction anywhere in it. I searched triggers.rs, the 7 e2e files and all of crates/server/src for compaction, PreCompact, transcript, turn boundary and continuation mode and found 0 hits, so the subject's precondition does not hold. This looping belongs to background-jobs and pipeline-dag.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:b0eabf78abd856a4",
+          "evaluatedRevision": 8
         }
       ],
       "governance": "governed"
