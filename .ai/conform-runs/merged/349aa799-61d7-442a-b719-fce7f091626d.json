@@ -1,0 +1,58 @@
+{
+ "schema": "conform-run/1",
+ "worker": "349aa799-61d7-442a-b719-fce7f091626d",
+ "subject": "tool-result-economy",
+ "evaluatedAt": "2026-10-26T22:40:13.761175+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "e2e-integration",
+   "subject": "tool-result-economy",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/e2e/mcp.rs:117 The context's MCP tests drive pumper as a tool producer and read each tool's own result back as it was built. A search of crates/server/src/e2e/ for compress, elide, escape_hatch, summarize and tool_result found nothing. No transform sits between a tool and the model here: nothing compresses, summarizes or elides a result before an agent reads it, so the subject's precondition does not hold in this context.",
+   "techniques": [
+    {
+     "technique": "compressibility-follows-the-producer",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/mcp.rs:456 The query_dataset result set reaches the caller whole, with its count. No size threshold or producer classification is applied to tool output in these tests or in what they exercise."
+    },
+    {
+     "technique": "formatting-before-information",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/mcp.rs:115 The tests only read the MCP envelope. The packaging is built off-context in crates/server/src/mcp/mod.rs:803-804, which puts the same payload in both content[0].text and structuredContent. That is a packaging question for the mcp context, not this test suite."
+    },
+    {
+     "technique": "untransformed-arm-is-the-floor",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/e2e/mcp.rs:484 The only size reduction exercised is limit/offset paging, which the consumer chooses itself. The technique's 'when not to use it' section excludes reductions the consumer asked for, and no harness transform exists that would need a floor."
+    }
+   ],
+   "absenceTerms": [
+    "compress",
+    "elide",
+    "summarize"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:40:13.761175+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "tool-result-economy"
+   ],
+   "techniques": [
+    "compressibility-follows-the-producer",
+    "formatting-before-information",
+    "untransformed-arm-is-the-floor"
+   ],
+   "deviations": 0,
+   "context": "e2e-integration",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

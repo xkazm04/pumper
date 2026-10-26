@@ -7840,6 +7840,32 @@
         }
       ],
       "registryProposal": "circuit-breakers' decision rule 'persist breaker state with a freshness bound — discard stale' assumes the breaker gates availability of a remote dependency. For a breaker over the correctness of the system's own output (an extractor quarantine), time-based discard is wrong: a broken selector does not heal by waiting, and exit must be evidence-only. The technique should say its freshness rule applies to availability breakers, and that correctness breakers leave only on evidence."
+    },
+    "b6cad188-6215-4135-aa56-8f84711e4744/tool-result-economy": {
+      "context": "e2e-integration",
+      "subject": "tool-result-economy",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:40:13.761Z",
+      "worker": "349aa799-61d7-442a-b719-fce7f091626d",
+      "techniques": [
+        {
+          "technique": "compressibility-follows-the-producer",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mcp.rs:456 The query_dataset result set reaches the caller whole, with its count. No size threshold or producer classification is applied to tool output in these tests or in what they exercise."
+        },
+        {
+          "technique": "formatting-before-information",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mcp.rs:115 The tests only read the MCP envelope. The packaging is built off-context in crates/server/src/mcp/mod.rs:803-804, which puts the same payload in both content[0].text and structuredContent. That is a packaging question for the mcp context, not this test suite."
+        },
+        {
+          "technique": "untransformed-arm-is-the-floor",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/mcp.rs:484 The only size reduction exercised is limit/offset paging, which the consumer chooses itself. The technique's 'when not to use it' section excludes reductions the consumer asked for, and no harness transform exists that would need a floor."
+        }
+      ]
     }
   }
 }

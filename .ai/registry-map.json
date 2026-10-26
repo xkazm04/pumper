@@ -4370,7 +4370,11 @@
           "revision": 3,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/mcp.rs:117 The context's MCP tests drive pumper as a tool producer and read each tool's own result back as it was built. A search of crates/server/src/e2e/ for compress, elide, escape_hatch, summarize and tool_result found nothing. No transform sits between a tool and the model here: nothing compresses, summarizes or elides a result before an agent reads it, so the subject's precondition does not hold in this context.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:89b6a4c78a49c5f0",
+          "evaluatedRevision": 4
         },
         {
           "subject": "concurrency-guards",
