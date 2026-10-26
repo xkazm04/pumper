@@ -7753,6 +7753,47 @@
         "at": "2026-10-25T23:43:34.056454+00:00",
         "reason": "reviewer (sonnet): The not-applicable anchors are incidental. mesh.rs:300 is a doc comment about one governor-import gap in the peer app. plugin/src/lib.rs:1996 is a test assertion about an empty plugin host, and does not say loading is owned by the server. plugin/tests/common/mod.rs:121 is just a test double's reload"
       }
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/read-serving-replicas": {
+      "context": "core-job-queue",
+      "subject": "read-serving-replicas",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:13:02.368Z",
+      "worker": "0497cdef-f6e9-45f8-8b14-f5ef7661a559",
+      "techniques": [
+        {
+          "technique": "committed-write-invalidation-hook",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:566 The only commit-driven invalidation is trigger_generation, an in-process counter bumped after commit. It is not a replica-side stream fed by a replicated log, so the technique's precondition is absent."
+        },
+        {
+          "technique": "forward-on-storage-error",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:587 The single read-write store has no read-only shim and no authority to forward to."
+        },
+        {
+          "technique": "preemptive-forward-for-known-writes",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:587 Every request runs on the one writer, so there is no forward path."
+        },
+        {
+          "technique": "evict-not-update-on-commit",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:587 There are no replica caches and no accepted/applied/invalidated index to report."
+        },
+        {
+          "technique": "fairshare-invalidation-queues",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:587 There are no peers to fan invalidations out to."
+        },
+        {
+          "technique": "client-carried-index",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:587 Reads and writes hit the same local database, so read-your-writes holds trivially."
+        }
+      ]
     }
   }
 }

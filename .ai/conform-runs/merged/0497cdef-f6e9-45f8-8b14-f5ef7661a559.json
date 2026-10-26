@@ -1,0 +1,77 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0497cdef-f6e9-45f8-8b14-f5ef7661a559",
+ "subject": "read-serving-replicas",
+ "evaluatedAt": "2026-10-26T22:13:02.368765+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-job-queue",
+   "subject": "read-serving-replicas",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/storage.rs:587 Storage::connect opens one local SQLite file in WAL mode through an 8-connection in-process pool. There is no leader, no standby and no replicated log, so the subject's precondition (a single-leader service whose standbys serve reads) does not hold; searching crates/core for replica, standby, leader and applied_index found zero hits.",
+   "techniques": [
+    {
+     "technique": "committed-write-invalidation-hook",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:566 The only commit-driven invalidation is trigger_generation, an in-process counter bumped after commit. It is not a replica-side stream fed by a replicated log, so the technique's precondition is absent."
+    },
+    {
+     "technique": "forward-on-storage-error",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 The single read-write store has no read-only shim and no authority to forward to."
+    },
+    {
+     "technique": "preemptive-forward-for-known-writes",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 Every request runs on the one writer, so there is no forward path."
+    },
+    {
+     "technique": "evict-not-update-on-commit",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 There are no replica caches and no accepted/applied/invalidated index to report."
+    },
+    {
+     "technique": "fairshare-invalidation-queues",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 There are no peers to fan invalidations out to."
+    },
+    {
+     "technique": "client-carried-index",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:587 Reads and writes hit the same local database, so read-your-writes holds trivially."
+    }
+   ],
+   "absenceTerms": [
+    "replica",
+    "standby",
+    "leader",
+    "applied_index"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:13:02.368765+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "read-serving-replicas"
+   ],
+   "techniques": [
+    "client-carried-index",
+    "committed-write-invalidation-hook",
+    "evict-not-update-on-commit",
+    "fairshare-invalidation-queues",
+    "forward-on-storage-error",
+    "preemptive-forward-for-known-writes"
+   ],
+   "deviations": 0,
+   "context": "core-job-queue",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
