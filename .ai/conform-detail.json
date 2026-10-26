@@ -7801,6 +7801,43 @@
           "evidence": "crates/core/src/storage.rs:587 Reads and writes hit the same local database, so read-your-writes holds trivially."
         }
       ]
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/retry-backoff": {
+      "context": "core-resilience",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:28:51.158Z",
+      "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+      "techniques": [
+        {
+          "technique": "circuit-breakers",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:893 Hysteresis breaker (Healthy/Suspect/Degraded/Quarantined/Probation as half-open), persisted, config thresholds, judged-only evidence — but quarantine exit ignores who opened it; set_state_manual(Quarantined) is lifted by detector evidence and commit_run nulls state_reason on the transition."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:182 Permanence is classified from structured status (404/410 on live uncached http only); 403/429/timeouts/DNS/cache responses never count as permanent, so rate-limited and transient failures are not misfiled."
+        },
+        {
+          "technique": "suspension-is-not-failure",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/store.rs:940 By analogy: a run the fetch gate could not judge (Inconclusive/BelowCohort/ContentEmpty) consumes no ladder evidence, advances no trip count and no recovery streak — could-not-judge is spelled apart from failed."
+        },
+        {
+          "technique": "backoff-design",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:837 The ladder here is a ladder of states, not of delays; no attempt is rescheduled, so base/factor/cap/jitter do not apply (its stability-window idea is mirrored by recovery_runs)."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge."
+        }
+      ],
+      "registryProposal": "circuit-breakers' decision rule 'persist breaker state with a freshness bound — discard stale' assumes the breaker gates availability of a remote dependency. For a breaker over the correctness of the system's own output (an extractor quarantine), time-based discard is wrong: a broken selector does not heal by waiting, and exit must be evidence-only. The technique should say its freshness rule applies to availability breakers, and that correctness breakers leave only on evidence."
     }
   }
 }

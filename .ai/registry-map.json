@@ -3198,7 +3198,11 @@
           "revision": 13,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined branch of next_state releases every quarantine on a clean-run streak without consulting provenance, so an operator-forced quarantine (set_state_manual, reason recorded) is auto-lifted to Probation and its reason cleared on the transition — the breaker technique's 'only a heuristic open is probeable / never shorten a stronger open' rule is not realized, while Retired (operator-only exit) shows the provenance distinction was made for one state but not this one.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
+          "evaluatedRevision": 13
         },
         {
           "subject": "quality-gates",

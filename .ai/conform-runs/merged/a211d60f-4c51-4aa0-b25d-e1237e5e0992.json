@@ -1,0 +1,66 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+ "subject": "retry-backoff",
+ "evaluatedAt": "2026-10-26T22:28:51.158607+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "retry-backoff",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined branch of next_state releases every quarantine on a clean-run streak without consulting provenance, so an operator-forced quarantine (set_state_manual, reason recorded) is auto-lifted to Probation and its reason cleared on the transition \u2014 the breaker technique's 'only a heuristic open is probeable / never shorten a stronger open' rule is not realized, while Retired (operator-only exit) shows the provenance distinction was made for one state but not this one.",
+   "techniques": [
+    {
+     "technique": "circuit-breakers",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/resilience/detect.rs:893 Hysteresis breaker (Healthy/Suspect/Degraded/Quarantined/Probation as half-open), persisted, config thresholds, judged-only evidence \u2014 but quarantine exit ignores who opened it; set_state_manual(Quarantined) is lifted by detector evidence and commit_run nulls state_reason on the transition."
+    },
+    {
+     "technique": "error-classification-for-retry",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/detect.rs:182 Permanence is classified from structured status (404/410 on live uncached http only); 403/429/timeouts/DNS/cache responses never count as permanent, so rate-limited and transient failures are not misfiled."
+    },
+    {
+     "technique": "suspension-is-not-failure",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/store.rs:940 By analogy: a run the fetch gate could not judge (Inconclusive/BelowCohort/ContentEmpty) consumes no ladder evidence, advances no trip count and no recovery streak \u2014 could-not-judge is spelled apart from failed."
+    },
+    {
+     "technique": "backoff-design",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:837 The ladder here is a ladder of states, not of delays; no attempt is rescheduled, so base/factor/cap/jitter do not apply (its stability-window idea is mirrored by recovery_runs)."
+    },
+    {
+     "technique": "durable-retries",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge."
+    }
+   ],
+   "registryProposal": "circuit-breakers' decision rule 'persist breaker state with a freshness bound \u2014 discard stale' assumes the breaker gates availability of a remote dependency. For a breaker over the correctness of the system's own output (an extractor quarantine), time-based discard is wrong: a broken selector does not heal by waiting, and exit must be evidence-only. The technique should say its freshness rule applies to availability breakers, and that correctness breakers leave only on evidence."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:28:51.158607+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "retry-backoff"
+   ],
+   "techniques": [
+    "backoff-design",
+    "circuit-breakers",
+    "durable-retries",
+    "error-classification-for-retry",
+    "suspension-is-not-failure"
+   ],
+   "deviations": 1,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
