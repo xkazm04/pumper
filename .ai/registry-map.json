@@ -5747,8 +5747,12 @@
           "revision": 2,
           "changedAt": "2026-09-25",
           "confidence": "strong",
-          "state": "unknown",
-          "priorNotApplicable": 2
+          "state": "not-applicable",
+          "priorNotApplicable": 2,
+          "evidence": "crates/apps/extractor/src/lib.rs:1 This context runs declarative CSS-selector rule sets over fetched or stored HTML to produce structured field records, and crawls link graphs. It never turns a foreign byte container (PDF, office file, scanned page) into human-visible text, so there are no text layers, unreadable regions, recognition paths, container expansions or emitted markup for the subject to govern; a search of crawl/ and extractor/ for pdf, docx, xlsx and text_layer found nothing (title/excerpt text comes from pumper_core::crawl, outside this context).",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:ee97c74f3f5e0c28",
+          "evaluatedRevision": 2
         },
         {
           "subject": "structured-output",

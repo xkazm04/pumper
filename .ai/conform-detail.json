@@ -3483,37 +3483,38 @@
       "context": "web-crawl-extraction",
       "subject": "document-text-extraction",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T11:43:16.127Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:53:40.098Z",
+      "worker": "99bf604e-64f0-4425-b11d-c564c1335c09",
       "techniques": [
         {
           "technique": "unreadable-region-refusal",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/extractor/src/lib.rs:1841 Lists missing stored HTML artifact files per key, not unread regions inside a document container."
+          "evidence": "crates/apps/extractor/src/lib.rs:1916 The closest analogue is source mode listing missing or unreadable stored HTML bodies per key instead of writing null records. That is whole-artifact absence, not partly readable regions inside one document, so the precondition does not hold (the spirit of a list over a count is honoured anyway)."
         },
         {
           "technique": "extraction-yield-bands",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/extractor/src/lib.rs:1817 Reports selector match counts for a rule set, not a region yield band."
+          "evidence": "crates/apps/extractor/src/lib.rs:640 The closed status set here is selector-binding status per field (Matched/ContainerEmpty/Empty/Error), not text yield per document region. That is web-scraping selector-drift territory, not extraction-yield banding."
         },
         {
-          "technique": "structural-amplification-caps",
+          "technique": "recognition-boundary-and-escalation",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/crawl/src/link_graph.rs:66 Caps in-memory crawl-edge bookkeeping, not expansion of a document container."
+          "evidence": "crates/apps/extractor/src/lib.rs:1808 The only escalation is the core fetcher's http→browser tier, which works at the fetch layer and is judged on a structured tier verdict. There is no cheap text extractor with an OCR/recognition path behind it."
         },
         {
           "technique": "context-decided-escaping",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/extractor/tests/result_honesty.rs:71 Emits structured field JSON from CSS rules; no Markdown converter in this context."
+          "evidence": "crates/apps/extractor/src/lib.rs:2681 The only markdown mention is a test fixture field of the core FetchOutcome. The context emits JSON records, never Markdown or other lightweight markup built from document text."
+        },
+        {
+          "technique": "structural-amplification-caps",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/extractor/src/induce.rs:21 The caps here bound run scope (pages, snapshots, records), not repeat or reference expansion inside a container reader. HTML parsing is delegated to core with no repeat-count construct to materialize."
         }
       ],
-      "withdrawn": {
-        "worker": "fa08f075-0599-41c4-8013-3ba65e84232d",
-        "state": "not-applicable",
-        "at": "2026-10-13T11:44:15.436976+00:00",
-        "reason": "reviewer (sonnet): The not-applicable anchor result_honesty.rs:71 is an assertion in a sweep-cap test (`out[\"mode\"] == \"source\"`), so it is incidental. It does not show that the crawl and extractor crates have no document-container (PDF/OCR) path, and the cited technique claim about CSS-to-JSON output rests on that sa"
-      }
+      "registryProposal": "The golden path's use_when could say explicitly that selector/rule-based structured extraction from HTML (web-scraping) falls outside the subject, or name the border with web-scraping in 'Where this subject stops'. Otherwise the word 'extractor' pulls scraping contexts into this subject by token match."
     },
     "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/document-text-extraction": {
       "context": "core-extraction",
