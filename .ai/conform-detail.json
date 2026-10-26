@@ -6382,67 +6382,69 @@
       "context": "pricing-valuation",
       "subject": "plan-entitlements",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-19",
-      "evaluatedTs": "2026-10-19T22:36:11.107Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:07:10.563Z",
+      "worker": "a00f9b31-35b5-4d73-90c4-470cc3410b3f",
       "techniques": [
+        {
+          "technique": "tier-model-single-source",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:1 These crates sell no tiers. 'Pricing' is the domain of the data being scraped."
+        },
         {
           "technique": "capability-gate-predicates",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/state-tax/src/lib.rs:202 This gate checks whether tax-year data is already held; context searches found no plan-based capability gate."
-        },
-        {
-          "technique": "deployment-mode-short-circuit",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:28 The subscription reference concerns upstream Claude execution costs; no commercial capability gates requiring deployment-mode bypass were found."
+          "evidence": "crates/apps/state-tax/src/lib.rs:109 The apps only implement ScrapeApp. None of them has a plan-inclusion gate."
         },
         {
           "technique": "entitlement-lifecycle-revocation",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:375 The lifecycle concerns vacancy postings and collection gaps; no billing subscription grant or revocation path was found."
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:28 The only 'subscription' here is the operator's own Claude CLI subscription. This product has no customer subscription lifecycle."
+        },
+        {
+          "technique": "deployment-mode-short-circuit",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:28 The subscription reference concerns upstream Claude execution costs; no commercial capability gates requiring deployment-mode bypass were found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "id-vs-label-split",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/valuation-multiples/src/lib.rs:304 Stored labels classify researched trades; searches found no persisted tenant plan identifiers or tier labels."
+          "evidence": "crates/apps/valuation-multiples/src/lib.rs:304 Stored labels classify researched trades; searches found no persisted tenant plan identifiers or tier labels.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "inherited-tier-not-cloned-tier",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:256 Price records identify locality, trade, and job benchmarks; no per-customer commercial agreement or derived tier was found."
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:256 Price records identify locality, trade, and job benchmarks; no per-customer commercial agreement or derived tier was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "live-catalog-edit-is-a-lifecycle-event",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:496 The catalog being refreshed is a government dump index; no subscribed tier catalog or operator-editable entitlement limits were found."
+          "evidence": "crates/apps/smlouvy-dump-watch/src/lib.rs:496 The catalog being refreshed is a government dump index; no subscribed tier catalog or operator-editable entitlement limits were found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "price-book-authority",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:342 The app stores researched market benchmarks, with no checkout price or product billing price book found in the context."
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:342 The app stores researched market benchmarks, with no checkout price or product billing price book found in the context.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "provider-publishes-state-not-decision",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:92 The published contract carries official wage source rows; no operator-authored entitlement vocabulary or entitlement read service was found."
+          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:92 The published contract carries official wage source rows; no operator-authored entitlement vocabulary or entitlement read service was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "subtractive-entitlement",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/smlouvy-dump-watch/tests/partial_parse_cannot_tombstone.rs:2 Removal handling protects scraped dump records; no inherited subscription capabilities or customer removal overrides were found."
-        },
-        {
-          "technique": "tier-model-single-source",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/transact/src/lib.rs:111 The manifest declares browser transaction inputs; searches across the context found no paid-tier model, plan selection, or pricing-page tier list."
+          "evidence": "crates/apps/smlouvy-dump-watch/tests/partial_parse_cannot_tombstone.rs:2 Removal handling protects scraped dump records; no inherited subscription capabilities or customer removal overrides were found.",
+          "carriedFrom": "2026-10-19"
         }
-      ],
-      "withdrawn": {
-        "worker": "56e0e452-3979-46f2-a3fd-b69899fa22ae",
-        "state": "not-applicable",
-        "at": "2026-10-19T22:36:30.931835+00:00",
-        "reason": "reviewer (sonnet): All five anchors are incidental. homewyse-pricing:27 is a doc comment about the Claude CLI subscription, and it doesn't show that plan or tenant entitlements are absent. state-tax:202 is a vintage freshness gate, mpsv-vpm:375 is a schema description of a gap guard, and valuation-multiples:304 is a t"
-      }
+      ]
     },
     "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/proactive-nudges": {
       "context": "job-scheduler",

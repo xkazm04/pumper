@@ -5164,7 +5164,11 @@
           "revision": 7,
           "changedAt": "2026-09-18",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:1 These crates scrape outside pricing, tax, licensing, valuation and labour-market data as datasets (here 'pricing' means scraped market prices, not this product's own price book). A case-insensitive grep over all eight app directories found 0 hits for entitlement, billing, plan_id or upgrade, and none of these crates has a tier model, capability gate or subscription lifecycle for this subject to govern.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:66961f93b3ce02ba",
+          "evaluatedRevision": 8
         },
         {
           "subject": "public-claim-provenance",
