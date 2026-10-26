@@ -1477,7 +1477,11 @@
           "revision": 5,
           "changedAt": "2026-10-21",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/census-common/Cargo.toml:9 These eight app crates depend only on pumper-core and parsing/serialization libraries, with no prover or spec library. Searching every file in the eight crate directories for unsafe, set_var, kani, verus, prusti and 'Send for'/'Sync for' found zero hits, so the context has no trust-base member (no escape block, marker impl, trusted body or unmarked re-marked call) for the subject to govern.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:3ad9d5604e9627ce",
+          "evaluatedRevision": 5
         }
       ],
       "governance": "governed"

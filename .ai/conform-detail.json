@@ -6657,52 +6657,51 @@
       "context": "census-economic-data",
       "subject": "trust-base",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-21",
-      "evaluatedTs": "2026-10-21T22:10:42.262Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:45:07.449Z",
+      "worker": "effc330a-4c2f-442f-b6f5-a880205f1914",
       "techniques": [
         {
-          "technique": "assumptions-are-build-errors",
+          "technique": "verifier-footprint-stays-contained",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/cms-fee-schedule/src/lib.rs:26 These assumptions concern input-file formats; searches found no proof or type-level argument depending on pointer width, endianness, or another platform fact."
+          "evidence": "crates/apps/census-common/Cargo.toml:6 No verification tooling appears among the dependencies, and the crate is a path-only member that is never published, so it has no verifier footprint to contain."
         },
         {
           "technique": "census-counts-unmarked-members",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/census-common/src/lib.rs:354 The context reads the environment; explicit searches found no set_var, remove_var, before_exec, or pre_exec calls despite its inherited Rust 2021 edition."
+          "evidence": "crates/apps/census-common/Cargo.toml:4 The edition is inherited from the workspace (2021, which predates the 2024 re-marking), so unmarked set_var/remove_var calls would be members. A grep across all eight crates found zero such calls, so a marker census of zero here is accurate, not the blindness the technique warns about."
+        },
+        {
+          "technique": "assumptions-are-build-errors",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/census-density/src/lib.rs:1933 This is a u64->usize cast on a request parameter, but no proof or type-level argument relies on the word size, so there is no verified-side statement for a build assertion to mirror."
         },
         {
           "technique": "leaf-spec-states-what-callers-read",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/census-bfs/src/lib.rs:500 This helper has an ordinary compiler-visible body; searches found no trusted function contracts consumed by proofs."
+          "evidence": "crates/apps/census-bfs/src/lib.rs:500 This helper has an ordinary compiler-visible body; searches found no trusted function contracts consumed by proofs.",
+          "carriedFrom": "2026-10-21"
         },
         {
           "technique": "marker-impl-names-its-exclusion",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/census-nesd/src/lib.rs:72 The application uses an ordinary trait implementation; searches across all eight crates found no manual Send/Sync assertions or UnsafeCell protocols."
+          "evidence": "crates/apps/census-nesd/src/lib.rs:72 The application uses an ordinary trait implementation; searches across all eight crates found no manual Send/Sync assertions or UnsafeCell protocols.",
+          "carriedFrom": "2026-10-21"
         },
         {
           "technique": "soundness-argument-names-its-dependencies",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/cms-fee-schedule/src/lib.rs:384 Archive access uses safe library APIs; searches found no local escape hatch whose soundness depends on a remote layout or constructor declaration."
+          "evidence": "crates/apps/cms-fee-schedule/src/lib.rs:384 Archive access uses safe library APIs; searches found no local escape hatch whose soundness depends on a remote layout or constructor declaration.",
+          "carriedFrom": "2026-10-21"
         },
         {
           "technique": "trusted-leaf-gets-an-outside-test",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/census-nonemp/src/lib.rs:558 The response classifier is an ordinary executable function; no body marked trusted while supplying a proof contract was found."
-        },
-        {
-          "technique": "verifier-footprint-stays-contained",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/census-common/Cargo.toml:6 All eight crates disable publication, and their inspected dependency declarations contain no prover or specification-library dependency."
+          "evidence": "crates/apps/census-nonemp/src/lib.rs:558 The response classifier is an ordinary executable function; no body marked trusted while supplying a proof contract was found.",
+          "carriedFrom": "2026-10-21"
         }
-      ],
-      "withdrawn": {
-        "worker": "d52d70b9-2b67-4d57-98cb-36d073f67ae2",
-        "state": "not-applicable",
-        "at": "2026-10-21T22:11:19.876808+00:00",
-        "reason": "reviewer (sonnet): The searches I re-ran over the eight crates (unsafe, set_var, remove_var, UnsafeCell, external_body, verus) found no hits, so the claim is probably true. But none of the cited anchors shows the precondition is absent. Cargo.toml:6 is only `publish = false`. lib.rs:26 is a doc comment on ZIP/CSV layo"
-      }
+      ]
     },
     "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/test-harness": {
       "context": "content-monitoring",

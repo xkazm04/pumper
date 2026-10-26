@@ -1,0 +1,60 @@
+{
+ "schema": "conform-run/1",
+ "worker": "effc330a-4c2f-442f-b6f5-a880205f1914",
+ "subject": "trust-base",
+ "evaluatedAt": "2026-10-26T22:45:07.449463+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "census-economic-data",
+   "subject": "trust-base",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/census-common/Cargo.toml:9 These eight app crates depend only on pumper-core and parsing/serialization libraries, with no prover or spec library. Searching every file in the eight crate directories for unsafe, set_var, kani, verus, prusti and 'Send for'/'Sync for' found zero hits, so the context has no trust-base member (no escape block, marker impl, trusted body or unmarked re-marked call) for the subject to govern.",
+   "techniques": [
+    {
+     "technique": "verifier-footprint-stays-contained",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/census-common/Cargo.toml:6 No verification tooling appears among the dependencies, and the crate is a path-only member that is never published, so it has no verifier footprint to contain."
+    },
+    {
+     "technique": "census-counts-unmarked-members",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/census-common/Cargo.toml:4 The edition is inherited from the workspace (2021, which predates the 2024 re-marking), so unmarked set_var/remove_var calls would be members. A grep across all eight crates found zero such calls, so a marker census of zero here is accurate, not the blindness the technique warns about."
+    },
+    {
+     "technique": "assumptions-are-build-errors",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/census-density/src/lib.rs:1933 This is a u64->usize cast on a request parameter, but no proof or type-level argument relies on the word size, so there is no verified-side statement for a build assertion to mirror."
+    }
+   ],
+   "absenceTerms": [
+    "unsafe",
+    "set_var",
+    "kani",
+    "verus",
+    "Sync for"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-10-26T22:45:07.449463+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "trust-base"
+   ],
+   "techniques": [
+    "assumptions-are-build-errors",
+    "census-counts-unmarked-members",
+    "verifier-footprint-stays-contained"
+   ],
+   "deviations": 0,
+   "context": "census-economic-data",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
