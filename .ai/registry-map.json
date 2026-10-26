@@ -2877,8 +2877,12 @@
           "revision": 2,
           "changedAt": "2026-09-04",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 5
+          "state": "not-applicable",
+          "priorNotApplicable": 5,
+          "evidence": "crates/core/src/storage.rs:834 This context is a durable SQLite job queue (enqueue/claim/heartbeat of persisted Job rows), which the golden path explicitly assigns to job-coordination rather than to engine-host contracts; a search of crates/core/src and crates/core/tests for microtask, JobExecutor, ModuleLoader, host_hook and 'event loop' found no embedded language engine, hook surface, module loader or engine job executor here.",
+          "evaluatedAt": "2026-10-26",
+          "evaluatedAgainst": "sha256-b2:dcbd96d1274205ef",
+          "evaluatedRevision": 3
         },
         {
           "subject": "fleet-orchestration",

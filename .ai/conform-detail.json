@@ -7914,6 +7914,32 @@
       "evaluatedTs": "2026-10-26T22:48:47.984Z",
       "worker": "a237072d-8a08-4b42-b5d4-2b665309900d",
       "techniques": []
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/engine-host-contract": {
+      "context": "core-job-queue",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:56:30.798Z",
+      "worker": "d2ffe38d-ee80-419d-adfb-a626acdf1b3b",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/job.rs:60 Job is a persisted scrape-job record, not an engine host-hook override surface; no spec hook trait exists in this context."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:701 Enqueue writes a durable row for a worker pool; there is no in-memory promise-job executor to default to null or blocking."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:1873 Lease/heartbeat semantics of durable jobs (job-coordination territory), not a host loop draining engine microtask/timer queues."
+        }
+      ]
     }
   }
 }
