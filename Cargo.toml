@@ -98,7 +98,7 @@ url = "2"
 wasmtime = "49"
 
 # embedded full-text search (in-process, no external service)
-tantivy = "0.26"
+tantivy = "0.27"
 
 # shared
 dashmap = "6"
