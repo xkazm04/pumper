@@ -6492,50 +6492,57 @@
       "subject": "public-claim-provenance",
       "bundle": "software-engineering",
       "state": "unknown",
-      "evaluatedAt": "2026-10-19",
-      "evaluatedTs": "2026-10-19T22:48:43.353Z",
+      "evaluatedAt": "2026-10-26",
+      "evaluatedTs": "2026-10-26T22:20:13.104Z",
       "techniques": [
         {
           "technique": "build-time-derivation-off-the-client-bundle",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:745 Heavy-feed aggregation produces persisted labour-market datasets; no public product counter or reader-side bundle was found."
+          "evidence": "crates/apps/mpsv-vpm/src/lib.rs:745 Heavy-feed aggregation produces persisted labour-market datasets; no public product counter or reader-side bundle was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "degraded-never-claims-live",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:161 Fetch completeness is reported in a scraper job result; no public counter with a liveness badge was found."
+          "evidence": "crates/apps/mpsv-ispv/src/lib.rs:161 Fetch completeness is reported in a scraper job result; no public counter with a liveness badge was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "derived-numerator-authored-denominator",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/state-tax/src/lib.rs:385 The denominator describes a jurisdiction roster for extraction completeness, rather than a hand-authored product goal on a public progress surface."
+          "evidence": "crates/apps/state-tax/src/lib.rs:385 The denominator describes a jurisdiction roster for extraction completeness, rather than a hand-authored product goal on a public progress surface.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "no-data-source-labelled-inline",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:342 Pricing figures are research-derived dataset records; no hand-authored public product figure requiring the technique's inline label was found."
+          "evidence": "crates/apps/homewyse-pricing/src/lib.rs:342 Pricing figures are research-derived dataset records; no hand-authored public product figure requiring the technique's inline label was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "presentation-invariants-on-derived-values",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/valuation-multiples/src/lib.rs:192 Coverage compares observed records with a domain roster; no rendered progress bar or mixed-provenance public target was found."
+          "evidence": "crates/apps/valuation-multiples/src/lib.rs:192 Coverage compares observed records with a domain roster; no rendered progress bar or mixed-provenance public target was found.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "promise-only-what-ships",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/transact/src/lib.rs:167 The confirmation construct probes an external browser workflow; it is not public success-panel copy promising a follow-up."
+          "evidence": "crates/apps/transact/src/lib.rs:167 The confirmation construct probes an external browser workflow; it is not public success-panel copy promising a follow-up.",
+          "carriedFrom": "2026-10-19"
         },
         {
           "technique": "provenance-as-a-build-gate",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/state-licensing/src/lib.rs:144 The manifest describes operational cost telemetry; no public claim-formatting surface requiring a provenance lint gate was found."
+          "evidence": "crates/apps/state-licensing/src/lib.rs:144 The manifest describes operational cost telemetry; no public claim-formatting surface requiring a provenance lint gate was found.",
+          "carriedFrom": "2026-10-19"
         }
       ],
       "withdrawn": {
-        "worker": "cd847111-3819-4511-bc26-593dc457e554",
+        "worker": "a018454f-27e1-4efe-8315-3d6e8a1bbe42",
         "state": "not-applicable",
-        "at": "2026-10-19T22:49:02.026365+00:00",
-        "reason": "reviewer (sonnet): The anchor at homewyse-pricing/src/lib.rs:10 is a doc-comment line about locality selection, so it doesn't show that a public claim surface is absent. The 'no hit' rests on three narrow search terms (roadmap, marketing, badge). I didn't find evidence that transact and valuation-multiples have no pub"
+        "at": "2026-10-26T22:21:04.374954+00:00",
+        "reason": "reviewer (sonnet): The claim that every crate upserts into an internal dataset and renders nothing is contradicted by crates/apps/transact/src/lib.rs, which drives live pages to a confirmation state, captures a `#confirm-panel` and confirm_selector receipt, and reports submit outcomes; the anchor at valuation-multiple"
       }
     },
     "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/transactions-over-a-replicated-log": {
