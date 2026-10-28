@@ -97,7 +97,7 @@ url = "2"
 # sandboxed WASM plugin runtime
 # Default features minus `cache`: the on-disk compilation cache is unused here and
 # pulls zstd 0.13 (RUSTSEC-2026-0391/0398/0403, no patched release on that line).
-wasmtime = { version = "49", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat",
     "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
     "addr2line", "coredump", "debug-builtins", "runtime", "component-model",
