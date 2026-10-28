@@ -19,36 +19,6 @@
   "labelThreshold": 2,
   "quarantine": [
     {
-      "id": "pumper-core::lib::governor::tests::distinct_hosts_run_in_parallel_but_each_host_spaces",
-      "owner": "xkazm04",
-      "entered": "2026-08-24",
-      "expires": "2026-10-26",
-      "cause": "test",
-      "form": "skipped",
-      "formReason": [
-        "libtest has no `muted` form: #[ignore] is a skip, so the preferred 'still runs,",
-        "result recorded, does not block' shape is not available in-process. The",
-        "compensating control is the nightly `long-lanes` CI leg, which runs the whole",
-        "--ignored set through scripts/ci/flake-record.mjs — so the outcome history a",
-        "mute would have produced accumulates anyway, off the blocking path."
-      ],
-      "evidence": [
-        "crates/core/src/governor.rs:340. Asserts a wall-clock lower bound",
-        "(`elapsed >= 350ms` for two 200ms per-host gaps) and an upper bound proving 32",
-        "hosts did not serialize. The lower bound is sound; the upper bound is what",
-        "slips under load, because a loaded machine can serialize the 32 spawned tasks",
-        "onto fewer worker threads. Failure signature: `per-host spacing lost` /",
-        "the concurrency upper-bound assert, never a logic error in the sharded map.",
-        "Accumulating evidence: .flake/history/ (nightly `long-lanes`), queried with",
-        "`just flake-report`."
-      ],
-      "exitPlan": [
-        "Replace the wall-clock upper bound with an observation of the sharded map's",
-        "own state (per-host next-allowed instants), which is the property the test",
-        "actually claims. Wall clock stays only for the lower bound."
-      ]
-    },
-    {
       "id": "pumper-engine-wasm::lib::tests::instance_pre_instantiation_is_never_slower_than_relinking_per_call",
       "owner": "xkazm04",
       "entered": "2026-08-24",

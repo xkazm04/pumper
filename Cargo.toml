@@ -95,7 +95,15 @@ simd-json = "0.18"
 url = "2"
 
 # sandboxed WASM plugin runtime
-wasmtime = "49"
+# Default features minus `cache`: the on-disk compilation cache is unused here and
+# pulls zstd 0.13 (RUSTSEC-2026-0391/0398/0403, no patched release on that line).
+wasmtime = { version = "49", default-features = false, features = [
+    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat",
+    "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
+    "addr2line", "coredump", "debug-builtins", "runtime", "component-model",
+    "component-model-async", "threads", "stack-switching", "std", "debug",
+    "compile-time-builtins", "wit-parser",
+] }
 
 # embedded full-text search (in-process, no external service)
 tantivy = "0.27"
