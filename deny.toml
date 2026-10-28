@@ -14,7 +14,8 @@
 #                not an accident
 # One tool, one config, one CI step.
 #
-# Run locally: `cargo deny check`
+# Run locally: `just audit` (= `cargo deny check advisories bans sources`, exactly the CI gate).
+# Bare `cargo deny check` also runs `licenses`, which is not gated yet (see below) and exits non-zero.
 
 [graph]
 # Check the dependency graph as it resolves on the platforms we actually ship

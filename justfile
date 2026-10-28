@@ -126,7 +126,8 @@ clients:
 # change that was not regenerated fails the build instead of shipping clients
 # built from the previous contract. Part of `sdk`, so `just ci` blocks on it.
 #
-# The generated-client drift gate: exit 1 when the clients are stale.
+# The generated-client drift gate: exit 1 when the clients are stale, exit 3
+# (cannot check, not a pass) when the generator toolchain is not installed.
 clients-check:
     node scripts/gen/generate-clients.mjs --check
 
@@ -384,6 +385,7 @@ harness-test:
     node --test scripts/ci/disk-check.test.mjs
     node --test scripts/ci/gate-inventory.test.mjs
     node --test scripts/ci/quality-report.test.mjs
+    node --test scripts/ci/generate-clients.test.mjs
 
 # Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
 # through the recorder (so the --ignored set finally accumulates history), then
@@ -453,6 +455,34 @@ lane-health:
 #
 # Everything CI blocks on: its six jobs, in the order CI reaches them.
 ci: _hooks-auto fmt-check lint test audit plugins-verify sdk inventory mcp-gate-parity supply-chain flake-check harness-test disk-check
+
+# `just ci` cannot finish inside a ~10-minute agent wake (clippy alone is ~2 min
+# and the full suite timed out at 600s), so the test half of the goal went
+# unmeasured cycle after cycle. This is the subset a wake CAN finish: format, an
+# incremental `check` (not clippy), and the library unit tests only - no
+# integration binaries, no doctests. It is NOT a substitute for `ci`; it exists so
+# a short budget produces a real measurement instead of silence. Pair it with
+# `just test-age` to report how old the last FULL-suite result is.
+#
+# The subset a short agent budget can finish.
+ci-fast: _hooks-auto fmt-check check test-fast
+
+# Library unit tests only (`cargo test --workspace --lib`): the quick half of
+# `test`. Skips integration tests and doctests, so green here is not green CI.
+#
+# Fast unit-test lane.
+test-fast: _hooks-auto
+    cargo test --workspace --lib
+
+# Reads the newest retained full-suite record in .flake/history/runs/ (written by
+# `just test-recorded`) and prints its age, sha, exit code and test count - so a
+# cycle that cannot afford the suite reports the real age of the last measurement
+# instead of silence. Exit 3 (cannot check) when there is no record: absence of a
+# measurement is not a pass.
+#
+# Age and verdict of the last recorded full-suite run.
+test-age:
+    node -e "const fs=require('fs'),p=require('path');const d='.flake/history/runs';let f=[];try{f=fs.readdirSync(d).filter(n=>n.endsWith('-suite.json')).sort()}catch(e){}if(!f.length){console.error('test-age: no recorded full-suite run in '+d+' - run just test-recorded (exit 3: cannot check)');process.exit(3)}const r=JSON.parse(fs.readFileSync(p.join(d,f[f.length-1]),'utf8'));const h=((Date.now()-Date.parse(r.finishedAt||r.startedAt))/36e5).toFixed(1);console.log('last full suite: '+(r.exit===0?'PASS':'FAIL (exit '+r.exit+')')+', '+h+'h ago ('+(r.finishedAt||r.startedAt)+'), sha '+String(r.sha).slice(0,10)+', '+r.tests.length+' tests, '+r.os)"
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:
