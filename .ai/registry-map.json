@@ -1317,13 +1317,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:6 Searching crates/server/src/ for agent runtime assembly terms confirmed that api-server-core bootstraps a web scraping server, an app registry, and an MCP tool server for external clients, rather than assembling an LLM agent runtime.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "state": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:121 tools/list renders the roster from process state alone (server_tools(state)), while the job-token-scoped fetch tool is refused per caller at run time (mcp/jobtoken.rs:98); the filter and the refusal are two policies, so every session without a token is shown a capability it will be refused. The prior not-applicable premise is wrong: this context assembles the Claude agent run pumper launches (state.rs:323) and serves its tools.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "node-boot-and-declarative-bootstrap",
@@ -3211,10 +3210,10 @@
           "changedAt": "2026-09-03",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined branch of next_state releases every quarantine on a clean-run streak without consulting provenance, so an operator-forced quarantine (set_state_manual, reason recorded) is auto-lifted to Probation and its reason cleared on the transition — the breaker technique's 'only a heuristic open is probeable / never shorten a stronger open' rule is not realized, while Retired (operator-only exit) shows the provenance distinction was made for one state but not this one.",
-          "evaluatedAt": "2026-10-26",
-          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
-          "evaluatedRevision": 13
+          "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined arm releases on any earned clean streak without consulting how the quarantine was set, and the caller (store.rs:969) passes only the prior state, so an operator quarantine written by set_state_manual (store.rs:181, reason recorded) is auto-lifted to Probation by heuristic evidence; circuit-breakers' provenance rules (only a heuristic open is probeable, never shorten a stronger open) are not realized.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:0ff53fb3a87ad13c",
+          "evaluatedRevision": 14
         },
         {
           "subject": "quality-gates",
@@ -3986,10 +3985,10 @@
           "changedAt": "2026-09-03",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/budget_terminal.rs:160 The contract requires governance-paused work to become terminally failed and consume an attempt instead of remaining suspended until its precondition changes.",
-          "evaluatedAt": "2026-10-15",
-          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
-          "evaluatedRevision": 13,
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The contract test pins a DataHub cost:pause governance hold (a local, caller-side precondition the worker knew before running) as a terminal Failed job that consumes one attempt, so the work is not held as suspended and is not owed a result once the hold lifts; the operator must re-enqueue.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:0ff53fb3a87ad13c",
+          "evaluatedRevision": 14,
           "revisionsBehind": 0
         }
       ],
@@ -4762,12 +4761,11 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:3 Searching crates/server/src/triggers.rs and its e2e test suite for agent runtime assembly terms confirmed the pipeline coordinates event-driven scraping job triggers rather than assembling an LLM agent runtime.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/triggers.rs:3 A trigger is an edge from a source event to an enqueue of a target app; its WASM predicate/transform stages wrap job enqueue, not a model or tool call. Searching triggers.rs and the seven e2e files for claude, research, model, tool_call, subagent, agent, prompt and mcp found only MCP param-validation helpers (triggers.rs:1537, 1626, 1770) and a test's 'reference model' of predicate outputs, so no agent runtime is assembled here.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "test-harness",
@@ -5429,7 +5427,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "clients/typescript/src/http.ts:3 Every read the @pumper/sync SDK makes goes through this JSON/ndjson transport to Pumper's own HTTP API. Searching clients/typescript (src, test, package.json, README) for prompt, claude, llm, anthropic, openai, completion and system found only generated API-doc comments in generated.ts describing the server's Claude tier, so the SDK builds no model prompt.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "agent-runtime-assembly",
@@ -6206,10 +6208,10 @@
           "changedAt": "2026-09-03",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/webhook.rs:906 The sender shortens dependency-stated waits above five seconds instead of honoring them or terminating with an over-budget-wait outcome.",
-          "evaluatedAt": "2026-10-15",
-          "evaluatedAgainst": "sha256-b2:4ca1a8af506f44d9",
-          "evaluatedRevision": 13,
+          "evidence": "crates/server/src/webhook.rs:1042 A receiver's Retry-After is truncated to 5 s for the next in-process attempt, so a stated 300 s wait is answered with a request at 5 s (and the drain ladder's 30 s first rung is also earlier than stated); backoff-design requires honouring the stated wait or ending with an over-budget-wait terminal carrying the stated delay.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:0ff53fb3a87ad13c",
+          "evaluatedRevision": 14,
           "revisionsBehind": 0
         },
         {
