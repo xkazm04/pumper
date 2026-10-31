@@ -61,13 +61,46 @@ const specPath = (() => {
   throw new Error("clients/openapi.json not found — run `just clients`");
 })();
 
-const schema = (name: string): { properties: Record<string, unknown> } => {
-  const doc = JSON.parse(readFileSync(specPath, "utf8")) as {
-    components: { schemas: Record<string, { properties?: Record<string, unknown> }> };
+type SchemaNode = { properties?: Record<string, unknown>; allOf?: SchemaNode[]; $ref?: string };
+type SpecDoc = { components: { schemas: Record<string, SchemaNode> } };
+
+const specDoc = (): SpecDoc => JSON.parse(readFileSync(specPath, "utf8")) as SpecDoc;
+
+/** The field names a component schema declares, resolved through `$ref` and
+ *  `allOf` (the served spec composes e.g. `JobDetail` as `allOf: [$ref JobDto,
+ *  {properties}]`, which has no direct `properties` at all). Pure. */
+const resolveSchemaFields = (doc: SpecDoc, name: string): string[] => {
+  const seen = new Set<string>();
+  const fields = new Set<string>();
+  const walk = (node: SchemaNode | undefined): void => {
+    if (!node) return;
+    if (node.$ref) {
+      const ref = node.$ref.replace("#/components/schemas/", "");
+      if (seen.has(ref)) return;
+      seen.add(ref);
+      walk(doc.components.schemas[ref]);
+    }
+    for (const k of Object.keys(node.properties ?? {})) fields.add(k);
+    for (const part of node.allOf ?? []) walk(part);
   };
   const found = doc.components.schemas[name];
   assert.ok(found, `the served spec has no component schema '${name}'`);
-  return { properties: found.properties ?? {} };
+  seen.add(name);
+  walk(found);
+  return [...fields];
+};
+
+/** The served fields `value` lacks — refusing a schema that resolves to ZERO
+ *  fields. A coverage comparison over an empty field list passes for every
+ *  fixture, so "covers every served field" would be a claim measured over
+ *  nothing; that is a broken resolver or a hollowed schema, never a pass. */
+const missingServedFields = (doc: SpecDoc, name: string, value: Record<string, unknown>): string[] => {
+  const fields = resolveSchemaFields(doc, name);
+  assert.ok(
+    fields.length > 0,
+    `schema '${name}' resolved to zero fields — a coverage check over nothing is not coverage`,
+  );
+  return fields.filter((k) => !(k in value));
 };
 
 /** Every property the SERVED schema declares must be present in the fixture.
@@ -77,9 +110,29 @@ const schema = (name: string): { properties: Record<string, unknown> } => {
  *  fixtures answerable to what it actually sends, so a field ADDED server-side
  *  fails here too — which the old list could never do. */
 const assertFixtureCoversSchema = (name: string, value: Record<string, unknown>) => {
-  const missing = Object.keys(schema(name).properties).filter((k) => !(k in value));
+  const missing = missingServedFields(specDoc(), name, value);
   assert.deepEqual(missing, [], `${name} fixture is missing served fields: ${missing.join(", ")}`);
 };
+
+test("schema_coverage_over_zero_fields_fails_not_passes", () => {
+  const doc: SpecDoc = {
+    components: {
+      schemas: {
+        Empty: {},
+        Base: { properties: { id: {}, state: {} } },
+        Composed: { allOf: [{ $ref: "#/components/schemas/Base" }, { properties: { progress: {} } }] },
+      },
+    },
+  };
+  // The anti-pattern: `found.properties ?? {}` made an empty schema cover every fixture.
+  assert.throws(() => missingServedFields(doc, "Empty", { anything: 1 }), /zero fields/);
+  // Composition is followed rather than read as "no properties".
+  assert.deepEqual(resolveSchemaFields(doc, "Composed").sort(), ["id", "progress", "state"]);
+  assert.deepEqual(missingServedFields(doc, "Composed", { id: 1, state: "x" }), ["progress"]);
+  // And against the real spec, the composed schema really resolves its parent's fields.
+  assert.ok(resolveSchemaFields(specDoc(), "JobDetail").includes("progress"));
+  assert.ok(resolveSchemaFields(specDoc(), "JobDetail").length > 1);
+});
 
 test("record fixture carries every field the served RecordDto schema declares", () => {
   const r = record();
