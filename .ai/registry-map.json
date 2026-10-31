@@ -1519,10 +1519,10 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "scripts/ci/lane-certify.mjs:178 bound() starts ok=true and only comparisons flip it, so a series of non-numeric or null samples (p95 = null) certifies as pass instead of cannot-see; reproduced with judge() on ['x','y',null] against max 10.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54,
+          "evidence": "scripts/ci/lane-certify.mjs:166 the comparison helper starts ok=true and only numeric comparisons flip it, so a null or non-finite measured value (null percentile, NaN slope) sails through every max bound as pass instead of being treated as below every floor.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55,
           "revisionsBehind": 0
         },
         {
@@ -1540,10 +1540,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "scripts/ci/flake-record.mjs:207 The run file is written into .flake/history before the zero-parsed-tests check at :212, which only warns, so an empty sample from a broken reader still lands in history and is counted in the '<n> recorded run(s)' predicate flake-check prints (scripts/ci/flake-check.mjs:321), overstating the evidence behind every flakiness figure.",
+          "evidence": "scripts/ci/lane-certify.mjs:178 bound() returns 'pass' whenever no comparison flipped ok, so a percentile over a series of nulls (percentile() sorts and returns null, and null > max is false) certifies a long lane as passed when it measured nothing, instead of spelling cannot-see.",
           "evaluatedAt": "2026-10-31",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27,
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28,
           "revisionsBehind": 0
         },
         {
@@ -1734,10 +1734,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The test's doc comment says it pins the app's provenance stamp, but its body builds a `Provenance` by hand and never runs `ConnectorApiWatch` (the real stamp is built at crates/apps/connector-api-watch/src/lib.rs:296-299), so dropping `artifact_sha` or inventing a `rules_hash` in the app would leave it green.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27
+          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:78 the test that claims to pin this app's provenance stamp builds a Provenance by hand and never runs the app, so mutating the app's real stamp (src/lib.rs:296) leaves it green.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28
         },
         {
           "subject": "prompt-assembly",
@@ -2247,10 +2247,10 @@
           "changedAt": "2026-10-06",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/src/governor.rs:383 The governor's parallelism claim (32 hosts did not serialize) is a wall-clock upper bound. That bound is what flips on a loaded machine, so the test is quarantined, and the fix (observe the sharded map's state instead) is still only an exit plan in the register.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27
+          "evidence": "crates/core/tests/tiers.rs:69 the TTL-lapse test proves the aging cutoff on the real clock (1 s horizon at :56, real 1100 ms sleep, Utc::now() in the product), so on a loaded runner more than 1 s between the third strike and the Some(\"browser\") assertion turns it red with no defect; the governor test beside it was moved to a paused clock for exactly this reason.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28
         },
         {
           "subject": "agent-instruction-files",
@@ -2783,10 +2783,10 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/tests/error_cause_chain.rs:64 The cause-flattening guard compares only the count of found sites (keyed `path:line`) against the length of EXPECTED_FLATTENED, whose entries are prose labels never matched against those keys. Fixing one waived extract.rs site while adding a new flattening site elsewhere keeps the count equal and stays green.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54
+          "evidence": "crates/core/tests/error_cause_chain.rs:64 the cause-flattening guard compares only the count of found sites with EXPECTED_FLATTENED.len(), never joining rows to sites, so fixing one allowlisted site while adding a new unlisted one stays green and a stale row is never reported.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55
         },
         {
           "subject": "concurrency-guards",
@@ -2961,10 +2961,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/core/src/process_env.rs:115 The unit test sets SENTRY_DSN, CENSUS_API_KEY and PUMPER_WEBHOOK_SIGNING_SECRET on the shared process environment and never removes them, so every later or parallel test in the same binary inherits secrets (app readiness reads env at crates/core/src/app.rs:1312) and isolation depends on test order.",
+          "evidence": "crates/core/src/process_env.rs:115 a unit test sets SENTRY_DSN, CENSUS_API_KEY and PUMPER_WEBHOOK_SIGNING_SECRET on the shared process environment of a parallel cargo test binary and never removes them, so every later or concurrent test in pumper-core inherits fake secrets.",
           "evaluatedAt": "2026-10-31",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27,
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28,
           "revisionsBehind": 0
         },
         {
@@ -3065,10 +3065,10 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/core/src/catalog.rs:344 Contract range checks drop any record whose ranged field is non-numeric before comparing. A contract that declares `ranges` without a matching `types` entry passes such values with no violation and no skip count. The test at catalog.rs:1328 pins that silent pass.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54
+          "evidence": "crates/core/src/catalog.rs:344 contract range checks keep only values that parse as f64, so a record whose ranged field is a string or object is dropped before comparison and the range check passes it when the contract declares ranges without types.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55
         },
         {
           "subject": "agent-instruction-files",
@@ -3626,10 +3626,10 @@
           "changedAt": "2026-10-06",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Each fixture copy (and each throwaway repo root at line 189) is a fresh temp directory that nothing deletes. The file has no rmSync and no after/afterEach hook, so the per-test copy has no named reaper and every run leaves directories in the OS temp dir.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 every fixture materialisation (and every throwaway repo root at :189) creates a fresh mkdtemp directory that nothing in the file deletes, so each `just doc-sync` run leaves scratch directories behind in the OS temp dir.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28
         },
         {
           "subject": "quality-gates",
@@ -3646,10 +3646,10 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.mjs:167 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parsed exits 0 (checked and consistent) instead of the hook's own exit 3 could-not-check.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54,
+          "evidence": "scripts/docs/check-doc-sync.mjs:166 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parses exits 0 (silent pass) instead of the hook's own exit-3 cannot-check.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55,
           "revisionsBehind": 0
         },
         {
@@ -4024,10 +4024,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export is checked by matching a header string and counting lines instead of parsing with a CSV reader, so broken quoting of the JSON data column (which contains commas and quotes) still passes.",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 the CSV export is checked by matching the header string and counting lines, explicitly not parsing quoted CSV, although the `data` column carries JSON (commas and quotes), so mis-quoting that a real CSV reader would reject stays green.",
           "evaluatedAt": "2026-10-31",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27,
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28,
           "revisionsBehind": 0
         },
         {
@@ -4087,10 +4087,10 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 the production HttpClient inventory matches only the literal one-line 'impl HttpClient for' spellings, so a generic, path-qualified, aliased or multiline impl is neither in the battery nor exempt and the test stays green without reporting the unrecognised form.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54,
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:672 the production-HttpClient inventory recognises only the literal one-line `impl HttpClient for` / `impl pumper_core::HttpClient for` forms, so a generic, crate::-qualified or rustfmt-wrapped impl is invisible and the 'every client in the battery' guard stays green over it.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55,
           "revisionsBehind": 0
         },
         {
@@ -4294,10 +4294,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/harness.rs:514 The harness offers a SpeedupAtLeast wall-time ratio between two arms as its sanctioned claim. fanout_offslot.rs:133 uses it to prove a scheduling property (the worker permit is released before indexing), and that test is recorded as load-flaky on the blocking path. The standard asks for a count of units in flight or the recorded spans, not a stopwatch ratio.",
+          "evidence": "crates/server/src/e2e/harness.rs:514 the harness offers SpeedupAtLeast, a wall-time ratio between a serial and an off-slot arm, as a sanctioned claim, and crates/server/src/e2e/fanout_offslot.rs:133 uses it on the blocking path for a test its own comment records as load-flaky.",
           "evaluatedAt": "2026-10-31",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27,
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28,
           "revisionsBehind": 0
         },
         {
@@ -4782,10 +4782,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/triggers.rs:2865 every_hook_failure_class_leaves_its_own_row_and_still_fires iterates a hand-written list of PluginFailure variants, and the inventory test at :2951 enumerates its produce side by hand too, so a new variant that maps to an existing outcome word is outside both tests while the name claims 'every'.",
+          "evidence": "crates/server/src/triggers.rs:2865 every_hook_failure_class_leaves_its_own_row_and_still_fires runs over a hand-written list of PluginFailure variants; the enum carries no ALL table (unlike ClaudeFailure) and nothing type-checks the list, so a new variant is silently outside a test whose name says every.",
           "evaluatedAt": "2026-10-31",
-          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
-          "evaluatedRevision": 27
+          "evaluatedAgainst": "sha256-b2:2287af36a9532062",
+          "evaluatedRevision": 28
         },
         {
           "subject": "convergence-loop-and-requeue",
@@ -5469,10 +5469,10 @@
           "changedAt": "2026-10-14",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:61 When the spec is missing, the conformance test tells the reader to run `just clients`. That recipe is `node scripts/gen/generate-clients.mjs`, which reads clients/openapi.json and itself exits 2 with \"clients/openapi.json is missing\". The remedy, applied as worded, cannot clear the check; the real producer is `just openapi`.",
-          "evaluatedAt": "2026-10-24",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54
+          "evidence": "clients/typescript/test/conformance.test.ts:61 when clients/openapi.json is missing the test tells the reader to run `just clients`, but that recipe (scripts/gen/generate-clients.mjs) reads the same file and itself refuses; the file is produced only by `just openapi`.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55
         },
         {
           "subject": "agent-instruction-files",
@@ -5549,10 +5549,10 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) falls into the absent-field arm, so the predicate ran, could not classify the input and still answers pass.",
-          "evaluatedAt": "2026-10-14",
-          "evaluatedAgainst": "sha256-b2:0d8378dd13155e59",
-          "evaluatedRevision": 54,
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) lands in the absent-field arm at :112 and the predicate passes, and an unreadable min_count silently defaults to 1 (:106), so a value the gate cannot read is treated as not applicable rather than failed closed.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:d5f8a264c5f1b9ff",
+          "evaluatedRevision": 55,
           "revisionsBehind": 0
         },
         {
