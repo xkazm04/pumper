@@ -20,6 +20,7 @@ import {
   isToolResultEntry,
   isUserTurnBoundary,
   normalizeEditedPath,
+  transcriptHasNoEvents,
 } from './check-doc-sync.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -211,6 +212,19 @@ function runHookWithMap(content, payload) {
 
 test('a_missing_transcript_is_cannot_check_not_a_pass', () => {
   const r = runHook({ transcript_path: path.join(os.tmpdir(), 'no-such-transcript.jsonl') });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /CANNOT CHECK/);
+});
+
+test('a_transcript_where_nothing_parses_is_cannot_check_not_a_clean_turn', () => {
+  // Every line unparseable used to collapse to an empty edit set, read as
+  // `no-edits`, and exit 0 - an unreadable transcript reported as a clean turn.
+  assert.equal(transcriptHasNoEvents('not json\n{ torn\n'), true);
+  assert.equal(transcriptHasNoEvents(''), true);
+  assert.equal(transcriptHasNoEvents('{ torn\n{"type":"user"}\n'), false);
+  const garbage = path.join(tempDir('doc-sync-'), 'garbage.jsonl');
+  fs.writeFileSync(garbage, 'not json\n{ torn\n\u0000\u0001\n');
+  const r = runHook({ transcript_path: garbage });
   assert.equal(r.status, 3, r.stderr);
   assert.match(r.stderr, /CANNOT CHECK/);
 });

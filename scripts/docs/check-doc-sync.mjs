@@ -155,6 +155,24 @@ export function compileGlob(pattern) {
   return new RegExp(`^${re}$`);
 }
 
+/**
+ * True when no line of a transcript's text parses to a JSON object.
+ *
+ * `collectEditedFilesFromTranscript` skips lines it cannot parse, which is right
+ * for one torn line and wrong for all of them: a transcript in which nothing
+ * parses (truncated, binary, the wrong file) yields an empty edit set, and an
+ * empty edit set reads as `no-edits` - a clean turn. That is an unreadable
+ * transcript answering in the voice of success. Pure, so the hook can route it
+ * to cannot-check and a test can pin it.
+ */
+export function transcriptHasNoEvents(text) {
+  if (typeof text !== 'string') return true;
+  return !text.split('\n').some((line) => {
+    const evt = line.trim() ? safeJson(line) : null;
+    return evt !== null && typeof evt === 'object';
+  });
+}
+
 export function collectEditedFilesFromTranscript(transcriptPath, repoRoot = defaultRepoRoot()) {
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return new Set();
   const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
@@ -292,6 +310,15 @@ function main() {
   if (!payload.transcript_path) cannotCheck('no transcript_path in the hook payload');
   if (!fs.existsSync(payload.transcript_path)) {
     cannotCheck(`the transcript does not exist: ${payload.transcript_path}`);
+  }
+  let transcriptText;
+  try {
+    transcriptText = fs.readFileSync(payload.transcript_path, 'utf8');
+  } catch (e) {
+    cannotCheck(`the transcript could not be read (${e.message})`);
+  }
+  if (transcriptHasNoEvents(transcriptText)) {
+    cannotCheck(`no line of the transcript parses as an event: ${payload.transcript_path}`);
   }
 
   // Instrument assertion #2: the standard. A rule map that will not load, or
