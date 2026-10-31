@@ -6,121 +6,168 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
+          "technique": "long-lane-certification",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:178 a null/non-finite measured value falls through to verdict 'pass'; the lane spells found-nothing the same as pass."
+        },
+        {
+          "technique": "flake-lifecycle",
+          "verdict": "realized",
+          "evidence": "scripts/ci/flake-check.mjs:305 flakiness is detected as outcome transitions on the same code over a declared window from retained history."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "realized",
+          "evidence": "scripts/ci/flake-record.mjs:223 a run that parsed zero tests is refused as cannot-check and not written to the history (the prior deviation at :207/:212 is fixed)."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "realized",
+          "evidence": "scripts/ci/lane-canary.mjs:29 A constant planted outside its own bound makes the certifier prove it still fires on every run.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "realized",
+          "evidence": "scripts/ci/ship-inventory.test.mjs:74 Every package manifest in the tree must be claimed by a CI job, an inventory walk rather than the workspace members list.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
           "technique": "derived-selection-must-be-measured",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/mcp-gate-parity.mjs:221 Zero gated tools parsed from the source is cannot-check, not a clean gate."
+          "verdict": "realized",
+          "evidence": "scripts/ci/flake-check.mjs:390 A source scan that finds zero #[ignore]d tests exits cannot-check instead of reporting a clean register.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "realized",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:111 The structural pin's needle is the quoted \"name\": \"<tool>\" construct prose does not spell, and missing sites exit cannot-check.",
+          "carriedFrom": "2026-10-31"
         },
         {
           "technique": "fixture-economics",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-certify.mjs:16 This file judges an emitted artifact; it does not build a schema or environment per test."
+          "evidence": "scripts/ci/lane-certify.mjs:16 This file judges an emitted artifact; it does not build a schema or environment per test.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "live-app-harness",
           "verdict": "not-applicable",
-          "evidence": "scripts/ci/lane-canary.mjs:39 The canary writes a constant artifact and does not drive a shipped process."
-        },
-        {
-          "technique": "platform-quirk-absorption",
-          "verdict": "deviation",
-          "evidence": "scripts/ci/flake-record.mjs:217 The wrapper says a zero parse means the reader broke, then leaves cargo's exit code unchanged, including zero."
-        },
-        {
-          "technique": "flake-lifecycle",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/flake-check.mjs:75 Quarantine rows require a person-owned, dated, caused, evidenced decision; same-commit transitions label and unlabel without a stored flag."
-        },
-        {
-          "technique": "long-lane-certification",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/lane-certify.mjs:428 Percentile and second-half slope are judged from predeclared bounds, and a lane that has never passed is its own health category."
-        },
-        {
-          "technique": "negative-control-tests",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/lane-canary.mjs:29 The canary emits a value outside its declared bound so the judge is proved by catching that planted breach."
-        },
-        {
-          "technique": "out-of-graph-artifacts",
-          "verdict": "deviation",
-          "evidence": "scripts/ci/ship-inventory.test.mjs:77 A manifest directory is claimed when its path string occurs anywhere in ci.yml or the justfile, so a comment counts as a job that builds and tests it."
+          "evidence": "scripts/ci/lane-canary.mjs:39 The canary writes a constant artifact and does not drive a shipped process.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "scripts/ci/lane-certify.mjs:119 A missing series is cannot-see, not a pass on a default."
-        },
-        {
-          "technique": "pin-the-call-not-the-name",
-          "verdict": "conformant",
-          "evidence": "scripts/ci/flake-id.mjs:172 The ignore scanner matches only an attribute at the start of a line, so prose that mentions #[ignore] is not a quarantine."
+          "evidence": "scripts/ci/lane-certify.mjs:119 A missing series is cannot-see, not a pass on a default.",
+          "carriedFrom": "2026-10-12"
         }
       ],
-      "registryProposal": "platform-quirk-absorption makes a zero-test run fatal, while flake-record.mjs is required not to change cargo's exit code. The standard should say which duty wins for a recorder placed in front of a required check."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "scripts/ci/flake-record.mjs:217 A recorded run that parses zero tests only warns and then exits with cargo's status, so a broken reader stays a green process.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by cloud-20261031-pumper-1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "scripts/ci/flake-record.mjs:207 The run file is written into .flake/history before the zero-parsed-tests check at :212, which only warns, so an empty sample from a broken reader still lands in history and is counted in the '<n> recorded run(s)' predicate flake-check prints (scripts/ci/flake-check.mjs:321), overstating the evidence behind every flakiness figure.",
+          "evaluatedAt": "2026-10-31T00:00:00.000Z",
+          "worker": "cloud-20261031-pumper-1",
+          "reason": "replaced by cloud-20261031-pumper-4"
+        }
+      ]
     },
     "05b680d3-a634-4401-ae6b-de54d48ca753/test-harness": {
       "context": "core-platform-services",
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 process-global env mutation with no reset in a parallel lane; tests inherit state from a previous test."
+        },
         {
           "technique": "fixture-economics",
           "verdict": "deviation",
-          "evidence": "crates/core/src/testing.rs:61 Every TempStore builds its schema by connecting and migrating; this constructor does not copy a built template."
+          "evidence": "crates/core/src/testing.rs:88 Every TempStore::new runs Storage::connect with the full 56-migration chain, and it is called at about 428 sites, so the schema is rebuilt per test instead of built once and copied.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "realized",
+          "evidence": "crates/core/tests/lane_artifact/mod.rs:7 The Rust lane only emits the artifact; lane-certify.mjs judges it against criteria declared beforehand.",
+          "carriedFrom": "2026-10-31"
         },
         {
           "technique": "live-app-harness",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/testing.rs:7 The shared harness is in-process stubs, not a driver of the shipped binary."
-        },
-        {
-          "technique": "isolation-lanes",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/process_env.rs:115 The test mutates the shared process environment and the function ends with those variables still set."
+          "evidence": "crates/core/src/testing.rs:7 The shared harness is in-process stubs, not a driver of the shipped binary.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "platform-quirk-absorption",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/process_env.rs:31 The Windows allowlist is product behaviour for child processes, not a repair in the test runner."
-        },
-        {
-          "technique": "long-lane-certification",
-          "verdict": "conformant",
-          "evidence": "crates/core/tests/lane_artifact/mod.rs:21 The Rust side emits raw series and panics if it cannot write; it does not decide pass or fail."
+          "evidence": "crates/core/src/process_env.rs:31 The Windows allowlist is product behaviour for child processes, not a repair in the test runner.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "gate-scope-is-not-report-scope",
           "verdict": "conformant",
-          "evidence": "crates/core/src/catalog.rs:1105 Coverage status carries named uncovered apps and a live-source denominator, not only a declared count."
+          "evidence": "crates/core/src/catalog.rs:1105 Coverage status carries named uncovered apps and a live-source denominator, not only a declared count.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/testing.rs:119 ScriptedResearcher is an in-process prompt script, not a captured remote exchange."
+          "evidence": "crates/core/src/testing.rs:119 ScriptedResearcher is an in-process prompt script, not a captured remote exchange.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "context-starved-executor",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/testing.rs:12 These modules are library doubles with no human-facing journey."
+          "evidence": "crates/core/src/testing.rs:12 These modules are library doubles with no human-facing journey.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "approval-snapshots-with-guarded-update",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/catalog.rs:866 Catalog tests embed expected TOML in the test; they do not record an output snapshot."
+          "evidence": "crates/core/src/catalog.rs:866 Catalog tests embed expected TOML in the test; they do not record an output snapshot.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "crates/core/src/testing.rs:88 Dead overrides trait defaults that returned a typed error, so an engine call panics instead of looking like the refusal under test."
+          "evidence": "crates/core/src/testing.rs:88 Dead overrides trait defaults that returned a typed error, so an engine call panics instead of looking like the refusal under test.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 The test writes secrets into the process environment and returns without clearing them, so later tests in the same process inherit that world.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by cloud-20261031-pumper-1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 The unit test sets SENTRY_DSN, CENSUS_API_KEY and PUMPER_WEBHOOK_SIGNING_SECRET on the shared process environment and never removes them, so every later or parallel test in the same binary inherits secrets (app readiness reads env at crates/core/src/app.rs:1312) and isolation depends on test order.",
+          "evaluatedAt": "2026-10-31T00:00:00.000Z",
+          "worker": "cloud-20261031-pumper-1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -129,59 +176,90 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 an artifact emitted for a foreign reader is asserted by line counts instead of by running a CSV parser over it."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:691 The battery's subject list is checked against an inventory of production HttpClient impls in both directions, so it is not a hand list under an 'every' claim.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:56 The must-not-fabricate probe targets loopback port 1, so it touches no network and costs no wall clock.",
+          "carriedFrom": "2026-10-31"
+        },
         {
           "technique": "derived-selection-must-be-measured",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:722 A battery entry that the source walk no longer finds fails, so the list cannot outlive the engines."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:722 A battery entry that the source walk no longer finds fails, so the list cannot outlive the engines.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "live-app-harness",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:90 The search tests call the in-process router, not a shipped process."
+          "evidence": "crates/server/src/e2e/search_degraded.rs:90 The search tests call the in-process router, not a shipped process.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "configuration-axes-cross-the-ladder",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:23 The axes here are response fields of a test double, not build-configuration cells."
-        },
-        {
-          "technique": "gate-scope-is-not-report-scope",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:706 The HttpClient population is walked from workspace sources and then compared with the battery and exemption lists."
+          "evidence": "crates/server/src/e2e/search_degraded.rs:23 The axes here are response fields of a test double, not build-configuration cells.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/vcr_attempts.rs:429 An app whose work does not cross the cassette seam is refused before it runs, and the replay must not reach the app."
+          "evidence": "crates/server/src/e2e/vcr_attempts.rs:429 An app whose work does not cross the cassette seam is refused before it runs, and the replay must not reach the app.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "context-starved-executor",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The sentence names an API caller; these files do not run a context-starved UI agent."
+          "evidence": "crates/server/src/e2e/search_degraded.rs:6 The sentence names an API caller; these files do not run a context-starved UI agent.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "constraint-injection-for-unreachable-tiers",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:26 SizedSearch is a stub of an empty index, not an override of a hardware capacity probe."
+          "evidence": "crates/server/src/e2e/search_degraded.rs:26 SizedSearch is a stub of an empty index, not an override of a hardware capacity probe.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/search_degraded.rs:110 An empty hit list must carry a degraded index flag, so a wiped index is not asserted as an honest miss."
+          "evidence": "crates/server/src/e2e/search_degraded.rs:110 An empty hit list must carry a degraded index flag, so a wiped index is not asserted as an honest miss.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "pin-the-call-not-the-name",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:754 The wiring pin drops comment lines before matching the HttpEngine::new call text."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:754 The wiring pin drops comment lines before matching the HttpEngine::new call text.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export check counts lines and compares a header string, and the comment says quoted CSV is not parsed, so a quoting bug stays green on this fixture.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by cloud-20261031-pumper-1"
         },
         {
-          "technique": "assert-through-the-reader",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 CSV is checked by line count because the fixture has no commas or quotes, so the CSV reader is never run."
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export is checked by matching a header string and counting lines instead of parsing with a CSV reader, so broken quoting of the JSON data column (which contains commas and quotes) still passes.",
+          "evaluatedAt": "2026-10-31T00:00:00.000Z",
+          "worker": "cloud-20261031-pumper-1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -189,70 +267,115 @@
       "context": "e2e-integration",
       "subject": "test-harness",
       "bundle": "software-engineering",
-      "state": "conformant",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/harness.rs:514 two arms compared by wall time instead of by recorded spans or units in flight."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/harness.rs:755 The footer panic hook chains the default hook rather than replacing it, so the failure channel is never quieted.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "flake-lifecycle",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/harness.rs:448 A failing test's footer looks up its quarantine-register status with a separate cannot-check outcome, so the label shows where the test appears.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/harness.rs:801 The census blanks comments and string contents (offsets kept) before matching, so prose about the rule cannot satisfy or trip it.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/harness.rs:22 Each e2e state is a fresh temp SQLite with Dead engines and only the supplied apps.",
+          "carriedFrom": "2026-10-31"
+        },
         {
           "technique": "derived-selection-must-be-measured",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:1374 The footer census fails when the directory walk is below its floor, so an empty scan is not a clean tree."
+          "evidence": "crates/server/src/e2e/harness.rs:1374 The footer census fails when the directory walk is below its floor, so an empty scan is not a clean tree.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "live-app-harness",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/mod.rs:8 The suite states it runs headless over AppState and does not claim to drive the shipped process."
+          "evidence": "crates/server/src/e2e/mod.rs:8 The suite states it runs headless over AppState and does not claim to drive the shipped process.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "platform-quirk-absorption",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:747 The panic hook chains the default hook and adds a named footer, including when libtest did not name the thread."
+          "evidence": "crates/server/src/e2e/harness.rs:747 The panic hook chains the default hook and adds a named footer, including when libtest did not name the thread.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "long-lane-certification",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/harness.rs:505 Claim is a per-test timing bound, not a scheduled statistical lane."
-        },
-        {
-          "technique": "negative-control-tests",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:1437 A seeded raw wall-clock assertion is required to be found, so the census is shown able to go red."
+          "evidence": "crates/server/src/e2e/harness.rs:505 Claim is a per-test timing bound, not a scheduled statistical lane.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "out-of-graph-artifacts",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/mod.rs:7 These tests are compiled inside the server binary, not a detached shipped package."
+          "evidence": "crates/server/src/e2e/mod.rs:7 These tests are compiled inside the server binary, not a detached shipped package.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "configuration-axes-cross-the-ladder",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/harness.rs:513 Speedup claims use a ratio so machine speed is not a build cell of this suite."
+          "evidence": "crates/server/src/e2e/harness.rs:513 Speedup claims use a ratio so machine speed is not a build cell of this suite.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "gate-scope-is-not-report-scope",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:774 The e2e inventories are derived from the directory listing, not from a hand-written module list."
+          "evidence": "crates/server/src/e2e/harness.rs:774 The e2e inventories are derived from the directory listing, not from a hand-written module list.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:309 Replay is run on Dead engines, so a cassette miss that reaches the network panics instead of passing."
+          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:309 Replay is run on Dead engines, so a cassette miss that reaches the network panics instead of passing.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "context-starved-executor",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/mod.rs:9 The suite is headless API composition with no prose UI journey."
+          "evidence": "crates/server/src/e2e/mod.rs:9 The suite is headless API composition with no prose UI journey.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:337 The replay path is given engines that panic, so only the cassette can produce the recorded body."
+          "evidence": "crates/server/src/e2e/app_fetch_chokepoint.rs:337 The replay path is given engines that panic, so only the cassette can produce the recorded body.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "conformant",
+          "evidence": "crates/server/src/e2e/harness.rs:1449 The e2e census blanks comments, keeps a module-count floor, and chains the panic hook so a scanner or a quiet hook cannot report a clean tree.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by cloud-20261031-pumper-1"
         },
         {
-          "technique": "pin-the-call-not-the-name",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:1449 A comment that names the timing rule does not hide a raw comparison, and a violation that exists only in a comment is not a hit."
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/harness.rs:514 The harness offers a SpeedupAtLeast wall-time ratio between two arms as its sanctioned claim. fanout_offslot.rs:133 uses it to prove a scheduling property (the worker permit is released before indexing), and that test is recorded as load-flaky on the blocking path. The standard asks for a count of units in flight or the recorded spans, not a stopwatch ratio.",
+          "evaluatedAt": "2026-10-31T00:00:00.000Z",
+          "worker": "cloud-20261031-pumper-1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -261,74 +384,99 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-1",
       "techniques": [
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:70 A derived population can shrink to zero and the check stays green, with no floor."
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "realized",
+          "evidence": "clients/typescript/test/conformance.test.ts:80 Required fields now come from the served clients/openapi.json schema instead of a hand-written list, which fixes the prior finding."
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "realized",
+          "evidence": "clients/typescript/test/conformance.test.ts:158 The client gets an injected fetch spy against an unroutable example.invalid:1 host, so the lane needs no server."
+        },
         {
           "technique": "suite-partitioning",
           "verdict": "conformant",
-          "evidence": "clients/typescript/package.json:26 The package has one test script over the compiled test directory, matching one small suite."
+          "evidence": "clients/typescript/package.json:26 The package has one test script over the compiled test directory, matching one small suite.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "fixture-economics",
           "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:5 Wire fixtures are hand-authored against current server shapes and the loader does not check a schema fingerprint before use."
+          "evidence": "clients/typescript/test/conformance.test.ts:5 Wire fixtures are hand-authored against current server shapes and the loader does not check a schema fingerprint before use.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "live-app-harness",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:13 The file says this suite does not drive a live server."
-        },
-        {
-          "technique": "isolation-lanes",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/sync-report.test.ts:127 The test supplies its own sink; there is no shared machine resource to isolate."
+          "evidence": "clients/typescript/test/conformance.test.ts:13 The file says this suite does not drive a live server.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "platform-quirk-absorption",
           "verdict": "conformant",
-          "evidence": "clients/typescript/package.json:25 npm test copies JSON fixtures into the emit directory because tsc does not, in the one pretest in front of the suite."
+          "evidence": "clients/typescript/package.json:25 npm test copies JSON fixtures into the emit directory because tsc does not, in the one pretest in front of the suite.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "long-lane-certification",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:24 Package scripts are build, typecheck, and node:test; there is no scheduled statistical lane."
-        },
-        {
-          "technique": "gate-scope-is-not-report-scope",
-          "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:40 \"Every field PumperRecord requires\" is checked by a hand-written list, and the JSON is only cast to the type."
+          "evidence": "clients/typescript/package.json:24 Package scripts are build, typecheck, and node:test; there is no scheduled statistical lane.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:91 HTTP is a stub that returns a supplied body, not a record/playback seam against a remote service."
+          "evidence": "clients/typescript/test/conformance.test.ts:91 HTTP is a stub that returns a supplied body, not a record/playback seam against a remote service.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "context-starved-executor",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:4 The package is a library with no human-facing interface."
+          "evidence": "clients/typescript/package.json:4 The package is a library with no human-facing interface.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "approval-snapshots-with-guarded-update",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:6 The JSON files are hand-authored inputs shaped like server types, not recorded SDK outputs."
+          "evidence": "clients/typescript/test/conformance.test.ts:6 The JSON files are hand-authored inputs shaped like server types, not recorded SDK outputs.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "far-side-oracle",
           "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/sync-report.test.ts:178 The effect under test is a caller-supplied sink, and the test asserts that sink rather than an external system."
+          "evidence": "clients/typescript/test/sync-report.test.ts:178 The effect under test is a caller-supplied sink, and the test asserts that sink rather than an external system.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/sync-report.test.ts:184 Zero upserts caused by the mapper is reported as droppedByMap, not as an idle feed."
+          "evidence": "clients/typescript/test/sync-report.test.ts:184 Zero upserts caused by the mapper is reported as droppedByMap, not as an idle feed.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assert-through-the-reader",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string."
+          "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by cloud-20261031-pumper-1"
         }
       ]
     },
@@ -564,19 +712,20 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:48.000Z",
-      "worker": "straighten-20261014T1720-pumper-w1",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "unmeasurable-criteria",
           "verdict": "deviation",
-          "evidence": "scripts/ci/lane-certify.mjs:178"
+          "evidence": "scripts/ci/lane-certify.mjs:166 absence of a measurement is not failed closed in the comparison helper; a hole in the instrument reads as compliance."
         },
         {
           "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "scripts/ci/lane-certify.mjs:263"
+          "evidence": "scripts/ci/lane-certify.mjs:263",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -586,6 +735,13 @@
           "evaluatedAt": "2026-10-12T21:56:36.968Z",
           "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
           "reason": "replaced by straighten-20261014T1720-pumper-w1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:178 bound() starts ok=true and only comparisons flip it, so a series of non-numeric or null samples (p95 = null) certifies as pass instead of cannot-see; reproduced with judge() on ['x','y',null] against max 10.",
+          "evaluatedAt": "2026-10-14T17:25:48.000Z",
+          "worker": "straighten-20261014T1720-pumper-w1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -594,19 +750,20 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:48.000Z",
-      "worker": "straighten-20261014T1720-pumper-w1",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "unparseable-form-is-a-finding",
           "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:664"
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:672 an unrecognised impl form is neither followed nor reported; the scanned world is not closed."
         },
         {
           "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:725"
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:725",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -616,6 +773,13 @@
           "evaluatedAt": "2026-10-12T21:56:36.968Z",
           "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
           "reason": "replaced by straighten-20261014T1720-pumper-w1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:664 the production HttpClient inventory matches only the literal one-line 'impl HttpClient for' spellings, so a generic, path-qualified, aliased or multiline impl is neither in the battery nor exempt and the test stays green without reporting the unrecognised form.",
+          "evaluatedAt": "2026-10-14T17:25:48.000Z",
+          "worker": "straighten-20261014T1720-pumper-w1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -624,14 +788,14 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:48.000Z",
-      "worker": "straighten-20261014T1720-pumper-w1",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "unmeasurable-criteria",
           "verdict": "deviation",
-          "evidence": "plugins-src/trigger-gate/src/lib.rs:107"
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 'ran and could not decide' (malformed present value) is conflated with 'absent'; it passes instead of failing closed."
         }
       ],
       "superseded": [
@@ -641,6 +805,13 @@
           "evaluatedAt": "2026-10-12T21:56:36.968Z",
           "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
           "reason": "replaced by straighten-20261014T1720-pumper-w1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) falls into the absent-field arm, so the predicate ran, could not classify the input and still answers pass.",
+          "evaluatedAt": "2026-10-14T17:25:48.000Z",
+          "worker": "straighten-20261014T1720-pumper-w1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -649,19 +820,20 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-14",
-      "evaluatedTs": "2026-10-14T17:25:48.000Z",
-      "worker": "straighten-20261014T1720-pumper-w1",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "gate-liveness",
           "verdict": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.mjs:167"
+          "evidence": "scripts/docs/check-doc-sync.mjs:166 the instrument is asserted on its target and map (:291-:305) but not on having read any events; a clean exit can mean nothing was checked."
         },
         {
           "technique": "unmeasurable-criteria",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.mjs:266"
+          "evidence": "scripts/docs/check-doc-sync.mjs:266",
+          "carriedFrom": "2026-10-14"
         }
       ],
       "superseded": [
@@ -671,6 +843,13 @@
           "evaluatedAt": "2026-10-12T21:56:36.968Z",
           "worker": "907c9a10-d7ad-4715-b106-a9d89ab2b875",
           "reason": "replaced by straighten-20261014T1720-pumper-w1"
+        },
+        {
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:167 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parsed exits 0 (checked and consistent) instead of the hook's own exit 3 could-not-check.",
+          "evaluatedAt": "2026-10-14T17:25:48.000Z",
+          "worker": "straighten-20261014T1720-pumper-w1",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -679,9 +858,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "recall-injection",
@@ -704,6 +883,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 I searched crates/server/src/e2e for episod, belief, distill and consolidat and got no hits; these eight files test dataset read/delete/report shapes, engine conformance, VCR, target exclusion, degraded search and dynamic apps, so no agent-memory pipeline is under test.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -712,9 +898,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "working-memory",
@@ -737,6 +923,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "clients/typescript/README.md:27 I searched clients/typescript (node_modules included) for episod, belief and distill and got no hits; the SDK is a stateless dataset mirror client that explicitly does not own persistence, and its only state is a sync watermark, so it carries no agent memory.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -745,9 +938,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "episodic-capture",
@@ -776,6 +969,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 I searched all 56 migrations for episod, belief, distill, recall and consolidat and got no hits; every 'memory' hit is the fetcher's per-host strike/penalty table (0015, 0016, 0033), DataHub governance state (0037/0038) or the event bus (0055), and the one LLM table (0009 research_cache) is a TTL response cache, so there is no episode, belief or recall store for this subject to govern.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -784,9 +984,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "working-memory",
@@ -815,6 +1015,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:2 I searched scripts/ci for episod, belief, distill, consolidat and recall and got no hits; these gates judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, so nothing here is an agent carrying state forward.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -1120,89 +1327,114 @@
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
       "techniques": [
         {
           "technique": "activation-is-a-separate-mutation",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:12 Trigger activation is configured statically on the Trigger struct rather than via separate extension install mutations."
+          "evidence": "crates/server/src/triggers.rs:12 Trigger activation is configured statically on the Trigger struct rather than via separate extension install mutations.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:84 Merges trigger event data into target job params ahead of enqueueing rather than injecting user input into a running agent loop."
+          "evidence": "crates/server/src/triggers.rs:84 Merges trigger event data into target job params ahead of enqueueing rather than injecting user input into a running agent loop.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:29 Provenance tracks trigger hop depth and trigger ID chain rather than an agent runtime assembly digest."
+          "evidence": "crates/server/src/triggers.rs:29 Provenance tracks trigger hop depth and trigger ID chain rather than an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:49 Trigger evaluation guards hop depth and cycles rather than projecting external long-running tool operations into an agent loop."
+          "evidence": "crates/server/src/triggers.rs:49 Trigger evaluation guards hop depth and cycles rather than projecting external long-running tool operations into an agent loop.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:75 Matches terminal job statuses for trigger execution rather than managing conversation checkpoint storage modes."
+          "evidence": "crates/server/src/triggers.rs:75 Matches terminal job statuses for trigger execution rather than managing conversation checkpoint storage modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:66 Change filters evaluate dataset revision kinds rather than reading agent guard containment policies."
+          "evidence": "crates/server/src/triggers.rs:66 Change filters evaluate dataset revision kinds rather than reading agent guard containment policies.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:394 Maps plugin failures to trigger run ledger outcomes rather than maintaining an agent hook event registry with timeouts."
+          "evidence": "crates/server/src/triggers.rs:394 Maps plugin failures to trigger run ledger outcomes rather than maintaining an agent hook event registry with timeouts.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_hops.rs:2 Evaluates multi-hop trigger chains between scraping jobs rather than resolving route shadowing for contributed HTTP handlers."
+          "evidence": "crates/server/src/e2e/trigger_hops.rs:2 Evaluates multi-hop trigger chains between scraping jobs rather than resolving route shadowing for contributed HTTP handlers.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "indeterminate-closure-on-interruption",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:398 Crashed trigger plugins are classified into specific hook failure ledger states rather than closing interrupted tool calls with indeterminate status."
+          "evidence": "crates/server/src/triggers.rs:398 Crashed trigger plugins are classified into specific hook failure ledger states rather than closing interrupted tool calls with indeterminate status.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "nested-run-is-not-its-parent",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:18 Hop chains track trigger provenance through depth and trigger ID arrays rather than managing nested subagent execution."
+          "evidence": "crates/server/src/triggers.rs:18 Hop chains track trigger provenance through depth and trigger ID arrays rather than managing nested subagent execution.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:331 The pipeline exposes predicate and transform WASM hooks on trigger envelopes rather than dual observer/mutator agent registration surfaces."
+          "evidence": "crates/server/src/triggers.rs:331 The pipeline exposes predicate and transform WASM hooks on trigger envelopes rather than dual observer/mutator agent registration surfaces.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "operator-tier-code-loading",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_plugins.rs:2 Trigger plugins are loaded from local WASM files rather than via an operator vs administrator code loading tier."
+          "evidence": "crates/server/src/e2e/trigger_plugins.rs:2 Trigger plugins are loaded from local WASM files rather than via an operator vs administrator code loading tier.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:430 The predicate hook executes before the transform hook on trigger data rather than rewriting tool arguments before agent guardrails."
+          "evidence": "crates/server/src/triggers.rs:430 The predicate hook executes before the transform hook on trigger data rather than rewriting tool arguments before agent guardrails.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:420 Applies fixed predicate and transform stages to trigger envelopes without semantic placement classes in an agent hook chain."
+          "evidence": "crates/server/src/triggers.rs:420 Applies fixed predicate and transform stages to trigger envelopes without semantic placement classes in an agent hook chain.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "session-scoped-capability",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_cache.rs:13 Caches trigger evaluations across job runs rather than resolving session-scoped tool capabilities for an agent."
+          "evidence": "crates/server/src/e2e/trigger_cache.rs:13 Caches trigger evaluations across job runs rather than resolving session-scoped tool capabilities for an agent.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:358 The hook verdict records whether a trigger hop fired or was vetoed rather than attributing substituted tool results to an alternate producer."
+          "evidence": "crates/server/src/triggers.rs:358 The hook verdict records whether a trigger hop fired or was vetoed rather than attributing substituted tool results to an alternate producer.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 Searching crates/server/src/triggers.rs and its e2e test suite for agent runtime assembly terms confirmed the pipeline coordinates event-driven scraping job triggers rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by cloud-20261031-pumper-3"
         }
       ]
     },
@@ -1210,90 +1442,113 @@
       "context": "api-server-core",
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
-      "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
       "techniques": [
+        {
+          "technique": "session-scoped-capability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:121 The roster ignores the caller that handle_rpc_as already holds; mod.rs:652 states fetch is advertised unconditionally and only the session's job token makes it usable, which is the granted-by-filter, refused-by-executor split the technique names as a fluent invitation to fail."
+        },
+        {
+          "technique": "nested-run-is-not-its-parent",
+          "verdict": "realized",
+          "evidence": "crates/server/src/state.rs:323 The launched Claude run is re-rooted into its own working directory under the storage root, so the host checkout's CLAUDE.md, skills and Stop hook no longer fire inside every research call (the comment at state.rs:311 records the measured leak)."
+        },
         {
           "technique": "activation-is-a-separate-mutation",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:196 Dynamic app discovery skips clashing names without dynamic extension activation mutations."
+          "evidence": "crates/server/src/registry.rs:196 Dynamic app discovery skips clashing names without dynamic extension activation mutations.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/activity.rs:64 ActivityGauge tracks in-flight HTTP and job work for maintenance gating rather than injecting additive user input at an agent call boundary."
+          "evidence": "crates/server/src/activity.rs:64 ActivityGauge tracks in-flight HTTP and job work for maintenance gating rather than injecting additive user input at an agent call boundary.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:42 Captures build identity from commit SHA or crate version rather than computing an agent runtime assembly digest."
+          "evidence": "crates/server/src/main.rs:42 Captures build identity from commit SHA or crate version rather than computing an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/live.rs:1 Provides an SSE notification stream for external MCP clients rather than managing an in-loop bounded projection of external work."
+          "evidence": "crates/server/src/mcp/live.rs:1 Provides an SSE notification stream for external MCP clients rather than managing an in-loop bounded projection of external work.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/progress.rs:304 Persists job execution progress checkpoints to storage rather than managing conversation checkpoint storage modes."
+          "evidence": "crates/server/src/progress.rs:304 Persists job execution progress checkpoints to storage rather than managing conversation checkpoint storage modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:32 Error reporting reads environment variables for server monitoring rather than enforcing agent guard containment policies."
+          "evidence": "crates/server/src/main.rs:32 Error reporting reads environment variables for server monitoring rather than enforcing agent guard containment policies.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:16 Hosts WASM plugins for scraping extraction and triggers rather than maintaining an agent hook event registry with timeouts."
+          "evidence": "crates/server/src/state.rs:16 Hosts WASM plugins for scraping extraction and triggers rather than maintaining an agent hook event registry with timeouts.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:52 The server mounts fixed internal axum routes rather than resolving shadowing for contributed extension routes."
+          "evidence": "crates/server/src/mcp/mod.rs:52 The server mounts fixed internal axum routes rather than resolving shadowing for contributed extension routes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "indeterminate-closure-on-interruption",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:64 Graceful shutdown waits for in-flight HTTP connections and worker drains rather than writing indeterminate closure records for interrupted tool calls."
-        },
-        {
-          "technique": "nested-run-is-not-its-parent",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:306 Isolates Claude subprocess working directories from server CWD rather than re-rooting nested agent runs."
+          "evidence": "crates/server/src/main.rs:64 Graceful shutdown waits for in-flight HTTP connections and worker drains rather than writing indeterminate closure records for interrupted tool calls.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:97 MCP tools are exposed via JSON-RPC protocol methods rather than dual observer/mutator agent extension surfaces."
+          "evidence": "crates/server/src/mcp/mod.rs:97 MCP tools are exposed via JSON-RPC protocol methods rather than dual observer/mutator agent extension surfaces.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "operator-tier-code-loading",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:381 Assembles startup application state from server configuration rather than supporting runtime code-loading tiers."
+          "evidence": "crates/server/src/state.rs:381 Assembles startup application state from server configuration rather than supporting runtime code-loading tiers.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/maintenance.rs:2 Performs background SQLite maintenance rather than rewriting tool call arguments before policy gates."
+          "evidence": "crates/server/src/maintenance.rs:2 Performs background SQLite maintenance rather than rewriting tool call arguments before policy gates.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:10 Registers scraping apps in a static list without semantic placement classes in a model/tool hook chain."
-        },
-        {
-          "technique": "session-scoped-capability",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/live.rs:36 Filters SSE event subscriptions per HTTP connection rather than resolving session-scoped agent tool capability rosters."
+          "evidence": "crates/server/src/registry.rs:10 Registers scraping apps in a static list without semantic placement classes in a model/tool hook chain.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:36 Caches research outputs on disk for scraping apps rather than attributing substituted tool results from wrapping frames."
+          "evidence": "crates/server/src/state.rs:36 Caches research outputs on disk for scraping apps rather than attributing substituted tool results from wrapping frames.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/registry.rs:6 Searching crates/server/src/ for agent runtime assembly terms confirmed that api-server-core bootstraps a web scraping server, an app registry, and an MCP tool server for external clients, rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by cloud-20261031-pumper-3"
         }
       ]
     },
@@ -2297,39 +2552,48 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:1177 The trait documents HTTP page and API fetches, not a language-spec host-hook table."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:1193 A missing capability is a named fetch error; there is no promise-job executor to default."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/core/tests/host_memory_honesty.rs:8 Host memory in this context is a SQLite row per fetched origin, not a traced guest heap."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/governor.rs:1 The wait here spaces HTTP requests per origin; there are no promise, timer, native or cleanup queues."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:36 The only path rule rejects separators in a profile name; there is no referrer or specifier module graph."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/tiers.rs:34 The time constant is an RFC3339 staleness cutoff for HTTP tier memory, not a guest timer clock beside a guest date clock."
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:2 Searched crates/core/src and crates/core/tests for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; the engines named on this line are HTTP, browser and Claude research traits wired by the server.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -2338,34 +2602,48 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0009_research_cache.sql:1 The nearest agent table is a disk cache of Claude research answers, not a host-hook trait."
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0001_init.sql:5 A job is a stored status column, not an in-memory promise executor."
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 The memory table records HTTP-tier strikes per origin; there is no traced heap."
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0001_init.sql:16 Jobs are claimed from SQLite by status and available_at, not from four in-memory engine queues."
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0017_job_heartbeat.sql:5 Timestamps are RFC3339 text for a job-heartbeat lease, not a guest monotonic clock and a guest wall clock."
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Searched crates/core/migrations for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; a host profile here is persisted HTTP-versus-browser tier memory.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -2374,81 +2652,99 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:8 The documented surface is guest exports (memory, alloc, extract), not specification host hooks the embedder fills."
+          "evidence": "crates/engine-wasm/src/lib.rs:1 Pumper is a host of wasmtime, not the author of an engine; it publishes no specification-mirrored override surface for embedders, only its own capability linker."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:902 A plugin run is one synchronous TypedFunc call; there is no promise-job executor pair."
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 The guest runs as a wasmtime async call on the host's tokio runtime; there is no guest job queue (promise reactions, timers) and so no executor seam to fill."
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:124 Liveness is a fresh wasm Store and linear memory per call, not a tracing collector walking jobs."
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 Core wasm/component guests have no traced heap shared with host-queued jobs, so the traced-heap-plus-outside-queue window the technique governs does not exist."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:371 Execution is synchronous and CPU-bound on the blocking pool, with no promise, timer, native or cleanup tasks."
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 Each run is one awaited guest call with no timers or microtask queues to drain, which the technique's own when-not-to-use names as the case that needs no loop."
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:594 A guest import fails at link time against an empty linker; there is no referrer/specifier loader."
+          "evidence": "crates/engine-wasm/wit/pumper-app.wit:18 The guest has no filesystem and no module import of its own; the host loads .wasm by directory scan (crates/engine-wasm/src/lib.rs:648), not by resolving a guest specifier against a referrer."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:2 The execution bound is CPU fuel, and the guest is given neither a timer clock nor a date clock."
+          "evidence": "crates/engine-wasm/wit/pumper-app.wit:18 The WIT world exposes no clock to the guest, so there is no timer or date seam to split; the host's Instant use is its own wall-time ceiling."
         }
       ],
-      "registryProposal": "use_when opens with embedding a language engine, which a wasmtime host matches on the words, while every technique assumes a specification that hands over promise jobs, import resolution, rejection tracking and two guest clocks. A sentence that the subject starts only where that table exists would keep wasm-UDF, scrape-engine and durable-queue contexts from being paired here."
+      "registryProposal": "engine-host-contract's use_when opens with 'embedding a language engine in a host', which literally matches a wasmtime host, but the body is written from the engine author's side and every technique assumes guest-visible jobs, a specifier loader or a guest clock. Add a scope line saying a host of a core-wasm/component engine with no guest event loop, imports or clock is out of scope (or name the host-side neighbour), so judges stop re-deriving the N/A.",
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:4 Searched engine-wasm, engine-claude and engine-search for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; wasm plugins declare no imports and one call is synchronous, Claude is a CLI subprocess, and search is Tantivy.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by cloud-20261031-pumper-2"
+        }
+      ]
     },
     "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/engine-host-contract": {
       "context": "e2e-data-integrity",
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The asserted obligations are HTTP fetch behaviour, not a language-spec hook list."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:80 The default under test is a typed binary-fetch refusal, not a promise executor."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The tests pin dataset read filters on stored rows; there is no guest heap."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:5 A discovered wasm module is refused at enqueue, so this suite never drains an engine job loop."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:1 Wasm coverage is directory listing of describe() modules, not an async import of a guest specifier."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:54 The only clock phrase in the conformance battery means the dead-URL probe must not sleep."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Searched crates/server/src/e2e for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; this battery's engine is one of five scrape capability traits, and a discovered wasm module is listed as not runnable.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -2457,39 +2753,48 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-2",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:18 The worker claims due scrape jobs onto shared engines; it does not expose a specification hook trait."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:833 A lost task is a heartbeat lease the reaper re-queues, not a blocking drain of promise jobs."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:255 A job's continuation is a checkpoint that resumes after restart, so it is stored, not an untraced heap root."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:111 An empty claim parks on notify or this poll sleep; the queues are not promise, timer, native and cleanup jobs."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/fanout.rs:3 Fan-out is post-persist indexing and delivery, not a guest import of a specifier."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:862 Elapsed run time is one std Instant for a host job deadline, not a guest timer type beside a guest date type."
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:256 Searched crates/server/src for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; shutdown re-queues the job from a durable checkpoint, so these jobs are stored work rather than in-memory promise reactions.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by cloud-20261031-pumper-2"
         }
       ]
     },
@@ -4271,34 +4576,44 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-15",
-      "evaluatedTs": "2026-10-15T21:07:38.519Z",
-      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
       "techniques": [
         {
           "technique": "backoff-design",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:906 A long Retry-After is truncated, allowing another request before the receiver's stated time."
-        },
-        {
-          "technique": "durable-retries",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:2629 The retry claim checks status but not the live retry budget; stale-pending reclamation can therefore permit dispatch beyond the cap after repeated interruptions."
+          "evidence": "crates/server/src/webhook.rs:1042 next_sleep = ra.min(RETRY_AFTER_INPROC_CAP) shortens the dependency's stated schedule rather than honouring it or stopping; the in-process default ladder at webhook.rs:997 is also unjittered (2 s, 4 s)."
         },
         {
           "technique": "error-classification-for-retry",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:85 Unrecognized response statuses default to transient rather than a separately counted unknown class."
+          "evidence": "crates/server/src/webhook.rs:89 Every status that is not 2xx or 4xx (including unexpected 3xx/1xx) falls into Transient; there is no separately counted unknown class, so a novel failure is silently filed as retryable."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "realized",
+          "evidence": "crates/core/src/storage.rs:3166 A failed delivery's next attempt is persisted as next_retry_at on the row with up to +25% jitter, so the drain ladder survives restarts."
         },
         {
           "technique": "retry-observability",
           "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:2594 Permanent rejection writes the same dead status used for exhaustion, without distinct structured terminal outcomes."
+          "evidence": "crates/core/src/storage.rs:3194 kill_delivery (permanent rejection) writes the same status 'dead' as the exhaustion branch of fail_delivery, so reclassified and exhausted are distinguishable only through last_error prose."
         },
         {
           "technique": "storm-control",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves."
+          "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves.",
+          "carriedFrom": "2026-10-15"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/webhook.rs:906 The sender shortens dependency-stated waits above five seconds instead of honoring them or terminating with an over-budget-wait outcome.",
+          "evaluatedAt": "2026-10-15T21:07:38.519Z",
+          "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+          "reason": "replaced by cloud-20261031-pumper-3"
         }
       ]
     },
@@ -4307,14 +4622,34 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-15",
-      "evaluatedTs": "2026-10-15T21:07:38.519Z",
-      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
       "techniques": [
         {
           "technique": "suspension-is-not-failure",
           "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test explicitly charges one attempt and requires failure despite the temporary local hold."
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test asserts attempts == 1 with status Failed; the technique's check is that a blocked attempt increments no failure count and the work stays suspended with the precondition named (the name is realized, the suspension is not)."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:80 Budget exhaustion is pinned as permanent: exactly one attempt spent and the remaining attempts left visibly unburned instead of a retry ladder against a refusal that cannot heal."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:100 A failed attempt with attempts remaining is re-queued with a persisted available_at later than creation, i.e. the retry-at is a row, not a sleeping task."
+        }
+      ],
+      "registryProposal": "suspension-is-not-failure names offline, missing credential, backgrounded and lease-not-held as suspension, and storm-control calls policy outcomes denials. An operator-imposed governance hold (a cost:pause tag) sits between the two; the technique should state whether such a hold suspends the work or is a terminal policy denial with the hold named, since pumper deliberately chose the latter.",
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:160 The contract requires governance-paused work to become terminally failed and consume an attempt instead of remaining suspended until its precondition changes.",
+          "evaluatedAt": "2026-10-15T21:07:38.519Z",
+          "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+          "reason": "replaced by cloud-20261031-pumper-3"
         }
       ]
     },
@@ -6706,29 +7041,41 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T00:07:06.120Z",
-      "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "deviation",
-          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The name and the doc comment claim the app's stamp is checked, but the assertions only check a struct the test built itself. The decision in lib.rs:298 is never reached. Elsewhere the context does this well: Dead engines rule out a re-derived answer (adoption.rs:32), and the plugin stub counts calls (run_door.rs:47)."
+          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:78 the asserted value is hand-constructed; the decision the test's name and doc claim (the app's stamp) is never executed."
         },
         {
           "technique": "negative-control-tests",
           "verdict": "conformant",
-          "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:69 The regression test names its control as the revert of the guard: unguarded, the empty body upserts as `changed`."
+          "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:69 The regression test names its control as the revert of the guard: unguarded, the empty body upserts as `changed`.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:24 The remote exchange is a single canned 200 body, small enough to fake honestly, which is the technique's own 'when not to use it' case."
+          "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:24 The remote exchange is a single canned 200 body, small enough to fake honestly, which is the technique's own 'when not to use it' case.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "approval-snapshots-with-guarded-update",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/research/tests/result_contract.rs:15 The rich output is checked by diffing a real run against the published declaration. Nothing is recorded, so there is no record mode that could be left on."
+          "evidence": "crates/apps/research/tests/result_contract.rs:15 The rich output is checked by diffing a real run against the published declaration. Nothing is recorded, so there is no record mode that could be left on.",
+          "carriedFrom": "2026-10-24"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:77 The test's doc comment says it pins the app's provenance stamp, but its body builds a `Provenance` by hand and never runs `ConnectorApiWatch` (the real stamp is built at crates/apps/connector-api-watch/src/lib.rs:296-299), so dropping `artifact_sha` or inventing a `rules_hash` in the app would leave it green.",
+          "evaluatedAt": "2026-10-24T00:07:06.120Z",
+          "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -6737,39 +7084,59 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T00:07:06.120Z",
-      "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 scratch directory created with no named reaper; the file has no rmSync/cleanup anywhere."
+        },
         {
           "technique": "fixture-economics",
           "verdict": "deviation",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Build once, cheap copy per test, which is right. But the technique requires the harness to name the copy's reaper (creation-names-reaper), and there is none."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Build once, cheap copy per test, which is right. But the technique requires the harness to name the copy's reaper (creation-names-reaper), and there is none.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "derived-selection-must-be-measured",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:222 The hook's membership is derived from map globs. A map that loads with zero entries is refused as cannot-check (check-doc-sync.mjs:307) instead of passing every turn."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:222 The hook's membership is derived from map globs. A map that loads with zero entries is refused as cannot-check (check-doc-sync.mjs:307) instead of passing every turn.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:241 The fixtures are redacted recordings of Claude Code's transcript format. A canary re-checks their shape against the real transcripts on the machine, and skips visibly when there are none."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:241 The fixtures are redacted recordings of Claude Code's transcript format. A canary re-checks their shape against the real transcripts on the machine, and skips visibly when there are none.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "negative-control-tests",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:182 The cannot-check regression tests record the pre-fix behaviour (exit 0) as their control. Each asserts a spawned process exits with 3."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:182 The cannot-check regression tests record the pre-fix behaviour (exit 0) as their control. Each asserts a spawned process exits with 3.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "live-app-harness",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:40 The shipped hook is driven as a separate process through its real stdin contract, not just imported."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:40 The shipped hook is driven as a separate process through its real stdin contract, not just imported.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "scripts/docs/check-doc-sync.test.mjs:171 Uses the fixture that otherwise exits 2, so a status of 0 can only come from the stop_hook_active branch. The asserted value has one possible producer."
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:171 Uses the fixture that otherwise exits 2, so a status of 0 can only come from the stop_hook_active branch. The asserted value has one possible producer.",
+          "carriedFrom": "2026-10-24"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 Each fixture copy (and each throwaway repo root at line 189) is a fresh temp directory that nothing deletes. The file has no rmSync and no after/afterEach hook, so the per-test copy has no named reaper and every run leaves directories in the OS temp dir.",
+          "evaluatedAt": "2026-10-24T00:07:06.120Z",
+          "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -6778,66 +7145,89 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T00:07:06.120Z",
-      "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "assert-the-schedule-not-the-stopwatch",
           "verdict": "deviation",
-          "evidence": "crates/core/src/governor.rs:383 Overlap is proved with a stopwatch rather than an in-flight count or a barrier. This is the technique's measured failure, and it has landed in the flake register as the technique predicts."
+          "evidence": "crates/core/tests/tiers.rs:69 a cutoff claim rests on a real sleep with a 100 ms margin over a 1 s horizon, not on an injected or paused clock."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "realized",
+          "evidence": "crates/core/tests/fetch_chokepoint.rs:228 the source scan drops comment lines and joins rustfmt-wrapped chains so prose cannot satisfy or hide a call site, with its own negative control at :380."
         },
         {
           "technique": "flake-lifecycle",
           "verdict": "conformant",
-          "evidence": "crates/core/src/governor.rs:339 The .flake/register.json entry has an owner, entry date, expiry (2026-10-26), cause, evidence, exit plan and a written reason for skipped over muted. The test still runs nightly in long-lanes."
-        },
-        {
-          "technique": "pin-the-call-not-the-name",
-          "verdict": "conformant",
-          "evidence": "crates/core/tests/fetch_chokepoint.rs:231 The needle is a receiver-qualified field access, comment lines are dropped, wrapped chains are joined, and the inventory is checked both ways (line 283), which also makes an empty walk go red."
+          "evidence": "crates/core/src/governor.rs:339 The .flake/register.json entry has an owner, entry date, expiry (2026-10-26), cause, evidence, exit plan and a written reason for skipped over muted. The test still runs nightly in long-lanes.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/fetch_chokepoint.rs:153 The inventory explains a raw-engine row by the decision it keeps reachable: routing through ctx.fetch would assert the default arm."
+          "evidence": "crates/core/tests/fetch_chokepoint.rs:153 The inventory explains a raw-engine row by the decision it keeps reachable: routing through ctx.fetch would assert the default arm.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "negative-control-tests",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/host_memory_honesty.rs:28 A second host acts as a control, so a pass that wipes everything cannot satisfy the zombie-penalty test."
+          "evidence": "crates/core/tests/host_memory_honesty.rs:28 A second host acts as a control, so a pass that wipes everything cannot satisfy the zombie-penalty test.",
+          "carriedFrom": "2026-10-24"
         }
       ],
-      "registryProposal": "flake-lifecycle prefers muted over skipped, but libtest has no in-process muted form. This repo works around it by running the skipped set through a recorder on a nightly leg. The technique could name that as the accepted substitute for runners with no mute."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/governor.rs:383 The governor's parallelism claim (32 hosts did not serialize) is a wall-clock upper bound. That bound is what flips on a loaded machine, so the test is quarantined, and the fix (observe the sharded map's state instead) is still only an exit plan in the register.",
+          "evaluatedAt": "2026-10-24T00:07:06.120Z",
+          "worker": "b6143b66-34a4-4261-9418-2749e92d2ef5",
+          "reason": "replaced by cloud-20261031-pumper-4"
+        }
+      ]
     },
     "1faf3871-64b3-4897-bf44-05b2ad892076/quality-gates": {
       "context": "pumper-sync-sdk",
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T01:11:54.935Z",
-      "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "refusal-names-a-reachable-remedy",
           "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:61 Names a recipe that consumes the missing file instead of producing it. scripts/gen/generate-clients.mjs:213-218 names the correct producer (UPDATE_OPENAPI=1 cargo test ... spec_snapshot, i.e. `just openapi`)."
+          "evidence": "clients/typescript/test/conformance.test.ts:61 the named remedy cannot produce the missing artifact."
         },
         {
           "technique": "gate-liveness",
           "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:70 A schema with no direct properties (e.g. one reshaped into allOf/$ref) yields zero required fields, and assertFixtureCoversSchema then passes having checked nothing. Nothing asserts the property set is non-empty. Latent: today RecordDto/RevisionDto/RevisionPageDto have 7/13/2 properties."
+          "evidence": "clients/typescript/test/conformance.test.ts:70 A schema with no direct properties (e.g. one reshaped into allOf/$ref) yields zero required fields, and assertFixtureCoversSchema then passes having checked nothing. Nothing asserts the property set is non-empty. Latent: today RecordDto/RevisionDto/RevisionPageDto have 7/13/2 properties.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "match-the-resolved-artifact",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:80 Required fields come from the served openapi.json, not a hand-typed list, so a field added on the server side reddens the test. The intermediate document is itself pinned to the live router by a Rust test."
+          "evidence": "clients/typescript/test/conformance.test.ts:80 Required fields come from the served openapi.json, not a hand-typed list, so a field added on the server side reddens the test. The intermediate document is itself pinned to the live router by a Rust test.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "instrument-answers-only-its-own-question",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:13 The header states the one question this instrument answers (fixture shape agreement) and explicitly disclaims the end-to-end HTTP wiring question."
+          "evidence": "clients/typescript/test/conformance.test.ts:13 The header states the one question this instrument answers (fixture shape agreement) and explicitly disclaims the end-to-end HTTP wiring question.",
+          "carriedFrom": "2026-10-24"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:61 When the spec is missing, the conformance test tells the reader to run `just clients`. That recipe is `node scripts/gen/generate-clients.mjs`, which reads clients/openapi.json and itself exits 2 with \"clients/openapi.json is missing\". The remedy, applied as worded, cannot clear the check; the real producer is `just openapi`.",
+          "evaluatedAt": "2026-10-24T01:11:54.935Z",
+          "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -6846,34 +7236,47 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T01:11:54.935Z",
-      "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "unmeasurable-criteria",
           "verdict": "deviation",
-          "evidence": "crates/core/src/catalog.rs:344 A record the range condition cannot evaluate is silently excluded, neither failed nor reported as a counted skip. The design delegates to `types` (line 251), but nothing announces how many records went unevaluated."
+          "evidence": "crates/core/src/catalog.rs:344 an unreadable value is filtered out rather than counted as a violation; absence of a measurable value reads as in-range."
         },
         {
           "technique": "severity-by-construction",
           "verdict": "conformant",
-          "evidence": "crates/core/src/catalog.rs:673 Warn vs Block is decided by the enforce flag in ContractVerdict::from_violations, and the status surface says in words when the label gates nothing."
+          "evidence": "crates/core/src/catalog.rs:673 Warn vs Block is decided by the enforce flag in ContractVerdict::from_violations, and the status surface says in words when the label gates nothing.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/lane_artifact/mod.rs:20 A lane that failed to write its artifact panics, so it cannot read as a lane that passed."
+          "evidence": "crates/core/tests/lane_artifact/mod.rs:20 A lane that failed to write its artifact panics, so it cannot read as a lane that passed.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "vacuous-by-evaluation",
           "verdict": "conformant",
-          "evidence": "crates/core/src/catalog.rs:421 A misspelled cadence used to be evaluated into 'no freshness expectation', making the rule unfireable. It is now refused at parse time by vocabulary_findings."
+          "evidence": "crates/core/src/catalog.rs:421 A misspelled cadence used to be evaluated into 'no freshness expectation', making the rule unfireable. It is now refused at parse time by vocabulary_findings.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "policy-projection",
           "verdict": "conformant",
-          "evidence": "crates/core/src/catalog.rs:213 One freshness_window_secs function feeds both /catalog/health and /sources, so the two surfaces cannot judge staleness differently."
+          "evidence": "crates/core/src/catalog.rs:213 One freshness_window_secs function feeds both /catalog/health and /sources, so the two surfaces cannot judge staleness differently.",
+          "carriedFrom": "2026-10-24"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/catalog.rs:344 Contract range checks drop any record whose ranged field is non-numeric before comparing. A contract that declares `ranges` without a matching `types` entry passes such values with no violation and no skip count. The test at catalog.rs:1328 pins that silent pass.",
+          "evaluatedAt": "2026-10-24T01:11:54.935Z",
+          "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -6882,59 +7285,77 @@
       "subject": "quality-gates",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T01:11:54.935Z",
-      "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
       "techniques": [
         {
           "technique": "waiver-names-its-finding",
           "verdict": "deviation",
-          "evidence": "crates/core/tests/error_cause_chain.rs:64 The waivers are a count, not identities. No entry is matched to a found site, so substituting one finding for another passes, and a mistyped entry is never reported."
+          "evidence": "crates/core/tests/error_cause_chain.rs:64 allowlist rows name a site but are honoured by count, so one exemption can silence a finding it never names."
         },
         {
           "technique": "renameable-detector-keys",
           "verdict": "deviation",
-          "evidence": "crates/core/tests/error_cause_chain.rs:228 The detector keys on the binding name. Renaming `e` to `x` keeps the flattening and clears the check, and the verdict does not state that limit."
+          "evidence": "crates/core/tests/error_cause_chain.rs:228 The detector keys on the binding name. Renaming `e` to `x` keeps the flattening and clears the check, and the verdict does not state that limit.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "unparseable-form-is-a-finding",
           "verdict": "deviation",
-          "evidence": "crates/core/tests/error_cause_chain.rs:192 A call the matcher cannot balance is skipped with `continue`, not reported. Alternative spellings (aliased imports, whitespace before the paren) are neither recognised nor banned, in a tree the repo owns."
+          "evidence": "crates/core/tests/error_cause_chain.rs:192 A call the matcher cannot balance is skipped with `continue`, not reported. Alternative spellings (aliased imports, whitespace before the paren) are neither recognised nor banned, in a tree the repo owns.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "gate-liveness",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/error_cause_chain.rs:82 A paired positive-control floor proves the same scanner still finds sites, so an empty walk or an unreadable crate cannot pass as clean."
+          "evidence": "crates/core/tests/error_cause_chain.rs:82 A paired positive-control floor proves the same scanner still finds sites, so an empty walk or an unreadable crate cannot pass as clean.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "match-the-resolved-artifact",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/error_cause_chain.rs:189 Comment lines naming the banned shape are normalised out, so prose cannot satisfy or trip the matcher. Partial: string literals and inline block comments are not blanked."
+          "evidence": "crates/core/tests/error_cause_chain.rs:189 Comment lines naming the banned shape are normalised out, so prose cannot satisfy or trip the matcher. Partial: string literals and inline block comments are not blanked.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "refusal-names-a-reachable-remedy",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/error_cause_chain.rs:70 The failure names an in-tree constructor and the in-file allowlist, both reachable from where the reader stands."
+          "evidence": "crates/core/tests/error_cause_chain.rs:70 The failure names an in-tree constructor and the in-file allowlist, both reachable from where the reader stands.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "prose-rule-drift",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/error_cause_chain.rs:12 The 'attach the cause' convention is mechanised as a test rather than left as prose."
+          "evidence": "crates/core/tests/error_cause_chain.rs:12 The 'attach the cause' convention is mechanised as a test rather than left as prose.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "decidable-in-a-window",
           "verdict": "conformant",
-          "evidence": "crates/core/tests/error_cause_chain.rs:227 The rule is local to one call expression, so a window-sized pattern can decide it without a call graph."
+          "evidence": "crates/core/tests/error_cause_chain.rs:227 The rule is local to one call expression, so a window-sized pattern can decide it without a call graph.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "severity-by-construction",
           "verdict": "conformant",
-          "evidence": "crates/core/src/error.rs:1669 Terminal classification is an exhaustive match, so a new variant fails compilation. Its blocking status comes from construction, not from a label."
+          "evidence": "crates/core/src/error.rs:1669 Terminal classification is an exhaustive match, so a new variant fails compilation. Its blocking status comes from construction, not from a label.",
+          "carriedFrom": "2026-10-24"
         },
         {
           "technique": "chokepoint-tag-registry",
           "verdict": "not-applicable",
-          "evidence": "crates/core/tests/store_instrument_chokepoint.rs:6 The store chokepoint is declared a partial measurement census (StoreOp::ALL), not a routing invariant. It deliberately makes no claim that every statement passes through it, so the bijection precondition does not hold."
+          "evidence": "crates/core/tests/store_instrument_chokepoint.rs:6 The store chokepoint is declared a partial measurement census (StoreOp::ALL), not a routing invariant. It deliberately makes no claim that every statement passes through it, so the bijection precondition does not hold.",
+          "carriedFrom": "2026-10-24"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/tests/error_cause_chain.rs:64 The cause-flattening guard compares only the count of found sites (keyed `path:line`) against the length of EXPECTED_FLATTENED, whose entries are prose labels never matched against those keys. Fixing one waived extract.rs site while adding a new flattening site elsewhere keeps the count equal and stays green.",
+          "evaluatedAt": "2026-10-24T01:11:54.935Z",
+          "worker": "a56475dc-f1d8-4cda-8d38-edaaf3891340",
+          "reason": "replaced by cloud-20261031-pumper-4"
         }
       ]
     },
@@ -7806,37 +8227,46 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-26",
-      "evaluatedTs": "2026-10-26T22:28:51.158Z",
-      "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
       "techniques": [
         {
           "technique": "circuit-breakers",
           "verdict": "deviation",
-          "evidence": "crates/core/src/resilience/detect.rs:893 Hysteresis breaker (Healthy/Suspect/Degraded/Quarantined/Probation as half-open), persisted, config thresholds, judged-only evidence — but quarantine exit ignores who opened it; set_state_manual(Quarantined) is lifted by detector evidence and commit_run nulls state_reason on the transition."
+          "evidence": "crates/core/src/resilience/detect.rs:893 Persisted hysteresis breaker with configurable recovery_runs and an operator override at store.rs:181, but release ignores provenance, so a manual (stronger) open is lifted by the same streak rule as a heuristic one."
         },
         {
           "technique": "error-classification-for-retry",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/resilience/detect.rs:182 Permanence is classified from structured status (404/410 on live uncached http only); 403/429/timeouts/DNS/cache responses never count as permanent, so rate-limited and transient failures are not misfiled."
+          "verdict": "realized",
+          "evidence": "crates/core/src/resilience/detect.rs:181 Permanence is classified from structured status (404/410 on a live uncached http tier only); 403, 429, timeouts, DNS and cache responses never count as permanent."
         },
         {
           "technique": "suspension-is-not-failure",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/resilience/store.rs:940 By analogy: a run the fetch gate could not judge (Inconclusive/BelowCohort/ContentEmpty) consumes no ladder evidence, advances no trip count and no recovery streak — could-not-judge is spelled apart from failed."
+          "verdict": "realized",
+          "evidence": "crates/core/src/resilience/store.rs:940 A run the detector could not judge moves neither the state, the trip count nor the recovery streak, so an attempt that never produced evidence spends nothing on the ladder."
         },
         {
           "technique": "backoff-design",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/resilience/detect.rs:837 The ladder here is a ladder of states, not of delays; no attempt is rescheduled, so base/factor/cap/jitter do not apply (its stability-window idea is mirrored by recovery_runs)."
+          "evidence": "crates/core/src/resilience/detect.rs:844 next_state is a ladder of health states advanced per scheduled run; nothing here reschedules an attempt, so base/cap/jitter delay rules have no site."
         },
         {
           "technique": "durable-retries",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge."
+          "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge.",
+          "carriedFrom": "2026-10-26"
         }
       ],
-      "registryProposal": "circuit-breakers' decision rule 'persist breaker state with a freshness bound — discard stale' assumes the breaker gates availability of a remote dependency. For a breaker over the correctness of the system's own output (an extractor quarantine), time-based discard is wrong: a broken selector does not heal by waiting, and exit must be evidence-only. The technique should say its freshness rule applies to availability breakers, and that correctness breakers leave only on evidence."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined branch of next_state releases every quarantine on a clean-run streak without consulting provenance, so an operator-forced quarantine (set_state_manual, reason recorded) is auto-lifted to Probation and its reason cleared on the transition — the breaker technique's 'only a heuristic open is probeable / never shorten a stronger open' rule is not realized, while Retired (operator-only exit) shows the provenance distinction was made for one state but not this one.",
+          "evaluatedAt": "2026-10-26T22:28:51.158Z",
+          "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+          "reason": "replaced by cloud-20261031-pumper-3"
+        }
+      ]
     },
     "b6cad188-6215-4135-aa56-8f84711e4744/tool-result-economy": {
       "context": "e2e-integration",
@@ -7940,6 +8370,59 @@
           "evidence": "crates/core/src/storage.rs:1873 Lease/heartbeat semantics of durable jobs (job-coordination territory), not a host loop draining engine microtask/timer queues."
         }
       ]
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/test-harness": {
+      "context": "job-triggers-pipeline",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-4",
+      "techniques": [
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:2865 a claim of 'every' over a closed set is run over a hand-written member list instead of one derived from the type."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/trigger_plugins.rs:793 The shipped wasm plugins are loaded and asserted present (fails rather than skips), so a detached artifact is loaded, not just compiled.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/trigger_hook_stages.rs:60 The only wall-clock bound is a loose one-sided ceiling three orders of magnitude above the fuel cost, a hang guard and not the verdict.",
+          "carriedFrom": "2026-10-31"
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/trigger_hook_stages.rs:563 The target asserts engagement: inputs actually reached the transform stage behind a stopped predicate, so a target measuring nothing goes red.",
+          "carriedFrom": "2026-10-31"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:2865 every_hook_failure_class_leaves_its_own_row_and_still_fires iterates a hand-written list of PluginFailure variants, and the inventory test at :2951 enumerates its produce side by hand too, so a new variant that maps to an existing outcome word is outside both tests while the name claims 'every'.",
+          "evaluatedAt": "2026-10-31T00:00:00.000Z",
+          "worker": "cloud-20261031-pumper-1",
+          "reason": "replaced by cloud-20261031-pumper-4"
+        }
+      ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/prompt-assembly": {
+      "context": "pumper-sync-sdk",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-10-31",
+      "evaluatedTs": "2026-10-31T00:00:00.000Z",
+      "worker": "cloud-20261031-pumper-3",
+      "techniques": []
     }
   }
 }

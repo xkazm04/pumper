@@ -19,9 +19,12 @@
 //
 // THE THREE RULES THIS WRAPPER LIVES BY
 //
-// 1. **The exit code is cargo's, byte for byte.** Nothing below can turn a red
-//    build green or a green build red. Every recording step is wrapped, and a
-//    recording failure is a warning on stderr, never a verdict.
+// 1. **The exit code is cargo's, byte for byte — with ONE exception.** Nothing
+//    below can turn a red build green. Every recording step is wrapped, and a
+//    recording failure is a warning on stderr, never a verdict. The exception
+//    is a green run that parsed ZERO test results: that is not a pass, it is
+//    an instrument that saw nothing, so it exits 3 (cannot check) and is NOT
+//    written to the history (`exitForParsedRun`, `runIsEvidence`).
 // 2. **Output is not swallowed.** stdout and stderr are merged into one file at
 //    the OS level (a single fd handed to both slots) so cargo's `Running <target>`
 //    headers and libtest's result lines keep their true write order — two
@@ -40,7 +43,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defaultRepoRoot, packages, parseCargoTestOutput, registerKey } from './flake-id.mjs';
-import { historyDir, labelled, loadRuns, transitions } from './flake-check.mjs';
+import { EXIT_CANNOT_CHECK, historyDir, labelled, loadRuns, runIsEvidence, transitions } from './flake-check.mjs';
 
 /**
  * Strip SGR/CSI escapes.
@@ -57,6 +60,20 @@ const ANSI = new RegExp('\\u001B\\[[0-9;?]*[ -/]*[@-~]', 'g');
 
 export function stripAnsi(text) {
   return text.replace(ANSI, '');
+}
+
+/**
+ * The wrapper's exit code once the run's output has been parsed.
+ *
+ * Cargo's code passes through untouched with one exception: cargo said 0 and
+ * the reader found zero test results. A required check must not go green on a
+ * run nobody can show ran a test, so that becomes cannot-check (3). A red run
+ * stays exactly as red as cargo made it — a crash before any test line is
+ * cargo's failure to report, not ours to relabel.
+ */
+export function exitForParsedRun(cargoExit, parsedTests) {
+  if (cargoExit === 0 && parsedTests === 0) return EXIT_CANNOT_CHECK;
+  return cargoExit;
 }
 
 function git(repoRoot, args, fallback) {
@@ -166,9 +183,11 @@ async function main() {
       ? status.code
       : 1;
 
+  let finalExit = exitCode;
   if (!status.spawnFailed) {
     try {
-      record({ repoRoot, capture, lane, startedAt, exitCode, command });
+      const parsed = record({ repoRoot, capture, lane, startedAt, exitCode, command });
+      finalExit = exitForParsedRun(exitCode, parsed);
     } catch (e) {
       // Instrumentation must never be the reason a build reports differently
       // from cargo. This is the one branch that makes the wrapper safe to put
@@ -179,7 +198,7 @@ async function main() {
       );
     }
   }
-  process.exit(exitCode);
+  process.exit(finalExit);
 }
 
 function record({ repoRoot, capture, lane, startedAt, exitCode, command }) {
@@ -201,6 +220,21 @@ function record({ repoRoot, capture, lane, startedAt, exitCode, command }) {
     tests,
   };
 
+  if (!runIsEvidence(run)) {
+    // Found-nothing and cannot-see are different sentences: a cargo run that
+    // compiled nothing new and cached every result still prints its test lines,
+    // so zero parsed tests means the reader broke, not that nothing ran. Such a
+    // run is NOT written to the history (it would be counted as a sample that
+    // measured nothing) and NOT written as a lane part; the caller turns a
+    // green exit into cannot-check.
+    process.stderr.write(
+      `flake-record: CANNOT CHECK — parsed 0 test results from this run. Nothing was ` +
+        `recorded; a run with no tests is a hole, not evidence.` +
+        (exitCode === 0 ? ` Exiting 3: a green exit with no test behind it is not a pass.\n` : `\n`)
+    );
+    return 0;
+  }
+
   const dir = historyDir(repoRoot);
   fs.mkdirSync(dir, { recursive: true });
   const stamp = startedAt.replace(/[:.]/g, '-');
@@ -208,16 +242,6 @@ function record({ repoRoot, capture, lane, startedAt, exitCode, command }) {
     path.join(dir, `${stamp}-${run.os}-${lane || 'suite'}.json`),
     `${JSON.stringify(run, null, 2)}\n`
   );
-
-  if (tests.length === 0) {
-    // Found-nothing and cannot-see are different sentences: a cargo run that
-    // compiled nothing new and cached every result still prints its test lines,
-    // so zero parsed tests means the reader broke, not that nothing ran.
-    process.stderr.write(
-      `flake-record: WARNING — parsed 0 test results from this run. The history got an ` +
-        `empty sample, which is a hole, not a clean run.\n`
-    );
-  }
 
   announceLabels(repoRoot, run);
 
@@ -252,6 +276,7 @@ function record({ repoRoot, capture, lane, startedAt, exitCode, command }) {
       )}\n`
     );
   }
+  return tests.length;
 }
 
 /** Remove every artifact file belonging to `lane`, so the run starts blind. */

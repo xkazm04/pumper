@@ -1,0 +1,163 @@
+{
+  "worker": "cloud-20261031-pumper-3",
+  "evaluatedAt": "2026-10-31",
+  "pairs": [
+    {
+      "context": "95f2922d-5dad-4ad2-828d-ce8b78c418aa",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined arm releases on any earned clean streak without consulting how the quarantine was set, and the caller (store.rs:969) passes only the prior state, so an operator quarantine written by set_state_manual (store.rs:181, reason recorded) is auto-lifted to Probation by heuristic evidence; circuit-breakers' provenance rules (only a heuristic open is probeable, never shorten a stronger open) are not realized.",
+      "techniques": [
+        {
+          "technique": "circuit-breakers",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:893 Persisted hysteresis breaker with configurable recovery_runs and an operator override at store.rs:181, but release ignores provenance, so a manual (stronger) open is lifted by the same streak rule as a heuristic one."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "realized",
+          "evidence": "crates/core/src/resilience/detect.rs:181 Permanence is classified from structured status (404/410 on a live uncached http tier only); 403, 429, timeouts, DNS and cache responses never count as permanent."
+        },
+        {
+          "technique": "suspension-is-not-failure",
+          "verdict": "realized",
+          "evidence": "crates/core/src/resilience/store.rs:940 A run the detector could not judge moves neither the state, the trip count nor the recovery streak, so an attempt that never produced evidence spends nothing on the ladder."
+        },
+        {
+          "technique": "backoff-design",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:844 next_state is a ladder of health states advanced per scheduled run; nothing here reschedules an attempt, so base/cap/jitter delay rules have no site."
+        }
+      ]
+    },
+    {
+      "context": "1d1816ea-080a-422a-b9c3-1f304338e4e3",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The contract test pins a DataHub cost:pause governance hold (a local, caller-side precondition the worker knew before running) as a terminal Failed job that consumes one attempt, so the work is not held as suspended and is not owed a result once the hold lifts; the operator must re-enqueue.",
+      "techniques": [
+        {
+          "technique": "suspension-is-not-failure",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test asserts attempts == 1 with status Failed; the technique's check is that a blocked attempt increments no failure count and the work stays suspended with the precondition named (the name is realized, the suspension is not)."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:80 Budget exhaustion is pinned as permanent: exactly one attempt spent and the remaining attempts left visibly unburned instead of a retry ladder against a refusal that cannot heal."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "realized",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:100 A failed attempt with attempts remaining is re-queued with a persisted available_at later than creation, i.e. the retry-at is a row, not a sleeping task."
+        }
+      ],
+      "registryProposal": "suspension-is-not-failure names offline, missing credential, backgrounded and lease-not-held as suspension, and storm-control calls policy outcomes denials. An operator-imposed governance hold (a cost:pause tag) sits between the two; the technique should state whether such a hold suspends the work or is a terminal policy denial with the hold named, since pumper deliberately chose the latter."
+    },
+    {
+      "context": "571c7935-fe1d-4818-bced-5005f04ecf96",
+      "subject": "retry-backoff",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/webhook.rs:1042 A receiver's Retry-After is truncated to 5 s for the next in-process attempt, so a stated 300 s wait is answered with a request at 5 s (and the drain ladder's 30 s first rung is also earlier than stated); backoff-design requires honouring the stated wait or ending with an over-budget-wait terminal carrying the stated delay.",
+      "techniques": [
+        {
+          "technique": "backoff-design",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:1042 next_sleep = ra.min(RETRY_AFTER_INPROC_CAP) shortens the dependency's stated schedule rather than honouring it or stopping; the in-process default ladder at webhook.rs:997 is also unjittered (2 s, 4 s)."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/webhook.rs:89 Every status that is not 2xx or 4xx (including unexpected 3xx/1xx) falls into Transient; there is no separately counted unknown class, so a novel failure is silently filed as retryable."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "realized",
+          "evidence": "crates/core/src/storage.rs:3166 A failed delivery's next attempt is persisted as next_retry_at on the row with up to +25% jitter, so the drain ladder survives restarts."
+        },
+        {
+          "technique": "retry-observability",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:3194 kill_delivery (permanent rejection) writes the same status 'dead' as the exhaustion branch of fail_delivery, so reclassified and exhausted are distinguishable only through last_error prose."
+        }
+      ]
+    },
+    {
+      "context": "571cf8b4-4f98-4205-b9c7-270fce8277e1",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/mcp/mod.rs:121 tools/list renders the roster from process state alone (server_tools(state)), while the job-token-scoped fetch tool is refused per caller at run time (mcp/jobtoken.rs:98); the filter and the refusal are two policies, so every session without a token is shown a capability it will be refused. The prior not-applicable premise is wrong: this context assembles the Claude agent run pumper launches (state.rs:323) and serves its tools.",
+      "techniques": [
+        {
+          "technique": "session-scoped-capability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:121 The roster ignores the caller that handle_rpc_as already holds; mod.rs:652 states fetch is advertised unconditionally and only the session's job token makes it usable, which is the granted-by-filter, refused-by-executor split the technique names as a fluent invitation to fail."
+        },
+        {
+          "technique": "nested-run-is-not-its-parent",
+          "verdict": "realized",
+          "evidence": "crates/server/src/state.rs:323 The launched Claude run is re-rooted into its own working directory under the storage root, so the host checkout's CLAUDE.md, skills and Stop hook no longer fire inside every research call (the comment at state.rs:311 records the measured leak)."
+        }
+      ]
+    },
+    {
+      "context": "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/triggers.rs:3 A trigger is an edge from a source event to an enqueue of a target app; its WASM predicate/transform stages wrap job enqueue, not a model or tool call. Searching triggers.rs and the seven e2e files for claude, research, model, tool_call, subagent, agent, prompt and mcp found only MCP param-validation helpers (triggers.rs:1537, 1626, 1770) and a test's 'reference model' of predicate outputs, so no agent runtime is assembled here.",
+      "techniques": []
+    },
+    {
+      "context": "e070c6d1-28bc-4b66-bdac-e9a46f152f10",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evidence": "crates/core/src/cache.rs:525 The context is mostly an HTTP response cache, but it also owns the Claude research-response cache whose key digests the prompt, the appended system prompt, role/model/effort, max_turns and schema and is extended with the researcher's answer fingerprint; that realizes one technique, while the other 31 presuppose an assembler this context does not own, so the evidence floor (16 of 32) cannot be met and not-applicable would be false.",
+      "techniques": [
+        {
+          "technique": "fingerprinting-and-cache-keys",
+          "verdict": "realized",
+          "evidence": "crates/core/src/cache.rs:499 The cached-answer key hashes the full standing text (append_system_prompt) beside the prompt, separated canonically, and key_with (cache.rs:525) folds in the resolved model/effort/tools fingerprint so a config edit starts a fresh key; resume_session requests bypass the cache."
+        }
+      ],
+      "registryProposal": "The conform evidence floor counts all of a subject's techniques. A context that legitimately owns one technique of a 32-technique subject (here a model-response cache) can never be conformant and is wrong as not-applicable; the floor should count applicable techniques, with not-applicable ones anchored once collectively."
+    },
+    {
+      "context": "1faf3871-64b3-4897-bf44-05b2ad892076",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "clients/typescript/src/http.ts:3 Every read the @pumper/sync SDK makes goes through this JSON/ndjson transport to Pumper's own HTTP API. Searching clients/typescript (src, test, package.json, README) for prompt, claude, llm, anthropic, openai, completion and system found only generated API-doc comments in generated.ts describing the server's Claude tier, so the SDK builds no model prompt.",
+      "techniques": []
+    }
+  ],
+  "declined": [],
+  "consults": [
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": ["retry-backoff"],
+      "techniques": ["circuit-breakers", "error-classification-for-retry", "suspension-is-not-failure", "backoff-design", "durable-retries", "retry-observability"],
+      "deviations": 3
+    },
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": ["agent-runtime-assembly"],
+      "techniques": ["session-scoped-capability", "nested-run-is-not-its-parent", "operator-tier-code-loading"],
+      "deviations": 1
+    },
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": ["prompt-assembly"],
+      "techniques": ["fingerprinting-and-cache-keys"],
+      "deviations": 0
+    }
+  ]
+}

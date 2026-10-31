@@ -1,0 +1,282 @@
+{
+  "worker": "cloud-20261031-pumper-4",
+  "evaluatedAt": "2026-10-31",
+  "pairs": [
+    {
+      "context": "637fe113-22d8-4d1a-bbb6-3de8199aa6bd",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/ci/lane-certify.mjs:178 bound() returns 'pass' whenever no comparison flipped ok, so a percentile over a series of nulls (percentile() sorts and returns null, and null > max is false) certifies a long lane as passed when it measured nothing, instead of spelling cannot-see.",
+      "techniques": [
+        {
+          "technique": "long-lane-certification",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:178 a null/non-finite measured value falls through to verdict 'pass'; the lane spells found-nothing the same as pass."
+        },
+        {
+          "technique": "flake-lifecycle",
+          "verdict": "realized",
+          "evidence": "scripts/ci/flake-check.mjs:305 flakiness is detected as outcome transitions on the same code over a declared window from retained history."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "realized",
+          "evidence": "scripts/ci/flake-record.mjs:223 a run that parsed zero tests is refused as cannot-check and not written to the history (the prior deviation at :207/:212 is fixed)."
+        }
+      ]
+    },
+    {
+      "context": "e48047d1-73c2-4b60-a1fc-0277d8a5e7af",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:78 the test that claims to pin this app's provenance stamp builds a Provenance by hand and never runs the app, so mutating the app's real stamp (src/lib.rs:296) leaves it green.",
+      "techniques": [
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "deviation",
+          "evidence": "crates/apps/connector-api-watch/tests/adoption.rs:78 the asserted value is hand-constructed; the decision the test's name and doc claim (the app's stamp) is never executed."
+        }
+      ]
+    },
+    {
+      "context": "fc25f145-0e20-4ffc-801f-4c2dfb7780ee",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/tests/tiers.rs:69 the TTL-lapse test proves the aging cutoff on the real clock (1 s horizon at :56, real 1100 ms sleep, Utc::now() in the product), so on a loaded runner more than 1 s between the third strike and the Some(\"browser\") assertion turns it red with no defect; the governor test beside it was moved to a paused clock for exactly this reason.",
+      "techniques": [
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/tiers.rs:69 a cutoff claim rests on a real sleep with a 100 ms margin over a 1 s horizon, not on an injected or paused clock."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "realized",
+          "evidence": "crates/core/tests/fetch_chokepoint.rs:228 the source scan drops comment lines and joins rustfmt-wrapped chains so prose cannot satisfy or hide a call site, with its own negative control at :380."
+        }
+      ]
+    },
+    {
+      "context": "05b680d3-a634-4401-ae6b-de54d48ca753",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/process_env.rs:115 a unit test sets SENTRY_DSN, CENSUS_API_KEY and PUMPER_WEBHOOK_SIGNING_SECRET on the shared process environment of a parallel cargo test binary and never removes them, so every later or concurrent test in pumper-core inherits fake secrets.",
+      "techniques": [
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/process_env.rs:115 process-global env mutation with no reset in a parallel lane; tests inherit state from a previous test."
+        }
+      ]
+    },
+    {
+      "context": "f49d6e82-d094-4a4b-b3dd-9d46ce0db001",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/docs/check-doc-sync.test.mjs:34 every fixture materialisation (and every throwaway repo root at :189) creates a fresh mkdtemp directory that nothing in the file deletes, so each `just doc-sync` run leaves scratch directories behind in the OS temp dir.",
+      "techniques": [
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.test.mjs:34 scratch directory created with no named reaper; the file has no rmSync/cleanup anywhere."
+        }
+      ]
+    },
+    {
+      "context": "413dd239-ed7e-4318-bd93-f2c3bd72c7b7",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/dataset_reads.rs:211 the CSV export is checked by matching the header string and counting lines, explicitly not parsing quoted CSV, although the `data` column carries JSON (commas and quotes), so mis-quoting that a real CSV reader would reject stays green.",
+      "techniques": [
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 an artifact emitted for a foreign reader is asserted by line counts instead of by running a CSV parser over it."
+        }
+      ]
+    },
+    {
+      "context": "b6cad188-6215-4135-aa56-8f84711e4744",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/harness.rs:514 the harness offers SpeedupAtLeast, a wall-time ratio between a serial and an off-slot arm, as a sanctioned claim, and crates/server/src/e2e/fanout_offslot.rs:133 uses it on the blocking path for a test its own comment records as load-flaky.",
+      "techniques": [
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/harness.rs:514 two arms compared by wall time instead of by recorded spans or units in flight."
+        }
+      ]
+    },
+    {
+      "context": "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/triggers.rs:2865 every_hook_failure_class_leaves_its_own_row_and_still_fires runs over a hand-written list of PluginFailure variants; the enum carries no ALL table (unlike ClaudeFailure) and nothing type-checks the list, so a new variant is silently outside a test whose name says every.",
+      "techniques": [
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:2865 a claim of 'every' over a closed set is run over a hand-written member list instead of one derived from the type."
+        }
+      ]
+    },
+    {
+      "context": "637fe113-22d8-4d1a-bbb6-3de8199aa6bd",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/ci/lane-certify.mjs:166 the comparison helper starts ok=true and only numeric comparisons flip it, so a null or non-finite measured value (null percentile, NaN slope) sails through every max bound as pass instead of being treated as below every floor.",
+      "techniques": [
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/lane-certify.mjs:166 absence of a measurement is not failed closed in the comparison helper; a hole in the instrument reads as compliance."
+        }
+      ]
+    },
+    {
+      "context": "dd1aeb6d-4da1-4b15-aea4-28a412dd9706",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/tests/error_cause_chain.rs:64 the cause-flattening guard compares only the count of found sites with EXPECTED_FLATTENED.len(), never joining rows to sites, so fixing one allowlisted site while adding a new unlisted one stays green and a stale row is never reported.",
+      "techniques": [
+        {
+          "technique": "waiver-names-its-finding",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/error_cause_chain.rs:64 allowlist rows name a site but are honoured by count, so one exemption can silence a finding it never names."
+        }
+      ]
+    },
+    {
+      "context": "05b680d3-a634-4401-ae6b-de54d48ca753",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/catalog.rs:344 contract range checks keep only values that parse as f64, so a record whose ranged field is a string or object is dropped before comparison and the range check passes it when the contract declares ranges without types.",
+      "techniques": [
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/catalog.rs:344 an unreadable value is filtered out rather than counted as a violation; absence of a measurable value reads as in-range."
+        }
+      ]
+    },
+    {
+      "context": "f49d6e82-d094-4a4b-b3dd-9d46ce0db001",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "scripts/docs/check-doc-sync.mjs:166 unparseable transcript lines are skipped silently and no parsed-event count is asserted, so a transcript of which nothing parses exits 0 (silent pass) instead of the hook's own exit-3 cannot-check.",
+      "techniques": [
+        {
+          "technique": "gate-liveness",
+          "verdict": "deviation",
+          "evidence": "scripts/docs/check-doc-sync.mjs:166 the instrument is asserted on its target and map (:291-:305) but not on having read any events; a clean exit can mean nothing was checked."
+        }
+      ]
+    },
+    {
+      "context": "413dd239-ed7e-4318-bd93-f2c3bd72c7b7",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/engine_conformance.rs:672 the production-HttpClient inventory recognises only the literal one-line `impl HttpClient for` / `impl pumper_core::HttpClient for` forms, so a generic, crate::-qualified or rustfmt-wrapped impl is invisible and the 'every client in the battery' guard stays green over it.",
+      "techniques": [
+        {
+          "technique": "unparseable-form-is-a-finding",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:672 an unrecognised impl form is neither followed nor reported; the scanned world is not closed."
+        }
+      ]
+    },
+    {
+      "context": "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evidence": "crates/server/src/triggers.rs:383 the in-path predicate hook fails open on its own breakage and records each failure class on its own outcome (:607), which realizes unmeasurable-criteria's in-path branch; no other of the 27 techniques was read against this context, so the evidence floor for conformant is not met.",
+      "techniques": [
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "realized",
+          "evidence": "crates/server/src/triggers.rs:383 a failed or malformed predicate withdraws open by default while hook_failure_outcome (:607) routes it to a distinct ledger outcome: open to the actor, loud to the operator."
+        }
+      ]
+    },
+    {
+      "context": "1faf3871-64b3-4897-bf44-05b2ad892076",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "clients/typescript/test/conformance.test.ts:61 when clients/openapi.json is missing the test tells the reader to run `just clients`, but that recipe (scripts/gen/generate-clients.mjs) reads the same file and itself refuses; the file is produced only by `just openapi`.",
+      "techniques": [
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:61 the named remedy cannot produce the missing artifact."
+        }
+      ]
+    },
+    {
+      "context": "f900cd3c-7445-4e85-936b-32135e8fb605",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "plugins-src/trigger-gate/src/lib.rs:107 a count that is present but not a u64 (string, negative, fractional) lands in the absent-field arm at :112 and the predicate passes, and an unreadable min_count silently defaults to 1 (:106), so a value the gate cannot read is treated as not applicable rather than failed closed.",
+      "techniques": [
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:107 'ran and could not decide' (malformed present value) is conflated with 'absent'; it passes instead of failing closed."
+        }
+      ]
+    }
+  ],
+  "declined": [],
+  "consults": [
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": [
+        "test-harness"
+      ],
+      "techniques": [
+        "long-lane-certification",
+        "flake-lifecycle",
+        "platform-quirk-absorption",
+        "unreached-decisions-pin-nothing",
+        "assert-the-schedule-not-the-stopwatch",
+        "pin-the-call-not-the-name",
+        "isolation-lanes",
+        "assert-through-the-reader",
+        "gate-scope-is-not-report-scope"
+      ],
+      "deviations": 8
+    },
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": [
+        "quality-gates"
+      ],
+      "techniques": [
+        "unmeasurable-criteria",
+        "waiver-names-its-finding",
+        "gate-liveness",
+        "unparseable-form-is-a-finding",
+        "refusal-names-a-reachable-remedy"
+      ],
+      "deviations": 7
+    }
+  ]
+}

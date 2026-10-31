@@ -1,0 +1,262 @@
+{
+  "worker": "cloud-20261031-pumper-2",
+  "evaluatedAt": "2026-10-31",
+  "pairs": [
+    {
+      "context": "9de42791-6e9a-4923-bc5e-c50fbc29fa9a",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/engine-wasm/wit/pumper-app.wit:18 The only embedded engine is wasmtime, which Pumper hosts rather than authors, and its guest world carries no filesystem, no clock and no job queue, so none of the six engine-side seams exists to judge (engine-claude is a subprocess, engine-search a tantivy index). Searched for HostHooks, JobExecutor, microtask, macrotask, ModuleLoader, rquickjs, boa_engine, deno_core, mlua, rhai and found none.",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:1 Pumper is a host of wasmtime, not the author of an engine; it publishes no specification-mirrored override surface for embedders, only its own capability linker."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 The guest runs as a wasmtime async call on the host's tokio runtime; there is no guest job queue (promise reactions, timers) and so no executor seam to fill."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 Core wasm/component guests have no traced heap shared with host-queued jobs, so the traced-heap-plus-outside-queue window the technique governs does not exist."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 Each run is one awaited guest call with no timers or microtask queues to drain, which the technique's own when-not-to-use names as the case that needs no loop."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/wit/pumper-app.wit:18 The guest has no filesystem and no module import of its own; the host loads .wasm by directory scan (crates/engine-wasm/src/lib.rs:648), not by resolving a guest specifier against a referrer."
+        },
+        {
+          "technique": "monotonic-and-wall-clock-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/wit/pumper-app.wit:18 The WIT world exposes no clock to the guest, so there is no timer or date seam to split; the host's Instant use is its own wall-time ceiling."
+        }
+      ],
+      "registryProposal": "engine-host-contract's use_when opens with 'embedding a language engine in a host', which literally matches a wasmtime host, but the body is written from the engine author's side and every technique assumes guest-visible jobs, a specifier loader or a guest clock. Add a scope line saying a host of a core-wasm/component engine with no guest event loop, imports or clock is out of scope (or name the host-side neighbour), so judges stop re-deriving the N/A."
+    },
+    {
+      "context": "fc25f145-0e20-4ffc-801f-4c2dfb7780ee",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/core/src/engine.rs:1 'Engine' here means a scraping capability trait (HttpClient, Browser, Researcher) that apps call, not a language engine evaluating guest source for a host, so the hook/job/loader/clock contract has no object. Searched for HostHooks, JobExecutor, microtask, macrotask, ModuleLoader, rquickjs, boa_engine, deno_core, mlua, rhai and found none.",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "monotonic-and-wall-clock-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ]
+    },
+    {
+      "context": "2d713bf8-16d5-4c0f-aa09-ce602aa575db",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/core/migrations/0016_host_profiles.sql:1 The migrations are SQLite DDL for durable stores ('host' means a scraped HTTP host profile), with no embedded-engine state of any kind across all 56 files. Searched for HostHooks, JobExecutor, microtask, macrotask, ModuleLoader, rquickjs, boa_engine, deno_core, mlua, rhai and found none.",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "monotonic-and-wall-clock-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ]
+    },
+    {
+      "context": "413dd239-ed7e-4318-bd93-f2c3bd72c7b7",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/e2e/engine_conformance.rs:4 The e2e 'engine conformance' battery tests the repo's five scraping capability traits over HTTP, not a language engine's host hooks, so there is no seam for these tests to exercise. Searched for HostHooks, JobExecutor, microtask, macrotask, ModuleLoader, rquickjs, boa_engine, deno_core, mlua, rhai and found none.",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "monotonic-and-wall-clock-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ]
+    },
+    {
+      "context": "6a152014-f86c-4ad6-8b65-6ab5ed484ea5",
+      "subject": "engine-host-contract",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/worker.rs:44 The worker claims durable job records from SQLite storage, which the golden path explicitly routes to job-coordination; it drains no in-memory engine job queue, so the engine-host job loop and executor rules do not apply. Searched for HostHooks, JobExecutor, microtask, macrotask, ModuleLoader, rquickjs, boa_engine, deno_core, mlua, rhai and found none.",
+      "techniques": [
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "contained-async-module-loader",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        },
+        {
+          "technique": "monotonic-and-wall-clock-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:44 Precondition (an embedded language engine with host hooks, guest jobs, an import loader or a guest clock) is absent here."
+        }
+      ]
+    },
+    {
+      "context": "637fe113-22d8-4d1a-bbb6-3de8199aa6bd",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/ci/flake-check.mjs:2 These gates judge a flake quarantine register, disk budget and lane artifacts; no LLM agent carries memory forward here, so the capture-distill-recall pipeline has no subject. Searched for episod, belief, distill, consolidat, recall, agent memory, long-term memory and got no hits.",
+      "techniques": []
+    },
+    {
+      "context": "2d713bf8-16d5-4c0f-aa09-ce602aa575db",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/core/migrations/0015_tier_memory.sql:1 The only 'memory' tables are a per-host HTTP-vs-browser strike counter (tier_memory, extended in 0016) and governance last-acted state, learned by a router not an LLM agent, so no agent-memory store exists in the 56 migrations. Searched for episod, belief, distill, consolidat, recall, agent memory, long-term memory and got no hits.",
+      "techniques": []
+    },
+    {
+      "context": "413dd239-ed7e-4318-bd93-f2c3bd72c7b7",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/e2e/dataset_reads.rs:1 These eight e2e files pin dataset read shapes, delete gates, VCR, search degradation and dynamic apps; none exercises an agent memory store, so there is nothing to judge. Searched for episod, belief, distill, consolidat, recall, agent memory, long-term memory and got no hits.",
+      "techniques": []
+    },
+    {
+      "context": "1faf3871-64b3-4897-bf44-05b2ad892076",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "clients/typescript/README.md:26 The SDK owns only transport, decode, a sync watermark and the record lifecycle for mirrored datasets; 'memory' hits are memoryWatermark (a test watermark store) and constant-memory streaming, so no agent memory exists. Searched for episod, belief, distill, consolidat, recall, agent memory, long-term memory and got no hits.",
+      "techniques": []
+    }
+  ],
+  "declined": [],
+  "consults": [
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": [
+        "engine-host-contract"
+      ],
+      "techniques": [
+        "spec-mirrored-hook-surface",
+        "null-and-blocking-executors",
+        "untraceable-jobs-as-roots",
+        "idle-aware-job-loop",
+        "contained-async-module-loader",
+        "monotonic-and-wall-clock-split"
+      ],
+      "deviations": 0
+    },
+    {
+      "ts": "2026-10-31T00:00:00Z",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [],
+      "deviations": 0
+    }
+  ]
+}
