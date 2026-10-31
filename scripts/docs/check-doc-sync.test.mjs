@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -28,10 +28,21 @@ const FIXTURES = path.join(HERE, 'fixtures');
 const HOOK = path.join(HERE, 'check-doc-sync.mjs');
 const MAP = JSON.parse(fs.readFileSync(path.join(HERE, 'feature-doc-map.json'), 'utf8'));
 
+/** Every temp directory this file creates, removed once the file's tests end. */
+const TEMP_DIRS = [];
+function tempDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  TEMP_DIRS.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of TEMP_DIRS.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 /** Materialize a fixture with {{REPO}} bound to this checkout. */
 function materialize(name) {
   const raw = fs.readFileSync(path.join(FIXTURES, name), 'utf8');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-sync-'));
+  const dir = tempDir('doc-sync-');
   const out = path.join(dir, name);
   fs.writeFileSync(out, raw.split('{{REPO}}').join(REPO_ROOT.split(path.sep).join('/')));
   return out;
@@ -186,7 +197,7 @@ test('a_stop_hook_reentry_is_not_a_second_reminder', () => {
 
 /** Run the hook against a throwaway repo root whose rule map is `content`. */
 function runHookWithMap(content, payload) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-sync-root-'));
+  const root = tempDir('doc-sync-root-');
   fs.mkdirSync(path.join(root, 'scripts/docs'), { recursive: true });
   if (content !== null) {
     fs.writeFileSync(path.join(root, 'scripts/docs/feature-doc-map.json'), content);
