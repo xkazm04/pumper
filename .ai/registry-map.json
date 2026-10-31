@@ -1541,10 +1541,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "scripts/ci/flake-record.mjs:217 A recorded run that parses zero tests only warns and then exits with cargo's status, so a broken reader stays a green process.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
+          "evidence": "scripts/ci/flake-record.mjs:207 The run file is written into .flake/history before the zero-parsed-tests check at :212, which only warns, so an empty sample from a broken reader still lands in history and is counted in the '<n> recorded run(s)' predicate flake-check prints (scripts/ci/flake-check.mjs:321), overstating the evidence behind every flakiness figure.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
           "revisionsBehind": 0
         },
         {
@@ -2962,10 +2962,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/core/src/process_env.rs:115 The test writes secrets into the process environment and returns without clearing them, so later tests in the same process inherit that world.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
+          "evidence": "crates/core/src/process_env.rs:115 The unit test sets SENTRY_DSN, CENSUS_API_KEY and PUMPER_WEBHOOK_SIGNING_SECRET on the shared process environment and never removes them, so every later or parallel test in the same binary inherits secrets (app readiness reads env at crates/core/src/app.rs:1312) and isolation depends on test order.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
           "revisionsBehind": 0
         },
         {
@@ -4025,10 +4025,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export check counts lines and compares a header string, and the comment says quoted CSV is not parsed, so a quoting bug stays green on this fixture.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export is checked by matching a header string and counting lines instead of parsing with a CSV reader, so broken quoting of the JSON data column (which contains commas and quotes) still passes.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
           "revisionsBehind": 0
         },
         {
@@ -4294,11 +4294,11 @@
           "revision": 26,
           "changedAt": "2026-10-06",
           "confidence": "strong",
-          "state": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:1449 The e2e census blanks comments, keeps a module-count floor, and chains the panic hook so a scanner or a quiet hook cannot report a clean tree.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/harness.rs:514 The harness offers a SpeedupAtLeast wall-time ratio between two arms as its sanctioned claim. fanout_offslot.rs:133 uses it to prove a scheduling property (the worker permit is released before indexing), and that test is recorded as load-flaky on the blocking path. The standard asks for a count of units in flight or the recorded spans, not a stopwatch ratio.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
           "revisionsBehind": 0
         },
         {
@@ -4783,7 +4783,11 @@
           "revision": 26,
           "changedAt": "2026-10-06",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:2865 every_hook_failure_class_leaves_its_own_row_and_still_fires iterates a hand-written list of PluginFailure variants, and the inventory test at :2951 enumerates its produce side by hand too, so a new variant that maps to an existing outcome word is outside both tests while the name claims 'every'.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "convergence-loop-and-requeue",
@@ -5301,10 +5305,10 @@
           "changedAt": "2026-10-06",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
+          "evidence": "clients/typescript/test/conformance.test.ts:70 The spec-derived field check defaults a schema with no direct properties (for example one moved behind allOf/$ref) to {}, so the coverage assertion would then compare zero fields and pass, with no floor on how many served fields it checked.",
+          "evaluatedAt": "2026-10-31",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
           "revisionsBehind": 0
         },
         {
