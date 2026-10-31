@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import {
   canaryIsPaired,
   certify,
+  hasMeasurement,
   healthReport,
   judge,
   loadArtifact,
@@ -108,6 +109,25 @@ test('a_metric_the_artifact_never_carried_is_cannot_see_not_a_pass', () => {
   ]) {
     assert.equal(judge(c, ARTIFACT).verdict, 'cannot-see', JSON.stringify(c));
   }
+});
+
+test('an_all_null_series_is_unmeasured_cannot_see_not_a_pass', () => {
+  // The harness ran and measured nothing: every sample null. null compares as 0,
+  // so before hasMeasurement() it slipped under every max and certified the lane.
+  assert.equal(hasMeasurement([null, null, null, null]), false);
+  assert.equal(hasMeasurement([]), false);
+  assert.equal(hasMeasurement([null, 3]), true);
+  const nulls = { series: { hold_ms: [null, null, null, null, null, null] }, scalars: {} };
+  for (const c of [
+    { kind: 'percentile', series: 'hold_ms', percentile: 95, max: 100 },
+    { kind: 'slope', series: 'hold_ms', maxPerSample: 1 },
+  ]) {
+    const v = judge(c, nulls);
+    assert.equal(v.verdict, 'cannot-see', JSON.stringify(c));
+    assert.match(v.detail, /unmeasured/);
+  }
+  // The bound itself refuses a non-number, whatever statistic produced it.
+  assert.equal(judge({ kind: 'scalar', scalar: 'x', max: 1 }, { scalars: { x: NaN } }).verdict, 'cannot-see');
 });
 
 test('a_criterion_with_no_bound_certifies_nothing_and_says_so', () => {

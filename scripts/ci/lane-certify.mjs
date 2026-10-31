@@ -109,6 +109,19 @@ export function secondHalfSlope(values) {
 
 // --- judging one criterion --------------------------------------------------
 
+/**
+ * Whether a series carries at least one real measurement.
+ *
+ * A series of nulls is what a harness emits when it ran the loop and measured
+ * nothing (a timer that never started, a probe that never answered). It is
+ * present, so the absent-metric check does not see it, and before this predicate
+ * it reached `bound()` as `null` — which compares as 0, slips under every `max`,
+ * and certified a lane that was never measured. Unmeasured is cannot-see.
+ */
+export function hasMeasurement(values) {
+  return Array.isArray(values) && values.some((v) => typeof v === 'number' && Number.isFinite(v));
+}
+
 /** { verdict, measured, detail } for one criterion against one artifact. */
 export function judge(criterion, artifact) {
   const series = artifact.series || {};
@@ -119,16 +132,24 @@ export function judge(criterion, artifact) {
     detail: `the artifact carries no ${what} — the harness did not measure it, so nothing was certified`,
   });
 
+  const unmeasured = (name, n) => ({
+    verdict: 'cannot-see',
+    measured: null,
+    detail: `series \`${name}\` has ${n} samples and none is a number — the lane ran unmeasured, so nothing was certified`,
+  });
+
   switch (criterion.kind) {
     case 'percentile': {
       const values = series[criterion.series];
       if (!Array.isArray(values) || values.length === 0) return missing(`series \`${criterion.series}\``);
+      if (!hasMeasurement(values)) return unmeasured(criterion.series, values.length);
       const measured = percentile(values, criterion.percentile);
       return bound(criterion, measured, `p${criterion.percentile} of ${values.length} samples`);
     }
     case 'slope': {
       const values = series[criterion.series];
       if (!Array.isArray(values) || values.length === 0) return missing(`series \`${criterion.series}\``);
+      if (!hasMeasurement(values)) return unmeasured(criterion.series, values.length);
       const measured = secondHalfSlope(values);
       if (measured === null) {
         return {
@@ -160,6 +181,10 @@ export function judge(criterion, artifact) {
 }
 
 function bound(criterion, measured, how) {
+  if (typeof measured !== 'number' || !Number.isFinite(measured)) {
+    // A partly-null series can still yield null or NaN here; neither may pass a bound.
+    return { verdict: 'cannot-see', measured: null, detail: `${how} = ${round(measured)} — not a measurement, nothing certified` };
+  }
   const max = criterion.max ?? criterion.maxPerSample;
   const { min } = criterion;
   const parts = [`${how} = ${round(measured)}`];
