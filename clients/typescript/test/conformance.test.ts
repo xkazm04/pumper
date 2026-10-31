@@ -58,7 +58,8 @@ const specPath = (() => {
     if (up === dir) break;
     dir = up;
   }
-  throw new Error("clients/openapi.json not found — run `just clients`");
+  // `just clients` reads this file, it cannot produce it; only the router can.
+  throw new Error("clients/openapi.json not found — run `just openapi` (regenerates it from the router)");
 })();
 
 type SchemaNode = { properties?: Record<string, unknown>; allOf?: SchemaNode[]; $ref?: string };
