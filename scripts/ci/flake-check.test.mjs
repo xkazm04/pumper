@@ -23,7 +23,8 @@ import {
   scanIgnoredTests,
   targetForSource,
 } from './flake-id.mjs';
-import { evaluateRegister, labelled, readsAsFlake, transitions } from './flake-check.mjs';
+import { evaluateRegister, labelled, loadRuns, readsAsFlake, runIsEvidence, transitions } from './flake-check.mjs';
+import { exitForParsedRun } from './flake-record.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '../..');
@@ -458,7 +459,8 @@ test('a_corrupt_register_is_cannot_check_not_a_pass', () => {
 // --- the recorder in front of a required check ------------------------------
 //
 // scripts/ci/flake-record.mjs wraps `cargo test` on a branch-protection required
-// check. Its whole contract is that it cannot change the verdict, so that is
+// check. Its contract is that it cannot change the verdict — except that a
+// green run which parsed zero tests is cannot-check, never a pass — so that is
 // what these assert.
 
 const RECORD = path.join(HERE, 'flake-record.mjs');
@@ -528,6 +530,52 @@ test('a_lane_run_that_emits_nothing_leaves_no_stale_artifact_to_be_judged', () =
   fs.writeFileSync(path.join(root, '.lanes/runs/x.json'), JSON.stringify({ lane: 'x', series: {}, scalars: { a: 1 } }));
   runRecord(root, ['--lane', 'x'], 'console.log("boom"); process.exit(101)');
   assert.equal(fs.existsSync(path.join(root, '.lanes/runs/x.json')), false);
+});
+
+test('a_run_that_parsed_zero_tests_is_not_evidence', () => {
+  assert.equal(runIsEvidence({ startedAt: '2026-10-01T00:00:00Z', tests: [] }), false);
+  assert.equal(runIsEvidence({ startedAt: '2026-10-01T00:00:00Z' }), false);
+  assert.equal(runIsEvidence(null), false);
+  assert.equal(
+    runIsEvidence({ startedAt: '2026-10-01T00:00:00Z', tests: [{ id: 'a::b', outcome: 'ok' }] }),
+    true
+  );
+});
+
+test('a_green_exit_with_zero_parsed_tests_is_cannot_check_not_green', () => {
+  assert.equal(exitForParsedRun(0, 0), 3);
+  assert.equal(exitForParsedRun(0, 5), 0);
+  // Red stays exactly as red as cargo made it.
+  assert.equal(exitForParsedRun(101, 0), 101);
+  assert.equal(exitForParsedRun(1, 3), 1);
+});
+
+test('a_zero_test_run_is_refused_as_cannot_check_and_never_lands_in_history', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'flake-record-'));
+  const r = runRecord(root, [], 'console.log("Compiling nothing, ran nothing")');
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stderr, /CANNOT CHECK — parsed 0 test results/);
+  assert.equal(fs.existsSync(path.join(root, '.flake/history/runs')), false);
+  // A red zero-test run keeps cargo's code and is not recorded either.
+  const red = runRecord(root, ['--lane', 'x'], 'console.log("boom"); process.exit(101)');
+  assert.equal(red.status, 101);
+  assert.equal(fs.existsSync(path.join(root, '.flake/history/runs')), false);
+  assert.equal(fs.existsSync(path.join(root, '.lanes/runs/x--suite.json')), false);
+});
+
+test('an_empty_history_record_is_not_counted_as_a_recorded_run', () => {
+  // Records written before the recorder refused them must not count either.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'flake-history-'));
+  fs.writeFileSync(path.join(dir, 'a.json'), JSON.stringify({ startedAt: '2026-10-01T00:00:00Z', branch: 'master', sha: 's', tests: [] }));
+  fs.writeFileSync(
+    path.join(dir, 'b.json'),
+    JSON.stringify({ startedAt: '2026-10-02T00:00:00Z', branch: 'master', sha: 's', tests: [{ id: 'a::b', outcome: 'ok' }] })
+  );
+  const runs = loadRuns(dir);
+  assert.equal(runs.length, 1);
+  const tr = transitions(runs, { branch: 'master', windowDays: 14, today: '2026-10-05' });
+  assert.equal(tr.runs, 1);
+  assert.match(tr.predicate, /1 recorded run\(s\)/);
 });
 
 // --- canaries over the real tree --------------------------------------------

@@ -257,6 +257,19 @@ export function historyDir(repoRoot = defaultRepoRoot()) {
   return path.join(repoRoot, '.flake/history/runs');
 }
 
+/**
+ * Whether a run record is EVIDENCE — a sample the flake history may count.
+ *
+ * A run that parsed zero test results is not a clean run, it is a reader that
+ * saw nothing (a cached cargo run still prints its result lines). Counting it
+ * would let "N recorded run(s)" in every predicate include samples that
+ * measured nothing, so it is refused here as well as at the recorder: the
+ * recorder stops writing new ones, this stops counting old ones.
+ */
+export function runIsEvidence(run) {
+  return Boolean(run && Array.isArray(run.tests) && run.tests.length > 0 && run.startedAt);
+}
+
 export function loadRuns(dir) {
   let names;
   try {
@@ -268,7 +281,7 @@ export function loadRuns(dir) {
   for (const n of names) {
     try {
       const r = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8'));
-      if (r && Array.isArray(r.tests) && r.startedAt) runs.push(r);
+      if (runIsEvidence(r)) runs.push(r);
     } catch {
       // A half-written run record is one lost sample, not a dead instrument.
     }

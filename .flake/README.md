@@ -149,7 +149,10 @@ does not run doctests at all and runs every test in its own process. Against a
 protected by — a coverage cut dressed as a tooling upgrade. The wrapper changes
 nothing about what runs; it only reads the output, and it forwards cargo's exit
 code byte for byte with every recording step wrapped so an instrument failure can
-never become a verdict.
+never become a verdict. The one exception: a **green run that parsed zero test
+results exits 3** (cannot check) and is **not written to the history** — a run
+with no tests behind it is a hole, not evidence, and `flake-check` likewise never
+counts an empty record as a recorded run (`exitForParsedRun`, `runIsEvidence`).
 
 ## Three outcomes
 
