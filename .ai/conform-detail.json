@@ -801,9 +801,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T16:29:03.177Z",
+      "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
       "techniques": [
         {
           "technique": "recall-injection",
@@ -826,6 +826,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 I searched crates/server/src/e2e for episod, belief, distill and consolidat and got no hits; these eight files test dataset read/delete/report shapes, engine conformance, VCR, target exclusion, degraded search and dynamic apps, so no agent-memory pipeline is under test.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by d20eea3d-bea0-409a-8466-477a0bf0cf39"
         }
       ]
     },
@@ -834,9 +841,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T16:29:03.177Z",
+      "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
       "techniques": [
         {
           "technique": "working-memory",
@@ -859,6 +866,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "clients/typescript/README.md:27 I searched clients/typescript (node_modules included) for episod, belief and distill and got no hits; the SDK is a stateless dataset mirror client that explicitly does not own persistence, and its only state is a sync watermark, so it carries no agent memory.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by d20eea3d-bea0-409a-8466-477a0bf0cf39"
         }
       ]
     },
@@ -867,9 +881,8 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T16:29:03.177Z",
       "techniques": [
         {
           "technique": "episodic-capture",
@@ -898,17 +911,30 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 I searched all 56 migrations for episod, belief, distill, recall and consolidat and got no hits; every 'memory' hit is the fetcher's per-host strike/penalty table (0015, 0016, 0033), DataHub governance state (0037/0038) or the event bus (0055), and the one LLM table (0009 research_cache) is a TTL response cache, so there is no episode, belief or recall store for this subject to govern.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by d20eea3d-bea0-409a-8466-477a0bf0cf39"
         }
-      ]
+      ],
+      "withdrawn": {
+        "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
+        "state": "not-applicable",
+        "at": "2026-11-03T16:29:37.872411+00:00",
+        "reason": "reviewer (sonnet): The anchor 0015_tier_memory.sql is not among the context's listed files (0001–0012). The directory has 56 migrations, so the claim that 0015 holds 'the only memory table' is about the whole schema, not this context. Other migrations such as 0022_checkpoints and 0053_plugin_kv were not examined."
+      }
     },
     "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/agent-memory": {
       "context": "ci-quality-gates",
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T02:22:32.401Z",
-      "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T16:29:03.177Z",
+      "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
       "techniques": [
         {
           "technique": "working-memory",
@@ -937,6 +963,13 @@
           "evaluatedAt": "2026-10-14T17:25:05.000Z",
           "worker": "straighten-20261014T1720-pumper-w2",
           "reason": "replaced by f0722500-da6d-434f-aa46-888099cc398b"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "scripts/ci/flake-check.mjs:2 I searched scripts/ci for episod, belief, distill, consolidat and recall and got no hits; these gates judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, so nothing here is an agent carrying state forward.",
+          "evaluatedAt": "2026-10-24T02:22:32.401Z",
+          "worker": "f0722500-da6d-434f-aa46-888099cc398b",
+          "reason": "replaced by d20eea3d-bea0-409a-8466-477a0bf0cf39"
         }
       ]
     },
