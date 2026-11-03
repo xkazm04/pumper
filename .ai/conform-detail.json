@@ -2457,39 +2457,53 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:12:21.671Z",
+      "worker": "d9f6d4fc-f414-4134-beb8-73f46d3eb41a",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:1177 The trait documents HTTP page and API fetches, not a language-spec host-hook table."
+          "evidence": "crates/core/src/engine.rs:1229 Pumper authors this trait surface itself; no standards body enumerates the host operations, so there is no spec table to mirror."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:1193 A missing capability is a named fetch error; there is no promise-job executor to default."
+          "evidence": "crates/core/src/engine.rs:1193 A missing capability is a named fetch error; there is no promise-job executor to default.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/core/tests/host_memory_honesty.rs:8 Host memory in this context is a SQLite row per fetched origin, not a traced guest heap."
+          "evidence": "crates/core/tests/host_memory_honesty.rs:8 Host memory in this context is a SQLite row per fetched origin, not a traced guest heap.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/governor.rs:1 The wait here spaces HTTP requests per origin; there are no promise, timer, native or cleanup queues."
+          "evidence": "crates/core/src/governor.rs:1 The wait here spaces HTTP requests per origin; there are no promise, timer, native or cleanup queues.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:36 The only path rule rejects separators in a profile name; there is no referrer or specifier module graph."
+          "evidence": "crates/core/src/engine.rs:36 The only path rule rejects separators in a profile name; there is no referrer or specifier module graph.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/tiers.rs:34 The time constant is an RFC3339 staleness cutoff for HTTP tier memory, not a guest timer clock beside a guest date clock."
+          "evidence": "crates/core/src/tiers.rs:34 The time constant is an RFC3339 staleness cutoff for HTTP tier memory, not a guest timer clock beside a guest date clock.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/src/engine.rs:2 Searched crates/core/src and crates/core/tests for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; the engines named on this line are HTTP, browser and Claude research traits wired by the server.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by d9f6d4fc-f414-4134-beb8-73f46d3eb41a"
         }
       ]
     },
@@ -2498,34 +2512,47 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:12:21.671Z",
+      "worker": "d9f6d4fc-f414-4134-beb8-73f46d3eb41a",
       "techniques": [
-        {
-          "technique": "spec-mirrored-hook-surface",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0009_research_cache.sql:1 The nearest agent table is a disk cache of Claude research answers, not a host-hook trait."
-        },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0001_init.sql:5 A job is a stored status column, not an in-memory promise executor."
+          "evidence": "crates/core/migrations/0001_init.sql:1 These are persisted queue rows, not promise reactions an engine enqueues for a host executor."
+        },
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:1 The nearest agent table is a disk cache of Claude research answers, not a host-hook trait.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 The memory table records HTTP-tier strikes per origin; there is no traced heap."
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 The memory table records HTTP-tier strikes per origin; there is no traced heap.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0001_init.sql:16 Jobs are claimed from SQLite by status and available_at, not from four in-memory engine queues."
+          "evidence": "crates/core/migrations/0001_init.sql:16 Jobs are claimed from SQLite by status and available_at, not from four in-memory engine queues.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0017_job_heartbeat.sql:5 Timestamps are RFC3339 text for a job-heartbeat lease, not a guest monotonic clock and a guest wall clock."
+          "evidence": "crates/core/migrations/0017_job_heartbeat.sql:5 Timestamps are RFC3339 text for a job-heartbeat lease, not a guest monotonic clock and a guest wall clock.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Searched crates/core/migrations for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; a host profile here is persisted HTTP-versus-browser tier memory.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by d9f6d4fc-f414-4134-beb8-73f46d3eb41a"
         }
       ]
     },
@@ -2534,81 +2561,110 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:12:21.671Z",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:8 The documented surface is guest exports (memory, alloc, extract), not specification host hooks the embedder fills."
-        },
-        {
-          "technique": "null-and-blocking-executors",
-          "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:902 A plugin run is one synchronous TypedFunc call; there is no promise-job executor pair."
-        },
-        {
-          "technique": "untraceable-jobs-as-roots",
-          "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:124 Liveness is a fresh wasm Store and linear memory per call, not a tracing collector walking jobs."
-        },
-        {
-          "technique": "idle-aware-job-loop",
-          "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:371 Execution is synchronous and CPU-bound on the blocking pool, with no promise, timer, native or cleanup tasks."
+          "evidence": "crates/engine-wasm/src/lib.rs:12 The import surface is pumper's own capability linker and WIT world, not a spec-enumerated host-hook table. The technique says it does not apply to a host's own extension surface."
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:594 A guest import fails at link time against an empty linker; there is no referrer/specifier loader."
+          "evidence": "crates/engine-wasm/src/lib.rs:6 Guests cannot import other modules by specifier: there is no referrer, specifier or module graph to contain."
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-wasm/src/lib.rs:2 The execution bound is CPU fuel, and the guest is given neither a timer clock nor a date clock."
+          "evidence": "crates/engine-wasm/src/app_host.rs:190 The guest is given no clock (the WIT world says 'no clock'). The host checks its deadline with the monotonic Instant, which is the 'exposes neither timers nor dates' exclusion."
+        },
+        {
+          "technique": "null-and-blocking-executors",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/app_host.rs:15 Async wasm calls are driven by the host's tokio runtime. Wasm has no promise job queue that would need a shipped null or blocking executor."
+        },
+        {
+          "technique": "idle-aware-job-loop",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:382 Each plugin call is one synchronous call on a blocking thread, with no engine queues to drain. Tokio is the host loop, which the technique's 'runtime already provides a loop' exclusion covers."
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:124 Liveness is a fresh wasm Store and linear memory per call, not a tracing collector walking jobs.",
+          "carriedFrom": "2026-10-13"
         }
       ],
-      "registryProposal": "use_when opens with embedding a language engine, which a wasmtime host matches on the words, while every technique assumes a specification that hands over promise jobs, import resolution, rejection tracking and two guest clocks. A sentence that the subject starts only where that table exists would keep wasm-UDF, scrape-engine and durable-queue contexts from being paired here."
+      "registryProposal": "The golden path's first use_when ('embedding a language engine in a host that already owns an event loop') matches a host that embeds a third-party engine (wasmtime inside tokio) with a host-authored import world, but every technique is written from the engine designer's side. The subject should say whether such a host inherits anything (for example, documenting obligations on each import, or giving guests no clock) or should be routed to untrusted-extension-host instead.",
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/engine-wasm/src/lib.rs:4 Searched engine-wasm, engine-claude and engine-search for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; wasm plugins declare no imports and one call is synchronous, Claude is a CLI subprocess, and search is Tantivy.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by d9f6d4fc-f414-4134-beb8-73f46d3eb41a"
+        }
+      ],
+      "withdrawn": {
+        "worker": "d9f6d4fc-f414-4134-beb8-73f46d3eb41a",
+        "state": "not-applicable",
+        "at": "2026-11-03T22:12:54.417591+00:00",
+        "reason": "reviewer (sonnet): The technique anchor crates/engine-wasm/src/lib.rs:6 says only that a plugin's linker is empty or capability-derived. It does not say guests cannot import modules by specifier or that there is no module graph, and the 'no job queue' claim about wasm is not shown in the code I opened."
+      }
     },
     "413dd239-ed7e-4318-bd93-f2c3bd72c7b7/engine-host-contract": {
       "context": "e2e-data-integrity",
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:12:21.671Z",
+      "worker": "d9f6d4fc-f414-4134-beb8-73f46d3eb41a",
       "techniques": [
         {
           "technique": "spec-mirrored-hook-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:71 The asserted obligations are HTTP fetch behaviour, not a language-spec hook list."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Conformance here means implementing pumper-authored traits, not a spec hook table."
         },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:80 The default under test is a typed binary-fetch refusal, not a promise executor."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:80 The default under test is a typed binary-fetch refusal, not a promise executor.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "untraceable-jobs-as-roots",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The tests pin dataset read filters on stored rows; there is no guest heap."
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:1 The tests pin dataset read filters on stored rows; there is no guest heap.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:5 A discovered wasm module is refused at enqueue, so this suite never drains an engine job loop."
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:5 A discovered wasm module is refused at enqueue, so this suite never drains an engine job loop.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/dynamic_apps.rs:1 Wasm coverage is directory listing of describe() modules, not an async import of a guest specifier."
+          "evidence": "crates/server/src/e2e/dynamic_apps.rs:1 Wasm coverage is directory listing of describe() modules, not an async import of a guest specifier.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:54 The only clock phrase in the conformance battery means the dead-URL probe must not sleep."
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:54 The only clock phrase in the conformance battery means the dead-URL probe must not sleep.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Searched crates/server/src/e2e for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; this battery's engine is one of five scrape capability traits, and a discovered wasm module is listed as not runnable.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by d9f6d4fc-f414-4134-beb8-73f46d3eb41a"
         }
       ]
     },
@@ -2617,39 +2673,52 @@
       "subject": "engine-host-contract",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-13",
-      "evaluatedTs": "2026-10-13T09:10:51.035Z",
-      "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:12:21.671Z",
+      "worker": "d9f6d4fc-f414-4134-beb8-73f46d3eb41a",
       "techniques": [
-        {
-          "technique": "spec-mirrored-hook-surface",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:18 The worker claims due scrape jobs onto shared engines; it does not expose a specification hook trait."
-        },
         {
           "technique": "null-and-blocking-executors",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:833 A lost task is a heartbeat lease the reaper re-queues, not a blocking drain of promise jobs."
-        },
-        {
-          "technique": "untraceable-jobs-as-roots",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:255 A job's continuation is a checkpoint that resumes after restart, so it is stored, not an untraced heap root."
+          "evidence": "crates/server/src/worker.rs:254 Jobs survive restarts as stored rows, so there are no in-memory engine job executors."
         },
         {
           "technique": "idle-aware-job-loop",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:111 An empty claim parks on notify or this poll sleep; the queues are not promise, timer, native and cleanup jobs."
+          "evidence": "crates/server/src/worker.rs:261 This is a graceful-shutdown drain of a worker pool, not a host loop draining an embedded engine's micro/macrotask queues."
+        },
+        {
+          "technique": "spec-mirrored-hook-surface",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:18 The worker claims due scrape jobs onto shared engines; it does not expose a specification hook trait.",
+          "carriedFrom": "2026-10-13"
+        },
+        {
+          "technique": "untraceable-jobs-as-roots",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:255 A job's continuation is a checkpoint that resumes after restart, so it is stored, not an untraced heap root.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "contained-async-module-loader",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/fanout.rs:3 Fan-out is post-persist indexing and delivery, not a guest import of a specifier."
+          "evidence": "crates/server/src/fanout.rs:3 Fan-out is post-persist indexing and delivery, not a guest import of a specifier.",
+          "carriedFrom": "2026-10-13"
         },
         {
           "technique": "monotonic-and-wall-clock-split",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:862 Elapsed run time is one std Instant for a host job deadline, not a guest timer type beside a guest date type."
+          "evidence": "crates/server/src/worker.rs:862 Elapsed run time is one std Instant for a host job deadline, not a guest timer type beside a guest date type.",
+          "carriedFrom": "2026-10-13"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:256 Searched crates/server/src for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; shutdown re-queues the job from a durable checkpoint, so these jobs are stored work rather than in-memory promise reactions.",
+          "evaluatedAt": "2026-10-13T09:10:51.035Z",
+          "worker": "f4e7b2fe-3e02-4ede-82b2-14ace82f16e7",
+          "reason": "replaced by d9f6d4fc-f414-4134-beb8-73f46d3eb41a"
         }
       ]
     },

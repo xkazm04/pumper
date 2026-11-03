@@ -691,11 +691,7 @@
           "confidence": "probable",
           "state": "not-applicable",
           "evidence": "crates/engine-wasm/src/lib.rs:4 Searched engine-wasm, engine-claude and engine-search for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; wasm plugins declare no imports and one call is synchronous, Claude is a CLI subprocess, and search is Tantivy.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
-          "evaluatedRevision": 2,
-          "revisionsBehind": 1,
-          "stale": true
+          "evaluatedAt": "2026-10-13"
         },
         {
           "subject": "quality-gates",
@@ -2266,12 +2262,11 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/src/engine.rs:2 Searched crates/core/src and crates/core/tests for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; the engines named on this line are HTTP, browser and Claude research traits wired by the server.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
-          "evaluatedRevision": 2,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/engine.rs:2 Here an 'engine' is a scrape capability trait (HTTP, browser, Claude) that pumper's server wires up, not an embedded language engine with a host-hook table; a search of crates/ for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader found nothing, so the subject's precondition does not hold.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:dcbd96d1274205ef",
+          "evaluatedRevision": 3,
+          "revisionsBehind": 1
         },
         {
           "subject": "module-design",
@@ -3705,13 +3700,12 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/migrations/0016_host_profiles.sql:1 Searched crates/core/migrations for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; a host profile here is persisted HTTP-versus-browser tier memory.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
-          "evaluatedRevision": 2,
+          "evidence": "crates/core/migrations/0001_init.sql:1 Jobs here are durable SQLite rows with status and attempts, which the golden path explicitly sends to job-coordination rather than to in-memory engine jobs; a search of crates/ for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader found nothing.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:dcbd96d1274205ef",
+          "evaluatedRevision": 3,
           "source": "retained",
-          "revisionsBehind": 1,
-          "stale": true
+          "revisionsBehind": 1
         }
       ],
       "governance": "governed"
@@ -4352,13 +4346,12 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 Searched crates/server/src/e2e for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; this battery's engine is one of five scrape capability traits, and a discovered wasm module is listed as not runnable.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
-          "evaluatedRevision": 2,
+          "evidence": "crates/server/src/e2e/engine_conformance.rs:4 The 'engine conformance' battery tests scrape capability traits, not a language engine's host hooks; a search of crates/ for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader found nothing.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:dcbd96d1274205ef",
+          "evaluatedRevision": 3,
           "source": "retained",
-          "revisionsBehind": 1,
-          "stale": true
+          "revisionsBehind": 1
         },
         {
           "subject": "conformance-checking",
@@ -5245,12 +5238,11 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:256 Searched crates/server/src for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader and found none; shutdown re-queues the job from a durable checkpoint, so these jobs are stored work rather than in-memory promise reactions.",
-          "evaluatedAt": "2026-10-13",
-          "evaluatedAgainst": "sha256-b2:08d3fea13f40733a",
-          "evaluatedRevision": 2,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/worker.rs:254 Worker jobs are durable queue records that are re-queued and resumed from a checkpoint across restarts, which is the job-coordination animal the golden path explicitly excludes; a search of crates/ for HostHooks, JobExecutor, microtask, macrotask and ModuleLoader found nothing.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:dcbd96d1274205ef",
+          "evaluatedRevision": 3,
+          "revisionsBehind": 1
         },
         {
           "subject": "job-coordination",
