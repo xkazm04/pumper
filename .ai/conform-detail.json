@@ -8327,6 +8327,32 @@
       "evaluatedTs": "2026-11-03T22:54:58.661Z",
       "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
       "techniques": []
+    },
+    "6fb74ed1-c2ac-4e2e-99b4-5415a68bc3d2/test-harness": {
+      "context": "api-data-access",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T23:17:30.320Z",
+      "worker": "cd99ab40-834e-4ae1-ae32-dab5f77ab83e",
+      "techniques": [
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1522 Comments and test code are rightly stripped from the haystack, but the population is cut at the first of four test modules, so ~250 lines of route code are silently excluded while the doc comment claims 'everything above the test module'."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1538 The 'seeded violation' appends the forbidden text and then checks that the string contains it. That cannot fail, and it never runs the guard in count_and_page_cannot_select_different_sets, so the guard has never been seen going red."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/search.rs:520 The degraded-index decision is lifted into the pure index_degraded_reason (search.rs:134) and asserted directly. Its single call site is search.rs:157; adoption is not asserted in this file."
+        }
+      ]
     }
   }
 }

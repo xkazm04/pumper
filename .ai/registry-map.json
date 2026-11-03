@@ -836,7 +836,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1522 The structural guard against `Utc::now().date_naive()` reads query.rs only up to the FIRST #[cfg(test)] (line 949), so the executable grants route code at lines 1015-1269 (list_fits, grants_for_profile, create_grant_profile) is outside its haystack, and the forbidden expression put back there would pass the guard.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "agent-runtime-assembly",
