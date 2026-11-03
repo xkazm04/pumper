@@ -537,27 +537,29 @@
       "context": "web-crawl-extraction",
       "subject": "mcp-tools",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T20:55:59.048Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T09:28:55.359Z",
+      "worker": "c7cf259b-b624-4e9c-8074-7fefae1f8e45",
       "techniques": [
+        {
+          "technique": "tool-schema-design",
+          "verdict": "deviation",
+          "evidence": "crates/apps/extractor/src/lib.rs:1300 Requiredness that varies by operation (mode) sits in the schema instead of a uniform runtime rule. The door error (validate_params formats the raw jsonschema errors) cannot say which mode moved the requirement."
+        },
+        {
+          "technique": "server-composition",
+          "verdict": "conformant",
+          "evidence": "crates/apps/extractor/tests/mode_door.rs:84 The test proves the published schema and the app's own guard refuse the same objects, using the real validator crate."
+        },
         {
           "technique": "orchestration-to-tool-migration",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/crawl/src/lib.rs:24 The crawl app is a batch ScrapeApp pipeline rather than an agent-facing MCP tool surface."
-        },
-        {
-          "technique": "tool-schema-design",
-          "verdict": "not-applicable",
-          "evidence": "crates/apps/extractor/src/lib.rs:21 The extractor app runs batch HTML rule extraction rather than defining MCP tool schemas."
+          "evidence": "crates/apps/crawl/src/lib.rs:24 The crawl app is a batch ScrapeApp pipeline rather than an agent-facing MCP tool surface.",
+          "carriedFrom": "2026-10-12"
         }
       ],
-      "withdrawn": {
-        "worker": "ee36a077-95e2-4ebd-ab7c-d5e56abcfbcb",
-        "state": "not-applicable",
-        "at": "2026-10-12T20:57:39.275771+00:00",
-        "reason": "reviewer (sonnet): The claim that these apps are not an MCP tool surface is contradicted by the code. The extractor's `mode_door.rs` tests `mcp::validate_app_params`, and the apps' manifests are published verbatim as MCP tool definitions (`result_contract.rs` tests). The anchors at crawl/src/lib.rs:24 and extractor/sr"
-      }
+      "registryProposal": "tool-schema-design's conditional-requiredness rule assumes a flat schema cannot express operation-dependent requiredness. It could say explicitly whether oneOf/if-then branches count as 'in the schema', given that their validator errors are the undiagnosable kind the rule warns against."
     },
     "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/quality-gates": {
       "context": "ci-quality-gates",
