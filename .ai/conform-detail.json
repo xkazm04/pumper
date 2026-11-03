@@ -350,76 +350,107 @@
       "subject": "test-harness",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T19:27:37.490Z",
-      "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T15:16:06.985Z",
       "techniques": [
         {
-          "technique": "suite-partitioning",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/package.json:26 The package has one test script over the compiled test directory, matching one small suite."
+          "technique": "approval-snapshots-with-guarded-update",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/fixtures/feed-shared-stamp.json:8 The record switch is a runtime env var, which the technique names as the invisible shape. assert_golden returns early (a pass) in record mode, and nothing proves the switch is off in the pipeline."
         },
         {
           "technique": "fixture-economics",
-          "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:5 Wire fixtures are hand-authored against current server shapes and the loader does not check a schema fingerprint before use."
-        },
-        {
-          "technique": "live-app-harness",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:13 The file says this suite does not drive a live server."
-        },
-        {
-          "technique": "isolation-lanes",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/sync-report.test.ts:127 The test supplies its own sink; there is no shared machine resource to isolate."
-        },
-        {
-          "technique": "platform-quirk-absorption",
           "verdict": "conformant",
-          "evidence": "clients/typescript/package.json:25 npm test copies JSON fixtures into the emit directory because tsc does not, in the one pretest in front of the suite."
-        },
-        {
-          "technique": "long-lane-certification",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:24 Package scripts are build, typecheck, and node:test; there is no scheduled statistical lane."
-        },
-        {
-          "technique": "gate-scope-is-not-report-scope",
-          "verdict": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:40 \"Every field PumperRecord requires\" is checked by a hand-written list, and the JSON is only cast to the type."
-        },
-        {
-          "technique": "recorded-interaction-fixtures",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:91 HTTP is a stub that returns a supplied body, not a record/playback seam against a remote service."
-        },
-        {
-          "technique": "context-starved-executor",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/package.json:4 The package is a library with no human-facing interface."
-        },
-        {
-          "technique": "approval-snapshots-with-guarded-update",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:6 The JSON files are hand-authored inputs shaped like server types, not recorded SDK outputs."
-        },
-        {
-          "technique": "far-side-oracle",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/sync-report.test.ts:178 The effect under test is a caller-supplied sink, and the test asserts that sink rather than an external system."
+          "evidence": "clients/typescript/test/conformance.test.ts:480 The replay fixture is seeded through the product's real write path (a real Datasets store), not hand-typed rows."
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/sync-report.test.ts:184 Zero upserts caused by the mapper is reported as droppedByMap, not as an idle feed."
+          "evidence": "clients/typescript/test/conformance.test.ts:265 The fake feed is keyed by cursor, so only the SDK's real resume decision can select the right page. A call counter cannot answer in its place."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/conformance.test.ts:364 The regression test names the defect it reverts against, which is the technique's 'control is its own fix' framing."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/conformance.test.ts:61 The spec lookup absorbs the test/ versus dist-test/test layout difference and turns a missing spec into a named diagnosis with the remedy."
+        },
+        {
+          "technique": "suite-partitioning",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/package.json:26 Suite membership is decided by location (the test/*.test files), not by annotation."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "conformant",
+          "evidence": ".github/workflows/ci.yml:259 The detached npm package has its own job, named after the artifact. It names its own manifest and lockfile cache and runs the package's test script, not only a typecheck."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:145 The far side is this repo's own server, pinned through openapi.json and a Rust companion test, not a service somebody else operates."
+        },
+        {
+          "technique": "live-app-harness",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/conformance.test.ts:13 The file says this suite does not drive a live server.",
+          "carriedFrom": "2026-10-12"
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/sync-report.test.ts:127 The test supplies its own sink; there is no shared machine resource to isolate.",
+          "carriedFrom": "2026-10-12"
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/package.json:24 Package scripts are build, typecheck, and node:test; there is no scheduled statistical lane.",
+          "carriedFrom": "2026-10-12"
+        },
+        {
+          "technique": "gate-scope-is-not-report-scope",
+          "verdict": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 \"Every field PumperRecord requires\" is checked by a hand-written list, and the JSON is only cast to the type.",
+          "carriedFrom": "2026-10-12"
+        },
+        {
+          "technique": "context-starved-executor",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/package.json:4 The package is a library with no human-facing interface.",
+          "carriedFrom": "2026-10-12"
+        },
+        {
+          "technique": "far-side-oracle",
+          "verdict": "not-applicable",
+          "evidence": "clients/typescript/test/sync-report.test.ts:178 The effect under test is a caller-supplied sink, and the test asserts that sink rather than an external system.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assert-through-the-reader",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string."
+          "evidence": "clients/typescript/test/conformance.test.ts:111 Export query parameters are read back through the URL parser, not by a substring of the request string.",
+          "carriedFrom": "2026-10-12"
         }
-      ]
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
+          "evaluatedAt": "2026-10-12T19:27:37.490Z",
+          "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
+          "reason": "replaced by 036159e7-00e7-4395-b223-256ec272510d"
+        }
+      ],
+      "withdrawn": {
+        "worker": "036159e7-00e7-4395-b223-256ec272510d",
+        "state": "deviation",
+        "at": "2026-11-03T15:16:31.247909+00:00",
+        "reason": "reviewer (sonnet): The record-mode writer (assert_golden in crates/core/tests/change_feed_keyset.rs) is Rust code in a different context, and the SDK's own conformance.test.ts replays the committed fixture whatever the env var does. So 'passes without verifying anything' is not shown for this context, and I could not "
+      }
     },
     "571cf8b4-4f98-4205-b9c7-270fce8277e1/mcp-tools": {
       "context": "api-server-core",
@@ -8077,6 +8108,52 @@
       "evaluatedTs": "2026-11-03T11:39:47.564Z",
       "worker": "360d640f-bff3-4710-9fa2-92a7ac92c38c",
       "techniques": []
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/test-harness": {
+      "context": "ai-extraction-engines",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T15:16:06.985Z",
+      "worker": "036159e7-00e7-4395-b223-256ec272510d",
+      "techniques": [
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/tests/fake_cli.rs:260 This is the hand-written fake the technique names as the weak option. It is not a recording, and there is no live certification lane. Searched engine-claude, scripts/smoke.ps1 and the justfile for any real-CLI lane and found none."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/engine-search/tests/recency.rs:163 Each search test deletes its own index directory at the end of its body, so cleanup is left to each test's diligence and a failing assertion leaks the directory. The same per-file unique_dir and cleanup is copied into facets.rs and entity_fields.rs. No harness-named reaper exists, unlike core's RAII TempStore."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "crates/engine-claude/tests/fake_cli.rs:30 The ETXTBSY fork race is absorbed once in settle_exec, with its incident (failed on ubuntu, passed locally) kept attached."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/engine-search/tests/recency.rs:130 A fixed-sleep flake was replaced by an observation poll with a generous one-sided deadline, and the incident is recorded."
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "conformant",
+          "evidence": "crates/engine-search/tests/recency.rs:10 The singleton resource (the exclusive writer lock) is named, and each test gets its own directory."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:111 The ABI pin matches the attribute line exactly, then reads the signature for its name, so prose in comments cannot satisfy it."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:12 The gate for a loadable artifact loads it rather than compiling it, plus an EXPECTED inventory of every plugins-src crate."
+        }
+      ]
     }
   }
 }

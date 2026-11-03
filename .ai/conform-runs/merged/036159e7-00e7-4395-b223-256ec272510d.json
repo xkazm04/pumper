@@ -1,0 +1,119 @@
+{
+  "schema": "conform-run/1",
+  "worker": "036159e7-00e7-4395-b223-256ec272510d",
+  "subject": "test-harness",
+  "evaluatedAt": "2026-11-03T15:16:06.985914+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "ai-extraction-engines",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/engine-claude/tests/fake_cli.rs:260 Every test of the Claude engine runs against hand-written CLI envelopes that name no CLI version, and no lane runs the real CLI. A change in the real CLI's output (for example a renamed cost field) would leave the whole suite green.",
+      "techniques": [
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "deviation",
+          "evidence": "crates/engine-claude/tests/fake_cli.rs:260 This is the hand-written fake the technique names as the weak option. It is not a recording, and there is no live certification lane. Searched engine-claude, scripts/smoke.ps1 and the justfile for any real-CLI lane and found none."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/engine-search/tests/recency.rs:163 Each search test deletes its own index directory at the end of its body, so cleanup is left to each test's diligence and a failing assertion leaks the directory. The same per-file unique_dir and cleanup is copied into facets.rs and entity_fields.rs. No harness-named reaper exists, unlike core's RAII TempStore."
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "crates/engine-claude/tests/fake_cli.rs:30 The ETXTBSY fork race is absorbed once in settle_exec, with its incident (failed on ubuntu, passed locally) kept attached."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/engine-search/tests/recency.rs:130 A fixed-sleep flake was replaced by an observation poll with a generous one-sided deadline, and the incident is recorded."
+        },
+        {
+          "technique": "isolation-lanes",
+          "verdict": "conformant",
+          "evidence": "crates/engine-search/tests/recency.rs:10 The singleton resource (the exclusive writer lock) is named, and each test gets its own directory."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:111 The ABI pin matches the attribute line exactly, then reads the signature for its name, so prose in comments cannot satisfy it."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:12 The gate for a loadable artifact loads it rather than compiling it, plus an EXPECTED inventory of every plugins-src crate."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "test-harness",
+      "context": "job-triggers-pipeline",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "wasm-plugins",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "job-worker",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "pumper-sync-sdk",
+      "reason": "withdrawn after review: reviewer (sonnet): The record-mode writer (assert_golden in crates/core/tests/change_feed_keyset.rs) is Rust code in a different context, and the SDK's own conformance.test.ts replays the committed fixture whatever the env var does. So 'passes without verifying anything' is not shown for this context, and I could not "
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-03T15:16:06.985914+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "test-harness"
+      ],
+      "techniques": [
+        "approval-snapshots-with-guarded-update",
+        "fixture-economics",
+        "negative-control-tests",
+        "out-of-graph-artifacts",
+        "platform-quirk-absorption",
+        "recorded-interaction-fixtures",
+        "suite-partitioning",
+        "unreached-decisions-pin-nothing"
+      ],
+      "deviations": 1,
+      "context": "pumper-sync-sdk",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-03T15:16:06.985914+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "test-harness"
+      ],
+      "techniques": [
+        "assert-the-schedule-not-the-stopwatch",
+        "fixture-economics",
+        "isolation-lanes",
+        "out-of-graph-artifacts",
+        "pin-the-call-not-the-name",
+        "platform-quirk-absorption",
+        "recorded-interaction-fixtures"
+      ],
+      "deviations": 1,
+      "context": "ai-extraction-engines",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

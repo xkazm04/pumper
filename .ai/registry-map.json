@@ -616,7 +616,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-claude/tests/fake_cli.rs:260 Every test of the Claude engine runs against hand-written CLI envelopes that name no CLI version, and no lane runs the real CLI. A change in the real CLI's output (for example a renamed cost field) would leave the whole suite green.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "document-text-extraction",
@@ -5527,11 +5531,7 @@
           "confidence": "strong",
           "state": "deviation",
           "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
-          "revisionsBehind": 1,
-          "stale": true
+          "evaluatedAt": "2026-10-12"
         },
         {
           "subject": "table",
