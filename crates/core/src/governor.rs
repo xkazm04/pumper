@@ -336,15 +336,10 @@ mod tests {
     /// Distinct hosts never serialize on each other, yet each host's own
     /// spacing still holds — the whole point of the per-host sharded map.
     ///
-    /// **Quarantined as a flake**, not merely ignored. The entry — owner, entry
-    /// date, expiry, suspected cause and the failure evidence — is in
-    /// `.flake/register.json`, and `just flake-check` fails if that entry
-    /// expires, stops naming a real test, or is missing. The `#[ignore]` string
-    /// below is the label made visible where the test appears; the register is
-    /// the decision. It runs nightly through the `long-lanes` CI leg so the
-    /// outcome history that will eventually release it keeps accumulating.
-    #[tokio::test]
-    #[ignore = "QUARANTINED flake — .flake/register.json (owner xkazm04, entered 2026-08-24, expires 2026-10-26, cause=test): the concurrency upper bound inverts on a loaded machine. `just flake-check` / `just test-ignored`"]
+    /// Runs on tokio's paused virtual clock, so the elapsed time is exact and no
+    /// loaded runner can stretch it. (It was a wall-clock flake, quarantined
+    /// 2026-08-24 and released once the clock stopped being real.)
+    #[tokio::test(start_paused = true)]
     async fn distinct_hosts_run_in_parallel_but_each_host_spaces() {
         // 200ms per-host spacing, no jitter for a deterministic lower bound.
         let cfg = GovernorConfig {
@@ -379,8 +374,9 @@ mod tests {
             "per-host spacing lost: {elapsed:?}"
         );
         // Upper bound: 32 hosts ran concurrently, not serialized into ~12.8s.
+        // On the virtual clock concurrent hosts finish in exactly two gaps (400ms).
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(1),
             "distinct hosts serialized: {elapsed:?}"
         );
     }

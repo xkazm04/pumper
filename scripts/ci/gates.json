@@ -15,7 +15,7 @@
   "inventoryTest": "scripts/ci/gate-inventory.test.mjs",
   "gatePredicate": "export const EXIT_CANNOT_CHECK",
   "scanRoots": ["scripts/ci", "scripts/docs"],
-  "extraFixtureTests": ["scripts/ci/ship-inventory.test.mjs"],
+  "extraFixtureTests": ["scripts/ci/ship-inventory.test.mjs", "scripts/ci/generate-clients.test.mjs"],
   "gates": [
     {
       "key": "flake-check",

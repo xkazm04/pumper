@@ -57,3 +57,6 @@ reqwest.workspace = true
 [dev-dependencies]
 # Self-referential: core's own integration tests get the harness.
 pumper-core = { path = ".", features = ["test-support"] }
+# `test-util`: `#[tokio::test(start_paused = true)]` gives the governor's spacing
+# tests a virtual clock, so they assert exact durations instead of racing a loaded runner.
+tokio = { workspace = true, features = ["test-util"] }

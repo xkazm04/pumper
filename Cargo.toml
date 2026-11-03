@@ -79,7 +79,7 @@ reqwest = { version = "0.13", features = ["json", "cookies", "gzip", "brotli", "
 # Already in the tree as reqwest's own cookie store — this is a direct edge, not
 # a new dependency.
 cookie_store = "0.22"
-scraper = "0.27"
+scraper = "0.29"
 # HTML/text charset decoding (windows-1250 etc.). Already in the tree as
 # reqwest's own body decoder — this promotes it to a direct edge for the
 # streamed-body path, which bypasses reqwest's `.text()` charset handling.
@@ -95,10 +95,18 @@ simd-json = "0.18"
 url = "2"
 
 # sandboxed WASM plugin runtime
-wasmtime = "49"
+# Default features minus `cache`: the on-disk compilation cache is unused here and
+# pulls zstd 0.13 (RUSTSEC-2026-0391/0398/0403, no patched release on that line).
+wasmtime = { version = "49", default-features = false, features = [
+    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat",
+    "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
+    "addr2line", "coredump", "debug-builtins", "runtime", "component-model",
+    "component-model-async", "threads", "stack-switching", "std", "debug",
+    "compile-time-builtins", "wit-parser",
+] }
 
 # embedded full-text search (in-process, no external service)
-tantivy = "0.26"
+tantivy = "0.27"
 
 # shared
 dashmap = "6"
@@ -116,7 +124,7 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Params-schema validation for app manifests (enqueue 422s + the MCP surface).
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 toml = "1.1"
 thiserror = "2"
 anyhow = "1"

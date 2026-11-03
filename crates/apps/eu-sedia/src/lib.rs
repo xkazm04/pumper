@@ -602,20 +602,37 @@ fn clean_inline(s: &str) -> String {
 }
 
 /// Removes the Markdown decoration `html_to_markdown` emits (headings `#`,
-/// bold `**`, italics `_`, code ticks); list dashes are kept — they read fine
-/// as plain text. Dropping `_` is safe here: SEDIA identifiers are hyphenated
-/// (HORIZON-CL4-…), so prose underscores don't occur.
+/// bold `**`, italics `_`, code ticks, and the backslash it puts before text
+/// that would otherwise parse as syntax, e.g. `\<trustworthy>`); list dashes
+/// are kept — they read fine as plain text. Dropping `_` is safe here: SEDIA
+/// identifiers are hyphenated (HORIZON-CL4-…), so prose underscores don't occur.
 fn strip_md(md: &str) -> String {
     md.lines()
-        .map(|l| {
-            l.trim_start_matches('#')
-                .trim_start()
-                .replace(['*', '`', '_'], "")
-        })
+        .map(|l| unescape_md(l.trim_start_matches('#').trim_start()).replace(['*', '`', '_'], ""))
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
+}
+
+/// Drops a Markdown backslash escape: `\X` -> `X` for ASCII punctuation `X`.
+/// A backslash before anything else is literal text and is kept.
+fn unescape_md(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                if n.is_ascii_punctuation() {
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn multipart_body(query: &str, languages: &str) -> String {

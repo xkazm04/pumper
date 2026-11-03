@@ -191,6 +191,10 @@ The field-level `is_blank` (which decides `FieldStatus::Empty` and `CoercionStat
 
 `<table>` renders as a **GitHub pipe table**. The first row is the header: `<th>` cells become the headers, and a `<th>`-less table promotes its first `<tr>` to the header. `<thead>`/`<tbody>`/`<tfoot>` wrappers are traversed; ragged rows are padded to a rectangular grid; cells with nested block content degrade to inline text (whitespace collapsed, `|` escaped); a nested table's text is flattened into its enclosing cell.
 
+### Text is escaped only where it would parse as Markdown
+
+Page text that would otherwise become syntax is backslash-escaped: `*not emphasis*`, `# not a heading`, `2024. A year`, `<your tenant>` (rendered as an unknown tag, it vanished), `&copy;`. Text that cannot parse is left byte-identical — prices, `5 * 3`, `snake_case`, a lone `*`, `a < b` — because every consumer that reads the Markdown as text (the model, SEDIA's `strip_md`) pays for each backslash. Whether a character is syntax depends on what *other* elements emit next to it (a `**` from a following `<b>`, a code span's backtick, a link's `[`), so `push_text` marks text characters and `resolve_escapes` decides after the block is assembled: a text-text pair is broken by escaping its later half; lookahead is spent only on emitted syntax, on backticks (a backslash does not stop a backtick from closing a code span), and on next-character rules. `html_fragment_to_markdown` treats its end as unknown context (the caller embeds or joins the value) and escapes a trailing delimiter as if a partner followed. Code spans and `<pre>` stay literal. Consumers that strip Markdown to plain text must drop the escapes too (`eu-sedia`'s `unescape_md`).
+
 ## WASM plugin sandbox (`engine-wasm`, `plugin` app)
 
 `engine-wasm` hosts **two** kinds of guest, deliberately kept apart:

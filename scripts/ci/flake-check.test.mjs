@@ -547,6 +547,6 @@ test('the_source_scan_actually_found_this_tree', () => {
   assert.ok(pkgs.some((p) => p.name === 'pumper-server' && !p.hasLib));
   const scanned = scanIgnoredTests(REPO_ROOT, pkgs);
   assert.ok(scanned.length >= 15, `only ${scanned.length} #[ignore]d tests found`);
-  assert.ok(scanned.some((s) => s.key === 'pumper-core::lib::distinct_hosts_run_in_parallel_but_each_host_spaces'));
+  assert.ok(scanned.some((s) => s.key === 'pumper-engine-wasm::lib::instance_pre_instantiation_is_never_slower_than_relinking_per_call'));
   assert.ok(scanned.some((s) => s.key.startsWith('pumper-server::bin:pumper::shipped_')));
 });

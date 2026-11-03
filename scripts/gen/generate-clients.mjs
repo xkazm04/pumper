@@ -22,7 +22,7 @@
 //
 // Usage:
 //   node scripts/gen/generate-clients.mjs          # write
-//   node scripts/gen/generate-clients.mjs --check  # exit 1 on drift
+//   node scripts/gen/generate-clients.mjs --check  # exit 1 on drift, 3 if the generator is not installed
 //
 // `--check` is the CI gate: it regenerates into memory and diffs against the
 // committed output, so a spec change that was not regenerated fails the build
@@ -33,6 +33,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  CANNOT_CHECK_MESSAGE,
+  EXIT_CANNOT_CHECK,
+  openapiTypescriptCli,
+  toolchainPresent,
+} from "./toolchain.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
@@ -55,15 +62,7 @@ function generateTypeScript() {
   // EINVAL unless a shell is spawned, and spawning a shell to run a generator is
   // how a path with a space becomes a mystery. This is one process, no shell,
   // identical on both CI legs.
-  const cli = path.join(
-    ROOT,
-    "clients/typescript/node_modules/openapi-typescript/bin/cli.js",
-  );
-  if (!fs.existsSync(cli)) {
-    throw new Error(
-      "openapi-typescript is not installed — run `npm --prefix clients/typescript ci` first",
-    );
-  }
+  const cli = openapiTypescriptCli(ROOT);
   const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pumper-gen-")), "generated.ts");
   execFileSync(process.execPath, [cli, SPEC, "-o", out], {
     stdio: ["ignore", "ignore", "inherit"],
@@ -216,6 +215,11 @@ if (!fs.existsSync(SPEC)) {
       "  UPDATE_OPENAPI=1 cargo test -p pumper-server --bin pumper spec_snapshot",
   );
   process.exit(2);
+}
+
+if (!toolchainPresent(ROOT)) {
+  console.error(CANNOT_CHECK_MESSAGE);
+  process.exit(EXIT_CANNOT_CHECK);
 }
 
 const spec = JSON.parse(fs.readFileSync(SPEC, "utf8"));
