@@ -3575,7 +3575,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0001_init.sql:1 The context is SQL DDL files only. A grep over crates/core/migrations for harness, fixture, mock and #[test] found no hits ('test' appears only as a JSON column comment in 0020 and a path reference in 0046), so it holds no test machinery to judge.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "prompt-assembly",
@@ -4438,13 +4442,12 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "strong",
-          "state": "conformant",
-          "evidence": "crates/server/src/e2e/harness.rs:1449 The e2e census blanks comments, keeps a module-count floor, and chains the panic hook so a scanner or a quiet hook cannot report a clean tree.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
-          "revisionsBehind": 1,
-          "stale": true
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/harness.rs:85 Every e2e test builds a new temp SQLite and runs the full migration chain through `Storage::connect`, so setup cost grows with each test added. This is the rebuild-per-test shape that fixture-economics names as its failure.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
+          "revisionsBehind": 1
         },
         {
           "subject": "agent-instruction-files",
@@ -5998,7 +6001,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/crawl/tests/result_contract.rs:164 Each run()-level test builds a new migrated SQLite store instead of copying a template built once, so every test pays the full migration chain. That is the rebuild-per-test shape fixture-economics names as its failure.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "structured-output",
