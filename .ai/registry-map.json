@@ -5212,7 +5212,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/worker_lifecycle.rs:561 The structural pin that claims all four gate/hook calls sit inside `finalize_fanout` ends the function at the next column-0 bare `fn ` (worker.rs:1577 `vcr_params`), so its window also covers `publish_running` (1465) and `finish_from_executor` (1493); a call moved into the remote-finish path would stay green, which is the instrument-defaults-toward-green failure the technique names.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "concurrency-guards",

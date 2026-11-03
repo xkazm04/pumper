@@ -8353,6 +8353,37 @@
           "evidence": "crates/server/src/routes/search.rs:520 The degraded-index decision is lifted into the pure index_degraded_reason (search.rs:134) and asserted directly. Its single call site is search.rs:157; adoption is not asserted in this file."
         }
       ]
+    },
+    "6a152014-f86c-4ad6-8b65-6ab5ed484ea5/test-harness": {
+      "context": "job-worker",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T23:33:21.598Z",
+      "worker": "b75473f8-cfe0-4f8a-8681-f68cdae77a63",
+      "techniques": [
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/worker_lifecycle.rs:561 The needles are good: they carry argument lists, and an exactly-once count makes a prose mention go red. The scope predicate is the problem: it reads 'next bare fn' rather than the construct's own end, so `pub(crate) fn` and `pub(crate) async fn` items are swallowed into the window."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/worker_lifecycle.rs:350 The per-app cap claim is proved by counting the peak number of runs in flight, with stubs held until `want` of them overlap. The run_one seam drains the fan-out as a synchronization point, not a deadline poll (worker.rs:236-237)."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/worker_lifecycle.rs:410 A control test proves the harness itself is not serialising, so a peak of 1 under cap 1 is evidence about the cap, not an artifact of the harness."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:36 The competing producer (the reaper) is armed, and the test asserts that the error text names panic containment rather than the reaper's message."
+        }
+      ]
     }
   }
 }
