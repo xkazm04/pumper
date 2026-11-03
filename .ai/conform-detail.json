@@ -8287,6 +8287,46 @@
           "evidence": "crates/engine-wasm/tests/plugins.rs:119 The ABI pin over plugin source needs a #[no_mangle] line followed by a signature, which comment prose cannot match; the walked population is closed by EXPECTED lists."
         }
       ]
+    },
+    "1faf3871-64b3-4897-bf44-05b2ad892076/prompt-assembly": {
+      "context": "pumper-sync-sdk",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:54:58.661Z",
+      "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
+      "techniques": []
+    },
+    "2d713bf8-16d5-4c0f-aa09-ce602aa575db/prompt-assembly": {
+      "context": "core-schema-migrations",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:54:58.661Z",
+      "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
+      "techniques": []
+    },
+    "d757edd3-47f7-4e38-850b-62b56a7c6740/prompt-assembly": {
+      "context": "grants-intelligence",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:54:58.661Z",
+      "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
+      "techniques": []
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/prompt-assembly": {
+      "context": "wasm-plugins",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T22:54:58.661Z",
+      "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
+      "techniques": []
     }
   }
 }

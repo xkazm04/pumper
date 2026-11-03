@@ -3585,7 +3585,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0009_research_cache.sql:3 The migrations only define storage. The one LLM-adjacent table, research_cache, stores answers under a hash key and has no column for prompt layers, budgets or history. A search of crates/core/migrations found no system_prompt, max_tokens, compaction or context_window, so the prompt-assembly precondition does not hold here.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "module-design",
@@ -4596,7 +4600,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/grants-common/src/lib.rs:4 The grant apps parse and normalize registry records deterministically and never build a ResearchRequest or prompt. A search of the five grant crates found no prompt, system_prompt, max_tokens or ResearchRequest. fit.rs says outright that Claude refinement is outside the v1 slice (METHOD_DETERMINISTIC).",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "supply-chain",
@@ -5637,7 +5645,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "clients/typescript/src/index.ts:1 The package is a typed dataset-mirror and watermark-sync client that makes no model calls and assembles no prompts. A search of clients/typescript (node_modules included) found no system_prompt, max_tokens, compaction or context_window. The only 'prompt' hit is a proposal-summary field in the generated wire types, not prompt assembly.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "agent-runtime-assembly",
@@ -5776,7 +5788,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "plugins-src/delta-slim/src/lib.rs:85 The plugins are pure JSON-in/JSON-out wasm guests behind the alloc/extract_v2/describe ABI and never talk to a language model. A search of plugins-src found no prompt, llm, claude, system_prompt or max_tokens.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "test-harness",
