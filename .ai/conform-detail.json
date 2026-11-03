@@ -351,47 +351,51 @@
       "bundle": "software-engineering",
       "state": "deviation",
       "evaluatedAt": "2026-11-03",
-      "evaluatedTs": "2026-11-03T15:16:06.985Z",
+      "evaluatedTs": "2026-11-03T17:35:56.096Z",
+      "worker": "e114bf59-3ae3-407b-a7b2-cfd3360f1fe8",
       "techniques": [
         {
           "technique": "approval-snapshots-with-guarded-update",
           "verdict": "deviation",
-          "evidence": "clients/typescript/test/fixtures/feed-shared-stamp.json:8 The record switch is a runtime env var, which the technique names as the invisible shape. assert_golden returns early (a pass) in record mode, and nothing proves the switch is off in the pipeline."
+          "evidence": "crates/core/tests/change_feed_keyset.rs:123 Record switch for clients/typescript/test/fixtures/feed-shared-stamp.json is an environment flag with no CI refusal and no integrity test; the technique names exactly this shape as invisible."
         },
         {
           "technique": "fixture-economics",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:480 The replay fixture is seeded through the product's real write path (a real Datasets store), not hand-typed rows."
+          "evidence": "clients/typescript/test/conformance.test.ts:80 Hand-authored record/revision fixtures are held to clients/openapi.json (generated from the router), so a field added server-side fails the fixture instead of letting it validate yesterday's shape."
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:265 The fake feed is keyed by cursor, so only the SDK's real resume decision can select the right page. A call counter cannot answer in its place."
+          "evidence": "clients/typescript/test/conformance.test.ts:167 The decision is asserted at the crossing (the URL handed to fetch), not at an in-process derivation; the keyset fake also serves pages by cursor rather than by call counter."
         },
         {
-          "technique": "negative-control-tests",
+          "technique": "recorded-interaction-fixtures",
           "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:364 The regression test names the defect it reverts against, which is the technique's 'control is its own fix' framing."
-        },
-        {
-          "technique": "platform-quirk-absorption",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/test/conformance.test.ts:61 The spec lookup absorbs the test/ versus dist-test/test layout difference and turns a missing spec into a named diagnosis with the remedy."
-        },
-        {
-          "technique": "suite-partitioning",
-          "verdict": "conformant",
-          "evidence": "clients/typescript/package.json:26 Suite membership is decided by location (the test/*.test files), not by annotation."
+          "evidence": "clients/typescript/test/conformance.test.ts:480 The replayed feed is captured from a real Datasets store and kept fresh by a golden compare on the Rust side (its re-record guard is the deviation above)."
         },
         {
           "technique": "out-of-graph-artifacts",
           "verdict": "conformant",
-          "evidence": ".github/workflows/ci.yml:259 The detached npm package has its own job, named after the artifact. It names its own manifest and lockfile cache and runs the package's test script, not only a typecheck."
+          "evidence": ".github/workflows/ci.yml:259 The detached npm package outside the Cargo workspace has its own CI job that runs its own test script, not just a compile."
         },
         {
-          "technique": "recorded-interaction-fixtures",
-          "verdict": "not-applicable",
-          "evidence": "clients/typescript/test/conformance.test.ts:145 The far side is this repo's own server, pinned through openapi.json and a Rust companion test, not a service somebody else operates."
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/conformance.test.ts:364 The regression test names the defect it reverts against, which is the technique's 'control is its own fix' framing.",
+          "carriedFrom": "2026-11-03"
+        },
+        {
+          "technique": "platform-quirk-absorption",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/test/conformance.test.ts:61 The spec lookup absorbs the test/ versus dist-test/test layout difference and turns a missing spec into a named diagnosis with the remedy.",
+          "carriedFrom": "2026-11-03"
+        },
+        {
+          "technique": "suite-partitioning",
+          "verdict": "conformant",
+          "evidence": "clients/typescript/package.json:26 Suite membership is decided by location (the test/*.test files), not by annotation.",
+          "carriedFrom": "2026-11-03"
         },
         {
           "technique": "live-app-harness",
@@ -443,14 +447,15 @@
           "evaluatedAt": "2026-10-12T19:27:37.490Z",
           "worker": "969af8e5-d110-4763-b9d9-717dc1010568",
           "reason": "replaced by 036159e7-00e7-4395-b223-256ec272510d"
+        },
+        {
+          "state": "deviation",
+          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
+          "evaluatedAt": "2026-10-12",
+          "worker": null,
+          "reason": "replaced by e114bf59-3ae3-407b-a7b2-cfd3360f1fe8"
         }
-      ],
-      "withdrawn": {
-        "worker": "036159e7-00e7-4395-b223-256ec272510d",
-        "state": "deviation",
-        "at": "2026-11-03T15:16:31.247909+00:00",
-        "reason": "reviewer (sonnet): The record-mode writer (assert_golden in crates/core/tests/change_feed_keyset.rs) is Rust code in a different context, and the SDK's own conformance.test.ts replays the committed fixture whatever the env var does. So 'passes without verifying anything' is not shown for this context, and I could not "
-      }
+      ]
     },
     "571cf8b4-4f98-4205-b9c7-270fce8277e1/mcp-tools": {
       "context": "api-server-core",
@@ -8185,6 +8190,32 @@
           "technique": "out-of-graph-artifacts",
           "verdict": "conformant",
           "evidence": "crates/engine-wasm/tests/plugins.rs:12 The gate for a loadable artifact loads it rather than compiling it, plus an EXPECTED inventory of every plugins-src crate."
+        }
+      ]
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/test-harness": {
+      "context": "wasm-plugins",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-03",
+      "evaluatedTs": "2026-11-03T17:35:56.096Z",
+      "worker": "e114bf59-3ae3-407b-a7b2-cfd3360f1fe8",
+      "techniques": [
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:160 The fixture names what it was derived from but carries no check that it still matches, which is the freshness failure the technique names."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "conformant",
+          "evidence": ".github/workflows/ci.yml:210 The workspace-detached cdylib crates are built, installed and loaded by the host in CI (plus their host-target unit tests via plugins-test), not just compiled; busyloop's built artifact is never loaded, which the technique exempts as a demo."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:119 The ABI pin over plugin source needs a #[no_mangle] line followed by a signature, which comment prose cannot match; the walked population is closed by EXPECTED lists."
         }
       ]
     }

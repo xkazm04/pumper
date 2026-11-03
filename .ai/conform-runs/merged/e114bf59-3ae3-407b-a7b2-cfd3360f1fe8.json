@@ -1,0 +1,121 @@
+{
+ "schema": "conform-run/1",
+ "worker": "e114bf59-3ae3-407b-a7b2-cfd3360f1fe8",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-11-03T17:35:56.096613+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "clients/typescript/test/fixtures/feed-shared-stamp.json:8 The SDK's one store-emitted fixture is re-baselined by a runtime env var that the golden writer obeys silently (write and return, no pipeline refusal, no test asserting the switch is off), so a runner or shell with PUMPER_UPDATE_FIXTURES=1 exported turns the golden compare into a rewrite that reports green; the stale 'hand-written field list' deviation is fixed: required fields are now read from the served OpenAPI schema.",
+   "techniques": [
+    {
+     "technique": "approval-snapshots-with-guarded-update",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/change_feed_keyset.rs:123 Record switch for clients/typescript/test/fixtures/feed-shared-stamp.json is an environment flag with no CI refusal and no integrity test; the technique names exactly this shape as invisible."
+    },
+    {
+     "technique": "fixture-economics",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/test/conformance.test.ts:80 Hand-authored record/revision fixtures are held to clients/openapi.json (generated from the router), so a field added server-side fails the fixture instead of letting it validate yesterday's shape."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/test/conformance.test.ts:167 The decision is asserted at the crossing (the URL handed to fetch), not at an in-process derivation; the keyset fake also serves pages by cursor rather than by call counter."
+    },
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "conformant",
+     "evidence": "clients/typescript/test/conformance.test.ts:480 The replayed feed is captured from a real Datasets store and kept fresh by a golden compare on the Rust side (its re-record guard is the deviation above)."
+    },
+    {
+     "technique": "out-of-graph-artifacts",
+     "verdict": "conformant",
+     "evidence": ".github/workflows/ci.yml:259 The detached npm package outside the Cargo workspace has its own CI job that runs its own test script, not just a compile."
+    }
+   ]
+  },
+  {
+   "context": "wasm-plugins",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "plugins-src/trigger-gate/src/lib.rs:160 trigger-gate's tests decide pass/veto against envelopes hand-copied from triggers.rs (dataset_trigger_obj/terminal_trigger_obj/external_trigger_obj), and nothing checks the copies against their producers; the shipped-plugin e2e test also uses a hand-written dataset delta, so only the job-hop envelope runs through the real fire path, and a renamed dataset-envelope field would leave every plugin test green while the gate misjudges in production.",
+   "techniques": [
+    {
+     "technique": "fixture-economics",
+     "verdict": "deviation",
+     "evidence": "plugins-src/trigger-gate/src/lib.rs:160 The fixture names what it was derived from but carries no check that it still matches, which is the freshness failure the technique names."
+    },
+    {
+     "technique": "out-of-graph-artifacts",
+     "verdict": "conformant",
+     "evidence": ".github/workflows/ci.yml:210 The workspace-detached cdylib crates are built, installed and loaded by the host in CI (plus their host-target unit tests via plugins-test), not just compiled; busyloop's built artifact is never loaded, which the technique exempts as a demo."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "conformant",
+     "evidence": "crates/engine-wasm/tests/plugins.rs:119 The ABI pin over plugin source needs a #[no_mangle] line followed by a signature, which comment prose cannot match; the walked population is closed by EXPECTED lists."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "job-worker",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-03T17:35:56.096613+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "approval-snapshots-with-guarded-update",
+    "fixture-economics",
+    "out-of-graph-artifacts",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T17:35:56.096613+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "fixture-economics",
+    "out-of-graph-artifacts",
+    "pin-the-call-not-the-name"
+   ],
+   "deviations": 1,
+   "context": "wasm-plugins",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

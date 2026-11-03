@@ -5523,9 +5523,10 @@
           "changedAt": "2026-10-23",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "clients/typescript/test/conformance.test.ts:40 The test claims every required record field by walking a hand-written list after a type cast, so a new required field omitted from the list does not fail it.",
-          "evaluatedAt": "2026-10-12",
-          "stale": true
+          "evidence": "clients/typescript/test/fixtures/feed-shared-stamp.json:8 The SDK's one store-emitted fixture is re-baselined by a runtime env var that the golden writer obeys silently (write and return, no pipeline refusal, no test asserting the switch is off), so a runner or shell with PUMPER_UPDATE_FIXTURES=1 exported turns the golden compare into a rewrite that reports green; the stale 'hand-written field list' deviation is fixed: required fields are now read from the served OpenAPI schema.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "table",
@@ -5801,7 +5802,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:160 trigger-gate's tests decide pass/veto against envelopes hand-copied from triggers.rs (dataset_trigger_obj/terminal_trigger_obj/external_trigger_obj), and nothing checks the copies against their producers; the shipped-plugin e2e test also uses a hand-written dataset delta, so only the job-hop envelope runs through the real fire path, and a renamed dataset-envelope field would leave every plugin test green while the gate misjudges in production.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "structured-output",
