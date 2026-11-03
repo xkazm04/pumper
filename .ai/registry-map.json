@@ -1601,12 +1601,11 @@
           "changedAt": "2026-10-23",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "scripts/ci/flake-record.mjs:217 A recorded run that parses zero tests only warns and then exits with cargo's status, so a broken reader stays a green process.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "scripts/ci/flake-record.mjs:217 The CI test job runs through this wrapper, and a run with zero parsed tests only prints a stderr warning before it exits with cargo's own status, so a run that executed or parsed nothing still counts as a pass.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
+          "revisionsBehind": 1
         },
         {
           "subject": "quality-gates",
@@ -3092,12 +3091,11 @@
           "changedAt": "2026-10-23",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/core/src/process_env.rs:115 The test writes secrets into the process environment and returns without clearing them, so later tests in the same process inherit that world.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/process_env.rs:115 The test writes three secrets into the shared process environment and never removes them. Every later test in the pumper-core lib binary, which runs on parallel threads, inherits them (CENSUS_API_KEY is one that app.rs credential checks read).",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
+          "revisionsBehind": 1
         },
         {
           "subject": "mcp-tools",
@@ -4172,12 +4170,11 @@
           "changedAt": "2026-10-23",
           "confidence": "strong",
           "state": "deviation",
-          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export check counts lines and compares a header string, and the comment says quoted CSV is not parsed, so a quoting bug stays green on this fixture.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:5521806124d93882",
-          "evaluatedRevision": 26,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export is checked by comparing the header string and counting lines, never by parsing it. The data column ({\"v\":1}) does contain quotes, so a quoting or escaping bug that a CSV reader would reject stays green.",
+          "evaluatedAt": "2026-11-03",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27,
+          "revisionsBehind": 1
         },
         {
           "subject": "voice-io",

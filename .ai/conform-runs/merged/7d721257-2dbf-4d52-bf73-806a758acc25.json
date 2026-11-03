@@ -1,0 +1,204 @@
+{
+ "schema": "conform-run/1",
+ "worker": "7d721257-2dbf-4d52-bf73-806a758acc25",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-11-03T10:35:37.273398+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "ci-quality-gates",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/ci/flake-record.mjs:217 The CI test job runs through this wrapper, and a run with zero parsed tests only prints a stderr warning before it exits with cargo's own status, so a run that executed or parsed nothing still counts as a pass.",
+   "techniques": [
+    {
+     "technique": "derived-selection-must-be-measured",
+     "verdict": "deviation",
+     "evidence": "scripts/ci/flake-record.mjs:217 Long lanes have tests_run floors in .lanes/criteria.json, but the protected suite run has no floor: zero tests is a warning, not a failure."
+    },
+    {
+     "technique": "platform-quirk-absorption",
+     "verdict": "deviation",
+     "evidence": "scripts/ci/flake-record.mjs:212 The ANSI quirk is absorbed once with its incident attached (line 48-56), but the runner's first duty, making zero-tests fatal, is reduced to a warning."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "deviation",
+     "evidence": "scripts/ci/ship-inventory.test.mjs:84 The needle is a bare directory name and the haystack is ci.yml plus the justfile, comments included. ci.yml:214 names `clients/typescript` and ci.yml:109 names `plugins-src/*` in comments, so deleting the job would leave a comment that still claims the manifest."
+    },
+    {
+     "technique": "flake-lifecycle",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/flake-check.mjs:75 Every quarantine row needs an owner, entry date, expiry and cause. Expiry escalates, the ceiling stops the line, and size, trend and oldest age are published."
+    },
+    {
+     "technique": "long-lane-certification",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/lane-certify.mjs:428 Criteria are declared before the run and judged afterwards, cannot-see/cannot-run are separate verdicts, and never-green is called out as its own category."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/lane-canary.mjs:29 A planted breach is judged by the same certifier, and a canary that passes or goes missing turns the run into cannot-check."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/flake-check.mjs:390 Engagement is published with the verdict: a scanner that sees nothing exits 3 (cannot check), not clean."
+    },
+    {
+     "technique": "out-of-graph-artifacts",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/ship-inventory.test.mjs:74 The inventory is taken from the artifact side over git ls-files manifests, with a liveness floor. Its matching predicate is weak (see pin-the-call)."
+    },
+    {
+     "technique": "isolation-lanes",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/flake-check.test.mjs:469 Recorder tests run in a fresh mkdtemp root, pointed at it via the root-override env var, so they never touch the real register or history."
+    }
+   ]
+  },
+  {
+   "context": "core-platform-services",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/process_env.rs:115 The test writes three secrets into the shared process environment and never removes them. Every later test in the pumper-core lib binary, which runs on parallel threads, inherits them (CENSUS_API_KEY is one that app.rs credential checks read).",
+   "techniques": [
+    {
+     "technique": "isolation-lanes",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/process_env.rs:115 No remove_var or scoped guard exists, so the leak into other tests is relied on 'not to collide' instead of being prevented."
+    },
+    {
+     "technique": "fixture-economics",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/testing.rs:88 Each TempStore re-runs the full chain of 56 migrations. There is no build-once template plus copy, and about 98 files construct a TempStore. Discarding the whole store and the deferred reaper are done correctly."
+    },
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/testing.rs:256 Replayed transcripts refuse an unmatched request instead of defaulting, so drift in what is sent fails the test."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/testing.rs:136 Dead overrides default-bodied trait methods so that reaching an engine cannot pass as the typed refusal under test."
+    },
+    {
+     "technique": "long-lane-certification",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/lane_artifact/mod.rs:20 The harness only measures and emits raw series plus the workload. The judgement happens in the certifier."
+    }
+   ]
+  },
+  {
+   "context": "e2e-data-integrity",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/dataset_reads.rs:211 The CSV export is checked by comparing the header string and counting lines, never by parsing it. The data column ({\"v\":1}) does contain quotes, so a quoting or escaping bug that a CSV reader would reject stays green.",
+   "techniques": [
+    {
+     "technique": "assert-through-the-reader",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/dataset_reads.rs:211 Emitted CSV is meant for a foreign reader, but the assertion is near-side: line count plus a header string."
+    },
+    {
+     "technique": "assert-the-schedule-not-the-stopwatch",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/target_exclusion.rs:71 Overlap is proven by a recorded peak-concurrency condition, not by elapsed time."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/target_exclusion.rs:212 A paired discriminator separates the target exclusion from a plain serialiser, the other possible producer of peak = 1."
+    },
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/vcr_attempts.rs:380 Replay fidelity is graded per component, with unreplayable apps declared, and the bypass list is reconciled against registered apps."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/engine_conformance.rs:769 The structural pin strips comment lines and uses a needle with argument tokens that prose cannot spell. Its reason sits in the asserting file."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "e2e-integration",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "pumper-sync-sdk",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-03T10:35:37.273398+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "derived-selection-must-be-measured",
+    "flake-lifecycle",
+    "isolation-lanes",
+    "long-lane-certification",
+    "negative-control-tests",
+    "out-of-graph-artifacts",
+    "pin-the-call-not-the-name",
+    "platform-quirk-absorption",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "ci-quality-gates",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T10:35:37.273398+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "fixture-economics",
+    "isolation-lanes",
+    "long-lane-certification",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "core-platform-services",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T10:35:37.273398+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "assert-the-schedule-not-the-stopwatch",
+    "assert-through-the-reader",
+    "pin-the-call-not-the-name",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "e2e-data-integrity",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
