@@ -1004,7 +1004,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/mod.rs:1005 The openapi approval snapshot's record switch is an environment variable. When it is set, the test rewrites clients/openapi.json and returns green, and no pipeline refusal or integrity test exists (a grep finds UPDATE_OPENAPI only in the justfile recipe and the client generator), so an inherited UPDATE_OPENAPI makes the snapshot test unfalsifiable.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "job-coordination",
