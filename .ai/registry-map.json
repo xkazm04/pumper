@@ -2607,7 +2607,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:56 The tier-3 eval replays Claude transcripts and HTML pages frozen on 2026-07-26. Nothing in the justfile, CI or .lanes re-records or runs it live on a schedule, so the 'extraction quality regressed' ratchet can only move when the code changes, never when the model or the pages do.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "chat-transcript",

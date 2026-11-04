@@ -8732,6 +8732,38 @@
       "evaluatedTs": "2026-11-04T22:08:04.553Z",
       "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
       "techniques": []
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/test-harness": {
+      "context": "core-extraction",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:27:20.458Z",
+      "worker": "4f888d24-a72d-4374-be12-db28cf430003",
+      "techniques": [
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:56 obligation 1 is met: manifest records recorded_at, cli_version and model. Obligation 2 is not: no live lane on a cadence (grep of justfile, .github, .lanes and scripts found none), so the suite has stopped testing the world, as the file itself admits"
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:583 coarse mutations (truncate to 1%, preface, refuse, chrome) must each score strictly below the recording, proving the scorer can say 'worse'"
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:96 the needle is the `.research(` call with its receiver, prose lines are excluded, and both directions are reconciled against EXPECTED. removal_guard.rs declares a floor (scanned > 50) but its `.detect_removed(` needle has no prose filter; that weakness is latent, not realized"
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/router_versus_candidate.rs:6 counting engines name the producer per tier, and the paired candidate-failure case keeps the router-failure stop from passing by never reaching the ladder"
+        }
+      ],
+      "registryProposal": "recorded-interaction-fixtures could name the case where the recording is of a PAID model call (this manifest records $2.62 per capture). The live lane's cost then decides its cadence, and the technique gives no rule for pricing that cadence or for a declared, dated waiver when the team will not fund one."
     }
   }
 }
