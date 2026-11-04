@@ -2704,7 +2704,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/cache_bounds.rs:6 Every test builds its fixture from scratch: `TempStore::new` calls `Storage::connect`, which runs all 56 migrations into a fresh temp DB for each test. There is no migrated template copied per test, and the build/copy cost ratio is never measured, which is the rebuild-per-test shape that fixture-economics names as the failure.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "data-access",
