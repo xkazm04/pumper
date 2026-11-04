@@ -1305,7 +1305,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/meta.rs:1281 The /metrics exposition is text for a foreign reader (a Prometheus scraper), but it is asserted with a home-grown whitespace lint rather than by running a real exposition parser (no Prometheus parser crate exists in the repo), so a body the reader rejects or misreads can pass.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         }
       ],
       "governance": "governed"
@@ -2101,7 +2105,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/datasets_batch_equivalence.rs:139 The differential batch-vs-per-record test reports 'no divergence' per round but never asserts that the removed/changed paths actually fired in any round, so a no-difference verdict over a population the mechanism never reached is indistinguishable from real equivalence.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "web-scraping",
@@ -4653,7 +4661,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:8 Every grants-gov run-level test asserts against hand-written fakes of the grants.gov API, and none of the nine declared lanes in .lanes/criteria.json re-certifies against the live service, so a green suite cannot notice an upstream contract change.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "agent-memory",

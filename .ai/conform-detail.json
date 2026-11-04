@@ -8526,32 +8526,32 @@
       "context": "grants-intelligence",
       "subject": "test-harness",
       "bundle": "software-engineering",
-      "state": "unknown",
+      "state": "deviation",
       "evaluatedAt": "2026-11-04",
-      "evaluatedTs": "2026-11-04T00:44:49.178Z",
+      "evaluatedTs": "2026-11-04T01:37:36.295Z",
+      "worker": "737e3585-5419-4012-868a-7b79bacf6738",
       "techniques": [
         {
           "technique": "recorded-interaction-fixtures",
           "verdict": "deviation",
-          "evidence": "crates/apps/grants-gov/tests/result_contract.rs:29 The suite uses the hand-written-fake option, which the technique names as asserting against the author's own model of the service, and has no live lane on a cadence. The repo does run one for hn_source (live_hn_item_still_matches_the_ruleset). The production SourceDrift guards catch drift at runtime, not in the harness."
-        },
-        {
-          "technique": "pin-the-call-not-the-name",
-          "verdict": "conformant",
-          "evidence": "crates/apps/grants-gov/src/lib.rs:2444 The structural pin walks production source only (split before the first `\\n#[cfg(test)]`, which works on the CRLF checkout). Its needle carries the opening paren that prose does not spell. The Error::App scan reads each construct's own message literal with a bounded lookahead, a fix made after the 400-character window strayed into the next guard's comment."
+          "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:8 Fixtures are hand-authored models of the remote service (ScriptedGrantsGov, PagedGrantsGov, Scripted); no recording names a contract revision or date, and no live lane exists."
         },
         {
           "technique": "unreached-decisions-pin-nothing",
           "verdict": "conformant",
-          "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:8 The file says the earlier fixed-page fake made every pagination decision unreachable. It replaces that fake with an offset-keyed sequence so every stop arm is reachable from run(). detail_corpus.rs:13 also pins the loud half so that 'stop detecting changes' cannot satisfy the test."
+          "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:7 The unreachable page-2 decision was lifted into a reachable fake keyed by the requested offset, and the offsets requested are recorded."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/apps/grants-gov/src/lib.rs:2444 The needle carries a call paren, the haystack excludes the test modules (the first cfg(test) is past all production code), and an exact EXPECTED count acts as a floor."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/apps/grants-gov/tests/detail_corpus.rs:13 The degenerate fix ('stop detecting changes') is explicitly made to fail by pinning the loud half, so the suite cannot absorb that mutation."
         }
-      ],
-      "withdrawn": {
-        "worker": "3f4710b6-4d69-4a3a-be98-6a7597520350",
-        "state": "deviation",
-        "at": "2026-11-04T00:46:13.737702+00:00",
-        "reason": "reviewer (sonnet): The evidence says result_contract.rs's header shows the upstream grants.gov contract already drifted, but that header describes the app's own `output_shape` declaration drifting from what its `run()` emits (`hit_count` vs `hitCount`, `removed?`, twelve omitted keys), not upstream drift. The conclusi"
-      }
+      ]
     },
     "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/agent-runtime-assembly": {
       "context": "api-platform-ops",
@@ -8588,6 +8588,84 @@
       "evaluatedTs": "2026-11-04T01:13:01.412Z",
       "worker": "772a6032-7eee-4d93-b985-22b2871329b3",
       "techniques": []
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/test-harness": {
+      "context": "core-change-detection",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T01:37:36.295Z",
+      "worker": "737e3585-5419-4012-868a-7b79bacf6738",
+      "techniques": [
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/datasets_batch_equivalence.rs:139 Only equality between the two paths is asserted; there is no engagement count (e.g. removed>0 somewhere) beside the verdict."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/datasets.rs:15 Every test builds a fresh SQLite store and runs the full 56-migration chain (Storage::connect); no build-once template copied per test. The reaper is named (TempStore Drop)."
+        },
+        {
+          "technique": "long-lane-certification",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/datasets_bulk_perf.rs:127 Cost harnesses are scheduled lanes that emit artifacts; pre-declared criteria are judged by an external certifier, not asserted in the test."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/tests/derived_backfill_perf.rs:16 Here the claim is cost (duration), which the technique excludes; the harness already uses a host-independent ratio, and no concurrency is asserted by stopwatch."
+        },
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/fingerprint_shared_dom.rs:50 The corpus is derived from read_dir and carries a floor, so an emptied selection fails instead of passing green."
+        }
+      ]
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/test-harness": {
+      "context": "api-platform-ops",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T01:37:36.295Z",
+      "worker": "737e3585-5419-4012-868a-7b79bacf6738",
+      "techniques": [
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/meta.rs:1281 A near-side model of the reader stands in for the reader; it targets one known defect shape, not parse validity."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:1285 The test seeds the exact defect, shows that contains() is blind to it, and asserts the checker reports every shape."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:1319 The source guard excludes test modules by span (not by truncation), drops comment lines, uses str::lines (CRLF-safe), and keeps its reason in the asserting file."
+        },
+        {
+          "technique": "derived-selection-must-be-measured",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:1345 The derived production-line population declares a floor, so an empty walk cannot pass."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:73 Where a cache or a re-render could produce the same bytes, the test asserts the producer (pointer identity) and separately asserts equality with a fresh render."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:98 The render-cost timing is printed, not asserted, so there is no stopwatch verdict."
+        }
+      ],
+      "registryProposal": "assert-through-the-reader frames the reader as a locally installed tool (shell, VCS, package manager); it could say explicitly that when the reader is a remote consumer (a metrics scraper, an API client), the reader's own published parser library is the unit-cost oracle, and that a hand-written lint of known defect shapes is the near-side assertion the technique warns against."
     }
   }
 }

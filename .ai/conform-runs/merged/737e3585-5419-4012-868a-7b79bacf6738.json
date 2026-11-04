@@ -1,0 +1,181 @@
+{
+ "schema": "conform-run/1",
+ "worker": "737e3585-5419-4012-868a-7b79bacf6738",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-11-04T01:37:36.295560+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-change-detection",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/tests/datasets_batch_equivalence.rs:139 The differential batch-vs-per-record test reports 'no divergence' per round but never asserts that the removed/changed paths actually fired in any round, so a no-difference verdict over a population the mechanism never reached is indistinguishable from real equivalence.",
+   "techniques": [
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/datasets_batch_equivalence.rs:139 Only equality between the two paths is asserted; there is no engagement count (e.g. removed>0 somewhere) beside the verdict."
+    },
+    {
+     "technique": "fixture-economics",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/datasets.rs:15 Every test builds a fresh SQLite store and runs the full 56-migration chain (Storage::connect); no build-once template copied per test. The reaper is named (TempStore Drop)."
+    },
+    {
+     "technique": "long-lane-certification",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/datasets_bulk_perf.rs:127 Cost harnesses are scheduled lanes that emit artifacts; pre-declared criteria are judged by an external certifier, not asserted in the test."
+    },
+    {
+     "technique": "assert-the-schedule-not-the-stopwatch",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/tests/derived_backfill_perf.rs:16 Here the claim is cost (duration), which the technique excludes; the harness already uses a host-independent ratio, and no concurrency is asserted by stopwatch."
+    },
+    {
+     "technique": "derived-selection-must-be-measured",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/fingerprint_shared_dom.rs:50 The corpus is derived from read_dir and carries a floor, so an emptied selection fails instead of passing green."
+    }
+   ]
+  },
+  {
+   "context": "grants-intelligence",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:8 Every grants-gov run-level test asserts against hand-written fakes of the grants.gov API, and none of the nine declared lanes in .lanes/criteria.json re-certifies against the live service, so a green suite cannot notice an upstream contract change.",
+   "techniques": [
+    {
+     "technique": "recorded-interaction-fixtures",
+     "verdict": "deviation",
+     "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:8 Fixtures are hand-authored models of the remote service (ScriptedGrantsGov, PagedGrantsGov, Scripted); no recording names a contract revision or date, and no live lane exists."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/apps/grants-gov/tests/sweep_end.rs:7 The unreachable page-2 decision was lifted into a reachable fake keyed by the requested offset, and the offsets requested are recorded."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "conformant",
+     "evidence": "crates/apps/grants-gov/src/lib.rs:2444 The needle carries a call paren, the haystack excludes the test modules (the first cfg(test) is past all production code), and an exact EXPECTED count acts as a floor."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "crates/apps/grants-gov/tests/detail_corpus.rs:13 The degenerate fix ('stop detecting changes') is explicitly made to fail by pinning the loud half, so the suite cannot absorb that mutation."
+    }
+   ]
+  },
+  {
+   "context": "api-platform-ops",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/meta.rs:1281 The /metrics exposition is text for a foreign reader (a Prometheus scraper), but it is asserted with a home-grown whitespace lint rather than by running a real exposition parser (no Prometheus parser crate exists in the repo), so a body the reader rejects or misreads can pass.",
+   "techniques": [
+    {
+     "technique": "assert-through-the-reader",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/meta.rs:1281 A near-side model of the reader stands in for the reader; it targets one known defect shape, not parse validity."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/meta.rs:1285 The test seeds the exact defect, shows that contains() is blind to it, and asserts the checker reports every shape."
+    },
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/meta.rs:1319 The source guard excludes test modules by span (not by truncation), drops comment lines, uses str::lines (CRLF-safe), and keeps its reason in the asserting file."
+    },
+    {
+     "technique": "derived-selection-must-be-measured",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/meta.rs:1345 The derived production-line population declares a floor, so an empty walk cannot pass."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/meta.rs:73 Where a cache or a re-render could produce the same bytes, the test asserts the producer (pointer identity) and separately asserts equality with a fresh render."
+    },
+    {
+     "technique": "assert-the-schedule-not-the-stopwatch",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/meta.rs:98 The render-cost timing is printed, not asserted, so there is no stopwatch verdict."
+    }
+   ],
+   "registryProposal": "assert-through-the-reader frames the reader as a locally installed tool (shell, VCS, package manager); it could say explicitly that when the reader is a remote consumer (a metrics scraper, an API client), the reader's own published parser library is the unit-cost oracle, and that a hand-written lint of known defect shapes is the near-side assertion the technique warns against."
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "e2e-api-contract",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-04T01:37:36.295560+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "assert-the-schedule-not-the-stopwatch",
+    "derived-selection-must-be-measured",
+    "fixture-economics",
+    "long-lane-certification",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T01:37:36.295560+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "negative-control-tests",
+    "pin-the-call-not-the-name",
+    "recorded-interaction-fixtures",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "grants-intelligence",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T01:37:36.295560+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "assert-the-schedule-not-the-stopwatch",
+    "assert-through-the-reader",
+    "derived-selection-must-be-measured",
+    "negative-control-tests",
+    "pin-the-call-not-the-name",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "api-platform-ops",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
