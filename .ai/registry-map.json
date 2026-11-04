@@ -1166,8 +1166,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "deviation",
+          "priorNotApplicable": 4,
+          "evidence": "crates/server/src/routes/triggers.rs:296 TriggerPluginHooks has no deny_unknown_fields, so a misspelled slot key (e.g. \"predicte\") deserializes to all-None. This branch then stores the trigger as having no hooks and returns 201, so the gate is silently absent instead of the registration being refused.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28
         },
         {
           "subject": "terminal-multiplexing",
@@ -1394,13 +1398,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:6 Searching crates/server/src/ for agent runtime assembly terms confirmed that api-server-core bootstraps a web scraping server, an app registry, and an MCP tool server for external clients, rather than assembling an LLM agent runtime.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "state": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:652 tools/list is built from AppState alone, so every MCP client is shown the `fetch` tool. tool_fetch then refuses any caller without a valid job token, so the roster and the run-time refusal are not derived from one policy on one session.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "node-boot-and-declarative-bootstrap",
@@ -4951,13 +4954,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:3 Searching crates/server/src/triggers.rs and its e2e test suite for agent runtime assembly terms confirmed the pipeline coordinates event-driven scraping job triggers rather than assembling an LLM agent runtime.",
-          "evaluatedAt": "2026-10-12",
-          "evaluatedAgainst": "sha256-b2:9036e979656a8dc5",
-          "evaluatedRevision": 27,
-          "revisionsBehind": 1,
-          "stale": true
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:384 A predicate hook can stop a hop, but if its contributed WASM plugin is missing, traps or returns garbage, the hop fires by default; the operator has to opt in to fail-closed with on_error=skip, which is the standard's 'skipped guard' failure mode (the code does report it at error level and in the ledger).",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28,
+          "revisionsBehind": 1
         },
         {
           "subject": "test-harness",

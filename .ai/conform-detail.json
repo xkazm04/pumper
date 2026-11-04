@@ -1279,90 +1279,110 @@
       "context": "job-triggers-pipeline",
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
-      "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:58:38.158Z",
+      "worker": "75bfe99b-6d85-4200-8c36-7b981b8e81fd",
       "techniques": [
         {
+          "technique": "operator-tier-code-loading",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/triggers.rs:384 Intercepting (predicate) contributions fail open by default. The standard says an intercepting contribution is required unless the operator explicitly downgrades it."
+        },
+        {
+          "technique": "observer-and-mutator-surfaces",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:749 post_enqueue is a pure observer whose output is discarded. predicate/transform form a closed mutator vocabulary (HookSlot), and a veto is a typed {pass:false} result, not a thrown error."
+        },
+        {
+          "technique": "semantic-hook-placement",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:520 Hooks are placed by a declared slot class with a fixed host-owned order (predicate→transform→enqueue→post_enqueue), never by list index. The host writes every incident, vetoes included, to the ledger."
+        },
+        {
+          "technique": "honest-hook-registry",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:595 Every hook call is bounded by a wasm fuel/memory cap. Each slot's fail direction comes from its class (predicate per on_error, transform keeps the original envelope, post_enqueue affects nothing)."
+        },
+        {
           "technique": "activation-is-a-separate-mutation",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:12 Trigger activation is configured statically on the Trigger struct rather than via separate extension install mutations."
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:1176 A configured hook whose payload is not installed or not executable is reported at error level and gets a ledger row. A missing payload is loud, not silent."
+        },
+        {
+          "technique": "nested-run-is-not-its-parent",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/triggers.rs:360 Judged by analogy: a hop is a new job with its own id, and its parent is carried as a field plus depth/chain lineage. This is job-to-job, not agent-to-agent."
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:84 Merges trigger event data into target job params ahead of enqueueing rather than injecting user input into a running agent loop."
+          "evidence": "crates/server/src/triggers.rs:84 Merges trigger event data into target job params ahead of enqueueing rather than injecting user input into a running agent loop.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:29 Provenance tracks trigger hop depth and trigger ID chain rather than an agent runtime assembly digest."
+          "evidence": "crates/server/src/triggers.rs:29 Provenance tracks trigger hop depth and trigger ID chain rather than an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:49 Trigger evaluation guards hop depth and cycles rather than projecting external long-running tool operations into an agent loop."
+          "evidence": "crates/server/src/triggers.rs:49 Trigger evaluation guards hop depth and cycles rather than projecting external long-running tool operations into an agent loop.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:75 Matches terminal job statuses for trigger execution rather than managing conversation checkpoint storage modes."
+          "evidence": "crates/server/src/triggers.rs:75 Matches terminal job statuses for trigger execution rather than managing conversation checkpoint storage modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:66 Change filters evaluate dataset revision kinds rather than reading agent guard containment policies."
-        },
-        {
-          "technique": "honest-hook-registry",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:394 Maps plugin failures to trigger run ledger outcomes rather than maintaining an agent hook event registry with timeouts."
+          "evidence": "crates/server/src/triggers.rs:66 Change filters evaluate dataset revision kinds rather than reading agent guard containment policies.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "host-routes-win",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_hops.rs:2 Evaluates multi-hop trigger chains between scraping jobs rather than resolving route shadowing for contributed HTTP handlers."
+          "evidence": "crates/server/src/e2e/trigger_hops.rs:2 Evaluates multi-hop trigger chains between scraping jobs rather than resolving route shadowing for contributed HTTP handlers.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "indeterminate-closure-on-interruption",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:398 Crashed trigger plugins are classified into specific hook failure ledger states rather than closing interrupted tool calls with indeterminate status."
-        },
-        {
-          "technique": "nested-run-is-not-its-parent",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:18 Hop chains track trigger provenance through depth and trigger ID arrays rather than managing nested subagent execution."
-        },
-        {
-          "technique": "observer-and-mutator-surfaces",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:331 The pipeline exposes predicate and transform WASM hooks on trigger envelopes rather than dual observer/mutator agent registration surfaces."
-        },
-        {
-          "technique": "operator-tier-code-loading",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_plugins.rs:2 Trigger plugins are loaded from local WASM files rather than via an operator vs administrator code loading tier."
+          "evidence": "crates/server/src/triggers.rs:398 Crashed trigger plugins are classified into specific hook failure ledger states rather than closing interrupted tool calls with indeterminate status.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:430 The predicate hook executes before the transform hook on trigger data rather than rewriting tool arguments before agent guardrails."
-        },
-        {
-          "technique": "semantic-hook-placement",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:420 Applies fixed predicate and transform stages to trigger envelopes without semantic placement classes in an agent hook chain."
+          "evidence": "crates/server/src/triggers.rs:430 The predicate hook executes before the transform hook on trigger data rather than rewriting tool arguments before agent guardrails.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "session-scoped-capability",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/trigger_cache.rs:13 Caches trigger evaluations across job runs rather than resolving session-scoped tool capabilities for an agent."
+          "evidence": "crates/server/src/e2e/trigger_cache.rs:13 Caches trigger evaluations across job runs rather than resolving session-scoped tool capabilities for an agent.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/triggers.rs:358 The hook verdict records whether a trigger hop fired or was vetoed rather than attributing substituted tool results to an alternate producer."
+          "evidence": "crates/server/src/triggers.rs:358 The hook verdict records whether a trigger hop fired or was vetoed rather than attributing substituted tool results to an alternate producer.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "registryProposal": "The fail-direction rule assumes an intercepting contribution guards safety. Here the predicate is a routing filter, and the repo deliberately prefers fail-open so that 'a broken plugin never wedges a pipeline edge'. The technique could say whether a contributed filter whose only cost on failure is extra work counts as intercepting.",
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 Searching crates/server/src/triggers.rs and its e2e test suite for agent runtime assembly terms confirmed the pipeline coordinates event-driven scraping job triggers rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by 75bfe99b-6d85-4200-8c36-7b981b8e81fd"
         }
       ]
     },
@@ -1370,90 +1390,110 @@
       "context": "api-server-core",
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
-      "state": "not-applicable",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:56:34.307Z",
-      "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:58:38.158Z",
+      "worker": "75bfe99b-6d85-4200-8c36-7b981b8e81fd",
       "techniques": [
         {
+          "technique": "session-scoped-capability",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:652 `fetch` is a session-scoped capability that resolves from the job token on the request, but it sits on the default roster for every session. The allow_enqueue tools do derive roster and call gate from the same config switch (mod.rs:746)."
+        },
+        {
+          "technique": "indeterminate-closure-on-interruption",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/main.rs:308 The boot sweep sends every interrupted running job through fail(): it is either requeued or permanently `failed`, with the cause kept only as a reason string (FailReason::Text(\"interrupted at boot\") in core storage). There is no first-class indeterminate status."
+        },
+        {
+          "technique": "operator-tier-code-loading",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/registry.rs:263 Dynamic-app code loads only from the operator's [plugins] app_dir behind the [wasm_apps] startup switch. A load failure is a warning, and the module is listed as unrunnable with a reason instead of being skipped silently."
+        },
+        {
+          "technique": "host-routes-win",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/registry.rs:300 Judged by analogy on the app-dispatch namespace: a contributed module can never shadow a compiled-in name. No contributed HTTP routes exist."
+        },
+        {
           "technique": "activation-is-a-separate-mutation",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:196 Dynamic app discovery skips clashing names without dynamic extension activation mutations."
+          "verdict": "conformant",
+          "evidence": "crates/server/src/registry.rs:379 Activation reads the payload's actual bytes against the reviewed catalog pin, not just the pointer. Unpinned modules still register but are marked pinned:false."
         },
         {
           "technique": "additive-input-at-the-call-boundary",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/activity.rs:64 ActivityGauge tracks in-flight HTTP and job work for maintenance gating rather than injecting additive user input at an agent call boundary."
+          "evidence": "crates/server/src/activity.rs:64 ActivityGauge tracks in-flight HTTP and job work for maintenance gating rather than injecting additive user input at an agent call boundary.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "assembly-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:42 Captures build identity from commit SHA or crate version rather than computing an agent runtime assembly digest."
+          "evidence": "crates/server/src/main.rs:42 Captures build identity from commit SHA or crate version rather than computing an agent runtime assembly digest.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "bounded-projection-of-external-work",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/live.rs:1 Provides an SSE notification stream for external MCP clients rather than managing an in-loop bounded projection of external work."
+          "evidence": "crates/server/src/mcp/live.rs:1 Provides an SSE notification stream for external MCP clients rather than managing an in-loop bounded projection of external work.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "checkpoint-mode-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/progress.rs:304 Persists job execution progress checkpoints to storage rather than managing conversation checkpoint storage modes."
+          "evidence": "crates/server/src/progress.rs:304 Persists job execution progress checkpoints to storage rather than managing conversation checkpoint storage modes.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "guard-input-custody",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:32 Error reporting reads environment variables for server monitoring rather than enforcing agent guard containment policies."
+          "evidence": "crates/server/src/main.rs:32 Error reporting reads environment variables for server monitoring rather than enforcing agent guard containment policies.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "honest-hook-registry",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:16 Hosts WASM plugins for scraping extraction and triggers rather than maintaining an agent hook event registry with timeouts."
-        },
-        {
-          "technique": "host-routes-win",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:52 The server mounts fixed internal axum routes rather than resolving shadowing for contributed extension routes."
-        },
-        {
-          "technique": "indeterminate-closure-on-interruption",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:64 Graceful shutdown waits for in-flight HTTP connections and worker drains rather than writing indeterminate closure records for interrupted tool calls."
+          "evidence": "crates/server/src/state.rs:16 Hosts WASM plugins for scraping extraction and triggers rather than maintaining an agent hook event registry with timeouts.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "nested-run-is-not-its-parent",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:306 Isolates Claude subprocess working directories from server CWD rather than re-rooting nested agent runs."
+          "evidence": "crates/server/src/state.rs:306 Isolates Claude subprocess working directories from server CWD rather than re-rooting nested agent runs.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "observer-and-mutator-surfaces",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:97 MCP tools are exposed via JSON-RPC protocol methods rather than dual observer/mutator agent extension surfaces."
-        },
-        {
-          "technique": "operator-tier-code-loading",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:381 Assembles startup application state from server configuration rather than supporting runtime code-loading tiers."
+          "evidence": "crates/server/src/mcp/mod.rs:97 MCP tools are exposed via JSON-RPC protocol methods rather than dual observer/mutator agent extension surfaces.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rewrite-before-the-gate",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/maintenance.rs:2 Performs background SQLite maintenance rather than rewriting tool call arguments before policy gates."
+          "evidence": "crates/server/src/maintenance.rs:2 Performs background SQLite maintenance rather than rewriting tool call arguments before policy gates.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "semantic-hook-placement",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:10 Registers scraping apps in a static list without semantic placement classes in a model/tool hook chain."
-        },
-        {
-          "technique": "session-scoped-capability",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/live.rs:36 Filters SSE event subscriptions per HTTP connection rather than resolving session-scoped agent tool capability rosters."
+          "evidence": "crates/server/src/registry.rs:10 Registers scraping apps in a static list without semantic placement classes in a model/tool hook chain.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "substituted-result-attribution",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:36 Caches research outputs on disk for scraping apps rather than attributing substituted tool results from wrapping frames."
+          "evidence": "crates/server/src/state.rs:36 Caches research outputs on disk for scraping apps rather than attributing substituted tool results from wrapping frames.",
+          "carriedFrom": "2026-10-12"
+        }
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/registry.rs:6 Searching crates/server/src/ for agent runtime assembly terms confirmed that api-server-core bootstraps a web scraping server, an app registry, and an MCP tool server for external clients, rather than assembling an LLM agent runtime.",
+          "evaluatedAt": "2026-10-12T23:56:34.307Z",
+          "worker": "3c78a9ee-9788-4669-a1a0-a30299ee33a2",
+          "reason": "replaced by 75bfe99b-6d85-4200-8c36-7b981b8e81fd"
         }
       ]
     },
@@ -8512,6 +8552,32 @@
         "at": "2026-11-04T00:46:13.737702+00:00",
         "reason": "reviewer (sonnet): The evidence says result_contract.rs's header shows the upstream grants.gov contract already drifted, but that header describes the app's own `output_shape` declaration drifting from what its `run()` emits (`hit_count` vs `hitCount`, `removed?`, twelve omitted keys), not upstream drift. The conclusi"
       }
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/agent-runtime-assembly": {
+      "context": "api-platform-ops",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:58:38.158Z",
+      "worker": "75bfe99b-6d85-4200-8c36-7b981b8e81fd",
+      "techniques": [
+        {
+          "technique": "honest-hook-registry",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/triggers.rs:296 A registration naming an unknown hook point is silently dropped instead of refused. Compare watches.rs:347, which refuses a plugin sink naming an unloaded module."
+        },
+        {
+          "technique": "operator-tier-code-loading",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/triggers.rs:125 The service tier cannot load code (provisioner.rs:13 says promotion cannot shortcut the operator's catalog edit). But the trigger API accepts an intercepting predicate on an uninstalled plugin, and that predicate fails open by default."
+        },
+        {
+          "technique": "activation-is-a-separate-mutation",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/triggers.rs:514 The dry-run is a separate check: it compares the declared hooks with what the host can actually execute and reports unusable_plugins (meaning the hop is ungated)."
+        }
+      ]
     }
   }
 }
