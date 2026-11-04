@@ -5898,16 +5898,40 @@
       "subject": "browser-credential-boundary",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-17",
-      "evaluatedTs": "2026-10-17T03:44:03.131Z",
-      "worker": "df19266b-5410-47c5-92cc-74f7a9021b40",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T02:01:53.737Z",
       "techniques": [
         {
           "technique": "outbound-fetch-destination-validation",
           "verdict": "deviation",
-          "evidence": "crates/engine-remote/src/lib.rs:187 The target guard checks hostname text rather than resolved addresses and does not pin validated addresses to connections; the HTTP transport also follows redirects automatically without rechecking destinations."
+          "evidence": "crates/engine-remote/src/lib.rs:162 Checks only the URL string: allowlists the scheme and refuses address literals and localhost names, but does no resolve-then-pin. It is applied only at /fetch-proxy, not as a single door inside the engine, and redirects are followed by the reqwest Policy::limited at engine-http:409 without being re-judged. The code admits this limit itself."
+        },
+        {
+          "technique": "broker-proxy-attaches-secret",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-remote/src/lib.rs:105 The shared secret is attached server-to-server, coordinator to peer. No browser client ever holds or asks for an upstream credential."
+        },
+        {
+          "technique": "public-vs-server-env-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-remote/src/lib.rs:135 Rust engines with no shipped browser bundle, so there is no public/server config split to make."
         }
-      ]
+      ],
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/engine-http/src/lib.rs:409 The HTTP engine automatically follows redirects without destination revalidation, so a permitted initial destination can redirect a server-side fetch into a private network.",
+          "evaluatedAt": "2026-10-17T03:44:03.131Z",
+          "worker": "df19266b-5410-47c5-92cc-74f7a9021b40",
+          "reason": "replaced by 217e06fc-294b-4cc1-bc1a-80e88bf0998e"
+        }
+      ],
+      "withdrawn": {
+        "worker": "217e06fc-294b-4cc1-bc1a-80e88bf0998e",
+        "state": "deviation",
+        "at": "2026-11-04T02:02:24.210927+00:00",
+        "reason": "reviewer (sonnet): The SSRF/redirect evidence is real (engine-http:409 uses Policy::limited, and blocked_target only checks the URL string, as its own doc comment says), but it doesn't bear on the subject browser-credential-boundary, which covers credentials reaching browser clients and a public/server config split; t"
+      }
     },
     "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/chat-transcript": {
       "context": "core-extraction",

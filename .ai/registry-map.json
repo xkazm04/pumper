@@ -6228,11 +6228,7 @@
           "confidence": "probable",
           "state": "deviation",
           "evidence": "crates/engine-http/src/lib.rs:409 The HTTP engine automatically follows redirects without destination revalidation, so a permitted initial destination can redirect a server-side fetch into a private network.",
-          "evaluatedAt": "2026-10-17",
-          "evaluatedAgainst": "sha256-b2:d3eef10e9ed8459f",
-          "evaluatedRevision": 3,
-          "revisionsBehind": 1,
-          "stale": true
+          "evaluatedAt": "2026-10-17"
         },
         {
           "subject": "agent-browser-control",
