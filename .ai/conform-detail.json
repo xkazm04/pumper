@@ -4500,34 +4500,45 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-15",
-      "evaluatedTs": "2026-10-15T21:07:38.519Z",
-      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:20:42.884Z",
+      "worker": "de093ceb-8057-432e-b95f-7a7251e60b8d",
       "techniques": [
         {
           "technique": "backoff-design",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:906 A long Retry-After is truncated, allowing another request before the receiver's stated time."
-        },
-        {
-          "technique": "durable-retries",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:2629 The retry claim checks status but not the live retry budget; stale-pending reclamation can therefore permit dispatch beyond the cap after repeated interruptions."
+          "evidence": "crates/server/src/webhook.rs:1042 Stated wait is truncated to fit the 5s in-process budget instead of honored or terminated as over-budget-wait; the stated value is not carried into the DLQ row's retry-at."
         },
         {
           "technique": "error-classification-for-retry",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:85 Unrecognized response statuses default to transient rather than a separately counted unknown class."
+          "evidence": "crates/server/src/webhook.rs:89 Classification happens at the boundary against status (good), but the closed set has no unknown lane and no rate-limited class: the fallback branch maps everything unrecognized to Transient, and 429 is folded into Transient."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/webhook.rs:941 Retry is a persisted row (next_retry_at, retry_count), CAS-claimed failed->pending before dispatch, with a stable delivery id, an exhaustion reaper to `dead`, and a stale-pending reclaim."
         },
         {
           "technique": "retry-observability",
           "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:2594 Permanent rejection writes the same dead status used for exhaustion, without distinct structured terminal outcomes."
+          "evidence": "crates/server/src/webhook.rs:767 A reclassified-permanent delivery and a ladder-exhausted delivery both land in the same `dead` status. Only the last_error text ('non-2xx (permanent)') tells them apart, so the terminal state is not spelled as data."
         },
         {
           "technique": "storm-control",
           "verdict": "deviation",
-          "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves."
+          "evidence": "crates/server/src/webhook.rs:861 Concurrent deliveries use identical in-process retry delays without jitter, preserving synchronized retry waves.",
+          "carriedFrom": "2026-10-15"
+        }
+      ],
+      "registryProposal": "backoff-design calls ±10% jitter cosmetic and full jitter the default, but says nothing about one-sided additive jitter (this sender's drain ladder adds up to +25% from a deterministic seed). It should state whether such jitter counts.",
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/webhook.rs:906 The sender shortens dependency-stated waits above five seconds instead of honoring them or terminating with an over-budget-wait outcome.",
+          "evaluatedAt": "2026-10-15T21:07:38.519Z",
+          "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+          "reason": "replaced by de093ceb-8057-432e-b95f-7a7251e60b8d"
         }
       ]
     },
@@ -4536,14 +4547,34 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-15",
-      "evaluatedTs": "2026-10-15T21:07:38.519Z",
-      "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:20:42.884Z",
+      "worker": "de093ceb-8057-432e-b95f-7a7251e60b8d",
       "techniques": [
         {
           "technique": "suspension-is-not-failure",
           "verdict": "deviation",
-          "evidence": "crates/server/src/e2e/budget_terminal.rs:161 The governance-hold test explicitly charges one attempt and requires failure despite the temporary local hold."
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:160 A precondition hold is recorded as Failed with attempts=1. Only the message text names `cost:pause`; the status does not distinguish suspended or denied from failed."
+        },
+        {
+          "technique": "error-classification-for-retry",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:54 Budget exhaustion is classified permanent and stops after one attempt (reclassification wins); the companion test asserts an ordinary transient app error is still requeued."
+        },
+        {
+          "technique": "durable-retries",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:100 A retryable failure is requeued with a persisted future available_at on the job row (the retry-at lives in the store, not in a sleeping task)."
+        }
+      ],
+      "registryProposal": "suspension-is-not-failure and the golden path's `denied` cover a breaker's verdict on the dependency and a caller's environmental block. Neither clearly names an operator or governance policy hold that refuses paid work mid-run. The standard should say which of the two it is, and whether it may consume an attempt.",
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:160 The contract requires governance-paused work to become terminally failed and consume an attempt instead of remaining suspended until its precondition changes.",
+          "evaluatedAt": "2026-10-15T21:07:38.519Z",
+          "worker": "9a2186aa-2bff-4288-8d32-eb320078ad39",
+          "reason": "replaced by de093ceb-8057-432e-b95f-7a7251e60b8d"
         }
       ]
     },
@@ -8035,37 +8066,46 @@
       "subject": "retry-backoff",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-26",
-      "evaluatedTs": "2026-10-26T22:28:51.158Z",
-      "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T00:20:42.884Z",
+      "worker": "de093ceb-8057-432e-b95f-7a7251e60b8d",
       "techniques": [
         {
           "technique": "circuit-breakers",
           "verdict": "deviation",
-          "evidence": "crates/core/src/resilience/detect.rs:893 Hysteresis breaker (Healthy/Suspect/Degraded/Quarantined/Probation as half-open), persisted, config thresholds, judged-only evidence — but quarantine exit ignores who opened it; set_state_manual(Quarantined) is lifted by detector evidence and commit_run nulls state_reason on the transition."
+          "evidence": "crates/core/src/resilience/detect.rs:893 No provenance is stored with the quarantine, so a manual (non-heuristic) open is lifted by the same streak rule as a detector-tripped one."
         },
         {
-          "technique": "error-classification-for-retry",
+          "technique": "backoff-design",
           "verdict": "conformant",
-          "evidence": "crates/core/src/resilience/detect.rs:182 Permanence is classified from structured status (404/410 on live uncached http only); 403/429/timeouts/DNS/cache responses never count as permanent, so rate-limited and transient failures are not misfiled."
+          "evidence": "crates/core/src/resilience/detect.rs:833 Recovery needs a consecutive clean streak of recovery_runs, broken by any trip, and steps back one rung at a time (Quarantined->Probation->Healthy). That is a minimum-stability window, not a reset on first success."
         },
         {
           "technique": "suspension-is-not-failure",
           "verdict": "conformant",
-          "evidence": "crates/core/src/resilience/store.rs:940 By analogy: a run the fetch gate could not judge (Inconclusive/BelowCohort/ContentEmpty) consumes no ladder evidence, advances no trip count and no recovery streak — could-not-judge is spelled apart from failed."
+          "evidence": "crates/core/src/resilience/store.rs:940 Inconclusive, below-cohort and content-empty runs neither advance the ladder nor feed the recovery streak, so a run that could not be judged is not counted as evidence."
         },
         {
-          "technique": "backoff-design",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/resilience/detect.rs:837 The ladder here is a ladder of states, not of delays; no attempt is rescheduled, so base/factor/cap/jitter do not apply (its stability-window idea is mirrored by recovery_runs)."
+          "technique": "error-classification-for-retry",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:181 Permanence is classified from the structured tier verdict and status (404/410 on a live tier), and 403/429/timeouts/DNS are explicitly excluded. Only health-bearing evidence feeds retirement, and the fetch gate keeps fetch-layer failures from indicting the extractor."
         },
         {
           "technique": "durable-retries",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge."
+          "evidence": "crates/core/src/resilience/store.rs:217 No retry rows exist in this context; the analogous discipline (trip counts derived from persisted run rows, not an in-memory counter) is present but there is no retry-at schedule to judge.",
+          "carriedFrom": "2026-10-26"
         }
       ],
-      "registryProposal": "circuit-breakers' decision rule 'persist breaker state with a freshness bound — discard stale' assumes the breaker gates availability of a remote dependency. For a breaker over the correctness of the system's own output (an extractor quarantine), time-based discard is wrong: a broken selector does not heal by waiting, and exit must be evidence-only. The technique should say its freshness rule applies to availability breakers, and that correctness breakers leave only on evidence."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/detect.rs:893 The Quarantined branch of next_state releases every quarantine on a clean-run streak without consulting provenance, so an operator-forced quarantine (set_state_manual, reason recorded) is auto-lifted to Probation and its reason cleared on the transition — the breaker technique's 'only a heuristic open is probeable / never shorten a stronger open' rule is not realized, while Retired (operator-only exit) shows the provenance distinction was made for one state but not this one.",
+          "evaluatedAt": "2026-10-26T22:28:51.158Z",
+          "worker": "a211d60f-4c51-4aa0-b25d-e1237e5e0992",
+          "reason": "replaced by de093ceb-8057-432e-b95f-7a7251e60b8d"
+        }
+      ]
     },
     "b6cad188-6215-4135-aa56-8f84711e4744/tool-result-economy": {
       "context": "e2e-integration",
