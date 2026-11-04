@@ -8578,6 +8578,16 @@
           "evidence": "crates/server/src/routes/triggers.rs:514 The dry-run is a separate check: it compares the declared hooks with what the host can actually execute and reports unusable_plugins (meaning the hop is ungated)."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/prompt-assembly": {
+      "context": "ci-quality-gates",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T01:13:01.412Z",
+      "worker": "772a6032-7eee-4d93-b985-22b2871329b3",
+      "techniques": []
     }
   }
 }

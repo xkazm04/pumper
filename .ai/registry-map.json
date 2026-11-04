@@ -1760,7 +1760,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/ci/disk-check.mjs:2 These are Node CI gate scripts (disk, flake, lane, MCP parity) that never build or send model prompts: a case-insensitive search of scripts/ci for prompt, system_prompt, ResearchRequest and llm found no hits, so the subject's precondition does not hold.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "prompt-safety",
