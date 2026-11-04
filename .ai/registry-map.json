@@ -1385,8 +1385,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "deviation",
+          "priorNotApplicable": 4,
+          "evidence": "crates/server/src/mcp/mod.rs:913 The MCP server tells agents that research/findings and research/sources, read with query_dataset, are 'the agent's memory', but query_dataset returns only the number of rows it picked, with no eligible total and no echoed limit, so an agent cannot tell a complete recall from a truncated one.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "agent-runtime-assembly",
@@ -2326,8 +2330,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/core/src/tiers.rs:1 The only 'memory' in this context is the fetcher's per-host tier-routing record (strikes, preferred tier, TTL). It is a learned routing cache, not an LLM agent's working, episodic or consolidated memory, and a search of crates/core for episod, belief, consolidat, distill and recall found nothing.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "test-harness",
@@ -2483,8 +2491,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/core/src/induce.rs:2 Rule induction is a stateless statistical pass over a page set that the caller supplies, and json_salvage only repairs output; a search of crates/core for episod, belief, consolidat, distill and recall found nothing, so this context keeps no carried-forward agent memory.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "document-text-extraction",
@@ -3551,9 +3563,10 @@
           "changedAt": "2026-10-25",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 I searched all 56 migrations for episod, belief, distill, recall and consolidat and got no hits; every 'memory' hit is the fetcher's per-host strike/penalty table (0015, 0016, 0033), DataHub governance state (0037/0038) or the event bus (0055), and the one LLM table (0009 research_cache) is a TTL response cache, so there is no episode, belief or recall store for this subject to govern.",
-          "evaluatedAt": "2026-10-24",
-          "stale": true
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 A case-insensitive search of crates/core for episod, belief, consolidat, distill and recall found nothing; every 'memory' table in the migrations is the fetcher's per-host strike/penalty router (0015/0016/0033), DataHub governance state (0038) or the event log (0055), so no schema here stores an agent's episodes, beliefs or recall items.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "mcp-tools",
@@ -3891,8 +3904,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "scripts/docs/check-doc-sync.mjs:130 The doc-sync hook reads session transcripts only to collect a turn's file edits, and it explicitly treats the agent memory dir as out of scope; a search of scripts/docs for episod, belief, consolidat, distill and recall found nothing, so no memory store is written or recalled here.",
+          "evaluatedAt": "2026-11-04",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "docs-content-model",

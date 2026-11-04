@@ -886,8 +886,9 @@
       "subject": "agent-memory",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-11-03",
-      "evaluatedTs": "2026-11-03T16:29:03.177Z",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:08:04.553Z",
+      "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
       "techniques": [
         {
           "technique": "episodic-capture",
@@ -923,14 +924,15 @@
           "evaluatedAt": "2026-10-24T02:22:32.401Z",
           "worker": "f0722500-da6d-434f-aa46-888099cc398b",
           "reason": "replaced by d20eea3d-bea0-409a-8466-477a0bf0cf39"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0015_tier_memory.sql:1 I searched all 56 migrations for episod, belief, distill, recall and consolidat and got no hits; every 'memory' hit is the fetcher's per-host strike/penalty table (0015, 0016, 0033), DataHub governance state (0037/0038) or the event bus (0055), and the one LLM table (0009 research_cache) is a TTL response cache, so there is no episode, belief or recall store for this subject to govern.",
+          "evaluatedAt": "2026-10-24",
+          "worker": null,
+          "reason": "replaced by a3051692-e017-4cc0-8915-7c6a1c016478"
         }
-      ],
-      "withdrawn": {
-        "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
-        "state": "not-applicable",
-        "at": "2026-11-03T16:29:37.872411+00:00",
-        "reason": "reviewer (sonnet): The anchor 0015_tier_memory.sql is not among the context's listed files (0001–0012). The directory has 56 migrations, so the claim that 0015 holds 'the only memory table' is about the whole schema, not this context. Other migrations such as 0022_checkpoints and 0053_plugin_kv were not examined."
-      }
+      ]
     },
     "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/agent-memory": {
       "context": "ci-quality-gates",
@@ -982,72 +984,82 @@
       "context": "api-server-core",
       "subject": "agent-memory",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-12",
-      "evaluatedTs": "2026-10-12T23:01:40.578Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:08:04.553Z",
+      "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
       "techniques": [
+        {
+          "technique": "recall-injection",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:913 The recall result gives only the selected count. The technique requires selected, eligible/considered and budget, so 100 bare rows read as everything the store holds."
+        },
+        {
+          "technique": "loss-site-inventory",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/mcp/mod.rs:895 A silent default cap of 100 rows on the memory read path is a loss site, and the result carries no notice that rows were cut."
+        },
+        {
+          "technique": "durable-store-failure-posture",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/mcp/mod.rs:927 The search tool passes the renderer's index degraded-state block through to the agent, so a wiped or failed lane does not read as an empty success."
+        },
         {
           "technique": "working-memory",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/progress.rs:7 The map holds the latest job-progress snapshot and is dropped on restart."
+          "evidence": "crates/server/src/progress.rs:7 The map holds the latest job-progress snapshot and is dropped on restart.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "decay-and-forgetting",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:578 The janitor deletes stale tier_memory rows, which are HTTP host strike records."
-        },
-        {
-          "technique": "recall-injection",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:297 Claude is given an isolated cwd so a project instruction file is not inherited; there is no recall budget."
+          "evidence": "crates/server/src/main.rs:578 The janitor deletes stale tier_memory rows, which are HTTP host strike records.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "procedure-promotion",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:145 The published agent tools are scrape-app definitions, not procedures promoted from memory."
+          "evidence": "crates/server/src/mcp/mod.rs:145 The published agent tools are scrape-app definitions, not procedures promoted from memory.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "episodic-capture",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/live.rs:8 The ring replays missed SSE notifications; it is not an episode store."
+          "evidence": "crates/server/src/mcp/live.rs:8 The ring replays missed SSE notifications; it is not an episode store.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "rollup-compaction",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/maintenance.rs:3 Maintenance folds the SQLite WAL, not redundant beliefs."
+          "evidence": "crates/server/src/maintenance.rs:3 Maintenance folds the SQLite WAL, not redundant beliefs.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "cross-context-promotion",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/registry.rs:6 The registry lists scrape apps; a search of the file found no memory store."
+          "evidence": "crates/server/src/registry.rs:6 The registry lists scrape apps; a search of the file found no memory store.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "memory-governance",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:43 The delete clears a host politeness penalty, not a proposed belief."
-        },
-        {
-          "technique": "durable-store-failure-posture",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/mcp/mod.rs:7 Each MCP POST is one JSON response, so there is no durable memory artifact to parse."
+          "evidence": "crates/server/src/state.rs:43 The delete clears a host politeness penalty, not a proposed belief.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "lane-reconciliation",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/state.rs:357 Tantivy is the dataset search index wired beside Storage, not a lane over a belief record."
+          "evidence": "crates/server/src/state.rs:357 Tantivy is the dataset search index wired beside Storage, not a lane over a belief record.",
+          "carriedFrom": "2026-10-12"
         },
         {
           "technique": "memory-value-model",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/main.rs:467 Host rows age by a TTL clock, not a shared trust, half-life, and usage score."
+          "evidence": "crates/server/src/main.rs:467 Host rows age by a TTL clock, not a shared trust, half-life, and usage score.",
+          "carriedFrom": "2026-10-12"
         }
       ],
-      "withdrawn": {
-        "worker": "a65a21d5-97eb-482e-acea-d7554b960117",
-        "state": "not-applicable",
-        "at": "2026-10-12T23:02:57.347779+00:00",
-        "reason": "reviewer (sonnet): The anchor crates/server/src/mcp/mod.rs:22 is `mod live;`, which doesn't show the tool list the evidence cites. The module doc there names only enqueue_job, fetch_readable and deep_research, so I could not confirm list_apps, query_dataset, search or wait_job from the line. The memory greps did confi"
-      }
+      "registryProposal": "The subject's precondition does not cover a host that keeps no memory pipeline itself but publishes a generic dataset read tool as an external agent's memory. It would help to say which techniques (recall-injection result shape, loss-site notices) still bind such a read surface."
     },
     "1faf3871-64b3-4897-bf44-05b2ad892076/agent-runtime-assembly": {
       "context": "pumper-sync-sdk",
@@ -8690,6 +8702,36 @@
         }
       ],
       "registryProposal": "assert-through-the-reader frames the reader as a locally installed tool (shell, VCS, package manager); it could say explicitly that when the reader is a remote consumer (a metrics scraper, an API client), the reader's own published parser library is the unit-cost oracle, and that a hand-written lint of known defect shapes is the near-side assertion the technique warns against."
+    },
+    "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/agent-memory": {
+      "context": "docs-and-ops-scripts",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:08:04.553Z",
+      "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
+      "techniques": []
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/agent-memory": {
+      "context": "core-extraction",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:08:04.553Z",
+      "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
+      "techniques": []
+    },
+    "fc25f145-0e20-4ffc-801f-4c2dfb7780ee/agent-memory": {
+      "context": "core-engine-contract",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-04",
+      "evaluatedTs": "2026-11-04T22:08:04.553Z",
+      "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
+      "techniques": []
     }
   }
 }
