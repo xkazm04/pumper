@@ -8764,6 +8764,16 @@
         }
       ],
       "registryProposal": "recorded-interaction-fixtures could name the case where the recording is of a PAID model call (this manifest records $2.62 per capture). The live lane's cost then decides its cadence, and the technique gives no rule for pricing that cadence or for a declared, dated waiver when the team will not fund one."
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/prompt-assembly": {
+      "context": "e2e-api-contract",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T22:06:10.530Z",
+      "worker": "847374bd-941c-47c1-bc42-cf5e4792cf9c",
+      "techniques": []
     }
   }
 }

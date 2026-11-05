@@ -4122,7 +4122,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/budget_terminal.rs:44 The only model call in these API-contract tests is a literal stub request used to hit a budget terminal, so the context composes, budgets and compacts no prompt. Searching crates/server/src/e2e found 0 hits for system_prompt, append_system, compaction and token_budget. The bare term 'prompt' hits only provisioner_lifecycle.rs and waiting_resume.rs, which belong to other contexts.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         },
         {
           "subject": "test-harness",
