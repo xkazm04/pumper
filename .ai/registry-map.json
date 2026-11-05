@@ -2129,7 +2129,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/datasets.rs:1344 detect_removed tombstones every live key missing from one snapshot at once. It does not wait for absence across N consecutive healthy harvests, so a single partial or rotated harvest is enough to remove entities.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "quality-gates",
@@ -3427,7 +3431,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/mod.rs:187 Removals are only held back from Degraded upward, and sync_many asks for this through enforced_state, which answers Healthy while soaking (store.rs:865-868). So the first run judged Broken (total_collapse, healthy to suspect) still runs absence processing and can tombstone keys from a partial batch, which breaks the dedup rule that a suspect harvest never reconciles.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "media-playback",
@@ -6295,7 +6303,11 @@
           "revision": 1,
           "changedAt": "2026-09-05",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-http/src/lib.rs:405 The HTTP client sets only a User-Agent (by default an impersonated Chrome string, config.rs:1563) and never states a preferred representation. No probe for alternate representations or rel=alternate exists anywhere in the repo, so the acquire stage has silently decided that markup is the only answer.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:19cc38b48911ea64",
+          "evaluatedRevision": 1
         },
         {
           "subject": "media-playback",

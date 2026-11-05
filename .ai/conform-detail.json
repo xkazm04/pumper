@@ -8784,6 +8784,65 @@
       "evaluatedTs": "2026-11-05T22:20:32.951Z",
       "worker": "870d6eee-2c7e-4122-80f8-038986668d59",
       "techniques": []
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/web-scraping": {
+      "context": "core-resilience",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T23:28:52.354Z",
+      "worker": "29f77f36-1460-4b52-8995-569371fc5f4d",
+      "techniques": [
+        {
+          "technique": "soak-mode-and-verdict-replay",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/store.rs:865 There are two accessors: state() reports and enforced_state() governs (neutral Healthy when not armed). preview.rs keeps an enumerated CONSEQUENCES inventory (line 57) with a test, and unjudged runs are counted separately and never credited with a transition (preview.rs:618). Recovery is a streak of judged clean runs through Probation (detect.rs:883)."
+        },
+        {
+          "technique": "shape-change-detection",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:314 Per-field collapse is judged against the baseline, with the field named in the reason. The fetch-health gate comes first (detect.rs:294), so an outage gives Inconclusive, not collapse. A container_empty quiet listing gives ContentEmpty, not Broken."
+        },
+        {
+          "technique": "dedup-and-datasets",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/mod.rs:187 Suspect, the state a single collapsed run lands in, does not suppress removals, so a collapsed harvest can still tombstone. The standard requires no absence processing on any harvest flagged as collapsed."
+        }
+      ],
+      "registryProposal": "The standard contradicts itself on the first rung. dedup-and-datasets and shape-change-detection say a harvest flagged as collapsed or suspect never reconciles and is quarantined at once. soak-mode-and-verdict-replay says the first rung (suspect) is inert, gates nothing, and that quarantine is earned through hysteresis. This code follows the soak ladder, which lets a single collapsed run tombstone. The registry should say whether per-run absence suppression on a Broken verdict sits outside the ladder, so it is not soaked and not hysteretic, or whether soak overrides it."
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/web-scraping": {
+      "context": "core-change-detection",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T23:28:52.354Z",
+      "worker": "29f77f36-1460-4b52-8995-569371fc5f4d",
+      "techniques": [
+        {
+          "technique": "dedup-and-datasets",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/datasets.rs:1344 Tombstones on the first miss, not on a policy. Reconciliation is otherwise strong: New/Changed/Unchanged ChangeKind, last_seen refreshed on unchanged, and a returning key revives its tombstone (datasets.rs:989) instead of minting a duplicate. The only guards are the empty-batch check and the RemovalGuard state token (datasets.rs:716)."
+        }
+      ]
+    },
+    "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/web-scraping": {
+      "context": "web-scraping-engines",
+      "subject": "web-scraping",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T23:28:52.354Z",
+      "worker": "29f77f36-1460-4b52-8995-569371fc5f4d",
+      "techniques": [
+        {
+          "technique": "negotiated-representation-probe",
+          "verdict": "deviation",
+          "evidence": "crates/engine-http/src/lib.rs:405 build_client sets no Accept preference. A repo-wide grep finds Accept headers only in API apps (application/json) and the archive engine's header allowlist, with no probe step before rule authoring."
+        }
+      ]
     }
   }
 }
