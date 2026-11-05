@@ -8774,6 +8774,16 @@
       "evaluatedTs": "2026-11-05T22:06:10.530Z",
       "worker": "847374bd-941c-47c1-bc42-cf5e4792cf9c",
       "techniques": []
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/prompt-assembly": {
+      "context": "web-crawl-extraction",
+      "subject": "prompt-assembly",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T22:20:32.951Z",
+      "worker": "870d6eee-2c7e-4122-80f8-038986668d59",
+      "techniques": []
     }
   }
 }

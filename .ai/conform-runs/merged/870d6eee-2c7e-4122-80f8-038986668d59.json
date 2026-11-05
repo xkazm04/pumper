@@ -1,0 +1,60 @@
+{
+ "schema": "conform-run/1",
+ "worker": "870d6eee-2c7e-4122-80f8-038986668d59",
+ "subject": "prompt-assembly",
+ "evaluatedAt": "2026-11-05T22:20:32.951173+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "web-crawl-extraction",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/extractor/src/lib.rs:1781 A case-insensitive search of crates/apps/crawl and crates/apps/extractor (src and tests) for prompt, ResearchRequest, system_prompt, max_turns and .research( found nothing; the extractor's only route to Claude is this fetch-strategy enum, which it hands to core's metered fetcher, so this context never builds prompt text (its induce mode is documented as 'no LLM', lib.rs:1280).",
+   "techniques": [],
+   "absenceTerms": [
+    "prompt",
+    "ResearchRequest",
+    "system_prompt",
+    "max_turns"
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "prompt-assembly",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "prompt-assembly",
+   "context": "core-extraction",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "prompt-assembly",
+   "context": "e2e-integration",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "prompt-assembly",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-05T22:20:32.951173+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "web-crawl-extraction",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

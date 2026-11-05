@@ -6196,7 +6196,11 @@
           "revision": 44,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/extractor/src/lib.rs:1781 A case-insensitive search of crates/apps/crawl and crates/apps/extractor (src and tests) for prompt, ResearchRequest, system_prompt, max_turns and .research( found nothing; the extractor's only route to Claude is this fetch-strategy enum, which it hands to core's metered fetcher, so this context never builds prompt text (its induce mode is documented as 'no LLM', lib.rs:1280).",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:ad13b2ee69c25e8d",
+          "evaluatedRevision": 44
         }
       ],
       "governance": "governed"
