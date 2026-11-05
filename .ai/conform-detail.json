@@ -5863,47 +5863,72 @@
       "subject": "background-jobs",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-17",
-      "evaluatedTs": "2026-10-17T03:30:33.838Z",
-      "worker": "d193bdfe-871c-4f91-afc6-7612111a8446",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T23:43:21.787Z",
+      "worker": "f1fbbfc2-4218-4282-b1f8-51ebecb87711",
       "techniques": [
         {
-          "technique": "loop-supervision",
+          "technique": "adaptive-cadence",
           "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:1824 The pass pulse upserts only a timestamp. There is no owner identity, claim-before-run, or verify-before-fire, so a second process is not stood down. Stop itself is present: the loop watches the shared token and main joins the task for SCHEDULER_SHUTDOWN_GRACE."
+          "evidence": "crates/server/src/scheduler.rs:114 Fixed-delay is good: the sleep follows the tick, so there is no catch-up burst. But there is no dual-rate cadence, no wake-on-signal hybrid (the select only races shutdown) and no phase jitter. The earlier verdict's anchor (line 46) was the fn signature; the interval itself is set on line 47 and slept on line 114."
         },
         {
           "technique": "tick-isolation",
           "verdict": "deviation",
-          "evidence": "crates/server/src/main.rs:79 Panic is caught around the tick and around each schedule, and the loop continues; the e2e test pins that. There is still no per-tick deadline in steady state and no consecutive-failure quarantine — the only bound is the shutdown grace."
-        },
-        {
-          "technique": "adaptive-cadence",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/scheduler.rs:110 Fixed-delay sleep of the same interval after every pass. No idle rate, no jitter, and no wake when a schedule is created; notify_one wakes the worker after enqueue, not this loop."
+          "evidence": "crates/server/src/scheduler.rs:89 Layer 1, crash capture, is realized: the whole tick is caught, and each schedule is caught again inside it (line 332). Re-entrancy cannot happen because the loop is sequential. The gap is Layer 3: tick_once has no per-tick deadline, and it runs network-bound work inline (webhook drain_due, subscriptions drain). A hung tick therefore wedges cron and the reaper. The only signal is the stale flag. There is no Layer 4 backoff or quarantine either."
         },
         {
           "technique": "loop-health-telemetry",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:854 Silence detection is realized. A durable heartbeat is written on each completed pass (line 153). The window is derived from the configured cadence × 4 with a 60s floor. Handlers check it from an independent vantage: GET /schedules publishes scheduler.stale. Per-schedule outcomes go to the decision ledger. Partial gap: the pass level keeps no persisted crashed/empty outcome. A panic is only a log line."
+        },
+        {
+          "technique": "loop-supervision",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:113 One loop hosts cron, the reaper, the webhook drain, the subscription drain, the refresher, datahub governance and scheduled workflows, each with the comment 'rides this tick rather than owning a timer'. It stops on the shared shutdown token, and the token is also honoured mid-pass (line 294). There is no cross-process heartbeat claim, but this is a single-binary local-first design."
+        },
+        {
+          "technique": "problem-set-change-logging",
           "verdict": "deviation",
-          "evidence": "crates/server/src/scheduler.rs:246 Silence is real: pass_is_stale uses schedule_tick_secs × 4 (floor 60s), None is stale, and GET /schedules reads the heartbeat from outside the loop. An all-idle pass is not a recorded succeeded-empty outcome, and crash, timeout, and skipped are not tick-exit marks."
+          "evidence": "crates/server/src/scheduler.rs:308 A standing refusal logs a warn line on every tick with no set diff: invalid cron here, unregistered app at line 426, invalid params at line 440. Each one also writes a refused ledger row. A broken row therefore repeats the same line every interval for as long as it stays broken."
         },
         {
           "technique": "startup-sweeps",
           "verdict": "conformant",
-          "evidence": "crates/server/src/scheduler.rs:574 The first pass shares decide() with steady state. last_pass None uses the grace floor; fire_once collapses to one run; skip enumeration stops at MAX_MISFIRE_SCAN; the ledger labels a collapsed catch-up."
+          "evidence": "crates/server/src/scheduler.rs:1210 The first pass after boot measures missed firings against a downtime cutoff and applies misfire_policy (fire_once collapses, skip advances). That catch-up is bounded by MAX_MISFIRE_SCAN and COLLAPSE_LOG_CAP and is recorded as skipped/fired ledger rows. Orphaned running-job repair lives in main.rs recover_stuck, which is outside this context."
+        },
+        {
+          "technique": "first-tick-gates-readiness",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:51 The scheduler maintains state but does not create the store that handlers serve (schedules rows exist independently). By the technique's own inversion, a housekeeping loop has no readiness to gate."
+        },
+        {
+          "technique": "failed-start-kept-and-retried-at-cadence",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1032 The scheduler's start cannot fail. Boot reconcile failures are logged and skipped, and the loop starts regardless."
         },
         {
           "technique": "job-progress-and-cancellation",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:3 This loop admits a queue job and returns. scheduler.rs has no progress, phase, or ETA writes. Cancel hits are the shutdown token and treating job status cancelled as slot-free, not a cancelling state."
+          "evidence": "crates/server/src/scheduler.rs:3 This loop admits a queue job and returns. scheduler.rs has no progress, phase, or ETA writes. Cancel hits are the shutdown token and treating job status cancelled as slot-free, not a cancelling state.",
+          "carriedFrom": "2026-10-17"
         },
         {
           "technique": "timeout-is-a-status-not-a-consumption",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:590 The step reports that it enqueued. It does not hold a job handle or give up a bounded wait, and there is no forever-budget sentinel in this file."
+          "evidence": "crates/server/src/scheduler.rs:590 The step reports that it enqueued. It does not hold a job handle or give up a bounded wait, and there is no forever-budget sentinel in this file.",
+          "carriedFrom": "2026-10-17"
         }
       ],
-      "registryProposal": "The golden path sends missed-run policy to scheduling, but this loop's body is the recurrence engine. Say which host clauses still bind in that fusion — cadence, per-tick deadline, tick-outcome vocabulary, single-runner claim — so a scheduler file is not scored as pure policy and not as if it owned job progress."
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:46 The scheduler derives one interval from configuration and sleeps that long after every pass, so how fast it notices due work never changes with whether anything is in flight.",
+          "evaluatedAt": "2026-10-17T03:30:33.838Z",
+          "worker": "d193bdfe-871c-4f91-afc6-7612111a8446",
+          "reason": "replaced by f1fbbfc2-4218-4282-b1f8-51ebecb87711"
+        }
+      ]
     },
     "1c9ccbb2-f4ea-457e-88a6-53fc89d8f71b/browser-credential-boundary": {
       "context": "web-scraping-engines",
@@ -8841,6 +8866,22 @@
           "technique": "negotiated-representation-probe",
           "verdict": "deviation",
           "evidence": "crates/engine-http/src/lib.rs:405 build_client sets no Accept preference. A repo-wide grep finds Accept headers only in API apps (application/json) and the archive engine's header allowlist, with no probe step before rule authoring."
+        }
+      ]
+    },
+    "cce276df-d2da-4c20-a3ea-30f2f78316b7/background-jobs": {
+      "context": "api-job-management",
+      "subject": "background-jobs",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-05",
+      "evaluatedTs": "2026-11-05T23:43:21.787Z",
+      "worker": "f1fbbfc2-4218-4282-b1f8-51ebecb87711",
+      "techniques": [
+        {
+          "technique": "job-progress-and-cancellation",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/jobs.rs:653 What is realized: a per-job token, an honest suspended answer during shutdown (line 657), an id-keyed live progress snapshot merged into GET /jobs/{id} (line 394) and distinct terminal states. What is missing is a persisted cancelling state between the request and the terminal cancelled."
         }
       ]
     }

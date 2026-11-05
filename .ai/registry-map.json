@@ -1098,7 +1098,11 @@
           "revision": 6,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/jobs.rs:653 Cancelling a running job fires its token and answers cancelled:true straight away. Storage still says running and has no intermediate cancelling status, so the two-step acknowledgement is collapsed: the caller is told 'cancelled' while the job may still be writing, and anyone polling GET /jobs/{id} cannot see that the cancel landed.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:e3e7a428140a2fbb",
+          "evaluatedRevision": 6
         },
         {
           "subject": "voice-io",
@@ -4772,12 +4776,11 @@
           "changedAt": "2026-10-27",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/scheduler.rs:46 The scheduler derives one interval from configuration and sleeps that long after every pass, so how fast it notices due work never changes with whether anything is in flight.",
-          "evaluatedAt": "2026-10-17",
-          "evaluatedAgainst": "sha256-b2:22ed2a99172ae050",
-          "evaluatedRevision": 5,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/scheduler.rs:114 After every pass the scheduler sleeps the same configured interval. Nothing wakes it early: there is no wake signal, no idle/active rate and no sleep-until-next-due-firing, even though cron already knows when the next firing is due. So in the worst case every cron firing, reap and drain waits a full tick, and that delay never adapts.",
+          "evaluatedAt": "2026-11-05",
+          "evaluatedAgainst": "sha256-b2:e3e7a428140a2fbb",
+          "evaluatedRevision": 6,
+          "revisionsBehind": 1
         },
         {
           "subject": "windowed-inference-over-oversized-inputs",

@@ -1,0 +1,111 @@
+{
+ "schema": "conform-run/1",
+ "worker": "f1fbbfc2-4218-4282-b1f8-51ebecb87711",
+ "subject": "background-jobs",
+ "evaluatedAt": "2026-11-05T23:43:21.787991+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-scheduler",
+   "subject": "background-jobs",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/scheduler.rs:114 After every pass the scheduler sleeps the same configured interval. Nothing wakes it early: there is no wake signal, no idle/active rate and no sleep-until-next-due-firing, even though cron already knows when the next firing is due. So in the worst case every cron firing, reap and drain waits a full tick, and that delay never adapts.",
+   "techniques": [
+    {
+     "technique": "adaptive-cadence",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:114 Fixed-delay is good: the sleep follows the tick, so there is no catch-up burst. But there is no dual-rate cadence, no wake-on-signal hybrid (the select only races shutdown) and no phase jitter. The earlier verdict's anchor (line 46) was the fn signature; the interval itself is set on line 47 and slept on line 114."
+    },
+    {
+     "technique": "tick-isolation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:89 Layer 1, crash capture, is realized: the whole tick is caught, and each schedule is caught again inside it (line 332). Re-entrancy cannot happen because the loop is sequential. The gap is Layer 3: tick_once has no per-tick deadline, and it runs network-bound work inline (webhook drain_due, subscriptions drain). A hung tick therefore wedges cron and the reaper. The only signal is the stale flag. There is no Layer 4 backoff or quarantine either."
+    },
+    {
+     "technique": "loop-health-telemetry",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/scheduler.rs:854 Silence detection is realized. A durable heartbeat is written on each completed pass (line 153). The window is derived from the configured cadence \u00d7 4 with a 60s floor. Handlers check it from an independent vantage: GET /schedules publishes scheduler.stale. Per-schedule outcomes go to the decision ledger. Partial gap: the pass level keeps no persisted crashed/empty outcome. A panic is only a log line."
+    },
+    {
+     "technique": "loop-supervision",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/scheduler.rs:113 One loop hosts cron, the reaper, the webhook drain, the subscription drain, the refresher, datahub governance and scheduled workflows, each with the comment 'rides this tick rather than owning a timer'. It stops on the shared shutdown token, and the token is also honoured mid-pass (line 294). There is no cross-process heartbeat claim, but this is a single-binary local-first design."
+    },
+    {
+     "technique": "problem-set-change-logging",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:308 A standing refusal logs a warn line on every tick with no set diff: invalid cron here, unregistered app at line 426, invalid params at line 440. Each one also writes a refused ledger row. A broken row therefore repeats the same line every interval for as long as it stays broken."
+    },
+    {
+     "technique": "startup-sweeps",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/scheduler.rs:1210 The first pass after boot measures missed firings against a downtime cutoff and applies misfire_policy (fire_once collapses, skip advances). That catch-up is bounded by MAX_MISFIRE_SCAN and COLLAPSE_LOG_CAP and is recorded as skipped/fired ledger rows. Orphaned running-job repair lives in main.rs recover_stuck, which is outside this context."
+    },
+    {
+     "technique": "first-tick-gates-readiness",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:51 The scheduler maintains state but does not create the store that handlers serve (schedules rows exist independently). By the technique's own inversion, a housekeeping loop has no readiness to gate."
+    },
+    {
+     "technique": "failed-start-kept-and-retried-at-cadence",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/scheduler.rs:1032 The scheduler's start cannot fail. Boot reconcile failures are logged and skipped, and the loop starts regardless."
+    }
+   ]
+  },
+  {
+   "context": "api-job-management",
+   "subject": "background-jobs",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/jobs.rs:653 Cancelling a running job fires its token and answers cancelled:true straight away. Storage still says running and has no intermediate cancelling status, so the two-step acknowledgement is collapsed: the caller is told 'cancelled' while the job may still be writing, and anyone polling GET /jobs/{id} cannot see that the cancel landed.",
+   "techniques": [
+    {
+     "technique": "job-progress-and-cancellation",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/jobs.rs:653 What is realized: a per-job token, an honest suspended answer during shutdown (line 657), an id-keyed live progress snapshot merged into GET /jobs/{id} (line 394) and distinct terminal states. What is missing is a persisted cancelling state between the request and the terminal cancelled."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-05T23:43:21.787991+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "background-jobs"
+   ],
+   "techniques": [
+    "adaptive-cadence",
+    "failed-start-kept-and-retried-at-cadence",
+    "first-tick-gates-readiness",
+    "loop-health-telemetry",
+    "loop-supervision",
+    "problem-set-change-logging",
+    "startup-sweeps",
+    "tick-isolation"
+   ],
+   "deviations": 1,
+   "context": "job-scheduler",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-05T23:43:21.787991+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "background-jobs"
+   ],
+   "techniques": [
+    "job-progress-and-cancellation"
+   ],
+   "deviations": 1,
+   "context": "api-job-management",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
