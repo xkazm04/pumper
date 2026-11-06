@@ -6857,41 +6857,58 @@
       "subject": "proactive-nudges",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-19",
-      "evaluatedTs": "2026-10-19T22:40:53.844Z",
-      "worker": "a1e9279f-9e26-4579-a3c1-6d550ad06738",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:23:58.789Z",
       "techniques": [
-        {
-          "technique": "attention-budgets",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:583 The schedule carries a monetary ceiling per job; it does not allocate daily human-contact allowances."
-        },
-        {
-          "technique": "efficacy-feedback",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:600 This outcome records a scheduled job firing, not a person's response to a delivered nudge."
-        },
-        {
-          "technique": "notice-delivery-decoupling",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:586 The durable queue receives executable jobs, so notice deferral and revalidation requirements have no notice lifecycle to govern here."
-        },
-        {
-          "technique": "nudge-identity-dedup",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:1173 Overlap protection follows the latest job's active status; it is not semantic deduplication of news delivered to a person."
-        },
         {
           "technique": "quiet-windows",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/e2e/quiet_window.rs:63 The similarly named tests gate database maintenance on foreground activity, not human contact on declared local hours."
+          "evidence": "crates/server/src/e2e/quiet_window.rs:1 The context's 'quiet window' is a gate that holds back maintenance (WAL checkpoint) while foreground work is running. It is not a declared span of hours in which the machine stays silent toward a person."
+        },
+        {
+          "technique": "attention-budgets",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:937 The only budget here is a per-schedule USD cost ceiling on a job run. There is no daily cap on contact with a human."
         },
         {
           "technique": "trigger-evaluators",
           "verdict": "not-applicable",
-          "evidence": "crates/server/src/scheduler.rs:1302 The decision evaluates a cron firing time, not whether an agent's judgment warrants human attention."
+          "evidence": "crates/server/src/scheduler.rs:1 Ticks check whether cron schedules are due and enqueue jobs. They never produce candidate notices meant for a person's attention."
+        },
+        {
+          "technique": "efficacy-feedback",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:600 This outcome records a scheduled job firing, not a person's response to a delivered nudge.",
+          "carriedFrom": "2026-10-19"
+        },
+        {
+          "technique": "notice-delivery-decoupling",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:586 The durable queue receives executable jobs, so notice deferral and revalidation requirements have no notice lifecycle to govern here.",
+          "carriedFrom": "2026-10-19"
+        },
+        {
+          "technique": "nudge-identity-dedup",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:1173 Overlap protection follows the latest job's active status; it is not semantic deduplication of news delivered to a person.",
+          "carriedFrom": "2026-10-19"
         }
-      ]
+      ],
+      "superseded": [
+        {
+          "state": "not-applicable",
+          "evidence": "crates/server/src/scheduler.rs:586 Context and repository searches found no efficacy, attention_budget, or trigger_evaluator identifiers, and this firing path enqueues scheduled work rather than discretionary notices for human attention.",
+          "evaluatedAt": "2026-10-19T22:40:53.844Z",
+          "worker": "a1e9279f-9e26-4579-a3c1-6d550ad06738",
+          "reason": "replaced by ee84d924-8a41-4467-947c-2a2fd95637bf"
+        }
+      ],
+      "withdrawn": {
+        "worker": "ee84d924-8a41-4467-947c-2a2fd95637bf",
+        "state": "not-applicable",
+        "at": "2026-11-06T01:24:32.926700+00:00",
+        "reason": "reviewer (sonnet): The anchor at scheduler.rs:586 is only the enqueue and wake-up line, so it is incidental. The same scheduler tick (scheduler.rs:162-180) also drives the webhook dead-letter drain and `subscriptions::drain`, which push outbound deliveries, including Slack messages (webhook.rs:26 and :183). The claim "
+      }
     },
     "acc95e70-ee24-4728-ad8d-addc654e7f87/public-claim-provenance": {
       "context": "pricing-valuation",
