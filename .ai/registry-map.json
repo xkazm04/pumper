@@ -3098,12 +3098,11 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:545 The queue executes SQL directly against SQLite WAL, and searches of the context and repository found no consensus, replicated_log, applied_index, or log_index, so the replicated-log precondition does not hold.",
-          "evaluatedAt": "2026-10-20",
-          "evaluatedAgainst": "sha256-b2:230a37319e1dd059",
-          "evaluatedRevision": 2,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/storage.rs:587 The job queue writes straight to a single-node SQLite WAL pool, with no consensus log or replicated state machine underneath. Searches for consensus, replicated_log, applied_index, log_index and quorum found nothing in crates/core or in any *.rs/*.toml file in the repo, so the subject's precondition does not hold.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:10473b2ddfd2ef20",
+          "evaluatedRevision": 3,
+          "revisionsBehind": 1
         }
       ],
       "governance": "governed"

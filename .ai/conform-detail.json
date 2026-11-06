@@ -6973,44 +6973,57 @@
       "subject": "transactions-over-a-replicated-log",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-20",
-      "evaluatedTs": "2026-10-20T21:32:21.674Z",
-      "worker": "fde078da-02ee-4dc5-8a86-75637d36a250",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:48:45.316Z",
+      "worker": "dbd6f5f5-4e5f-495e-8df5-770c12b84d44",
       "techniques": [
         {
-          "technique": "capture-index-before-snapshot",
+          "technique": "snapshot-read-plus-verify-log",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:1071 The queue fences stale workers by job attempt number; it does not capture an applied-log index alongside a transaction snapshot."
-        },
-        {
-          "technique": "compose-then-conform",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/store_instrument.rs:610 The instrument measures a closure receiving a SQLite connection; it does not implement a transactional storage interface with its own transaction handles."
-        },
-        {
-          "technique": "list-verification-by-present-keys",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:1460 Job listing queries the pool directly, without a transaction write buffer, reconciled key list, or apply-time verification hash."
+          "evidence": "crates/core/src/storage.rs:545 Writes go to local SQLite with no consensus round trip, so there is no commit entry and no apply step to verify at."
         },
         {
           "technique": "live-file-is-the-snapshot",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:587 The durable engine uses SQLite WAL directly, without a consensus library requesting state-machine snapshots."
+          "evidence": "crates/core/src/storage.rs:587 No log library is asking for snapshots. The WAL here is SQLite's own journal, not a replicated log."
+        },
+        {
+          "technique": "capture-index-before-snapshot",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:567 There is no log index. trigger_generation is a related in-process ordering rule (read the label before the SELECT), not an index into a replicated log."
+        },
+        {
+          "technique": "compose-then-conform",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/store_instrument.rs:610 The instrument measures a closure receiving a SQLite connection; it does not implement a transactional storage interface with its own transaction handles.",
+          "carriedFrom": "2026-10-20"
+        },
+        {
+          "technique": "list-verification-by-present-keys",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:1460 Job listing queries the pool directly, without a transaction write buffer, reconciled key list, or apply-time verification hash.",
+          "carriedFrom": "2026-10-20"
         },
         {
           "technique": "no-writes-no-log",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:1452 The job read executes directly against the pool; there is no buffered transaction commit that could propose an empty replicated entry."
+          "evidence": "crates/core/src/storage.rs:1452 The job read executes directly against the pool; there is no buffered transaction commit that could propose an empty replicated entry.",
+          "carriedFrom": "2026-10-20"
         },
         {
           "technique": "same-value-still-conflicts",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:1080 Completion uses an SQL status-and-attempt fence, rather than optimistic snapshot hashes checked when applying a replicated transaction."
-        },
+          "evidence": "crates/core/src/storage.rs:1080 Completion uses an SQL status-and-attempt fence, rather than optimistic snapshot hashes checked when applying a replicated transaction.",
+          "carriedFrom": "2026-10-20"
+        }
+      ],
+      "superseded": [
         {
-          "technique": "snapshot-read-plus-verify-log",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:853 Claiming mutates the queue through one atomic SQL statement, without a consensus round trip or a verification-and-write log entry."
+          "state": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:545 The queue executes SQL directly against SQLite WAL, and searches of the context and repository found no consensus, replicated_log, applied_index, or log_index, so the replicated-log precondition does not hold.",
+          "evaluatedAt": "2026-10-20T21:32:21.674Z",
+          "worker": "fde078da-02ee-4dc5-8a86-75637d36a250",
+          "reason": "replaced by dbd6f5f5-4e5f-495e-8df5-770c12b84d44"
         }
       ]
     },
