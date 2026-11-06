@@ -1090,7 +1090,11 @@
           "revision": 7,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/routes/jobs.rs:1 These handlers manage a scraping job queue, schedules, webhook ingress, receipts and runtime pause/resume. They do not run a repository-authored build definition on runners. A search of crates/server for GITHUB_TOKEN, workflow_dispatch, pull_request, CI_JOB_TOKEN and runs-on returned nothing, so the CI-execution-trust precondition is absent.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:47305180676ccbaa",
+          "evaluatedRevision": 7
         },
         {
           "subject": "background-jobs",
@@ -5142,7 +5146,11 @@
           "revision": 7,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 The trigger system enqueues jobs for a fixed registry of compiled scraping apps when a source event fires; it is not a delivery system that runs a repository's build definition with credentials. Searching crates/server for GITHUB_TOKEN, workflow_dispatch, pull_request, CI_JOB_TOKEN and runs-on found no hits, so this subject's precondition (an orchestrator executing pipeline instructions on runners) does not hold here.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:47305180676ccbaa",
+          "evaluatedRevision": 7
         },
         {
           "subject": "agent-memory",

@@ -9304,6 +9304,83 @@
       "evaluatedTs": "2026-11-06T02:42:19.896Z",
       "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
       "techniques": []
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/ci-execution-trust": {
+      "context": "job-triggers-pipeline",
+      "subject": "ci-execution-trust",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T03:05:40.671Z",
+      "worker": "0be604dc-6c7b-4627-b127-a10367ff6afe",
+      "techniques": [
+        {
+          "technique": "control-plane-execution-boundary",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 A trigger's target is an app id that is already registered, not commands authored in a repository, so there is no CI decide/perform boundary to draw."
+        },
+        {
+          "technique": "job-instruction-signing",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No external orchestrator instructs runners. Triggers are evaluated in-process."
+        },
+        {
+          "technique": "untrusted-contribution-lanes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No outside contributor changes a build definition that this code executes."
+        },
+        {
+          "technique": "measure-apply-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No job runs a proposed change's code."
+        },
+        {
+          "technique": "per-call-write-token-handout",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No pipeline write tokens."
+        },
+        {
+          "technique": "self-edited-ci-forfeits-evidence",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No pipeline result gates a merge."
+        },
+        {
+          "technique": "evidence-pipeline-provenance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/triggers.rs:3 No gate here reads CI run artefacts."
+        }
+      ]
+    },
+    "cce276df-d2da-4c20-a3ea-30f2f78316b7/ci-execution-trust": {
+      "context": "api-job-management",
+      "subject": "ci-execution-trust",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T03:05:40.671Z",
+      "worker": "0be604dc-6c7b-4627-b127-a10367ff6afe",
+      "techniques": [
+        {
+          "technique": "control-plane-execution-boundary",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/jobs.rs:1 A job queue for registered apps is not a delivery orchestrator."
+        },
+        {
+          "technique": "untrusted-contribution-lanes",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/ingress.rs:7 Ingress takes GitHub webhooks as HMAC-verified event data that feeds triggers. It never executes contributed build definitions, so the lane split does not arise."
+        },
+        {
+          "technique": "measure-apply-split",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/jobs.rs:1 No contributor code runs."
+        },
+        {
+          "technique": "evidence-pipeline-provenance",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/receipt.rs:1 Receipts are per-job audit views of scrape runs, not CI evidence that gates a change."
+        }
+      ]
     }
   }
 }
