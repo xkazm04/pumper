@@ -894,7 +894,11 @@
           "revision": 3,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/routes/remote.rs:1 The only remote-facing file in this context is the serving side of the fetch fabric. It is the peer that gets asked, not the prober: it runs a coordinator's whole-request fetch through the local engine and never works out what an upstream peer can do. Searching crates/server/src/routes for accept-ranges, partial_content, content-range and bytes=0- found zero hits.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:9bb6b3bf0d353d66",
+          "evaluatedRevision": 3
         },
         {
           "subject": "index-free-random-access",
@@ -2878,7 +2882,11 @@
           "revision": 3,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:128 The cache stores whole responses and uses only ETag/Last-Modified conditional revalidation, which belongs to client-fetch-cache. It never decides whether a peer can serve fragments. Searching crates/core for accept-ranges, partial_content, content-range, bytes=0- and readahead found zero hits, so there is no capability verdict, fallback rung or latency-class buffer to judge.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:9bb6b3bf0d353d66",
+          "evaluatedRevision": 3
         }
       ],
       "governance": "governed"
@@ -3352,7 +3360,11 @@
           "revision": 3,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/resilience/mod.rs:13 The module judges extraction and fetch health (bot walls, 5xx, selector rebinds) from stored history, which is the health-checks neighbour's present-tense question rather than a per-peer how-to-address-it verdict; searching crates/core and the context's tests for accept-ranges, partial_content, content-range, bytes=0- and readahead found zero hits, so no fragment-read probe, capability ladder or read buffer exists here.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:9bb6b3bf0d353d66",
+          "evaluatedRevision": 3
         },
         {
           "subject": "data-retention",

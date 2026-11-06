@@ -9136,6 +9136,79 @@
           "evidence": "crates/core/src/resilience/store.rs:878 One call hides sketching, baseline, drift, invariant checks, scoring, transition and persistence. Its informal interface (call before writing the batch) is documented at the call. Minor: store() at :822 exposes the HealthStore underneath."
         }
       ]
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/remote-capability-probing": {
+      "context": "core-resilience",
+      "subject": "remote-capability-probing",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:38:27.444Z",
+      "worker": "b42a3a23-d3b9-46e6-98ae-fb3cb7328430",
+      "techniques": [
+        {
+          "technique": "advertised-support-is-not-evidence",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/resilience/detect.rs:182 FetchHealth classifies response statuses for retirement and health judgement; it never accepts a capability from a peer's header or a provoked response."
+        },
+        {
+          "technique": "verdict-basis-tagging",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/doctor.rs:124 The doctor's three-valued outcome looks like basis tagging, but it reports on the local SQLite store and artifact tree. It is not a feature report about a hosted platform."
+        }
+      ]
+    },
+    "6fb74ed1-c2ac-4e2e-99b4-5415a68bc3d2/remote-capability-probing": {
+      "context": "api-data-access",
+      "subject": "remote-capability-probing",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:38:27.444Z",
+      "worker": "b42a3a23-d3b9-46e6-98ae-fb3cb7328430",
+      "techniques": [
+        {
+          "technique": "advertised-support-is-not-evidence",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/remote.rs:197 The route proxies one whole request and returns the envelope as it is. No branch reads a peer's capability advertisement."
+        },
+        {
+          "technique": "degraded-rung-refusal-ceiling",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/remote.rs:184 The body cap is a node ceiling on every proxied fetch. It is not a refusal ceiling on a fallback that swaps a fragment read for a whole-object read, because there are no fragment reads."
+        },
+        {
+          "technique": "single-blocker-short-circuit",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/remote.rs:152 These guards are the serving node's own admission checks. They are not a prober's preflight in front of capability rows."
+        }
+      ]
+    },
+    "e070c6d1-28bc-4b66-bdac-e9a46f152f10/remote-capability-probing": {
+      "context": "core-http-cache",
+      "subject": "remote-capability-probing",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:38:27.444Z",
+      "worker": "b42a3a23-d3b9-46e6-98ae-fb3cb7328430",
+      "techniques": [
+        {
+          "technique": "advertised-support-is-not-evidence",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:151 Stored validators feed a conditional GET. That is cache revalidation, not a capability accepted from an advertisement."
+        },
+        {
+          "technique": "buffer-by-access-latency-class",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/lru.rs:2 The LRU tracks a pool of client and browser handles. It is not a file-shaped buffer over backing stores at different distances."
+        },
+        {
+          "technique": "instrument-by-cause-not-by-hit-rate",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:192 The revalidation log counts changed and unchanged results on whole-response revalidation. There is no readahead or fragment byte counter whose cause could be split out."
+        }
+      ]
     }
   }
 }
