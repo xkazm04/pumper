@@ -2268,25 +2268,33 @@
       "subject": "data-access",
       "bundle": "software-engineering",
       "state": "not-applicable",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T01:50:11.497Z",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T00:55:33.611Z",
       "techniques": [
-        {
-          "technique": "query-construction",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0011_idempotency.sql:3 Statements are static SQL literals; there is no host-language choice between a bound value and an identifier.",
-          "carriedFrom": "2026-10-13"
-        },
         {
           "technique": "cross-driver-invariant-parity",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0021_ingress.sql:14 The chain is one SQLite dialect, including the table-rebuild used because SQLite cannot alter a CHECK.",
-          "carriedFrom": "2026-10-13"
+          "evidence": "crates/core/migrations/0021_ingress.sql:14 The schema is written for one engine (SQLite-specific table rebuild), and no Postgres or MySQL backend exists in crates/, so there is no second driver to keep in parity."
         },
         {
           "technique": "localized-record-identity",
           "verdict": "not-applicable",
-          "evidence": "crates/core/migrations/0002_platform.sql:24 Record identity is app, dataset, and key; a search of every migration for language, locale, translation, and i18n found no hits.",
+          "evidence": "crates/core/migrations/0002_platform.sql:24 Record identity has no language component, and a grep for locale/lang in migrations found nothing. Records are scraped data, not user-authored translations."
+        },
+        {
+          "technique": "row-mapping",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0020_resilient_extraction.sql:27 The DDL pins closed vocabularies at the store, but the decode seam and the corrupt-row policy live in host code (storage.rs), not in this context."
+        },
+        {
+          "technique": "read-models-and-projections",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0029_saved_search_materialize.sql:2 The column declares a stored read model, but its recomputation and propagation contract are host code outside this context."
+        },
+        {
+          "technique": "query-construction",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/migrations/0011_idempotency.sql:3 Statements are static SQL literals; there is no host-language choice between a bound value and an identifier.",
           "carriedFrom": "2026-10-13"
         },
         {
@@ -2308,6 +2316,7 @@
           "carriedFrom": "2026-10-13"
         }
       ],
+      "registryProposal": "operator-defined-tables treats the universal document column as a failure. It does not cover stores whose payloads have an unknown shape by nature (scraped JSON, keyed by app/dataset/key, with indexes only on system columns), where nobody declares typed fields, so a 'definition plane' has nothing to hold. The technique could say when a document store is the honest substrate rather than a degraded one.",
       "superseded": [
         {
           "state": "not-applicable",
@@ -2315,13 +2324,20 @@
           "evaluatedAt": "2026-10-13T08:04:02.947Z",
           "worker": "8fc3acbe-9689-4e92-99ec-9d7a9e8ee7f3",
           "reason": "replaced by 6928bafa-c16d-4262-8b4b-371b6ae0268f"
+        },
+        {
+          "state": "not-applicable",
+          "evidence": "crates/core/migrations/0002_platform.sql:15 This directory is SQLite DDL and in-database backfill; a search of crates/core/migrations for sqlx, QueryBuilder, FromRow, and push_bind found no host-language repository, row mapper, or query builder.",
+          "evaluatedAt": "2026-10-13",
+          "worker": null,
+          "reason": "replaced by 31d6dffb-e155-474d-833c-9f41c5035c60"
         }
       ],
       "withdrawn": {
-        "worker": "6928bafa-c16d-4262-8b4b-371b6ae0268f",
+        "worker": "31d6dffb-e155-474d-833c-9f41c5035c60",
         "state": "not-applicable",
-        "at": "2026-10-24T01:50:43.417275+00:00",
-        "reason": "reviewer (sonnet): The anchor 0002_platform.sql:15 is just a CREATE TABLE records line, so it doesn't show that a repository surface is absent. The claim also leans on UNIQUE (host, url_template) in 0025, which isn't among the context's listed files."
+        "at": "2026-11-06T00:55:58.083720+00:00",
+        "reason": "reviewer (sonnet): The anchor storage.rs:528 is the sqlx migrator in host code outside this context, so it does not show the precondition is absent. The seat's own technique anchors (0020 CHECK vocabularies pinned at the store, 0029 stored read-model column) show the DDL does carry subject constructs, so 'not-applicab"
       }
     },
     "e070c6d1-28bc-4b66-bdac-e9a46f152f10/data-access": {

@@ -3718,8 +3718,7 @@
           "confidence": "probable",
           "state": "not-applicable",
           "evidence": "crates/core/migrations/0002_platform.sql:15 This directory is SQLite DDL and in-database backfill; a search of crates/core/migrations for sqlx, QueryBuilder, FromRow, and push_bind found no host-language repository, row mapper, or query builder.",
-          "evaluatedAt": "2026-10-13",
-          "stale": true
+          "evaluatedAt": "2026-10-13"
         },
         {
           "subject": "webhook-ingestion",
