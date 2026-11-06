@@ -1,0 +1,54 @@
+{
+ "schema": "conform-run/1",
+ "worker": "20ac8b9a-404c-4700-99cf-9586f6f1e863",
+ "subject": "cross-provider-benchmark-operations",
+ "evaluatedAt": "2026-11-06T00:42:23.878068+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "cross-provider-benchmark-operations",
+   "bundle": "llm-observability",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/resilience/mod.rs:21 The resilience module scores extraction health using pure statistical detectors over stored revision history, with no LLM in the decision. A search of crates/core for benchmark, scorecard, prompt_variant, thinking_budget and anonymiz found nothing, so this context runs no provider \u00d7 model \u00d7 prompt-variant benchmark matrix and the subject's precondition does not hold.",
+   "techniques": [
+    {
+     "technique": "target-matrix-runs",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:5 The verdict is a pure function of sketches with no model targets, so there is no matrix to declare."
+    },
+    {
+     "technique": "failure-clustering-recommendations",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/invariants.rs:12 Invariants are mined and checked without any model, so there is no scorecard to turn into prompt or routing changes."
+    }
+   ],
+   "absenceTerms": [
+    "benchmark",
+    "scorecard",
+    "prompt_variant",
+    "thinking_budget",
+    "anonymiz"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-06T00:42:23.878068+00:00",
+   "bundle": "llm-observability",
+   "subjects": [
+    "cross-provider-benchmark-operations"
+   ],
+   "techniques": [
+    "failure-clustering-recommendations",
+    "target-matrix-runs"
+   ],
+   "deviations": 0,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

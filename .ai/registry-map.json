@@ -3513,12 +3513,11 @@
           "changedAt": "2026-10-25",
           "confidence": "probable",
           "state": "not-applicable",
-          "evidence": "crates/core/src/resilience/detect.rs:5 Searches for scorecard, prompt_variant, thinking_budget, entitlement, and anonymize found nothing in this context or the repo, and the detector is a pure function over extractor sketches with no model in the decision, so it does not operate a cross-provider benchmark matrix.",
-          "evaluatedAt": "2026-10-17",
-          "evaluatedAgainst": "sha256-b2:609da9e2f3c21869",
-          "evaluatedRevision": 12,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/core/src/resilience/mod.rs:21 The resilience module scores extraction health using pure statistical detectors over stored revision history, with no LLM in the decision. A search of crates/core for benchmark, scorecard, prompt_variant, thinking_budget and anonymiz found nothing, so this context runs no provider × model × prompt-variant benchmark matrix and the subject's precondition does not hold.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:a6d9e74af45916cc",
+          "evaluatedRevision": 13,
+          "revisionsBehind": 1
         }
       ],
       "governance": "governed"
