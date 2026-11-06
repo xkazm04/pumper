@@ -5288,7 +5288,11 @@
           "revision": 15,
           "changedAt": "2026-09-17",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/worker.rs:614 The per-run timing clock starts when the job is claimed, so the run's durable JobStages record (run/index/hooks/alerts/total, where total is 'Claim → end of fan-out') never stores how long the job waited in the queue; a fast executor behind a slow queue looks like a slow executor. Two more deviations: the worker promotes on slot count with no host-pressure gate, and the refresher's skipped probes are never counted.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:56e509787bc708cd",
+          "evaluatedRevision": 15
         },
         {
           "subject": "test-harness",

@@ -4755,77 +4755,76 @@
       "context": "job-worker",
       "subject": "admission-queue",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-16",
-      "evaluatedTs": "2026-10-16T21:08:11.560Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:29:34.539Z",
+      "worker": "d62c52fa-627f-46ac-89bb-9435a8702002",
       "techniques": [
         {
-          "technique": "admission-vocabulary",
+          "technique": "wait-telemetry",
           "verdict": "deviation",
-          "evidence": "crates/server/src/fanout.rs:126 Capacity checking and acquisition are separate: the counter increments at line 137, allowing concurrent callers to exceed max_queued despite the standard's atomic check-and-take requirement."
-        },
-        {
-          "technique": "budget-includes-the-callers-own-cache",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/worker.rs:24 Worker admission reserves count-based permits rather than consulting platform-free resource capacity; there is no free-capacity denominator here to correct for allocator reserves."
-        },
-        {
-          "technique": "depth-bounds-and-shed",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:717 The enqueue implementation inserts new queued rows without checking waiting depth; fanout_max_queued bounds a different population and supplies no bound or shed policy for SQLite jobs."
-        },
-        {
-          "technique": "drain-and-shutdown",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/routes/jobs.rs:174 The worker stops claiming and durably suspends stragglers, but the enqueue handler has no shutdown check before committing work, so requests already entering the handler cannot receive refused:draining."
+          "evidence": "crates/server/src/worker.rs:614 StageWatch is seeded from the claim instant. Queue wait (available_at → claim) is not recorded as its own measurement on the run. created_at is the wrong 'arrived' instant for scheduled jobs because available_at gates them. Core does expose oldest_queued_secs, but no per-run wait split exists."
         },
         {
           "technique": "load-aware-admission",
           "verdict": "deviation",
-          "evidence": "crates/server/src/worker.rs:44 Promotion follows permit acquisition and app-cap filtering without a host-pressure probe, pressure thresholds, or hysteresis."
-        },
-        {
-          "technique": "priority-and-fairness",
-          "verdict": "deviation",
-          "evidence": "crates/server/src/routes/jobs.rs:164 Priority comes directly from an unrestricted caller-supplied integer rather than a centrally assigned named request class, realizing the open priority scale the technique rejects."
-        },
-        {
-          "technique": "queue-cardinality",
-          "verdict": "conformant",
-          "evidence": "crates/core/src/storage.rs:791 The shared worker permits can dispatch any registered app, and capped apps are excluded inside candidate selection before LIMIT 1, allowing eligible work behind them to use free capacity."
-        },
-        {
-          "technique": "refusal-without-release",
-          "verdict": "not-applicable",
-          "evidence": "crates/server/src/routes/jobs.rs:177 Submission returns a durable job receipt immediately; admission does not retain an expensive long-lived caller whose release would synchronize reconnections."
-        },
-        {
-          "technique": "self-paced-intake",
-          "verdict": "conformant",
-          "evidence": "crates/server/src/refresher.rs:106 The refresher runs on the configured scheduler cadence with bounded candidate selection, a per-pass cap, per-host caps, and overlap prevention; individual jobs retain separate claim and failure boundaries."
+          "evidence": "crates/server/src/worker.rs:44 Promotion is gated only by the global semaphore and per-app caps. No host signal (memory/CPU) is checked before claiming, and a search of server/core for sysinfo/loadavg/pressure/high_water found no pressure gate."
         },
         {
           "technique": "speculative-work-admission",
           "verdict": "deviation",
-          "evidence": "crates/server/src/refresher.rs:122 Busy candidates are correctly skipped through a non-blocking probe, but the skip path records no submission, skip, or usefulness counters; the pass reports only the refreshed count."
+          "evidence": "crates/server/src/refresher.rs:122 Probe-and-skip is done right: a non-blocking idle-slot probe, the skip ends the submission, and a later demand fetch takes over. But a skip just runs `continue` with no counter or metric (only `refreshed` is logged, at debug), so the technique's 'count the skips separately' rule is unmet."
         },
         {
-          "technique": "wait-telemetry",
+          "technique": "self-paced-intake",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/refresher.rs:106 The refresher runs on the scheduler's own clock with a per-drain cap (global_per_tick plus per_host_per_tick) and an overlap guard. The worker waking per enqueue falls under the per-item-execution exemption."
+        },
+        {
+          "technique": "queue-cardinality",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/fanout.rs:26 The line count is a stated decision: separate fan-out and delivery pools because their backpressure means different things. The job queue is one line in front of a pool of identical workers, and per-app blocked lists stop a capped app from blocking the head of the line."
+        },
+        {
+          "technique": "depth-bounds-and-shed",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/fanout.rs:64 The fan-out backlog is bounded (fanout_max_queued) with a named shed policy (run inline, never drop), extracted and tested. Caveat: placement() reads inflight and fetch_add (line 137) takes the slot separately, so concurrent callers can overshoot the bound by up to the number of simultaneous arrivals."
+        },
+        {
+          "technique": "priority-and-fairness",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:43 Priority ordering with configurable aging (the claim_next ORDER BY uses priority plus age divided by the coefficient), plus per-app occupancy caps from blocked_apps/app_limit so one app cannot take every slot."
+        },
+        {
+          "technique": "drain-and-shutdown",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/worker.rs:252 Claiming stops when shutdown is signalled. Running jobs get a deadline-bounded clean finish, then a checkpoint suspend that re-queues them (park), then a recover_stuck sweep tagged with the drain reason. The fan-out and delivery pools are drained, and stragglers are counted and logged. Queued jobs stay durable in SQLite."
+        },
+        {
+          "technique": "admission-vocabulary",
           "verdict": "deviation",
-          "evidence": "crates/core/src/storage.rs:1364 Although wait and execution metrics are exported separately, each claim overwrites started_at while created_at persists, so a retried job's reported queue wait includes previous execution time."
+          "evidence": "crates/server/src/fanout.rs:126 Capacity checking and acquisition are separate: the counter increments at line 137, allowing concurrent callers to exceed max_queued despite the standard's atomic check-and-take requirement.",
+          "carriedFrom": "2026-10-16"
+        },
+        {
+          "technique": "budget-includes-the-callers-own-cache",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/worker.rs:24 Worker admission reserves count-based permits rather than consulting platform-free resource capacity; there is no free-capacity denominator here to correct for allocator reserves.",
+          "carriedFrom": "2026-10-16"
+        },
+        {
+          "technique": "refusal-without-release",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/jobs.rs:177 Submission returns a durable job receipt immediately; admission does not retain an expensive long-lived caller whose release would synchronize reconnections.",
+          "carriedFrom": "2026-10-16"
         },
         {
           "technique": "zero-depth-admission",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:698 Jobs support durable deferred execution and asynchronous receipt-based submission; this gate does not impose a synchronous caller deadline near one service time."
+          "evidence": "crates/core/src/storage.rs:698 Jobs support durable deferred execution and asynchronous receipt-based submission; this gate does not impose a synchronous caller deadline near one service time.",
+          "carriedFrom": "2026-10-16"
         }
-      ],
-      "withdrawn": {
-        "worker": "d56898d6-c19f-4cd4-8b7a-d818e1d65256",
-        "state": "deviation",
-        "at": "2026-10-16T21:08:23.075035+00:00",
-        "reason": "reviewer (sonnet): The deviation rests on the enqueue path (storage.rs:717 INSERT and routes/jobs.rs:174 handler), which sits outside the job-worker context's files, while the in-context code (worker.rs:24 semaphore, fanout.rs:126 and :137) only supports weaker claims about a different queue; the fanout check-then-inc"
-      }
+      ]
     },
     "1faf3871-64b3-4897-bf44-05b2ad892076/bounded-enumeration": {
       "context": "pumper-sync-sdk",
