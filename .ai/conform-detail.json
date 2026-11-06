@@ -9254,6 +9254,56 @@
           "evidence": "crates/server/src/scheduler.rs:706 A new member went through an existing shape (blast radius: every reader of `health`) without the contract's member list being fixed in the same change (commit 72eed87, typed `feat`, not breaking). Health is an untyped Option<String>, so derived readers cannot see the vocabulary at all."
         }
       ]
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/agent-memory": {
+      "context": "core-job-queue",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:42:19.896Z",
+      "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+      "techniques": []
+    },
+    "05b680d3-a634-4401-ae6b-de54d48ca753/agent-memory": {
+      "context": "core-platform-services",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:42:19.896Z",
+      "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+      "techniques": []
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/agent-memory": {
+      "context": "ai-extraction-engines",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:42:19.896Z",
+      "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+      "techniques": []
+    },
+    "acc95e70-ee24-4728-ad8d-addc654e7f87/agent-memory": {
+      "context": "pricing-valuation",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:42:19.896Z",
+      "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+      "techniques": []
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/agent-memory": {
+      "context": "job-triggers-pipeline",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:42:19.896Z",
+      "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+      "techniques": []
     }
   }
 }
