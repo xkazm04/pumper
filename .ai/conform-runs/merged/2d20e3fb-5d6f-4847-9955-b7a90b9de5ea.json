@@ -1,0 +1,135 @@
+{
+ "schema": "conform-run/1",
+ "worker": "2d20e3fb-5d6f-4847-9955-b7a90b9de5ea",
+ "subject": "module-design",
+ "evaluatedAt": "2026-11-06T01:12:29.319947+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-change-detection",
+   "subject": "module-design",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/datasets.rs:781 The derived-chain defaults (3 and 10_000) are written by hand both here and in config.rs:841-842 (DerivedConfig::default), and the doc comment says the constant 'mirrors' the config; no test links the two, so if one is changed the other silently stops matching. That is the information-leakage failure module-depth names.",
+   "techniques": [
+    {
+     "technique": "module-depth",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/datasets.rs:781 One default is encoded in two modules with nothing tying them together; a grep found only datasets.rs:781/785 and config.rs:841-842. Also seen: the pass-through chain upsert -> upsert_trusted -> upsert_stamped, which adds one parameter per concern, and pool() at :830, which hands out the pool underneath."
+    },
+    {
+     "technique": "marked-unverifiable-region",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/datasets.rs:1136 The hatch is marked (greppable AssertSqlSafe), enclosed and minimal, but none of the 6 sites in datasets.rs states the invariant that makes it safe (e.g. 'the interpolated text is a constant with no caller input'). Property four is missing."
+    },
+    {
+     "technique": "io-free-core",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/datasets.rs:5130 The batch verdict (New/Changed/Unchanged plus the revision plan) is a pure function over the state already read; the SQL lives in the driver around it. diff_values, hash_value and simhash are pure too."
+    },
+    {
+     "technique": "seams-and-adapters",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/datasets_batch_equivalence.rs:12 The change classification exists twice (inline at datasets.rs:968 and in plan_chunk at :5142). The two producers are held to one randomized parity test, which is the remedy the technique prescribes."
+    },
+    {
+     "technique": "declarative-or-sequential",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/datasets.rs:5137 Explicit loop that threads mutable per-key state and produces several outputs (plans and next_revision). The state sequence is the algorithm, so the sequential form is correct here."
+    },
+    {
+     "technique": "concurrency-at-the-edge",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/simhash.rs:23 Fingerprinting and diffing are synchronous; async appears only where sqlx I/O happens, so no async colouring leaks into the logic."
+    },
+    {
+     "technique": "scoreable-designs-are-built-not-argued",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/datasets_bulk_perf.rs:3 The batch-vs-per-record write path is judged by one harness against criteria declared up front (.lanes/criteria.json), not by argument."
+    }
+   ]
+  },
+  {
+   "context": "core-resilience",
+   "subject": "module-design",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/resilience/store.rs:165 Five AssertSqlSafe(format!(..)) sites in the health store splice SQL constants (SOURCE_COLUMNS_LIST_SQL, RunVerdict::JUDGED_SQL, a correlated-subquery template) into statements. None of them states the fact that makes the splice safe, so an audit of this unverifiable region means investigating each site rather than reading a stated claim.",
+   "techniques": [
+    {
+     "technique": "marked-unverifiable-region",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/resilience/store.rs:165 Marked, enclosed in HealthStore, and minimal, but no site carries the invariant (property four). The same holds at :220 and :702/:710."
+    },
+    {
+     "technique": "io-free-core",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/detect.rs:5 The verdict, score and state transition are pure functions; store.rs is the driver, behind the storage feature. The same split holds in doctor::diagnose(facts), retention::plan_artifact_retention (takes older_than as a parameter, :206) and preview::replay."
+    },
+    {
+     "technique": "concurrency-at-the-edge",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/detect.rs:289 The decision core is synchronous; async exists only in the sqlx-facing store and preview_fleet driver. Removing it costs nothing in the logic."
+    },
+    {
+     "technique": "declarative-or-sequential",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/detect.rs:844 The health ladder is written as an explicit match over SourceState, the state-machine case the technique says to keep sequential."
+    },
+    {
+     "technique": "module-depth",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/store.rs:878 One call hides sketching, baseline, drift, invariant checks, scoring, transition and persistence. Its informal interface (call before writing the batch) is documented at the call. Minor: store() at :822 exposes the HealthStore underneath."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "module-design",
+   "context": "core-schema-migrations",
+   "reason": "The context is 25+ sequential .sql migration files with no module interface, seam, generator or flow-control code, so none of the 16 module-design techniques has its precondition met in a way I could anchor. The closest finding is that the SourceState vocabulary is encoded both in the 0020_resilient_extraction.sql:27 CHECK and in resilience/mod.rs SourceState::parse. That is held only implicitly, by resilience tests writing every rung, so it reads as a resilience module-depth observation rather than a verdict on the migrations. I did not grep exhaustively enough to justify a not-applicable verdict."
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-06T01:12:29.319947+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "module-design"
+   ],
+   "techniques": [
+    "concurrency-at-the-edge",
+    "declarative-or-sequential",
+    "io-free-core",
+    "marked-unverifiable-region",
+    "module-depth",
+    "scoreable-designs-are-built-not-argued",
+    "seams-and-adapters"
+   ],
+   "deviations": 1,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T01:12:29.319947+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "module-design"
+   ],
+   "techniques": [
+    "concurrency-at-the-edge",
+    "declarative-or-sequential",
+    "io-free-core",
+    "marked-unverifiable-region",
+    "module-depth"
+   ],
+   "deviations": 1,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

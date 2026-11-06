@@ -2216,7 +2216,11 @@
           "revision": 18,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/datasets.rs:781 The derived-chain defaults (3 and 10_000) are written by hand both here and in config.rs:841-842 (DerivedConfig::default), and the doc comment says the constant 'mirrors' the config; no test links the two, so if one is changed the other silently stops matching. That is the information-leakage failure module-depth names.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18
         },
         {
           "subject": "agent-instruction-files",
@@ -3475,7 +3479,11 @@
           "revision": 18,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/resilience/store.rs:165 Five AssertSqlSafe(format!(..)) sites in the health store splice SQL constants (SOURCE_COLUMNS_LIST_SQL, RunVerdict::JUDGED_SQL, a correlated-subquery template) into statements. None of them states the fact that makes the splice safe, so an audit of this unverifiable region means investigating each site rather than reading a stated claim.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:7c8008f2207b1946",
+          "evaluatedRevision": 18
         },
         {
           "subject": "health-checks",

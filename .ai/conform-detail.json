@@ -9037,6 +9037,88 @@
           "evidence": "crates/server/src/e2e/quiet_window.rs:8 The e2e checks that the gate is wired in (the same gauge the server feeds), beside the unit test of the pure predicate."
         }
       ]
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/module-design": {
+      "context": "core-change-detection",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:12:29.319Z",
+      "worker": "2d20e3fb-5d6f-4847-9955-b7a90b9de5ea",
+      "techniques": [
+        {
+          "technique": "module-depth",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/datasets.rs:781 One default is encoded in two modules with nothing tying them together; a grep found only datasets.rs:781/785 and config.rs:841-842. Also seen: the pass-through chain upsert -> upsert_trusted -> upsert_stamped, which adds one parameter per concern, and pool() at :830, which hands out the pool underneath."
+        },
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/datasets.rs:1136 The hatch is marked (greppable AssertSqlSafe), enclosed and minimal, but none of the 6 sites in datasets.rs states the invariant that makes it safe (e.g. 'the interpolated text is a constant with no caller input'). Property four is missing."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/datasets.rs:5130 The batch verdict (New/Changed/Unchanged plus the revision plan) is a pure function over the state already read; the SQL lives in the driver around it. diff_values, hash_value and simhash are pure too."
+        },
+        {
+          "technique": "seams-and-adapters",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/datasets_batch_equivalence.rs:12 The change classification exists twice (inline at datasets.rs:968 and in plan_chunk at :5142). The two producers are held to one randomized parity test, which is the remedy the technique prescribes."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/datasets.rs:5137 Explicit loop that threads mutable per-key state and produces several outputs (plans and next_revision). The state sequence is the algorithm, so the sequential form is correct here."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/simhash.rs:23 Fingerprinting and diffing are synchronous; async appears only where sqlx I/O happens, so no async colouring leaks into the logic."
+        },
+        {
+          "technique": "scoreable-designs-are-built-not-argued",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/datasets_bulk_perf.rs:3 The batch-vs-per-record write path is judged by one harness against criteria declared up front (.lanes/criteria.json), not by argument."
+        }
+      ]
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/module-design": {
+      "context": "core-resilience",
+      "subject": "module-design",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T01:12:29.319Z",
+      "worker": "2d20e3fb-5d6f-4847-9955-b7a90b9de5ea",
+      "techniques": [
+        {
+          "technique": "marked-unverifiable-region",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/resilience/store.rs:165 Marked, enclosed in HealthStore, and minimal, but no site carries the invariant (property four). The same holds at :220 and :702/:710."
+        },
+        {
+          "technique": "io-free-core",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:5 The verdict, score and state transition are pure functions; store.rs is the driver, behind the storage feature. The same split holds in doctor::diagnose(facts), retention::plan_artifact_retention (takes older_than as a parameter, :206) and preview::replay."
+        },
+        {
+          "technique": "concurrency-at-the-edge",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:289 The decision core is synchronous; async exists only in the sqlx-facing store and preview_fleet driver. Removing it costs nothing in the logic."
+        },
+        {
+          "technique": "declarative-or-sequential",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/detect.rs:844 The health ladder is written as an explicit match over SourceState, the state-machine case the technique says to keep sequential."
+        },
+        {
+          "technique": "module-depth",
+          "verdict": "conformant",
+          "evidence": "crates/core/src/resilience/store.rs:878 One call hides sketching, baseline, drift, invariant checks, scoring, transition and persistence. Its informal interface (call before writing the batch) is documented at the call. Minor: store() at :822 exposes the HealthStore underneath."
+        }
+      ]
     }
   }
 }
