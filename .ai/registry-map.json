@@ -1267,12 +1267,11 @@
           "changedAt": "2026-10-27",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/server/src/routes/meta.rs:1140 The app listing reports the Claude-backed research app ready through its empty default requirements without proving the CLI is installed or authorized.",
-          "evaluatedAt": "2026-10-17",
-          "evaluatedAgainst": "sha256-b2:5791230ffb7d9fad",
-          "evaluatedRevision": 9,
-          "revisionsBehind": 1,
-          "stale": true
+          "evidence": "crates/server/src/routes/meta.rs:1422 GET /apps marks an app ready when all its declared Requirements hold, but Requirement has only an Env variant (crates/core/src/app.rs:1302-1306) and the default requires() is empty. So Claude-cost apps such as research (cost_class Claude at crates/apps/research/src/lib.rs:488, no requires override) show ready: true without proving the claude binary is installed or authorized. That turns an unknown into a confident yes, which is the failure availability-probe names.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:75415727a875a42a",
+          "evaluatedRevision": 10,
+          "revisionsBehind": 1
         },
         {
           "subject": "credential-vault",
