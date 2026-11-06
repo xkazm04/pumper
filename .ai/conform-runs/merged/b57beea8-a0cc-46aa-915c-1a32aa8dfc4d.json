@@ -1,0 +1,133 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+ "subject": "agent-memory",
+ "evaluatedAt": "2026-11-06T23:47:22.546707+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-http-cache",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/cache.rs:457 The only LLM-adjacent construct here is a request-keyed TTL response cache (plus a VCR cassette store) that replays identical Claude answers to save cost; it does not capture, consolidate, decay or inject anything an agent carries forward, and a case-insensitive search of crates/core/src and crates/core/tests for agent_memory, episodic, consolidat and memory_store found no hits.",
+   "techniques": [],
+   "absenceTerms": [
+    "episodic",
+    "consolidat"
+   ]
+  },
+  {
+   "context": "api-platform-ops",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/health.rs:1 These are operational HTTP handlers (health, doctor, economics, meta, SSE events, triggers, watches) with no agent memory store or recall-into-prompt path; a case-insensitive search of crates/server/src/routes for agent_memory, episodic, consolidat and memory_store found no hits (Claude appears only as a cost/engine label in economics.rs).",
+   "techniques": [],
+   "absenceTerms": [
+    "episodic",
+    "consolidat"
+   ]
+  },
+  {
+   "context": "wasm-plugins",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "plugins-src/trigger-gate/src/lib.rs:1 The plugins are stateless wasm32 extraction/predicate functions over a JSON envelope (\"memory\" here means wasm linear memory), so there is no agent memory pipeline; a case-insensitive search of plugins-src for agent_memory, episodic, consolidat and memory_store found no hits.",
+   "techniques": [],
+   "absenceTerms": [
+    "episodic",
+    "consolidat"
+   ]
+  },
+  {
+   "context": "core-resilience",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/resilience/mod.rs:1 The module keeps rolling-window extraction-health counters and enforcement state per scraping app, which is not an agent's carried-forward memory; a case-insensitive search of crates/core/src (including resilience/) and crates/core/tests for agent_memory, episodic, consolidat and memory_store found no hits.",
+   "techniques": [],
+   "absenceTerms": [
+    "episodic",
+    "consolidat"
+   ]
+  },
+  {
+   "context": "grants-intelligence",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/grants-common/src/lib.rs:1 These are deterministic scrapers that normalize grant records into datasets; the only \"recall\" hits are precision-over-recall comments about record identity matching, not memory recall, and a case-insensitive search of the five grant crates for agent_memory, episodic, consolidat and memory_store found no hits.",
+   "techniques": [],
+   "absenceTerms": [
+    "episodic",
+    "consolidat"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-06T23:47:22.546707+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-http-cache",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T23:47:22.546707+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "api-platform-ops",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T23:47:22.546707+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "wasm-plugins",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T23:47:22.546707+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T23:47:22.546707+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "grants-intelligence",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

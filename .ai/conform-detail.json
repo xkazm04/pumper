@@ -9403,6 +9403,56 @@
         }
       ],
       "registryProposal": "catalog-projection-modes allows a second authority only when an outside cap on catalog size forces it. It has no rule for a second authority that exists for no such reason and is held together by a build-time parity check. Please state whether a CI parity gate counts as the bidirectional completeness assertions 'that run wherever the artifact runs', or only as a temporary floor."
+    },
+    "e070c6d1-28bc-4b66-bdac-e9a46f152f10/agent-memory": {
+      "context": "core-http-cache",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T23:47:22.546Z",
+      "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+      "techniques": []
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/agent-memory": {
+      "context": "api-platform-ops",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T23:47:22.546Z",
+      "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+      "techniques": []
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/agent-memory": {
+      "context": "wasm-plugins",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T23:47:22.546Z",
+      "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+      "techniques": []
+    },
+    "95f2922d-5dad-4ad2-828d-ce8b78c418aa/agent-memory": {
+      "context": "core-resilience",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T23:47:22.546Z",
+      "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+      "techniques": []
+    },
+    "d757edd3-47f7-4e38-850b-62b56a7c6740/agent-memory": {
+      "context": "grants-intelligence",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T23:47:22.546Z",
+      "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
+      "techniques": []
     }
   }
 }

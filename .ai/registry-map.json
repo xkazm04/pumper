@@ -1240,8 +1240,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/server/src/routes/health.rs:1 These are operational HTTP handlers (health, doctor, economics, meta, SSE events, triggers, watches) with no agent memory store or recall-into-prompt path; a case-insensitive search of crates/server/src/routes for agent_memory, episodic, consolidat and memory_store found no hits (Claude appears only as a cost/engine label in economics.rs).",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "observability-telemetry",
@@ -2844,8 +2848,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/core/src/cache.rs:457 The only LLM-adjacent construct here is a request-keyed TTL response cache (plus a VCR cassette store) that replays identical Claude answers to save cost; it does not capture, consolidate, decay or inject anything an agent carries forward, and a case-insensitive search of crates/core/src and crates/core/tests for agent_memory, episodic, consolidat and memory_store found no hits.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "deterministic-prefix-caching",
@@ -3440,8 +3448,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/core/src/resilience/mod.rs:1 The module keeps rolling-window extraction-health counters and enforcement state per scraping app, which is not an agent's carried-forward memory; a case-insensitive search of crates/core/src (including resilience/) and crates/core/tests for agent_memory, episodic, consolidat and memory_store found no hits.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "quality-gates",
@@ -4762,8 +4774,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "crates/apps/grants-common/src/lib.rs:1 These are deterministic scrapers that normalize grant records into datasets; the only \"recall\" hits are precision-over-recall comments about record identity matching, not memory recall, and a case-insensitive search of the five grant crates for agent_memory, episodic, consolidat and memory_store found no hits.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         },
         {
           "subject": "native-shell-integration",
@@ -6061,8 +6077,12 @@
           "revision": 52,
           "changedAt": "2026-10-25",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "not-applicable",
+          "priorNotApplicable": 4,
+          "evidence": "plugins-src/trigger-gate/src/lib.rs:1 The plugins are stateless wasm32 extraction/predicate functions over a JSON envelope (\"memory\" here means wasm linear memory), so there is no agent memory pipeline; a case-insensitive search of plugins-src for agent_memory, episodic, consolidat and memory_store found no hits.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:6c06fb6d8d6c900f",
+          "evaluatedRevision": 52
         }
       ],
       "governance": "governed"
