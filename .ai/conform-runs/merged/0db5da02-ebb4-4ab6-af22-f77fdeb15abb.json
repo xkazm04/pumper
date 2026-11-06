@@ -1,0 +1,69 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0db5da02-ebb4-4ab6-af22-f77fdeb15abb",
+ "subject": "mcp-tools",
+ "evaluatedAt": "2026-11-06T22:36:33.147025+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "ci-quality-gates",
+   "subject": "mcp-tools",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "scripts/ci/mcp-gate-parity.mjs:41 This context's MCP gate checks after the fact that three hand-copied lists of the gated tool names agree (what is advertised, what dispatch allows, and what gets a refusal); the standard's server-composition rule says listing and dispatch should be read from one registry, and the gate's own header admits that single authority does not exist yet.",
+   "techniques": [
+    {
+     "technique": "server-composition",
+     "verdict": "deviation",
+     "evidence": "scripts/ci/mcp-gate-parity.mjs:41 Three hand-maintained copies of the gated vocabulary (verified in crates/server/src/mcp/mod.rs: 290/476 list blocks, guarded arms 746-754, refusal arm 755). The standard names parallel lists as the anti-pattern; this gate is a floor under the gap, not a fix for it."
+    },
+    {
+     "technique": "catalog-projection-modes",
+     "verdict": "conformant",
+     "evidence": "scripts/ci/mcp-gate-parity.mjs:210 The operator switch hides whole tool groups. The gate checks both directions (advertised vs guarded dispatch, gated vs refusal arm), and a call to a hidden tool must get a refusal that names the setting that restores it. That is the 'paid-for second authority' plus the 'refusal names the switch' rule."
+    }
+   ],
+   "registryProposal": "catalog-projection-modes allows a second authority only when an outside cap on catalog size forces it. It has no rule for a second authority that exists for no such reason and is held together by a build-time parity check. Please state whether a CI parity gate counts as the bidirectional completeness assertions 'that run wherever the artifact runs', or only as a temporary floor."
+  }
+ ],
+ "declined": [
+  {
+   "subject": "mcp-tools",
+   "context": "api-data-access",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "mcp-tools",
+   "context": "api-platform-ops",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "mcp-tools",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "mcp-tools",
+   "context": "e2e-data-integrity",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-06T22:36:33.147025+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "mcp-tools"
+   ],
+   "techniques": [
+    "catalog-projection-modes",
+    "server-composition"
+   ],
+   "deviations": 1,
+   "context": "ci-quality-gates",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

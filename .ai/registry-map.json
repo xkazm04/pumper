@@ -1746,7 +1746,11 @@
           "revision": 34,
           "changedAt": "2026-10-15",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:41 This context's MCP gate checks after the fact that three hand-copied lists of the gated tool names agree (what is advertised, what dispatch allows, and what gets a refusal); the standard's server-composition rule says listing and dispatch should be read from one registry, and the gate's own header admits that single authority does not exist yet.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:cb2b1c9f6fef5eb9",
+          "evaluatedRevision": 35
         },
         {
           "subject": "docs-sync",

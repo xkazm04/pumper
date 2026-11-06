@@ -9381,6 +9381,28 @@
           "evidence": "crates/server/src/routes/receipt.rs:1 Receipts are per-job audit views of scrape runs, not CI evidence that gates a change."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/mcp-tools": {
+      "context": "ci-quality-gates",
+      "subject": "mcp-tools",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T22:36:33.147Z",
+      "worker": "0db5da02-ebb4-4ab6-af22-f77fdeb15abb",
+      "techniques": [
+        {
+          "technique": "server-composition",
+          "verdict": "deviation",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:41 Three hand-maintained copies of the gated vocabulary (verified in crates/server/src/mcp/mod.rs: 290/476 list blocks, guarded arms 746-754, refusal arm 755). The standard names parallel lists as the anti-pattern; this gate is a floor under the gap, not a fix for it."
+        },
+        {
+          "technique": "catalog-projection-modes",
+          "verdict": "conformant",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:210 The operator switch hides whole tool groups. The gate checks both directions (advertised vs guarded dispatch, gated vs refusal arm), and a call to a hidden tool must get a refusal that names the setting that restores it. That is the 'paid-for second authority' plus the 'refusal names the switch' rule."
+        }
+      ],
+      "registryProposal": "catalog-projection-modes allows a second authority only when an outside cap on catalog size forces it. It has no rule for a second authority that exists for no such reason and is held together by a build-time parity check. Please state whether a CI parity gate counts as the bidirectional completeness assertions 'that run wherever the artifact runs', or only as a temporary floor."
     }
   }
 }
