@@ -8884,6 +8884,114 @@
           "evidence": "crates/server/src/routes/jobs.rs:653 What is realized: a per-job token, an honest suspended answer during shutdown (line 657), an id-keyed live progress snapshot merged into GET /jobs/{id} (line 394) and distinct terminal states. What is missing is a persisted cancelling state between the request and the terminal cancelled."
         }
       ]
+    },
+    "ebd0e47f-ad00-406e-ac98-b2ad8a693fa8/test-harness": {
+      "context": "job-triggers-pipeline",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T00:10:19.242Z",
+      "worker": "1f27ca2b-0572-407c-96c6-76f6b9c5ed3e",
+      "techniques": [
+        {
+          "technique": "isolation-lanes",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/trigger_hook_stages.rs:252 Scratch dirs have no named reaper at exit, and the startup reap only matches the same pid, so a previous run's leftovers are never cleared."
+        },
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/trigger_cache.rs:66 Every test builds a new TempStore, which runs the full migration chain (core testing.rs:88 'connect + migrate'). There is no template that is built once and copied per test."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/trigger_cache.rs:73 Asserts which producer answered (cache vs DB load count), not just the hop result; line 103 also picks a fresh source job so dedup cannot be the producer."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/requeue_policy.rs:42 Retry timing is proved by fast-forwarding available_at inside a declared window instead of sleeping. The one wall-clock bound in trigger_hook_stages is documented as a ceiling three orders of magnitude loose (line 58)."
+        },
+        {
+          "technique": "out-of-graph-artifacts",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/trigger_plugins.rs:15 The shipped plugins build outside the workspace (plugins-src). They are covered by loading the installed artifact in a CI step, not by a compile."
+        },
+        {
+          "technique": "flake-lifecycle",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/trigger_plugins.rs:790 Each skip carries a recorded reason and has a matching row in .flake/register.json (line 121)."
+        },
+        {
+          "technique": "assert-through-the-reader",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/trigger_plugins.rs:1 The hook envelope is input for a plugin program, and it is asserted by running a real WASM host and the shipped plugins, not by string checks."
+        }
+      ]
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/test-harness": {
+      "context": "e2e-api-contract",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T00:10:19.242Z",
+      "worker": "1f27ca2b-0572-407c-96c6-76f6b9c5ed3e",
+      "techniques": [
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/body_limit.rs:43 Rebuilds the migrated store per test. There is no template that is built once and copied."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/error_contract.rs:45 Asserts the config branch was actually reached before reading the 503s, so a default cannot produce the same observation."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:50 'Fails now, not after the stale window' is proved by ordering (one run_one, then read the row), not by a timer."
+        }
+      ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/test-harness": {
+      "context": "job-scheduler",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T00:10:19.242Z",
+      "worker": "1f27ca2b-0572-407c-96c6-76f6b9c5ed3e",
+      "techniques": [
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/scheduler_overlap.rs:19 Rebuilds per test. Also seeds time by a raw UPDATE of created_at (line 36) that skips the product's write path, although that state is one the product can produce."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/scheduler_overlap.rs:56 The firing decision takes an injected now, so the overlap and hold claims are asserted against the schedule, not a stopwatch. quiet_window.rs:21-23 likewise moves config, never sleeps."
+        },
+        {
+          "technique": "pin-the-call-not-the-name",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:2163 Needle carries tokens prose cannot spell, and the haystack is comment-stripped non-test source (code_only, non_test_source). All code after scheduler.rs's first #[cfg(test)] is test code, so nothing executable is missed."
+        },
+        {
+          "technique": "negative-control-tests",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:2170 Seeds a foreign outcome word and a commented word, and proves the structural guard goes red on the first and ignores the second."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/quiet_window.rs:8 The e2e checks that the gate is wired in (the same gauge the server feeds), beside the unit test of the pure predicate."
+        }
+      ]
     }
   }
 }

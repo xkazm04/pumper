@@ -4154,7 +4154,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/body_limit.rs:43 Every API-contract test builds a new temp SQLite and runs the full migration chain through TempStore::new, so setup cost grows with each test added: the rebuild-per-test shape fixture-economics names as its failure.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "retry-backoff",
@@ -4897,7 +4901,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/scheduler_overlap.rs:19 Each scheduler e2e test builds a new migrated SQLite rather than copying a template built once, so every test pays the full migration chain.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "release-pipeline",
@@ -5027,7 +5035,11 @@
           "revision": 27,
           "changedAt": "2026-10-23",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/trigger_hook_stages.rs:252 Each WASM fixture directory is named by process id and only cleared at creation (line 253, the same in trigger_plugins.rs:78-81), never at exit; a later run has a different pid and so never clears it, and every run of these tests leaves directories in the OS temp dir.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:c96e1ee699a88119",
+          "evaluatedRevision": 27
         },
         {
           "subject": "convergence-loop-and-requeue",
