@@ -2188,7 +2188,11 @@
           "revision": 11,
           "changedAt": "2026-09-20",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/simhash.rs:402 Persisted record fingerprints depend on hash_token's exact output, an unpromised and load-bearing regularity. Its stability is stated only in this comment and in the manual `reindex_simhashes` one-shot (datasets.rs:2317). No test pins a known fingerprint value and no algorithm marker is stored, so a future edit to the token hash (as the later splitmix finalizer was) ships green and silently mixes incomparable fingerprints in the store.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:faf052699c35ced4",
+          "evaluatedRevision": 11
         },
         {
           "subject": "prompt-assembly",
@@ -4933,7 +4937,11 @@
           "revision": 11,
           "changedAt": "2026-09-20",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:706 The scheduler added a seventh member, `retired`, to the existing `health` string that GET /schedules publishes. The schema field's contract text (crates/server/src/routes/dto.rs:373, and so openapi.json and the generated TS/CLI types) still enumerates only six values. The route description lists seven, so readers built from the field schema were never told about the new member of an existing shape.",
+          "evaluatedAt": "2026-11-06",
+          "evaluatedAgainst": "sha256-b2:faf052699c35ced4",
+          "evaluatedRevision": 11
         },
         {
           "subject": "alerting",

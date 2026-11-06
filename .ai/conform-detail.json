@@ -9222,6 +9222,39 @@
           "evidence": "crates/core/src/cache.rs:192 The revalidation log counts changed and unchanged results on whole-response revalidation. There is no readahead or fragment byte counter whose cause could be split out."
         }
       ]
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/release-pipeline": {
+      "context": "core-change-detection",
+      "subject": "release-pipeline",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:19:11.069Z",
+      "worker": "01f6be5c-3902-41b7-a27e-d972f3abf29f",
+      "techniques": [
+        {
+          "technique": "announcing-versus-silent-breakage",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/simhash.rs:516 The simhash tests assert only relative Hamming distances (near/far/zero). All of them would still pass if hash_token changed, so the persisted-fingerprint regularity is true but not tested. The publisher-side aid is a manual reindex (datasets.rs:2317), with no probe that detects a mixed store."
+        }
+      ],
+      "registryProposal": "announcing-versus-silent-breakage frames the silent class as release-to-consumer. A sibling case is worth naming: a producer's own persisted derived values (fingerprints, content hashes) are a silent contract with the producer's past self. There the aid is a stored algorithm-version marker or a golden-value test, not a restore switch."
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/release-pipeline": {
+      "context": "job-scheduler",
+      "subject": "release-pipeline",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-06",
+      "evaluatedTs": "2026-11-06T02:19:11.069Z",
+      "worker": "01f6be5c-3902-41b7-a27e-d972f3abf29f",
+      "techniques": [
+        {
+          "technique": "release-level-by-reader-reach",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:706 A new member went through an existing shape (blast radius: every reader of `health`) without the contract's member list being fixed in the same change (commit 72eed87, typed `feat`, not breaking). Health is an untyped Option<String>, so derived readers cannot see the vocabulary at all."
+        }
+      ]
     }
   }
 }
