@@ -1,0 +1,22 @@
+{
+ "schema": "conform-run/1",
+ "worker": "9d1e28f6-44a6-4b27-a528-fb2051c5ac98",
+ "subject": "fleet-orchestration",
+ "evaluatedAt": "2026-11-06T03:28:07.943949+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "fleet-orchestration",
+   "context": "api-server-core",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "fleet-orchestration",
+   "context": "pricing-valuation",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": []
+}
