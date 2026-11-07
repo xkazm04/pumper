@@ -860,8 +860,8 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "priorNotApplicable": 4,
+          "state": "unknown"
         },
         {
           "subject": "search",
@@ -3029,8 +3029,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "deviation",
+          "priorNotApplicable": 4,
+          "evidence": "crates/core/src/storage.rs:336 Jobs found `running` at boot, at lease expiry or at the drain deadline are closed through the ordinary `fail` door with only a prose reason (FailReason::Text sets no cause_kind). With attempts used up they become `Failed`, and JobStatus has no indeterminate value, so 'outcome unknown' is stored as a definite failure that consumers can only recover by reading the message text.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28
         },
         {
           "subject": "read-serving-replicas",
@@ -4111,8 +4115,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "deviation",
+          "priorNotApplicable": 4,
+          "evidence": "crates/server/src/e2e/panic_containment.rs:60 The API-contract e2e suite pins that a panic is told apart from an app error, a timeout or a reaped lease by the error message prefix alone (all of them end as `Failed`), so the contract it guards is a verdict held in prose rather than in status or cause_kind.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:45b3f952560a4cbc",
+          "evaluatedRevision": 28
         },
         {
           "subject": "ipc-contract",

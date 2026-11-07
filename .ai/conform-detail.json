@@ -9453,6 +9453,54 @@
       "evaluatedTs": "2026-11-06T23:47:22.546Z",
       "worker": "b57beea8-a0cc-46aa-915c-1a32aa8dfc4d",
       "techniques": []
+    },
+    "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/agent-runtime-assembly": {
+      "context": "core-job-queue",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:04:56.666Z",
+      "worker": "93fe9e7f-f426-4b0d-8e30-d0510077b971",
+      "techniques": [
+        {
+          "technique": "indeterminate-closure-on-interruption",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1853 The recovery sweep writes FAILURE (requeue, or Failed once attempts run out) instead of a first-class indeterminate status. The verdict lives only in the error string; the core test at crates/core/tests/jobs.rs:323 recovers it with `contains(\"lease expired\")`, which is the technique's named tell."
+        }
+      ],
+      "registryProposal": "The golden path assigns the job record's status vocabulary to job-coordination, while this technique requires a third, indeterminate status. A scrape-job queue that hosts no agent loop sits between the two. The registry should say which subject owns the interrupted-job status when the job is not an agent tool call."
+    },
+    "1d1816ea-080a-422a-b9c3-1f304338e4e3/agent-runtime-assembly": {
+      "context": "e2e-api-contract",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:04:56.666Z",
+      "worker": "93fe9e7f-f426-4b0d-8e30-d0510077b971",
+      "techniques": [
+        {
+          "technique": "indeterminate-closure-on-interruption",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:60 The test separates panic from the reaper's 'lease expired (heartbeat stale)' label by string comparison, which is the technique's 'string comparison against an error message' tell."
+        }
+      ]
+    },
+    "6fb74ed1-c2ac-4e2e-99b4-5415a68bc3d2/agent-runtime-assembly": {
+      "context": "api-data-access",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:04:56.666Z",
+      "techniques": [],
+      "withdrawn": {
+        "worker": "93fe9e7f-f426-4b0d-8e30-d0510077b971",
+        "state": "not-applicable",
+        "at": "2026-11-07T00:05:43.505049+00:00",
+        "reason": "reviewer (sonnet): The not-applicable anchor, search.rs:128, is an incidental line that does not show the precondition is absent. The searched terms (subagent, tool_call, transcript, compaction) are the wrong ones for this subject, since routes/mod.rs mentions an agent-facing MCP tool that shares code with GET /search"
+      }
     }
   }
 }
