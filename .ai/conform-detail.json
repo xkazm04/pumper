@@ -8153,32 +8153,27 @@
       "context": "content-monitoring",
       "subject": "node-boot-and-declarative-bootstrap",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-25",
-      "evaluatedTs": "2026-10-25T23:43:01.271Z",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T22:19:46.292Z",
+      "worker": "1a8f9fd6-d351-4232-bcab-2f35faf090ed",
       "techniques": [
         {
           "technique": "ordered-boot-dag",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/peer/src/mesh.rs:303 The only 'boot' in this context is this comment about the server's boot; the apps add no startup steps."
+          "evidence": "crates/apps/plugin/src/lib.rs:696 The app is a job handler the server invokes; it builds no startup components, so it has no boot order to declare."
         },
         {
           "technique": "reload-partition",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/plugin/tests/common/mod.rs:121 The only 'reload' is a test double for the core Plugins trait, not a config-reload handler. These apps read per-job params, not node config keys."
+          "evidence": "crates/apps/plugin/tests/common/mod.rs:121 The only reload here is a test double of the host's Plugins trait; config reload belongs to the server and engine-wasm, not these apps."
         },
         {
           "technique": "config-objects-are-api-immutable",
           "verdict": "not-applicable",
-          "evidence": "crates/apps/plugin/src/lib.rs:1996 Plugin loading and registration are owned by the server/engine-wasm host. This app only consumes loaded plugins and creates no config-born devices."
+          "evidence": "crates/apps/provisioner/src/lib.rs:19 The provisioner only emits proposals and creates no config-born or API-born devices, so there is no dual provenance to reconcile."
         }
-      ],
-      "withdrawn": {
-        "worker": "4f327981-e91c-4b12-bd22-2152e37235e1",
-        "state": "not-applicable",
-        "at": "2026-10-25T23:43:34.056454+00:00",
-        "reason": "reviewer (sonnet): The not-applicable anchors are incidental. mesh.rs:300 is a doc comment about one governor-import gap in the peer app. plugin/src/lib.rs:1996 is a test assertion about an empty plugin host, and does not say loading is owned by the server. plugin/tests/common/mod.rs:121 is just a test double's reload"
-      }
+      ]
     },
     "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/read-serving-replicas": {
       "context": "core-job-queue",

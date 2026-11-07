@@ -1,0 +1,59 @@
+{
+ "schema": "conform-run/1",
+ "worker": "1a8f9fd6-d351-4232-bcab-2f35faf090ed",
+ "subject": "node-boot-and-declarative-bootstrap",
+ "evaluatedAt": "2026-11-07T22:19:46.292774+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "content-monitoring",
+   "subject": "node-boot-and-declarative-bootstrap",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/peer/src/mesh.rs:300 These crates are per-job `impl ScrapeApp` units with no node lifecycle, so the subject's precondition (a stateful node's own startup, reload or first-start bootstrap) does not hold. This line records that server state, and with it boot, belongs to the server. A grep over all eight app directories found 0 hits for bootstrap, unseal, startup or first_start. The only `boot` hit is this comment ('adopts it at the next boot', referring to the server), and the only `reload` hit is a test mock of the plugin host's trait.",
+   "techniques": [
+    {
+     "technique": "ordered-boot-dag",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/plugin/src/lib.rs:696 The app is a job handler the server invokes; it builds no startup components, so it has no boot order to declare."
+    },
+    {
+     "technique": "reload-partition",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/plugin/tests/common/mod.rs:121 The only reload here is a test double of the host's Plugins trait; config reload belongs to the server and engine-wasm, not these apps."
+    },
+    {
+     "technique": "config-objects-are-api-immutable",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/provisioner/src/lib.rs:19 The provisioner only emits proposals and creates no config-born or API-born devices, so there is no dual provenance to reconcile."
+    }
+   ],
+   "absenceTerms": [
+    "bootstrap",
+    "unseal",
+    "startup",
+    "first_start"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-07T22:19:46.292774+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "node-boot-and-declarative-bootstrap"
+   ],
+   "techniques": [
+    "config-objects-are-api-immutable",
+    "ordered-boot-dag",
+    "reload-partition"
+   ],
+   "deviations": 0,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

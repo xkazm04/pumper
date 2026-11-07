@@ -2025,7 +2025,11 @@
           "revision": 3,
           "changedAt": "2026-09-26",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/apps/peer/src/mesh.rs:300 These crates are per-job `impl ScrapeApp` units with no node lifecycle, so the subject's precondition (a stateful node's own startup, reload or first-start bootstrap) does not hold. This line records that server state, and with it boot, belongs to the server. A grep over all eight app directories found 0 hits for bootstrap, unseal, startup or first_start. The only `boot` hit is this comment ('adopts it at the next boot', referring to the server), and the only `reload` hit is a test mock of the plugin host's trait.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:1c83f54ea0028875",
+          "evaluatedRevision": 3
         },
         {
           "subject": "web-scraping",
