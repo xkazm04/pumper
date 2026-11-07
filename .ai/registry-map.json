@@ -3071,7 +3071,11 @@
           "revision": 2,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "conformant",
+          "evidence": "crates/core/src/storage.rs:241 The store says outright that its queue is durable: rows are user, scheduler and trigger promises that cannot be rebuilt from other state, so the in-memory, derived-queue techniques do not apply. The two that do carry over (a separate error-policy function, and per-key exclusion under a global cap) are both realized and anchored, and no technique is a deviation.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:fc5a1774272e601e",
+          "evaluatedRevision": 2
         },
         {
           "subject": "engine-host-contract",

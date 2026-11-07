@@ -7990,43 +7990,38 @@
       "context": "core-job-queue",
       "subject": "convergence-loop-and-requeue",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-24",
-      "evaluatedTs": "2026-10-24T21:26:02.767Z",
+      "state": "conformant",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:19:29.559Z",
+      "worker": "98b0840d-ab8e-4a2d-862d-e4d51deacc9a",
       "techniques": [
         {
           "technique": "error-policy-as-a-separate-function",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:297 There is no convergence pass here. Still, the seam the technique describes exists for job retries: a pure policy over a typed error, with give-up recorded on the row via requeue_reason and jitter applied upward. It is well formed, but this subject does not govern it."
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:297 Pure function with no now(), jitter or config input. It takes the typed Error, kept through FailReason::Typed, and returns Requeue::After or Requeue::Never. The policy may give up visibly: Never routes to fail_permanently_because, which records requeue_reason. Fail sets the delay as Utc::now() plus the delay, so it is measured from completion. The retry goes back into the same jobs table through available_at. Table tests sit at storage.rs:6421 and onward."
         },
         {
           "technique": "per-key-exclusion-under-a-global-cap",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:171 Something close exists: per-target exclusion is built into the atomic claim, separate from the per-app blocked cap, and has its own held_by_target gauge. But it guards durable jobs, not passes of a converger, and apps opt in (None opts out), so the subject's 'exclusion has no knob' rule does not govern it."
+          "verdict": "conformant",
+          "evidence": "crates/core/src/storage.rs:171 Per-target exclusion is a predicate inside the atomic claim UPDATE. It is not a knob and is kept separate from the per-app `blocked` cap (doc at line 817: 'Two exclusions, two different questions'). held_by_target (line 1633) reports parked-behind-a-twin with the same predicate, separately from queue_ages and the running count. Because the predicate lives in the DB, a second process gets the same exclusion."
         },
         {
           "technique": "keyed-queue-with-earliest-wins",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:384 Dedup turns away a second enqueue and returns the original job. Nothing moves a time earlier, because each job is a distinct unit of work, and the technique itself says a job queue 'belongs to a different subject entirely'."
-        },
-        {
-          "technique": "drain-a-derived-queue",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:340 Drain here gives a verdict on still-running durable rows through the recovery sweep. It does not drop a derived queue, because this queue is not derived."
+          "evidence": "crates/core/src/storage.rs:402 Jobs are separate units that must each run, so this is the job-queue case the technique sends to a different subject. Idempotency dedup returns the original row and does not coalesce by key with earliest-wins."
         },
         {
           "technique": "told-that-not-why",
           "verdict": "not-applicable",
-          "evidence": "crates/core/src/storage.rs:388 Jobs carry their params and their trigger lineage as the work item itself. No pass takes a key and reads the whole world, so the rule about erasing the reason has nothing to apply to."
+          "evidence": "crates/core/src/storage.rs:387 A job carries its own params and is not a full-state pass over a key. The trigger reason is kept as lineage and is not part of any identity, so the 'reason erased from the key' construction has nothing to act on here."
+        },
+        {
+          "technique": "drain-a-derived-queue",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/storage.rs:340 The queue is not derived, so abandoning entries at shutdown would lose promises. A still-running job instead gets a recorded recovery verdict, which is the admission-queue/job-coordination discipline, not this technique's."
         }
       ],
-      "registryProposal": "The error-policy-as-a-separate-function seam (pure policy over a typed error, give-up recorded on the record, one re-entry path) is realised cleanly in a durable job queue here. The technique could note that its seam carries over to durable queues unchanged, and point to retry-backoff/durable-retries for that case, so judges don't misfile durable-queue code under this subject.",
-      "withdrawn": {
-        "worker": "bf4866b3-f31a-4666-ab3d-0a254adc28b6",
-        "state": "not-applicable",
-        "at": "2026-10-24T21:26:27.763777+00:00",
-        "reason": "reviewer (sonnet): The not-applicable rests on a vocabulary search that left out 'reconcile', and storage.rs (in this context) also holds the scheduler's reconcile-loop state: schedule_runs, the mark_schedule_pass heartbeat and schedule_pass_heartbeat (storage.rs:2113-2198), described as 'the reconcile loop completed "
-      }
+      "registryProposal": "The golden path puts durable queues out of scope ('no means theirs'), yet two of its techniques carry over cleanly to a durable SQLite claim queue. First, error-policy-as-a-separate-function: a pure requeue_after(typed error, attempts, stated wait) that returns After or Never. Second, per-key exclusion: a NOT IN (running target_key) predicate inside the atomic claim UPDATE, which also gives cross-process exclusion, the guarantee the in-memory form explicitly lacks. The boundary section could say that these two techniques generalize to durable queues and that the DB-predicate form is the cross-process realization."
     },
     "f49d6e82-d094-4a4b-b3dd-9d46ce0db001/docs-content-model": {
       "context": "docs-and-ops-scripts",
