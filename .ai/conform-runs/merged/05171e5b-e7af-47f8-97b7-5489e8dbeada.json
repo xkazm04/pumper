@@ -1,0 +1,47 @@
+{
+ "schema": "conform-run/1",
+ "worker": "05171e5b-e7af-47f8-97b7-5489e8dbeada",
+ "subject": "delivery-analytics",
+ "evaluatedAt": "2026-11-07T01:33:05.643125+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-change-detection",
+   "subject": "delivery-analytics",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/datasets.rs:1 The context's \"change detection\" means diffing scraped records (SHA-256 value hashes, simhash/dom_simhash near-duplicate fingerprints) across scrape runs, not reading a team's VCS change history; a case-insensitive search of crates/core/src and crates/core/tests for pull_request, co-authored-by, change_failure, review_coverage and merge_commit found zero hits, so none of the subject's techniques (attribution, review coverage, revert linkage, batch size, denominators) has a precondition here.",
+   "techniques": [
+    {
+     "technique": "revert-linkage",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/simhash.rs:1 The module fingerprints documents for near-duplicate detection; it computes no failure or revert signal from commit history."
+    }
+   ],
+   "absenceTerms": [
+    "pull_request",
+    "co-authored-by",
+    "change_failure",
+    "merge_commit"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-07T01:33:05.643125+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "delivery-analytics"
+   ],
+   "techniques": [
+    "revert-linkage"
+   ],
+   "deviations": 0,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

@@ -9531,6 +9531,22 @@
       "evaluatedTs": "2026-11-07T00:48:09.715Z",
       "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
       "techniques": []
+    },
+    "52108c9a-314a-4741-bab2-7e654b3c68bc/delivery-analytics": {
+      "context": "core-change-detection",
+      "subject": "delivery-analytics",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T01:33:05.643Z",
+      "worker": "05171e5b-e7af-47f8-97b7-5489e8dbeada",
+      "techniques": [
+        {
+          "technique": "revert-linkage",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/simhash.rs:1 The module fingerprints documents for near-duplicate detection; it computes no failure or revert signal from commit history."
+        }
+      ]
     }
   }
 }

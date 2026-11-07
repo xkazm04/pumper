@@ -2124,7 +2124,11 @@
           "revision": 5,
           "changedAt": "2026-09-17",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/datasets.rs:1 The context's \"change detection\" means diffing scraped records (SHA-256 value hashes, simhash/dom_simhash near-duplicate fingerprints) across scrape runs, not reading a team's VCS change history; a case-insensitive search of crates/core/src and crates/core/tests for pull_request, co-authored-by, change_failure, review_coverage and merge_commit found zero hits, so none of the subject's techniques (attribution, review coverage, revert linkage, batch size, denominators) has a precondition here.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:e43700f2d197398b",
+          "evaluatedRevision": 5
         },
         {
           "subject": "test-harness",
