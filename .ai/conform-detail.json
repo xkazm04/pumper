@@ -6904,8 +6904,8 @@
       "subject": "public-claim-provenance",
       "bundle": "software-engineering",
       "state": "unknown",
-      "evaluatedAt": "2026-10-26",
-      "evaluatedTs": "2026-10-26T22:20:13.104Z",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T23:23:47.852Z",
       "techniques": [
         {
           "technique": "build-time-derivation-off-the-client-bundle",
@@ -6951,10 +6951,10 @@
         }
       ],
       "withdrawn": {
-        "worker": "a018454f-27e1-4efe-8315-3d6e8a1bbe42",
+        "worker": "87f47ad7-46eb-4947-9c84-bb7a6510ea4e",
         "state": "not-applicable",
-        "at": "2026-10-26T22:21:04.374954+00:00",
-        "reason": "reviewer (sonnet): The claim that every crate upserts into an internal dataset and renders nothing is contradicted by crates/apps/transact/src/lib.rs, which drives live pages to a confirmation state, captures a `#confirm-panel` and confirm_selector receipt, and reports submit outcomes; the anchor at valuation-multiple"
+        "at": "2026-11-07T23:24:27.326470+00:00",
+        "reason": "reviewer (sonnet): The anchor (homewyse-pricing lib.rs:9) only says output is upserted and cost is reported to a consumer. Elsewhere in the same file and in state-tax, the apps emit coverage, completeness (ok/suspect/collapsed) and join_complete verdicts that downstream consumers read (e.g. homewyse-pricing lib.rs:355"
       }
     },
     "dd1aeb6d-4da1-4b15-aea4-28a412dd9706/transactions-over-a-replicated-log": {
