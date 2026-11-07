@@ -9594,6 +9594,37 @@
           "evidence": "scripts/ci/mcp-gate-parity.mjs:17 The parity checked is between three sites in one Rust file. It is not a prompt-safety rule implemented twice across a language boundary."
         }
       ]
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/release-pipeline": {
+      "context": "core-extraction",
+      "subject": "release-pipeline",
+      "bundle": "software-engineering",
+      "state": "unknown",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T23:45:19.984Z",
+      "techniques": [
+        {
+          "technique": "deprecation-by-version-arithmetic",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/Cargo.toml:6 The technique's own exemption covers this: internal symbols with no callers outside the repo are deleted together with their callers, and no window is needed."
+        },
+        {
+          "technique": "release-level-by-reader-reach",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/Cargo.toml:3 The crate has no version of its own (it inherits the workspace's) and it has no readers outside the repo, so there is no reader population whose reach would set a level."
+        },
+        {
+          "technique": "announcing-versus-silent-breakage",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/Cargo.toml:6 No consumer outside the repo receives a breaking release of this library. In-repo behaviour pins live in the tests, not in release aids."
+        }
+      ],
+      "withdrawn": {
+        "worker": "b0eaa4ce-0150-43f8-8c1e-5f64a10b2e4d",
+        "state": "not-applicable",
+        "at": "2026-11-07T23:47:14.271970+00:00",
+        "reason": "reviewer (sonnet): The claim that the extraction primitives have no callers outside the repo is contradicted by the code: crates/core/Cargo.toml itself says embedders such as Personas depend on pumper-core with default-features = false, and personas-app's Cargo.toml pins it by git rev (7e13f31). The extract, markdown,"
+      }
     }
   }
 }
