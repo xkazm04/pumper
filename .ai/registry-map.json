@@ -1815,7 +1815,11 @@
           "revision": 8,
           "changedAt": "2026-10-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "scripts/ci/lane-canary.mjs:2 Every script in this context is a deterministic Node gate over files on disk (lane artifacts, flake register, target/ size, Rust source spellings) and none of them builds a prompt or reads model output: case-insensitive searches of scripts/ci for prompt, llm, untrusted, injection, anthropic and 'claude -p' returned no hits, so there is no untrusted-span-to-model boundary for this subject to govern.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:33b072141695f2eb",
+          "evaluatedRevision": 8
         },
         {
           "subject": "invariant-placement",

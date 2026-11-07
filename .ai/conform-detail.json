@@ -9568,6 +9568,32 @@
           "evidence": "crates/core/src/lru.rs:21 No fixed-page memory pool shared by consumer classes with different per-element costs. The LRU caps a count of keyed handles, not paged memory."
         }
       ]
+    },
+    "637fe113-22d8-4d1a-bbb6-3de8199aa6bd/prompt-safety": {
+      "context": "ci-quality-gates",
+      "subject": "prompt-safety",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T23:09:26.761Z",
+      "worker": "20bb41b2-ff65-4113-89d8-48d8408ee2f9",
+      "techniques": [
+        {
+          "technique": "canary-tripwires",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/lane-canary.mjs:2 This canary checks that the CI lane judge is alive by planting a breach of a declared bound. No prompt boundary is crossed and no model run emits a marker."
+        },
+        {
+          "technique": "session-capability-conjunction",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:2 A static check that tool names are spelled the same way in Rust source. It judges no agent session, credential or egress."
+        },
+        {
+          "technique": "cross-language-rule-parity",
+          "verdict": "not-applicable",
+          "evidence": "scripts/ci/mcp-gate-parity.mjs:17 The parity checked is between three sites in one Rust file. It is not a prompt-safety rule implemented twice across a language boundary."
+        }
+      ]
     }
   }
 }
