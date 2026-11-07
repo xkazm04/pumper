@@ -1130,8 +1130,12 @@
           "revision": 23,
           "changedAt": "2026-10-18",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 5
+          "state": "not-applicable",
+          "priorNotApplicable": 5,
+          "evidence": "crates/server/src/routes/jobs.rs:1 These are axum routes for the job lifecycle plus two maintenance binaries. Grepping crates/server/src/routes and crates/server/src/bin for speech, tts, microphone, audio and whisper found nothing; the one 'voice' hit, at error.rs:722, is prose ('in a voice indistinguishable from'), so it was left out of the absence terms.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:ad2538ae80ec48fd",
+          "evaluatedRevision": 24
         }
       ],
       "governance": "governed"
@@ -1962,8 +1966,12 @@
           "revision": 23,
           "changedAt": "2026-10-18",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 5
+          "state": "not-applicable",
+          "priorNotApplicable": 5,
+          "evidence": "crates/apps/watch/src/lib.rs:1 These apps fetch, fingerprint and aggregate web content. Grepping the hackernews, research, readable, watch, connector-api-watch, peer, provisioner and plugin crates for speech, tts, microphone, audio and whisper found nothing; 'synthesize' in research means LLM text synthesis, not speech.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:ad2538ae80ec48fd",
+          "evaluatedRevision": 24
         },
         {
           "subject": "sidecar-provisioning",
@@ -6035,8 +6043,12 @@
           "revision": 23,
           "changedAt": "2026-10-18",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 5
+          "state": "not-applicable",
+          "priorNotApplicable": 5,
+          "evidence": "plugins-src/title-extractor/Cargo.toml:14 The plugins are wasm32 cdylibs that depend only on serde_json and implement a JSON extract/predicate ABI. Grepping plugins-src for speech, tts, microphone, audio and whisper found nothing; the only near-hit was the word 'transcribed' in a code comment, so there is no voice input or output.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:ad2538ae80ec48fd",
+          "evaluatedRevision": 24
         },
         {
           "subject": "supply-chain",
@@ -6237,8 +6249,12 @@
           "revision": 23,
           "changedAt": "2026-10-18",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 5
+          "state": "not-applicable",
+          "priorNotApplicable": 5,
+          "evidence": "crates/apps/crawl/src/lib.rs:1 The context crawls web pages and extracts records from HTML. A case-insensitive grep of crates/apps/crawl and crates/apps/extractor for speech, tts, microphone, audio and whisper found nothing, so no capture or synthesis pipeline exists for voice-io to govern.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:ad2538ae80ec48fd",
+          "evaluatedRevision": 24
         },
         {
           "subject": "supply-chain",

@@ -9496,6 +9496,46 @@
         "at": "2026-11-07T00:05:43.505049+00:00",
         "reason": "reviewer (sonnet): The not-applicable anchor, search.rs:128, is an incidental line that does not show the precondition is absent. The searched terms (subagent, tool_call, transcript, compaction) are the wrong ones for this subject, since routes/mod.rs mentions an agent-facing MCP tool that shares code with GET /search"
       }
+    },
+    "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/voice-io": {
+      "context": "web-crawl-extraction",
+      "subject": "voice-io",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:48:09.715Z",
+      "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
+      "techniques": []
+    },
+    "f900cd3c-7445-4e85-936b-32135e8fb605/voice-io": {
+      "context": "wasm-plugins",
+      "subject": "voice-io",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:48:09.715Z",
+      "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
+      "techniques": []
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/voice-io": {
+      "context": "content-monitoring",
+      "subject": "voice-io",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:48:09.715Z",
+      "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
+      "techniques": []
+    },
+    "cce276df-d2da-4c20-a3ea-30f2f78316b7/voice-io": {
+      "context": "api-job-management",
+      "subject": "voice-io",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T00:48:09.715Z",
+      "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
+      "techniques": []
     }
   }
 }
