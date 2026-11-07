@@ -9537,6 +9537,37 @@
           "evidence": "crates/core/src/simhash.rs:1 The module fingerprints documents for near-duplicate detection; it computes no failure or revert signal from commit history."
         }
       ]
+    },
+    "e070c6d1-28bc-4b66-bdac-e9a46f152f10/paged-block-cache": {
+      "context": "core-http-cache",
+      "subject": "paged-block-cache",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T22:49:36.879Z",
+      "worker": "7668c81a-c4ee-4095-9772-321e1704f76e",
+      "techniques": [
+        {
+          "technique": "chained-block-identity",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:72 Whole-artifact content key over unordered request attributes, not blocks of an ordered input. The technique's 'unordered inputs' exclusion applies: plain content addressing is correct here."
+        },
+        {
+          "technique": "append-only-tolerates-duplicates",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:288 No per-request append-only reference table exists. Entries are long-lived SQLite rows upserted in place, which is the technique's own 'long-lived/mutable entries' exclusion."
+        },
+        {
+          "technique": "release-order-is-the-eviction-policy",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:344 Entries are independent whole responses with no parent/descendant structure, so the releasing party has no depth signal. Oldest-confirmed eviction is the fallback the technique itself names."
+        },
+        {
+          "technique": "one-page-size-bought-with-padding",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/lru.rs:21 No fixed-page memory pool shared by consumer classes with different per-element costs. The LRU caps a count of keyed handles, not paged memory."
+        }
+      ]
     }
   }
 }

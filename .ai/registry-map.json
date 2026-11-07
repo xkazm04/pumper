@@ -2906,7 +2906,11 @@
           "revision": 1,
           "changedAt": "2026-09-03",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/core/src/cache.rs:68 The cache key is one SHA-256 over a whole request (method, url, body, sorted headers, proxy), so each request produces one key for one whole stored response; there is no prefix-monotone computation, no fixed-size block or block pool, and no chained per-block key. Searching crates/core for parent_key, block_hash, prefix_cache, block_size and free_list found 0 hits, so the subject's precondition does not hold here.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:bdc97e412853bc4f",
+          "evaluatedRevision": 1
         },
         {
           "subject": "remote-capability-probing",
