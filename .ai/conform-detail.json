@@ -6269,47 +6269,42 @@
       "context": "core-resilience",
       "subject": "data-retention",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-10-17",
-      "evaluatedTs": "2026-10-17T21:26:07.712Z",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-07",
+      "evaluatedTs": "2026-11-07T01:10:05.664Z",
+      "worker": "f0ecd98e-fb96-4b17-b41a-247728554a9f",
       "techniques": [
-        {
-          "technique": "confirm-by-echo",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/retention.rs:343 Destructive cleanup in core-resilience runs as an unattended janitor pass without an interactive operator confirmation path."
-        },
-        {
-          "technique": "destructive-override-floor",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/resilience/store.rs:694 HealthStore::prune clamps below-floor values to 1 instead of refusing, which also floors the zero sentinel to 1 and prunes all but one run."
-        },
         {
           "technique": "dry-run-preview",
           "verdict": "conformant",
-          "evidence": "crates/core/src/retention.rs:207 Artifact retention implements a pure dry-run plan calculating the exact delete list and partitioned byte counts executed by delete_artifacts."
-        },
-        {
-          "technique": "erasure-requests",
-          "verdict": "not-applicable",
-          "evidence": "crates/core/src/resilience/mod.rs:78 The resilience module manages health state, rolling sketch metrics, and scraped artifacts with no personal data or external erasure obligations."
-        },
-        {
-          "technique": "per-tenant-retention-policy",
-          "verdict": "deviation",
-          "evidence": "crates/core/src/retention.rs:210 Retention planning applies a single global age cutoff across all apps rather than supporting stored per-tenant policies and resolution."
+          "evidence": "crates/core/src/retention.rs:38 The preview is a mode of the deleter: plan_artifact_retention is pure, and the server preview and the janitor both call the same artifact_retention_plan. The four keep/reclaim classes partition the tree per app. Gap: RetentionPlan carries no cutoff moment and no as-of timestamp (count-carries-predicate). The preview emits only cutoff_days."
         },
         {
           "technique": "time-budgeted-batch-purge",
           "verdict": "deviation",
-          "evidence": "crates/core/src/resilience/store.rs:703 HealthStore::prune executes an unbounded, unbatched SQL delete query without a wall-clock budget, chunking, or partial summary reporting."
+          "evidence": "crates/core/src/retention.rs:357 A per-file failure goes only to a log line and never enters the result, so the janitor reports Ran while some deletes failed (degraded shows as green). There is no budget derived from a runner limit and no batch boundary. The sibling HealthStore::prune (crates/core/src/resilience/store.rs:703) is a single unbounded DELETE statement."
+        },
+        {
+          "technique": "destructive-override-floor",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/retention.rs:202 The cutoff predicate accepts any window. Config validation (config.rs:1100-1135) checks only cross-key consistency, so artifact_retention_days = 1 is accepted and deletes every unpinned body older than a day, unattended. No floor refuses it, and there is no out-of-band opt-in. HealthStore::prune also clamps keep.max(1) (store.rs:694) rather than refusing. The 0 = off sentinel is honoured; the pin veto mitigates but is not a floor."
+        },
+        {
+          "technique": "per-tenant-retention-policy",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/retention.rs:210 This is a single-deployment, local-first service: the plan takes one global cutoff with no tenant dimension. The technique's 'single-tenant systems' exclusion applies. The keep-everything sentinel (0 = off, the default) does exist in config."
+        },
+        {
+          "technique": "confirm-by-echo",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/retention.rs:343 The only caller is the unattended janitor, and the server exposes only GET /retention/preview. No operator-initiated destructive retention operation exists, so the technique's 'unattended paths' exclusion applies."
+        },
+        {
+          "technique": "erasure-requests",
+          "verdict": "not-applicable",
+          "evidence": "crates/core/src/retention.rs:22 Deletion here is horizon-only over scraped bodies and health sketches. A search of crates/ for erasure, gdpr and 'data subject' found nothing, and no subject-erasure obligation is declared. Low confidence: scraped content could contain personal data."
         }
-      ],
-      "withdrawn": {
-        "worker": "2b5caa86-c1cd-4a1d-8e16-36125126d1d1",
-        "state": "deviation",
-        "at": "2026-10-17T21:26:41.984706+00:00",
-        "reason": "reviewer (sonnet): Line 694 does clamp keep to 1 (`keep.max(1)`), but I found no caller anywhere in crates/ that passes 0 as a sentinel, and no non-test caller of HealthStore::prune at all, so the 'zero sentinel' and 'unattended janitor' claims are unconfirmed; the supporting anchors retention.rs:343 (delete_artifacts"
-      }
+      ]
     },
     "e070c6d1-28bc-4b66-bdac-e9a46f152f10/deterministic-prefix-caching": {
       "context": "core-http-cache",

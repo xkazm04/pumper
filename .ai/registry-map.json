@@ -3427,7 +3427,11 @@
           "revision": 2,
           "changedAt": "2026-08-27",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/src/retention.rs:343 The artifact purge walks the whole delete list in one unbounded pass. It has no time budget, no batching and no partial or out-of-budget outcome. It returns a bare (files, bytes) tuple, so a failed delete cannot reach the run's status, and the configurable age window that drives it has no floor.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:c04dbf25f3ca1ea6",
+          "evaluatedRevision": 2
         },
         {
           "subject": "retry-backoff",
