@@ -4479,7 +4479,11 @@
           "revision": 2,
           "changedAt": "2026-09-26",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/e2e/dataset_delete_gate.rs:1 These eight end-to-end suites test dataset reads, the delete gate, doctor reports, engine conformance, VCR attempts, target exclusion, search degraded mode and dynamic WASM app listing; none of them mints, leases, renews or revokes a credential. A word-boundary search for issuer, renewal, max_ttl and lease_ttl across crates/server/src/e2e/ found zero hits. Within the eight files, revoke, credential, secret and ttl also had zero hits; the only substring match for lease was 'release' in a fetch_bytes test.",
+          "evaluatedAt": "2026-11-07",
+          "evaluatedAgainst": "sha256-b2:9d26f7a6264acd94",
+          "evaluatedRevision": 2
         },
         {
           "subject": "engine-host-contract",
