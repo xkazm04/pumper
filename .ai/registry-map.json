@@ -1232,7 +1232,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/doctor.rs:39 A store with more than 5,000 replayable revisions always gets an incomplete verdict and healthy=false, and DoctorQuery offers only skip_artifacts, so no request an operator can make clears it.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "agent-memory",
@@ -2654,7 +2658,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:109 A rustfmt-wrapped `.research(` line has an empty receiver and is dropped here (the form already exists at crates/apps/connector-api-watch/src/lib.rs:558), so a new wrapped direct Researcher call inside core passes the model-chokepoint inventory with nothing reported.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "test-harness",

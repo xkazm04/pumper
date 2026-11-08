@@ -9815,6 +9815,98 @@
           "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:10 An empty extraction is treated as nothing measured, not as a page change, and no alert fires."
         }
       ]
+    },
+    "e26c5dc1-2d40-41f9-9ec8-da51cca1720f/quality-gates": {
+      "context": "core-extraction",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-08",
+      "evaluatedTs": "2026-11-08T23:46:33.025Z",
+      "worker": "39993fe8-e8eb-4622-bc68-61c1b45ed6f9",
+      "techniques": [
+        {
+          "technique": "unparseable-form-is-a-finding",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:109 The wrapped-chain form is neither followed nor refused; it silently reads as no call site. enforcement_preview.rs joins lines and fixtures this exact case, this scanner does not."
+        },
+        {
+          "technique": "renameable-detector-keys",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:130 Compliance is keyed on the receiver's name: inside core, where the pub(crate) layer does not help, `let ctx = self.engines.researcher(); ctx.research(req)` is exempt with behaviour unchanged."
+        },
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:122 A member lost from the walk is skipped rather than named as could-not-run; removal_guard.rs:258 uses expect for the same read."
+        },
+        {
+          "technique": "gate-liveness",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:186 no_app_crate_can_name_the_researcher folds an unreadable file into not-an-offender and has no walked-file floor, so a moved crates/apps stays green; removal_guard.rs:267 asserts scanned > 50, this guard asserts nothing."
+        },
+        {
+          "technique": "chokepoint-tag-registry",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:160 Both directions of the EXPECTED set are enforced, so a row with no live call site goes red; the compiler-enforced pub(crate) boundary is the stronger half."
+        },
+        {
+          "technique": "false-positive-economics",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:96 Prose documenting the chokepoint is excluded so the detector does not fire on correct content."
+        },
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:156 The failure names the wrapper to call and the list to edit if the bypass is justified."
+        },
+        {
+          "technique": "waiver-names-its-finding",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/llm_chokepoint.rs:52 Each exemption is one exact path::receiver site, and a stale entry fails the test."
+        },
+        {
+          "technique": "blocking-by-input-determinism",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/eval_tier3_extraction.rs:13 The blocking eval reads frozen fixtures and recorded transcripts only, so its verdict is a function of the tree."
+        }
+      ]
+    },
+    "c6709bb4-2a2a-4ea2-b62b-d6650f46603c/quality-gates": {
+      "context": "api-platform-ops",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-08",
+      "evaluatedTs": "2026-11-08T23:46:33.025Z",
+      "worker": "39993fe8-e8eb-4622-bc68-61c1b45ed6f9",
+      "techniques": [
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/routes/doctor.rs:39 The ceiling is compile-time and not paged, and the truncated reason names no action, unlike the skipped case, which says to re-request without the flag. The watch-target refusal at watches.rs:577 does carry its way out."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/doctor.rs:172 The route declares what it did not gather instead of handing over an empty list that reads as clean."
+        },
+        {
+          "technique": "gate-liveness",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:1345 The source guard asserts its own population floor before judging."
+        },
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/meta.rs:1319 The scan normalises to production code by span, explicitly to avoid losing the code after the test block."
+        },
+        {
+          "technique": "false-positive-economics",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/routes/watches.rs:587 The watch-target refusal is narrowed so an unwritten dataset is accepted rather than refused on a guess."
+        }
+      ]
     }
   }
 }
