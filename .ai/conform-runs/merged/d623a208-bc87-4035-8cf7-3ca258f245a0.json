@@ -1,0 +1,285 @@
+{
+ "schema": "conform-run/1",
+ "worker": "d623a208-bc87-4035-8cf7-3ca258f245a0",
+ "subject": "quality-gates",
+ "evaluatedAt": "2026-11-08T23:15:28.918056+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/triggers.rs:2945 The inventory claims to cover every outcome the module records, but its population is hand-built from hook outcomes, so fired, bad_params, bind_miss, filter_miss and any new literal at a NewTriggerRun site go unchecked, and record_trigger_run does not validate against the allowlist either.",
+   "techniques": [
+    {
+     "technique": "chokepoint-tag-registry",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:2945 The set compared with TRIGGER_OUTCOMES is typed in the test and only hook_* words get the reverse direction; the NewTriggerRun call sites in production are not enumerated, so a new outcome word at one of them stays green."
+    },
+    {
+     "technique": "unmeasurable-criteria",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:672 An in-path predicate that did not answer opens for the hop and leaves a ledger incident under its own failure outcome: open to the actor, loud to the operator."
+    },
+    {
+     "technique": "severity-by-construction",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:749 post_enqueue is declared non-gating by construction, because it runs after the enqueue, and its result is ignored rather than labelled as enforcement."
+    },
+    {
+     "technique": "self-reported-gate-inputs",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:394 The depth and chain cycle guards read host-owned keys that are re-stamped after the transform, so the sandbox cannot author the record that gates it."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/trigger_plugins.rs:793 A missing shipped wasm artifact fails the test instead of skipping it."
+    },
+    {
+     "technique": "refusal-names-a-reachable-remedy",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/trigger_plugins.rs:786 The named remedy is an in-tree recipe; it exists at justfile:778."
+    },
+    {
+     "technique": "gate-laddering",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/trigger_plugins.rs:15 The ignored tests run on the binding rung: .github/workflows/ci.yml:211 runs e2e::trigger_plugins with --ignored."
+    }
+   ]
+  },
+  {
+   "context": "e2e-api-contract",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/request_panics.rs:108 The test under this claim only asserts that /health returns 200, so if routes::router stopped applying with_middleware the panic layer would be gone from the shipped server and this check would stay green.",
+   "techniques": [
+    {
+     "technique": "gate-liveness",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/request_panics.rs:108 No input removing the layer from the real router can turn this test red; the panicking routes only ever go through with_middleware directly."
+    },
+    {
+     "technique": "refusal-names-a-reachable-remedy",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/error_contract.rs:62 The test requires the 503 refusal to name the config switch that clears it."
+    },
+    {
+     "technique": "vacuous-by-evaluation",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/error_contract.rs:114 A real state is sent as a counterexample so the refusal guard cannot pass by rejecting everything."
+    },
+    {
+     "technique": "unmeasurable-criteria",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/enqueue_door_parity.rs:229 A stored schedule that cannot be validated is skipped visibly on the schedule's own surface rather than silently."
+    },
+    {
+     "technique": "policy-projection",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/enqueue_door_parity.rs:126 The job door and the schedule door are held to one refusal text for the same params policy."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/error_contract.rs:7 A rule that lived in a doc sentence is now pinned over real responses from the real router."
+    }
+   ]
+  },
+  {
+   "context": "api-data-access",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/query.rs:1538 The test named the_forbidden_expression_guard_can_still_fail appends the needle to a string and asserts the string contains it, so it can only fail if format! breaks and never shows the guard going red.",
+   "techniques": [
+    {
+     "technique": "gate-liveness",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/query.rs:1538 The seeded violation never passes through the guard or route_code's filtering; it is a tautology presented as a proof of red."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/query.rs:1522 The first #[cfg(test)] is market_tests at line 949, so production code at lines 990-1270 (fit_filters, grants_for_profile) is dropped from the haystack although the doc says everything above the test module."
+    },
+    {
+     "technique": "unparseable-form-is-a-finding",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/query.rs:1500 The route binds now at line 322 and the test doc at line 1389 names now.date_naive() as the forbidden form, yet the guard matches one spelling and nothing refuses the other."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/query.rs:1501 The deadline rule has a mechanical check rather than only a comment, even though that check has the gaps recorded above."
+    },
+    {
+     "technique": "instrument-answers-only-its-own-question",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/datasets.rs:1417 The SDK fixture pin states the question it does not answer: wiring over real HTTP."
+    }
+   ]
+  },
+  {
+   "context": "web-crawl-extraction",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/extractor/tests/result_honesty.rs:293 The extractor's manifest check is a substring search over the shape text, so dropping the standalone truncated key stays green because records_truncated still contains it, and promised keys outside the test's own lists are never checked.",
+   "techniques": [
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "deviation",
+     "evidence": "crates/apps/extractor/tests/result_honesty.rs:293 The shape is prose and keys together; a substring hit in another key or a sentence satisfies the matcher."
+    },
+    {
+     "technique": "chokepoint-tag-registry",
+     "verdict": "deviation",
+     "evidence": "crates/apps/extractor/tests/result_honesty.rs:290 The doc says every promised key must appear, but the loop walks a retyped list in one direction; the shape's own urls and archive keys are not derived from it."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/apps/crawl/tests/result_contract.rs:286 An empty parse of the plan key block fails rather than passing as an empty diff."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/apps/crawl/tests/result_contract.rs:148 The crawl contract moved from a declared string to a comparison against a real run."
+    }
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/plugin/tests/result_contract.rs:57 This test never reads the plugin manifest's output_shape; it checks a hand-typed list that omits the declared unchanged and cost keys, so the manifest can drift from the result with the test still green.",
+   "techniques": [
+    {
+     "technique": "chokepoint-tag-registry",
+     "verdict": "deviation",
+     "evidence": "crates/apps/plugin/tests/result_contract.rs:29 A retyped list acts as a second authority over the manifest; no test in the crate reads output_shape."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "deviation",
+     "evidence": "crates/apps/hackernews/src/lib.rs:675 Substring match over a shape that mixes keys and prose: the sentence naming `removed` would satisfy the check if the key left the key block."
+    },
+    {
+     "technique": "vacuous-by-evaluation",
+     "verdict": "deviation",
+     "evidence": "crates/apps/research/tests/result_contract.rs:256 The test checks six hand-listed reasons appear in the declaration and observes two emitted, so a declared reason no code path produces stays green."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/apps/research/tests/result_contract.rs:13 Research derives declared and emitted shapes from real runs and diffs them in both directions."
+    },
+    {
+     "technique": "unmeasurable-criteria",
+     "verdict": "conformant",
+     "evidence": "crates/apps/watch/tests/empty_extraction_is_not_a_change.rs:10 An empty extraction is treated as nothing measured, not as a page change, and no alert fires."
+    }
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-08T23:15:28.918056+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "chokepoint-tag-registry",
+    "gate-laddering",
+    "gate-liveness",
+    "refusal-names-a-reachable-remedy",
+    "self-reported-gate-inputs",
+    "severity-by-construction",
+    "unmeasurable-criteria"
+   ],
+   "deviations": 1,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-08T23:15:28.918056+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "gate-liveness",
+    "policy-projection",
+    "prose-rule-drift",
+    "refusal-names-a-reachable-remedy",
+    "unmeasurable-criteria",
+    "vacuous-by-evaluation"
+   ],
+   "deviations": 1,
+   "context": "e2e-api-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-08T23:15:28.918056+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "gate-liveness",
+    "instrument-answers-only-its-own-question",
+    "match-the-resolved-artifact",
+    "prose-rule-drift",
+    "unparseable-form-is-a-finding"
+   ],
+   "deviations": 1,
+   "context": "api-data-access",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-08T23:15:28.918056+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "chokepoint-tag-registry",
+    "gate-liveness",
+    "match-the-resolved-artifact",
+    "prose-rule-drift"
+   ],
+   "deviations": 1,
+   "context": "web-crawl-extraction",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-08T23:15:28.918056+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "chokepoint-tag-registry",
+    "match-the-resolved-artifact",
+    "prose-rule-drift",
+    "unmeasurable-criteria",
+    "vacuous-by-evaluation"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

@@ -824,7 +824,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/query.rs:1538 The test named the_forbidden_expression_guard_can_still_fail appends the needle to a string and asserts the string contains it, so it can only fail if format! breaks and never shows the guard going red.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "test-harness",
@@ -1954,7 +1958,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/plugin/tests/result_contract.rs:57 This test never reads the plugin manifest's output_shape; it checks a hand-typed list that omits the declared unchanged and cost keys, so the manifest can drift from the result with the test still green.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "voice-io",
@@ -4189,7 +4197,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/e2e/request_panics.rs:108 The test under this claim only asserts that /health returns 200, so if routes::router stopped applying with_middleware the panic layer would be gone from the shipped server and this check would stay green.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "multi-provider-gateway-plane",
@@ -5194,7 +5206,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "strong",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/triggers.rs:2945 The inventory claims to cover every outcome the module records, but its population is hand-built from hook outcomes, so fired, bad_params, bind_miss, filter_miss and any new literal at a NewTriggerRun site go unchecked, and record_trigger_run does not validate against the allowlist either.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "ci-execution-trust",
@@ -6310,7 +6326,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/apps/extractor/tests/result_honesty.rs:293 The extractor's manifest check is a substring search over the shape text, so dropping the standalone truncated key stays green because records_truncated still contains it, and promised keys outside the test's own lists are never checked.",
+          "evaluatedAt": "2026-11-08",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "llm-extracted-entity-graph",
