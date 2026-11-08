@@ -1,0 +1,80 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b75473f8-cfe0-4f8a-8681-f68cdae77a63",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-11-03T23:33:21.598764+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-worker",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/e2e/worker_lifecycle.rs:561 The structural pin that claims all four gate/hook calls sit inside `finalize_fanout` ends the function at the next column-0 bare `fn ` (worker.rs:1577 `vcr_params`), so its window also covers `publish_running` (1465) and `finish_from_executor` (1493); a call moved into the remote-finish path would stay green, which is the instrument-defaults-toward-green failure the technique names.",
+   "techniques": [
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/e2e/worker_lifecycle.rs:561 The needles are good: they carry argument lists, and an exactly-once count makes a prose mention go red. The scope predicate is the problem: it reads 'next bare fn' rather than the construct's own end, so `pub(crate) fn` and `pub(crate) async fn` items are swallowed into the window."
+    },
+    {
+     "technique": "assert-the-schedule-not-the-stopwatch",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/worker_lifecycle.rs:350 The per-app cap claim is proved by counting the peak number of runs in flight, with stubs held until `want` of them overlap. The run_one seam drains the fan-out as a synchronization point, not a deadline poll (worker.rs:236-237)."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/worker_lifecycle.rs:410 A control test proves the harness itself is not serialising, so a peak of 1 under cap 1 is evidence about the cap, not an artifact of the harness."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/e2e/panic_containment.rs:36 The competing producer (the reaper) is armed, and the test asserts that the error text names panic containment rather than the reaper's message."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "e2e-api-contract",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-03T23:33:21.598764+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "assert-the-schedule-not-the-stopwatch",
+    "negative-control-tests",
+    "pin-the-call-not-the-name",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "job-worker",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

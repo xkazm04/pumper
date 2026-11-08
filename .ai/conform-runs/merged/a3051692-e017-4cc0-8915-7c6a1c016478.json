@@ -1,0 +1,162 @@
+{
+ "schema": "conform-run/1",
+ "worker": "a3051692-e017-4cc0-8915-7c6a1c016478",
+ "subject": "agent-memory",
+ "evaluatedAt": "2026-11-04T22:08:04.553317+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-schema-migrations",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/migrations/0015_tier_memory.sql:1 A case-insensitive search of crates/core for episod, belief, consolidat, distill and recall found nothing; every 'memory' table in the migrations is the fetcher's per-host strike/penalty router (0015/0016/0033), DataHub governance state (0038) or the event log (0055), so no schema here stores an agent's episodes, beliefs or recall items.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill",
+    "recall"
+   ]
+  },
+  {
+   "context": "api-server-core",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/mcp/mod.rs:913 The MCP server tells agents that research/findings and research/sources, read with query_dataset, are 'the agent's memory', but query_dataset returns only the number of rows it picked, with no eligible total and no echoed limit, so an agent cannot tell a complete recall from a truncated one.",
+   "techniques": [
+    {
+     "technique": "recall-injection",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:913 The recall result gives only the selected count. The technique requires selected, eligible/considered and budget, so 100 bare rows read as everything the store holds."
+    },
+    {
+     "technique": "loss-site-inventory",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:895 A silent default cap of 100 rows on the memory read path is a loss site, and the result carries no notice that rows were cut."
+    },
+    {
+     "technique": "durable-store-failure-posture",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/mcp/mod.rs:927 The search tool passes the renderer's index degraded-state block through to the agent, so a wiped or failed lane does not read as an empty success."
+    }
+   ],
+   "registryProposal": "The subject's precondition does not cover a host that keeps no memory pipeline itself but publishes a generic dataset read tool as an external agent's memory. It would help to say which techniques (recall-injection result shape, loss-site notices) still bind such a read surface."
+  },
+  {
+   "context": "docs-and-ops-scripts",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "scripts/docs/check-doc-sync.mjs:130 The doc-sync hook reads session transcripts only to collect a turn's file edits, and it explicitly treats the agent memory dir as out of scope; a search of scripts/docs for episod, belief, consolidat, distill and recall found nothing, so no memory store is written or recalled here.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill",
+    "recall"
+   ]
+  },
+  {
+   "context": "core-extraction",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/induce.rs:2 Rule induction is a stateless statistical pass over a page set that the caller supplies, and json_salvage only repairs output; a search of crates/core for episod, belief, consolidat, distill and recall found nothing, so this context keeps no carried-forward agent memory.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill",
+    "recall"
+   ]
+  },
+  {
+   "context": "core-engine-contract",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/tiers.rs:1 The only 'memory' in this context is the fetcher's per-host tier-routing record (strikes, preferred tier, TTL). It is a learned routing cache, not an LLM agent's working, episodic or consolidated memory, and a search of crates/core for episod, belief, consolidat, distill and recall found nothing.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill",
+    "recall"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-04T22:08:04.553317+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T22:08:04.553317+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [
+    "durable-store-failure-posture",
+    "loss-site-inventory",
+    "recall-injection"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T22:08:04.553317+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "docs-and-ops-scripts",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T22:08:04.553317+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-extraction",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T22:08:04.553317+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-engine-contract",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

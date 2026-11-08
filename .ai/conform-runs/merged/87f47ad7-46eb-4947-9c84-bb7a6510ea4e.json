@@ -1,0 +1,30 @@
+{
+  "schema": "conform-run/1",
+  "worker": "87f47ad7-46eb-4947-9c84-bb7a6510ea4e",
+  "subject": "public-claim-provenance",
+  "evaluatedAt": "2026-11-07T23:23:47.852050+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "public-claim-provenance",
+      "context": "pricing-valuation",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor (homewyse-pricing lib.rs:9) only says output is upserted and cost is reported to a consumer. Elsewhere in the same file and in state-tax, the apps emit coverage, completeness (ok/suspect/collapsed) and join_complete verdicts that downstream consumers read (e.g. homewyse-pricing lib.rs:355"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-07T23:23:47.852050+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "public-claim-provenance"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "pricing-valuation",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

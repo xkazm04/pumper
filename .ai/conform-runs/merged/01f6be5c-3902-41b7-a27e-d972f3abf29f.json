@@ -1,0 +1,76 @@
+{
+ "schema": "conform-run/1",
+ "worker": "01f6be5c-3902-41b7-a27e-d972f3abf29f",
+ "subject": "release-pipeline",
+ "evaluatedAt": "2026-11-06T02:19:11.069830+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-change-detection",
+   "subject": "release-pipeline",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/src/simhash.rs:402 Persisted record fingerprints depend on hash_token's exact output, an unpromised and load-bearing regularity. Its stability is stated only in this comment and in the manual `reindex_simhashes` one-shot (datasets.rs:2317). No test pins a known fingerprint value and no algorithm marker is stored, so a future edit to the token hash (as the later splitmix finalizer was) ships green and silently mixes incomparable fingerprints in the store.",
+   "techniques": [
+    {
+     "technique": "announcing-versus-silent-breakage",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/simhash.rs:516 The simhash tests assert only relative Hamming distances (near/far/zero). All of them would still pass if hash_token changed, so the persisted-fingerprint regularity is true but not tested. The publisher-side aid is a manual reindex (datasets.rs:2317), with no probe that detects a mixed store."
+    }
+   ],
+   "registryProposal": "announcing-versus-silent-breakage frames the silent class as release-to-consumer. A sibling case is worth naming: a producer's own persisted derived values (fingerprints, content hashes) are a silent contract with the producer's past self. There the aid is a stored algorithm-version marker or a golden-value test, not a restore switch."
+  },
+  {
+   "context": "job-scheduler",
+   "subject": "release-pipeline",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/scheduler.rs:706 The scheduler added a seventh member, `retired`, to the existing `health` string that GET /schedules publishes. The schema field's contract text (crates/server/src/routes/dto.rs:373, and so openapi.json and the generated TS/CLI types) still enumerates only six values. The route description lists seven, so readers built from the field schema were never told about the new member of an existing shape.",
+   "techniques": [
+    {
+     "technique": "release-level-by-reader-reach",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/scheduler.rs:706 A new member went through an existing shape (blast radius: every reader of `health`) without the contract's member list being fixed in the same change (commit 72eed87, typed `feat`, not breaking). Health is an untyped Option<String>, so derived readers cannot see the vocabulary at all."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "release-pipeline",
+   "context": "core-extraction",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-06T02:19:11.069830+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "release-pipeline"
+   ],
+   "techniques": [
+    "announcing-versus-silent-breakage"
+   ],
+   "deviations": 1,
+   "context": "core-change-detection",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T02:19:11.069830+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "release-pipeline"
+   ],
+   "techniques": [
+    "release-level-by-reader-reach"
+   ],
+   "deviations": 1,
+   "context": "job-scheduler",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

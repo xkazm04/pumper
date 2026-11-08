@@ -1,0 +1,35 @@
+{
+  "schema": "conform-run/1",
+  "worker": "31d6dffb-e155-474d-833c-9f41c5035c60",
+  "subject": "data-access",
+  "evaluatedAt": "2026-11-06T00:55:33.611681+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "data-access",
+      "context": "core-schema-migrations",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor storage.rs:528 is the sqlx migrator in host code outside this context, so it does not show the precondition is absent. The seat's own technique anchors (0020 CHECK vocabularies pinned at the store, 0029 stored read-model column) show the DDL does carry subject constructs, so 'not-applicab"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-06T00:55:33.611681+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "data-access"
+      ],
+      "techniques": [
+        "cross-driver-invariant-parity",
+        "localized-record-identity",
+        "read-models-and-projections",
+        "row-mapping"
+      ],
+      "deviations": 0,
+      "context": "core-schema-migrations",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

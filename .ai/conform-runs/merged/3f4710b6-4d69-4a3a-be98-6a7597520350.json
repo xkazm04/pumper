@@ -1,0 +1,96 @@
+{
+  "schema": "conform-run/1",
+  "worker": "3f4710b6-4d69-4a3a-be98-6a7597520350",
+  "subject": "test-harness",
+  "evaluatedAt": "2026-11-04T00:44:49.178492+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "core-http-cache",
+      "subject": "test-harness",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/tests/cache_bounds.rs:6 Every test builds its fixture from scratch: `TempStore::new` calls `Storage::connect`, which runs all 56 migrations into a fresh temp DB for each test. There is no migrated template copied per test, and the build/copy cost ratio is never measured, which is the rebuild-per-test shape that fixture-economics names as the failure.",
+      "techniques": [
+        {
+          "technique": "fixture-economics",
+          "verdict": "deviation",
+          "evidence": "crates/core/tests/cache_bounds.rs:6 Rebuild per test (crates/core/src/testing.rs:88 → storage.rs:578 runs the migrator on every connect). Cleanup is per-test and discard-whole, which is right, but the expensive build is never amortized."
+        },
+        {
+          "technique": "recorded-interaction-fixtures",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/vcr.rs:3 This is a product job-replay VCR, not a test-only fixture, but it follows the technique's rules: one declared seam (AppContext::fetch); a replay miss is a typed terminal error rather than a silent live fetch (vcr.rs:14); bypassing apps are declared Unreplayable/Partial; and the tests add a second tripwire (Dead engines panic). Caveat: entries record no capture date or upstream revision. That matters little because the cassette certifies a past run, not the live service."
+        },
+        {
+          "technique": "unreached-decisions-pin-nothing",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/cache_bounds.rs:7 The tests drive the real pruners against real tables because the defect class was an unreachable pruner. A mock would have answered in the pruner's place."
+        },
+        {
+          "technique": "assert-the-schedule-not-the-stopwatch",
+          "verdict": "conformant",
+          "evidence": "crates/core/tests/cache.rs:74 The staleness check is one-sided (sleep 25ms, then require a miss at max_age 5ms). Load can only make the entry older, so a busy runner cannot turn it red. The `fill` helper's 2ms gaps for ordering are load-safe in the same way."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "test-harness",
+      "context": "job-triggers-pipeline",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "core-change-detection",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "e2e-api-contract",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "test-harness",
+      "context": "grants-intelligence",
+      "reason": "withdrawn after review: reviewer (sonnet): The evidence says result_contract.rs's header shows the upstream grants.gov contract already drifted, but that header describes the app's own `output_shape` declaration drifting from what its `run()` emits (`hit_count` vs `hitCount`, `removed?`, twelve omitted keys), not upstream drift. The conclusi"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-04T00:44:49.178492+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "test-harness"
+      ],
+      "techniques": [
+        "assert-the-schedule-not-the-stopwatch",
+        "fixture-economics",
+        "recorded-interaction-fixtures",
+        "unreached-decisions-pin-nothing"
+      ],
+      "deviations": 1,
+      "context": "core-http-cache",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-04T00:44:49.178492+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "test-harness"
+      ],
+      "techniques": [
+        "pin-the-call-not-the-name",
+        "recorded-interaction-fixtures",
+        "unreached-decisions-pin-nothing"
+      ],
+      "deviations": 1,
+      "context": "grants-intelligence",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

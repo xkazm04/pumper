@@ -1,0 +1,44 @@
+{
+  "schema": "conform-run/1",
+  "worker": "217e06fc-294b-4cc1-bc1a-80e88bf0998e",
+  "subject": "browser-credential-boundary",
+  "evaluatedAt": "2026-11-04T02:01:53.737121+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [],
+  "declined": [
+    {
+      "subject": "browser-credential-boundary",
+      "context": "e2e-integration",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "browser-credential-boundary",
+      "context": "e2e-api-contract",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "browser-credential-boundary",
+      "context": "web-scraping-engines",
+      "reason": "withdrawn after review: reviewer (sonnet): The SSRF/redirect evidence is real (engine-http:409 uses Policy::limited, and blocked_target only checks the URL string, as its own doc comment says), but it doesn't bear on the subject browser-credential-boundary, which covers credentials reaching browser clients and a public/server config split; t"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-04T02:01:53.737121+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "browser-credential-boundary"
+      ],
+      "techniques": [
+        "broker-proxy-attaches-secret",
+        "outbound-fetch-destination-validation",
+        "public-vs-server-env-split"
+      ],
+      "deviations": 1,
+      "context": "web-scraping-engines",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

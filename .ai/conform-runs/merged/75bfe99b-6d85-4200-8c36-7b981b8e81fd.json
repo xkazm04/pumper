@@ -1,0 +1,175 @@
+{
+ "schema": "conform-run/1",
+ "worker": "75bfe99b-6d85-4200-8c36-7b981b8e81fd",
+ "subject": "agent-runtime-assembly",
+ "evaluatedAt": "2026-11-04T00:58:38.158989+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "agent-runtime-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/triggers.rs:384 A predicate hook can stop a hop, but if its contributed WASM plugin is missing, traps or returns garbage, the hop fires by default; the operator has to opt in to fail-closed with on_error=skip, which is the standard's 'skipped guard' failure mode (the code does report it at error level and in the ledger).",
+   "techniques": [
+    {
+     "technique": "operator-tier-code-loading",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/triggers.rs:384 Intercepting (predicate) contributions fail open by default. The standard says an intercepting contribution is required unless the operator explicitly downgrades it."
+    },
+    {
+     "technique": "observer-and-mutator-surfaces",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:749 post_enqueue is a pure observer whose output is discarded. predicate/transform form a closed mutator vocabulary (HookSlot), and a veto is a typed {pass:false} result, not a thrown error."
+    },
+    {
+     "technique": "semantic-hook-placement",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:520 Hooks are placed by a declared slot class with a fixed host-owned order (predicate\u2192transform\u2192enqueue\u2192post_enqueue), never by list index. The host writes every incident, vetoes included, to the ledger."
+    },
+    {
+     "technique": "honest-hook-registry",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:595 Every hook call is bounded by a wasm fuel/memory cap. Each slot's fail direction comes from its class (predicate per on_error, transform keeps the original envelope, post_enqueue affects nothing)."
+    },
+    {
+     "technique": "activation-is-a-separate-mutation",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:1176 A configured hook whose payload is not installed or not executable is reported at error level and gets a ledger row. A missing payload is loud, not silent."
+    },
+    {
+     "technique": "nested-run-is-not-its-parent",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/triggers.rs:360 Judged by analogy: a hop is a new job with its own id, and its parent is carried as a field plus depth/chain lineage. This is job-to-job, not agent-to-agent."
+    }
+   ],
+   "registryProposal": "The fail-direction rule assumes an intercepting contribution guards safety. Here the predicate is a routing filter, and the repo deliberately prefers fail-open so that 'a broken plugin never wedges a pipeline edge'. The technique could say whether a contributed filter whose only cost on failure is extra work counts as intercepting."
+  },
+  {
+   "context": "api-server-core",
+   "subject": "agent-runtime-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/mcp/mod.rs:652 tools/list is built from AppState alone, so every MCP client is shown the `fetch` tool. tool_fetch then refuses any caller without a valid job token, so the roster and the run-time refusal are not derived from one policy on one session.",
+   "techniques": [
+    {
+     "technique": "session-scoped-capability",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/mcp/mod.rs:652 `fetch` is a session-scoped capability that resolves from the job token on the request, but it sits on the default roster for every session. The allow_enqueue tools do derive roster and call gate from the same config switch (mod.rs:746)."
+    },
+    {
+     "technique": "indeterminate-closure-on-interruption",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/main.rs:308 The boot sweep sends every interrupted running job through fail(): it is either requeued or permanently `failed`, with the cause kept only as a reason string (FailReason::Text(\"interrupted at boot\") in core storage). There is no first-class indeterminate status."
+    },
+    {
+     "technique": "operator-tier-code-loading",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/registry.rs:263 Dynamic-app code loads only from the operator's [plugins] app_dir behind the [wasm_apps] startup switch. A load failure is a warning, and the module is listed as unrunnable with a reason instead of being skipped silently."
+    },
+    {
+     "technique": "host-routes-win",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/registry.rs:300 Judged by analogy on the app-dispatch namespace: a contributed module can never shadow a compiled-in name. No contributed HTTP routes exist."
+    },
+    {
+     "technique": "activation-is-a-separate-mutation",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/registry.rs:379 Activation reads the payload's actual bytes against the reviewed catalog pin, not just the pointer. Unpinned modules still register but are marked pinned:false."
+    }
+   ]
+  },
+  {
+   "context": "api-platform-ops",
+   "subject": "agent-runtime-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/triggers.rs:296 TriggerPluginHooks has no deny_unknown_fields, so a misspelled slot key (e.g. \"predicte\") deserializes to all-None. This branch then stores the trigger as having no hooks and returns 201, so the gate is silently absent instead of the registration being refused.",
+   "techniques": [
+    {
+     "technique": "honest-hook-registry",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/triggers.rs:296 A registration naming an unknown hook point is silently dropped instead of refused. Compare watches.rs:347, which refuses a plugin sink naming an unloaded module."
+    },
+    {
+     "technique": "operator-tier-code-loading",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/triggers.rs:125 The service tier cannot load code (provisioner.rs:13 says promotion cannot shortcut the operator's catalog edit). But the trigger API accepts an intercepting predicate on an uninstalled plugin, and that predicate fails open by default."
+    },
+    {
+     "technique": "activation-is-a-separate-mutation",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/triggers.rs:514 The dry-run is a separate check: it compares the declared hooks with what the host can actually execute and reports unusable_plugins (meaning the hop is ungated)."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "agent-runtime-assembly",
+   "context": "api-job-management",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "agent-runtime-assembly",
+   "context": "e2e-api-contract",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-04T00:58:38.158989+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-runtime-assembly"
+   ],
+   "techniques": [
+    "activation-is-a-separate-mutation",
+    "honest-hook-registry",
+    "nested-run-is-not-its-parent",
+    "observer-and-mutator-surfaces",
+    "operator-tier-code-loading",
+    "semantic-hook-placement"
+   ],
+   "deviations": 1,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T00:58:38.158989+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-runtime-assembly"
+   ],
+   "techniques": [
+    "activation-is-a-separate-mutation",
+    "host-routes-win",
+    "indeterminate-closure-on-interruption",
+    "operator-tier-code-loading",
+    "session-scoped-capability"
+   ],
+   "deviations": 1,
+   "context": "api-server-core",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-04T00:58:38.158989+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-runtime-assembly"
+   ],
+   "techniques": [
+    "activation-is-a-separate-mutation",
+    "honest-hook-registry",
+    "operator-tier-code-loading"
+   ],
+   "deviations": 1,
+   "context": "api-platform-ops",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

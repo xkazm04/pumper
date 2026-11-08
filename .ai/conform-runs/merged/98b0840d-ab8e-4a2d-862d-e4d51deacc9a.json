@@ -1,0 +1,66 @@
+{
+ "schema": "conform-run/1",
+ "worker": "98b0840d-ab8e-4a2d-862d-e4d51deacc9a",
+ "subject": "convergence-loop-and-requeue",
+ "evaluatedAt": "2026-11-07T00:19:29.559241+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-job-queue",
+   "subject": "convergence-loop-and-requeue",
+   "bundle": "software-engineering",
+   "state": "conformant",
+   "evidence": "crates/core/src/storage.rs:241 The store says outright that its queue is durable: rows are user, scheduler and trigger promises that cannot be rebuilt from other state, so the in-memory, derived-queue techniques do not apply. The two that do carry over (a separate error-policy function, and per-key exclusion under a global cap) are both realized and anchored, and no technique is a deviation.",
+   "techniques": [
+    {
+     "technique": "error-policy-as-a-separate-function",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/storage.rs:297 Pure function with no now(), jitter or config input. It takes the typed Error, kept through FailReason::Typed, and returns Requeue::After or Requeue::Never. The policy may give up visibly: Never routes to fail_permanently_because, which records requeue_reason. Fail sets the delay as Utc::now() plus the delay, so it is measured from completion. The retry goes back into the same jobs table through available_at. Table tests sit at storage.rs:6421 and onward."
+    },
+    {
+     "technique": "per-key-exclusion-under-a-global-cap",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/storage.rs:171 Per-target exclusion is a predicate inside the atomic claim UPDATE. It is not a knob and is kept separate from the per-app `blocked` cap (doc at line 817: 'Two exclusions, two different questions'). held_by_target (line 1633) reports parked-behind-a-twin with the same predicate, separately from queue_ages and the running count. Because the predicate lives in the DB, a second process gets the same exclusion."
+    },
+    {
+     "technique": "keyed-queue-with-earliest-wins",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:402 Jobs are separate units that must each run, so this is the job-queue case the technique sends to a different subject. Idempotency dedup returns the original row and does not coalesce by key with earliest-wins."
+    },
+    {
+     "technique": "told-that-not-why",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:387 A job carries its own params and is not a full-state pass over a key. The trigger reason is kept as lineage and is not part of any identity, so the 'reason erased from the key' construction has nothing to act on here."
+    },
+    {
+     "technique": "drain-a-derived-queue",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/storage.rs:340 The queue is not derived, so abandoning entries at shutdown would lose promises. A still-running job instead gets a recorded recovery verdict, which is the admission-queue/job-coordination discipline, not this technique's."
+    }
+   ],
+   "registryProposal": "The golden path puts durable queues out of scope ('no means theirs'), yet two of its techniques carry over cleanly to a durable SQLite claim queue. First, error-policy-as-a-separate-function: a pure requeue_after(typed error, attempts, stated wait) that returns After or Never. Second, per-key exclusion: a NOT IN (running target_key) predicate inside the atomic claim UPDATE, which also gives cross-process exclusion, the guarantee the in-memory form explicitly lacks. The boundary section could say that these two techniques generalize to durable queues and that the DB-predicate form is the cross-process realization."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-07T00:19:29.559241+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "convergence-loop-and-requeue"
+   ],
+   "techniques": [
+    "drain-a-derived-queue",
+    "error-policy-as-a-separate-function",
+    "keyed-queue-with-earliest-wins",
+    "per-key-exclusion-under-a-global-cap",
+    "told-that-not-why"
+   ],
+   "deviations": 0,
+   "context": "core-job-queue",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

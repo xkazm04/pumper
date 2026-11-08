@@ -35,7 +35,9 @@ use std::time::Duration;
 use pumper_core::catalog::ContractsStatus;
 use pumper_core::Config;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing::Level;
+use tracing_subscriber::filter::{filter_fn, LevelFilter};
+use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
@@ -181,13 +183,19 @@ fn main() -> anyhow::Result<()> {
 
     let _sentry_guard = init_sentry();
 
-    // stdout logging is unchanged; the Sentry layer is *added* beside it. The
-    // default `sentry-tracing` event filter maps `error!` to a Sentry event and
-    // `warn!`/`info!` to breadcrumbs, which is exactly the accepted scope.
+    // stdout logging is unchanged; the Sentry layers are *added* beside it. They
+    // reproduce the legacy combined layer's default mapping, which is the accepted
+    // scope: `error!` becomes a Sentry event, `warn!`/`info!` become breadcrumbs.
+    // The individual layers do not filter by level, so each carries its own filter.
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())
-        .with(sentry_tracing::layer())
+        .with(sentry_tracing::ErrorLayer::new().with_filter(LevelFilter::ERROR))
+        .with(
+            sentry_tracing::BreadcrumbLayer::new().with_filter(filter_fn(|metadata| {
+                matches!(*metadata.level(), Level::WARN | Level::INFO)
+            })),
+        )
         .init();
 
     let mode = parse_mode(std::env::args().skip(1))?;

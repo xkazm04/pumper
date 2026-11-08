@@ -1,0 +1,143 @@
+{
+ "schema": "conform-run/1",
+ "worker": "2298580c-1736-47b0-a51d-12aa8b2e391e",
+ "subject": "agent-memory",
+ "evaluatedAt": "2026-11-06T02:42:19.896150+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-job-queue",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/storage.rs:701 Storage is a durable SQLite job queue (enqueue/claim/complete). Searching crates/core/src and crates/core/tests for episod, belief, consolidat, distill and agent_memory found nothing, and every 'memory' hit means an in-memory SQLite database or instrument, so this context never captures, consolidates or recalls anything for an agent.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill"
+   ]
+  },
+  {
+   "context": "core-platform-services",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/recipes.rs:275 The closest construct is the API-recipe store: a candidate\u2192validated\u2192retired list with strikes that the fetcher learns from, but code replays it and no model ever reads it, so it is fetcher routing state rather than agent memory. Searching the context directories for episod, belief, consolidat, distill and agent_memory found nothing.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill"
+   ]
+  },
+  {
+   "context": "ai-extraction-engines",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/engine-claude/src/lib.rs:149 The engine's only link between runs is forwarding an opaque caller-supplied session id to the Claude CLI. The memory policy lives in the CLI and in caller apps outside this context (research, provisioner). engine-search is a BM25 index over scraped records, and searching these crates for episod, belief, consolidat, distill and agent_memory found nothing.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill"
+   ]
+  },
+  {
+   "context": "pricing-valuation",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/state-tax/src/lib.rs:231 These apps send one-shot research prompts and upsert the results into datasets. None of them sets resume_session (only research, provisioner and connector-api-watch do), and searching the eight app crates for episod, belief, consolidat, distill and agent_memory found nothing.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill"
+   ]
+  },
+  {
+   "context": "job-triggers-pipeline",
+   "subject": "agent-memory",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/triggers.rs:3 Triggers are event\u2192enqueue edges with a ledger and WASM hooks, not stored memory. The 'memory' hits are WASM linear-memory fixtures and sandbox memory caps, and searching crates/server/src for episod, belief, consolidat, distill and agent_memory found nothing.",
+   "techniques": [],
+   "absenceTerms": [
+    "episod",
+    "belief",
+    "consolidat",
+    "distill"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-06T02:42:19.896150+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-job-queue",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T02:42:19.896150+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-platform-services",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T02:42:19.896150+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "ai-extraction-engines",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T02:42:19.896150+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "pricing-valuation",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T02:42:19.896150+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-memory"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "job-triggers-pipeline",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

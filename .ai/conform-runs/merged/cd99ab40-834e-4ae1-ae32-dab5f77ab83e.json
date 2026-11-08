@@ -1,0 +1,74 @@
+{
+ "schema": "conform-run/1",
+ "worker": "cd99ab40-834e-4ae1-ae32-dab5f77ab83e",
+ "subject": "test-harness",
+ "evaluatedAt": "2026-11-03T23:17:30.320402+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-data-access",
+   "subject": "test-harness",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/query.rs:1522 The structural guard against `Utc::now().date_naive()` reads query.rs only up to the FIRST #[cfg(test)] (line 949), so the executable grants route code at lines 1015-1269 (list_fits, grants_for_profile, create_grant_profile) is outside its haystack, and the forbidden expression put back there would pass the guard.",
+   "techniques": [
+    {
+     "technique": "pin-the-call-not-the-name",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/query.rs:1522 Comments and test code are rightly stripped from the haystack, but the population is cut at the first of four test modules, so ~250 lines of route code are silently excluded while the doc comment claims 'everything above the test module'."
+    },
+    {
+     "technique": "negative-control-tests",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/query.rs:1538 The 'seeded violation' appends the forbidden text and then checks that the string contains it. That cannot fail, and it never runs the guard in count_and_page_cannot_select_different_sets, so the guard has never been seen going red."
+    },
+    {
+     "technique": "unreached-decisions-pin-nothing",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/search.rs:520 The degraded-index decision is lifted into the pure index_degraded_reason (search.rs:134) and asserted directly. Its single call site is search.rs:157; adoption is not asserted in this file."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "test-harness",
+   "context": "job-triggers-pipeline",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "job-worker",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "test-harness",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-03T23:17:30.320402+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "test-harness"
+   ],
+   "techniques": [
+    "negative-control-tests",
+    "pin-the-call-not-the-name",
+    "unreached-decisions-pin-nothing"
+   ],
+   "deviations": 1,
+   "context": "api-data-access",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

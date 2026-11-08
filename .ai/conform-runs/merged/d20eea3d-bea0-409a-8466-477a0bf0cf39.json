@@ -1,0 +1,115 @@
+{
+  "schema": "conform-run/1",
+  "worker": "d20eea3d-bea0-409a-8466-477a0bf0cf39",
+  "subject": "agent-memory",
+  "evaluatedAt": "2026-11-03T16:29:03.177359+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "e2e-data-integrity",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "crates/server/src/e2e/dataset_reads.rs:1 I searched crates/server/src/e2e for episod, belief, distill and consolidat and found nothing; the eight files test dataset read shapes, the delete gate, store reports, engine conformance, VCR, target exclusion, degraded search and dynamic apps, so no agent-memory pipeline is under test here.",
+      "techniques": [],
+      "absenceTerms": [
+        "episod",
+        "belief",
+        "distill",
+        "consolidat"
+      ]
+    },
+    {
+      "context": "pumper-sync-sdk",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "clients/typescript/README.md:27 I searched clients/typescript for episod, belief, distill and consolidat and found nothing; the SDK is a stateless dataset-mirror client that explicitly does not own persistence, and its only carried state is a sync watermark the caller supplies, so there is no agent memory here.",
+      "techniques": [],
+      "absenceTerms": [
+        "episod",
+        "belief",
+        "distill",
+        "consolidat"
+      ]
+    },
+    {
+      "context": "ci-quality-gates",
+      "subject": "agent-memory",
+      "bundle": "software-engineering",
+      "state": "not-applicable",
+      "evidence": "scripts/ci/flake-check.mjs:2 I searched scripts/ci for episod, belief, distill, consolidat and recall and found nothing; these gates judge a flake quarantine register, a disk ceiling, lane artifacts and MCP tool-name parity, so no agent carries state forward here.",
+      "techniques": [],
+      "absenceTerms": [
+        "episod",
+        "belief",
+        "distill",
+        "consolidat",
+        "recall"
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "agent-memory",
+      "context": "api-server-core",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "agent-memory",
+      "context": "core-schema-migrations",
+      "reason": "withdrawn after review: reviewer (sonnet): The anchor 0015_tier_memory.sql is not among the context's listed files (0001–0012). The directory has 56 migrations, so the claim that 0015 holds 'the only memory table' is about the whole schema, not this context. Other migrations such as 0022_checkpoints and 0053_plugin_kv were not examined."
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-03T16:29:03.177359+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "core-schema-migrations",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-03T16:29:03.177359+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "e2e-data-integrity",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-03T16:29:03.177359+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "pumper-sync-sdk",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-03T16:29:03.177359+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-memory"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "ci-quality-gates",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

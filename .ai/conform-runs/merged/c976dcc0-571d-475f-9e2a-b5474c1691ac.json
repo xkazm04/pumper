@@ -1,0 +1,124 @@
+{
+ "schema": "conform-run/1",
+ "worker": "c976dcc0-571d-475f-9e2a-b5474c1691ac",
+ "subject": "prompt-assembly",
+ "evaluatedAt": "2026-11-03T22:54:58.661028+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "pumper-sync-sdk",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "clients/typescript/src/index.ts:1 The package is a typed dataset-mirror and watermark-sync client that makes no model calls and assembles no prompts. A search of clients/typescript (node_modules included) found no system_prompt, max_tokens, compaction or context_window. The only 'prompt' hit is a proposal-summary field in the generated wire types, not prompt assembly.",
+   "techniques": [],
+   "absenceTerms": [
+    "system_prompt",
+    "max_tokens",
+    "compaction",
+    "context_window"
+   ]
+  },
+  {
+   "context": "core-schema-migrations",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/migrations/0009_research_cache.sql:3 The migrations only define storage. The one LLM-adjacent table, research_cache, stores answers under a hash key and has no column for prompt layers, budgets or history. A search of crates/core/migrations found no system_prompt, max_tokens, compaction or context_window, so the prompt-assembly precondition does not hold here.",
+   "techniques": [],
+   "absenceTerms": [
+    "system_prompt",
+    "max_tokens",
+    "compaction",
+    "context_window"
+   ]
+  },
+  {
+   "context": "grants-intelligence",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/grants-common/src/lib.rs:4 The grant apps parse and normalize registry records deterministically and never build a ResearchRequest or prompt. A search of the five grant crates found no prompt, system_prompt, max_tokens or ResearchRequest. fit.rs says outright that Claude refinement is outside the v1 slice (METHOD_DETERMINISTIC).",
+   "techniques": [],
+   "absenceTerms": [
+    "prompt",
+    "system_prompt",
+    "max_tokens",
+    "ResearchRequest"
+   ]
+  },
+  {
+   "context": "wasm-plugins",
+   "subject": "prompt-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "plugins-src/delta-slim/src/lib.rs:85 The plugins are pure JSON-in/JSON-out wasm guests behind the alloc/extract_v2/describe ABI and never talk to a language model. A search of plugins-src found no prompt, llm, claude, system_prompt or max_tokens.",
+   "techniques": [],
+   "absenceTerms": [
+    "prompt",
+    "llm",
+    "claude",
+    "system_prompt",
+    "max_tokens"
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "prompt-assembly",
+   "context": "core-http-cache",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-03T22:54:58.661028+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "pumper-sync-sdk",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T22:54:58.661028+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "core-schema-migrations",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T22:54:58.661028+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "grants-intelligence",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-03T22:54:58.661028+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "prompt-assembly"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "wasm-plugins",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

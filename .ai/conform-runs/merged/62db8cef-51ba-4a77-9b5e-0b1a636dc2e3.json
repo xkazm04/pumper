@@ -1,0 +1,121 @@
+{
+ "schema": "conform-run/1",
+ "worker": "62db8cef-51ba-4a77-9b5e-0b1a636dc2e3",
+ "subject": "voice-io",
+ "evaluatedAt": "2026-11-07T00:48:09.715313+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "web-crawl-extraction",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/crawl/src/lib.rs:1 The context crawls web pages and extracts records from HTML. A case-insensitive grep of crates/apps/crawl and crates/apps/extractor for speech, tts, microphone, audio and whisper found nothing, so no capture or synthesis pipeline exists for voice-io to govern.",
+   "techniques": [],
+   "absenceTerms": [
+    "speech",
+    "tts",
+    "microphone",
+    "audio",
+    "whisper"
+   ]
+  },
+  {
+   "context": "wasm-plugins",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "plugins-src/title-extractor/Cargo.toml:14 The plugins are wasm32 cdylibs that depend only on serde_json and implement a JSON extract/predicate ABI. Grepping plugins-src for speech, tts, microphone, audio and whisper found nothing; the only near-hit was the word 'transcribed' in a code comment, so there is no voice input or output.",
+   "techniques": [],
+   "absenceTerms": [
+    "speech",
+    "tts",
+    "microphone",
+    "audio",
+    "whisper"
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/apps/watch/src/lib.rs:1 These apps fetch, fingerprint and aggregate web content. Grepping the hackernews, research, readable, watch, connector-api-watch, peer, provisioner and plugin crates for speech, tts, microphone, audio and whisper found nothing; 'synthesize' in research means LLM text synthesis, not speech.",
+   "techniques": [],
+   "absenceTerms": [
+    "speech",
+    "tts",
+    "microphone",
+    "audio",
+    "whisper"
+   ]
+  },
+  {
+   "context": "api-job-management",
+   "subject": "voice-io",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/jobs.rs:1 These are axum routes for the job lifecycle plus two maintenance binaries. Grepping crates/server/src/routes and crates/server/src/bin for speech, tts, microphone, audio and whisper found nothing; the one 'voice' hit, at error.rs:722, is prose ('in a voice indistinguishable from'), so it was left out of the absence terms.",
+   "techniques": [],
+   "absenceTerms": [
+    "speech",
+    "tts",
+    "microphone",
+    "audio",
+    "whisper"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-07T00:48:09.715313+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "web-crawl-extraction",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-07T00:48:09.715313+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "wasm-plugins",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-07T00:48:09.715313+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-07T00:48:09.715313+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "voice-io"
+   ],
+   "techniques": [],
+   "deviations": 0,
+   "context": "api-job-management",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

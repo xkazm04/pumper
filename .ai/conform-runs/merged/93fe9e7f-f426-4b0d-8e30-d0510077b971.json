@@ -1,0 +1,98 @@
+{
+  "schema": "conform-run/1",
+  "worker": "93fe9e7f-f426-4b0d-8e30-d0510077b971",
+  "subject": "agent-runtime-assembly",
+  "evaluatedAt": "2026-11-07T00:04:56.666095+00:00",
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "pairs": [
+    {
+      "context": "core-job-queue",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/core/src/storage.rs:336 Jobs found `running` at boot, at lease expiry or at the drain deadline are closed through the ordinary `fail` door with only a prose reason (FailReason::Text sets no cause_kind). With attempts used up they become `Failed`, and JobStatus has no indeterminate value, so 'outcome unknown' is stored as a definite failure that consumers can only recover by reading the message text.",
+      "techniques": [
+        {
+          "technique": "indeterminate-closure-on-interruption",
+          "verdict": "deviation",
+          "evidence": "crates/core/src/storage.rs:1853 The recovery sweep writes FAILURE (requeue, or Failed once attempts run out) instead of a first-class indeterminate status. The verdict lives only in the error string; the core test at crates/core/tests/jobs.rs:323 recovers it with `contains(\"lease expired\")`, which is the technique's named tell."
+        }
+      ],
+      "registryProposal": "The golden path assigns the job record's status vocabulary to job-coordination, while this technique requires a third, indeterminate status. A scrape-job queue that hosts no agent loop sits between the two. The registry should say which subject owns the interrupted-job status when the job is not an agent tool call."
+    },
+    {
+      "context": "e2e-api-contract",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evidence": "crates/server/src/e2e/panic_containment.rs:60 The API-contract e2e suite pins that a panic is told apart from an app error, a timeout or a reaped lease by the error message prefix alone (all of them end as `Failed`), so the contract it guards is a verdict held in prose rather than in status or cause_kind.",
+      "techniques": [
+        {
+          "technique": "indeterminate-closure-on-interruption",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/e2e/panic_containment.rs:60 The test separates panic from the reaper's 'lease expired (heartbeat stale)' label by string comparison, which is the technique's 'string comparison against an error message' tell."
+        }
+      ]
+    }
+  ],
+  "declined": [
+    {
+      "subject": "agent-runtime-assembly",
+      "context": "api-job-management",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "agent-runtime-assembly",
+      "context": "e2e-data-integrity",
+      "reason": "the seat returned unknown"
+    },
+    {
+      "subject": "agent-runtime-assembly",
+      "context": "api-data-access",
+      "reason": "withdrawn after review: reviewer (sonnet): The not-applicable anchor, search.rs:128, is an incidental line that does not show the precondition is absent. The searched terms (subagent, tool_call, transcript, compaction) are the wrong ones for this subject, since routes/mod.rs mentions an agent-facing MCP tool that shares code with GET /search"
+    }
+  ],
+  "consults": [
+    {
+      "ts": "2026-11-07T00:04:56.666095+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-runtime-assembly"
+      ],
+      "techniques": [
+        "indeterminate-closure-on-interruption"
+      ],
+      "deviations": 1,
+      "context": "core-job-queue",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-07T00:04:56.666095+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-runtime-assembly"
+      ],
+      "techniques": [
+        "indeterminate-closure-on-interruption"
+      ],
+      "deviations": 1,
+      "context": "e2e-api-contract",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "ts": "2026-11-07T00:04:56.666095+00:00",
+      "bundle": "software-engineering",
+      "subjects": [
+        "agent-runtime-assembly"
+      ],
+      "techniques": [],
+      "deviations": 0,
+      "context": "api-data-access",
+      "via": "curator-multi:claude",
+      "model": "claude-opus-5-5"
+    }
+  ]
+}

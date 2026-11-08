@@ -1,0 +1,147 @@
+{
+ "schema": "conform-run/1",
+ "worker": "b42a3a23-d3b9-46e6-98ae-fb3cb7328430",
+ "subject": "remote-capability-probing",
+ "evaluatedAt": "2026-11-06T01:38:27.444152+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "remote-capability-probing",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/resilience/mod.rs:13 The module judges extraction and fetch health (bot walls, 5xx, selector rebinds) from stored history, which is the health-checks neighbour's present-tense question rather than a per-peer how-to-address-it verdict; searching crates/core and the context's tests for accept-ranges, partial_content, content-range, bytes=0- and readahead found zero hits, so no fragment-read probe, capability ladder or read buffer exists here.",
+   "techniques": [
+    {
+     "technique": "advertised-support-is-not-evidence",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/resilience/detect.rs:182 FetchHealth classifies response statuses for retirement and health judgement; it never accepts a capability from a peer's header or a provoked response."
+    },
+    {
+     "technique": "verdict-basis-tagging",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/doctor.rs:124 The doctor's three-valued outcome looks like basis tagging, but it reports on the local SQLite store and artifact tree. It is not a feature report about a hosted platform."
+    }
+   ],
+   "absenceTerms": [
+    "accept-ranges",
+    "partial_content",
+    "content-range",
+    "bytes=0-",
+    "readahead"
+   ]
+  },
+  {
+   "context": "api-data-access",
+   "subject": "remote-capability-probing",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/remote.rs:1 The only remote-facing file in this context is the serving side of the fetch fabric. It is the peer that gets asked, not the prober: it runs a coordinator's whole-request fetch through the local engine and never works out what an upstream peer can do. Searching crates/server/src/routes for accept-ranges, partial_content, content-range and bytes=0- found zero hits.",
+   "techniques": [
+    {
+     "technique": "advertised-support-is-not-evidence",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/remote.rs:197 The route proxies one whole request and returns the envelope as it is. No branch reads a peer's capability advertisement."
+    },
+    {
+     "technique": "degraded-rung-refusal-ceiling",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/remote.rs:184 The body cap is a node ceiling on every proxied fetch. It is not a refusal ceiling on a fallback that swaps a fragment read for a whole-object read, because there are no fragment reads."
+    },
+    {
+     "technique": "single-blocker-short-circuit",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/remote.rs:152 These guards are the serving node's own admission checks. They are not a prober's preflight in front of capability rows."
+    }
+   ],
+   "absenceTerms": [
+    "accept-ranges",
+    "partial_content",
+    "content-range",
+    "bytes=0-"
+   ]
+  },
+  {
+   "context": "core-http-cache",
+   "subject": "remote-capability-probing",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/core/src/cache.rs:128 The cache stores whole responses and uses only ETag/Last-Modified conditional revalidation, which belongs to client-fetch-cache. It never decides whether a peer can serve fragments. Searching crates/core for accept-ranges, partial_content, content-range, bytes=0- and readahead found zero hits, so there is no capability verdict, fallback rung or latency-class buffer to judge.",
+   "techniques": [
+    {
+     "technique": "advertised-support-is-not-evidence",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:151 Stored validators feed a conditional GET. That is cache revalidation, not a capability accepted from an advertisement."
+    },
+    {
+     "technique": "buffer-by-access-latency-class",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/lru.rs:2 The LRU tracks a pool of client and browser handles. It is not a file-shaped buffer over backing stores at different distances."
+    },
+    {
+     "technique": "instrument-by-cause-not-by-hit-rate",
+     "verdict": "not-applicable",
+     "evidence": "crates/core/src/cache.rs:192 The revalidation log counts changed and unchanged results on whole-response revalidation. There is no readahead or fragment byte counter whose cause could be split out."
+    }
+   ],
+   "absenceTerms": [
+    "accept-ranges",
+    "partial_content",
+    "content-range",
+    "bytes=0-",
+    "readahead"
+   ]
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-06T01:38:27.444152+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "remote-capability-probing"
+   ],
+   "techniques": [
+    "advertised-support-is-not-evidence",
+    "verdict-basis-tagging"
+   ],
+   "deviations": 0,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T01:38:27.444152+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "remote-capability-probing"
+   ],
+   "techniques": [
+    "advertised-support-is-not-evidence",
+    "degraded-rung-refusal-ceiling",
+    "single-blocker-short-circuit"
+   ],
+   "deviations": 0,
+   "context": "api-data-access",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-06T01:38:27.444152+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "remote-capability-probing"
+   ],
+   "techniques": [
+    "advertised-support-is-not-evidence",
+    "buffer-by-access-latency-class",
+    "instrument-by-cause-not-by-hit-rate"
+   ],
+   "deviations": 0,
+   "context": "core-http-cache",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
