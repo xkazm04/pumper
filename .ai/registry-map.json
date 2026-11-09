@@ -869,7 +869,11 @@
           "changedAt": "2026-10-14",
           "confidence": "probable",
           "priorNotApplicable": 4,
-          "state": "unknown"
+          "state": "not-applicable",
+          "evidence": "crates/server/src/routes/search.rs:225 These eight read and proxy routes assemble no agent runtime: a search of their files for wasm, plugin, hook, claude, agent, mcp, lease and untrusted found only MCP handlers sharing a read parser, a status doc line about enricher failures, peer data import and untrusted-name handling, and the five subject terms listed returned no hits across the routes directory.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:c29c78bbbf9eb4fe",
+          "evaluatedRevision": 29
         },
         {
           "subject": "search",
@@ -2032,8 +2036,12 @@
           "revision": 28,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown",
-          "priorNotApplicable": 4
+          "state": "deviation",
+          "priorNotApplicable": 4,
+          "evidence": "crates/apps/plugin/src/lib.rs:1319 Each document resolves the plugin by name against the live module map, and POST /plugins/reload replaces that map in place, so a reload during a job runs one job across two builds while the rules_hash pin was computed once from the manifest.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:c29c78bbbf9eb4fe",
+          "evaluatedRevision": 29
         },
         {
           "subject": "node-boot-and-declarative-bootstrap",

@@ -9486,16 +9486,17 @@
       "context": "api-data-access",
       "subject": "agent-runtime-assembly",
       "bundle": "software-engineering",
-      "state": "unknown",
-      "evaluatedAt": "2026-11-07",
-      "evaluatedTs": "2026-11-07T00:04:56.666Z",
-      "techniques": [],
-      "withdrawn": {
-        "worker": "93fe9e7f-f426-4b0d-8e30-d0510077b971",
-        "state": "not-applicable",
-        "at": "2026-11-07T00:05:43.505049+00:00",
-        "reason": "reviewer (sonnet): The not-applicable anchor, search.rs:128, is an incidental line that does not show the precondition is absent. The searched terms (subagent, tool_call, transcript, compaction) are the wrong ones for this subject, since routes/mod.rs mentions an agent-facing MCP tool that shares code with GET /search"
-      }
+      "state": "not-applicable",
+      "evaluatedAt": "2026-11-09",
+      "evaluatedTs": "2026-11-09T01:29:06.486Z",
+      "worker": "e290d52f-5a81-41ba-81b6-c87358ac0107",
+      "techniques": [
+        {
+          "technique": "operator-tier-code-loading",
+          "verdict": "not-applicable",
+          "evidence": "crates/server/src/routes/recipes.rs:197 The one write path a remote party reaches here imports declarative entries (host, url_template, params, json_paths) that land unvalidated, so no key names code."
+        }
+      ]
     },
     "c51c1102-cb6c-447c-b4a1-43f6227e2eb5/voice-io": {
       "context": "web-crawl-extraction",
@@ -10115,6 +10116,42 @@
           "technique": "severity-by-construction",
           "verdict": "conformant",
           "evidence": "crates/server/src/e2e/job_budget_floor.rs:41 Names the inputs that block, and the test asserts a 422 with nothing enqueued."
+        }
+      ]
+    },
+    "e48047d1-73c2-4b60-a1fc-0277d8a5e7af/agent-runtime-assembly": {
+      "context": "content-monitoring",
+      "subject": "agent-runtime-assembly",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-09",
+      "evaluatedTs": "2026-11-09T01:29:06.486Z",
+      "worker": "e290d52f-5a81-41ba-81b6-c87358ac0107",
+      "techniques": [
+        {
+          "technique": "operator-tier-code-loading",
+          "verdict": "deviation",
+          "evidence": "crates/apps/plugin/src/lib.rs:1319 Rule: bind one immutable extension snapshot per run. `ctx.plugins.clone()` (:1307) clones the host handle, not a module; engine-wasm lib.rs:440-451 looks the module up per call and :581 swaps the map. The urls path at :1032 has the same shape, and the observatory loop calls run_metered per page."
+        },
+        {
+          "technique": "guard-input-custody",
+          "verdict": "conformant",
+          "evidence": "crates/apps/research/src/lib.rs:636 The spend ceiling is computed by the host from the job ledger and handed to the session per step, so the model can spend it and cannot raise it. The subprocess's full tool grant is set in engine-claude and was not audited here."
+        },
+        {
+          "technique": "activation-is-a-separate-mutation",
+          "verdict": "conformant",
+          "evidence": "crates/apps/provisioner/src/lib.rs:20 The LLM-drafted proposal is data only: the app writes neither the catalog nor a schedule, and going live is a separate human edit."
+        },
+        {
+          "technique": "substituted-result-attribution",
+          "verdict": "conformant",
+          "evidence": "crates/apps/provisioner/src/lib.rs:26 The proposal names the tier that really served the sample rather than the one requested, so a fallback names its actual producer."
+        },
+        {
+          "technique": "bounded-projection-of-external-work",
+          "verdict": "not-applicable",
+          "evidence": "crates/apps/research/src/lib.rs:643 Each research step is one awaited call inside a checkpointed job. No remote handle outlives the step, and the model does not poll anything."
         }
       ]
     }

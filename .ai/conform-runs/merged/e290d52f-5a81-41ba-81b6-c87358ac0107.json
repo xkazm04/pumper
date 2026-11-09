@@ -1,0 +1,111 @@
+{
+ "schema": "conform-run/1",
+ "worker": "e290d52f-5a81-41ba-81b6-c87358ac0107",
+ "subject": "agent-runtime-assembly",
+ "evaluatedAt": "2026-11-09T01:29:06.486276+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "api-data-access",
+   "subject": "agent-runtime-assembly",
+   "bundle": "software-engineering",
+   "state": "not-applicable",
+   "evidence": "crates/server/src/routes/search.rs:225 These eight read and proxy routes assemble no agent runtime: a search of their files for wasm, plugin, hook, claude, agent, mcp, lease and untrusted found only MCP handlers sharing a read parser, a status doc line about enricher failures, peer data import and untrusted-name handling, and the five subject terms listed returned no hits across the routes directory.",
+   "techniques": [
+    {
+     "technique": "operator-tier-code-loading",
+     "verdict": "not-applicable",
+     "evidence": "crates/server/src/routes/recipes.rs:197 The one write path a remote party reaches here imports declarative entries (host, url_template, params, json_paths) that land unvalidated, so no key names code."
+    }
+   ],
+   "absenceTerms": [
+    "placement_class",
+    "hook_chain",
+    "checkpointer",
+    "subagent",
+    "register_interceptor"
+   ]
+  },
+  {
+   "context": "content-monitoring",
+   "subject": "agent-runtime-assembly",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/apps/plugin/src/lib.rs:1319 Each document resolves the plugin by name against the live module map, and POST /plugins/reload replaces that map in place, so a reload during a job runs one job across two builds while the rules_hash pin was computed once from the manifest.",
+   "techniques": [
+    {
+     "technique": "operator-tier-code-loading",
+     "verdict": "deviation",
+     "evidence": "crates/apps/plugin/src/lib.rs:1319 Rule: bind one immutable extension snapshot per run. `ctx.plugins.clone()` (:1307) clones the host handle, not a module; engine-wasm lib.rs:440-451 looks the module up per call and :581 swaps the map. The urls path at :1032 has the same shape, and the observatory loop calls run_metered per page."
+    },
+    {
+     "technique": "guard-input-custody",
+     "verdict": "conformant",
+     "evidence": "crates/apps/research/src/lib.rs:636 The spend ceiling is computed by the host from the job ledger and handed to the session per step, so the model can spend it and cannot raise it. The subprocess's full tool grant is set in engine-claude and was not audited here."
+    },
+    {
+     "technique": "activation-is-a-separate-mutation",
+     "verdict": "conformant",
+     "evidence": "crates/apps/provisioner/src/lib.rs:20 The LLM-drafted proposal is data only: the app writes neither the catalog nor a schedule, and going live is a separate human edit."
+    },
+    {
+     "technique": "substituted-result-attribution",
+     "verdict": "conformant",
+     "evidence": "crates/apps/provisioner/src/lib.rs:26 The proposal names the tier that really served the sample rather than the one requested, so a fallback names its actual producer."
+    },
+    {
+     "technique": "bounded-projection-of-external-work",
+     "verdict": "not-applicable",
+     "evidence": "crates/apps/research/src/lib.rs:643 Each research step is one awaited call inside a checkpointed job. No remote handle outlives the step, and the model does not poll anything."
+    }
+   ]
+  }
+ ],
+ "declined": [
+  {
+   "subject": "agent-runtime-assembly",
+   "context": "api-job-management",
+   "reason": "evidence leans on core/src/app.rs, which is not a tracked file"
+  },
+  {
+   "subject": "agent-runtime-assembly",
+   "context": "e2e-data-integrity",
+   "reason": "the seat returned unknown"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-09T01:29:06.486276+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-runtime-assembly"
+   ],
+   "techniques": [
+    "operator-tier-code-loading"
+   ],
+   "deviations": 0,
+   "context": "api-data-access",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-09T01:29:06.486276+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-runtime-assembly"
+   ],
+   "techniques": [
+    "activation-is-a-separate-mutation",
+    "bounded-projection-of-external-work",
+    "guard-input-custody",
+    "operator-tier-code-loading",
+    "substituted-result-attribution"
+   ],
+   "deviations": 1,
+   "context": "content-monitoring",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}
