@@ -5775,29 +5775,44 @@
       "subject": "agent-browser-control",
       "bundle": "software-engineering",
       "state": "deviation",
-      "evaluatedAt": "2026-10-17",
-      "evaluatedTs": "2026-10-17T02:53:08.696Z",
-      "worker": "f3afb305-4016-4ba1-a3e9-527792a5239b",
+      "evaluatedAt": "2026-11-09",
+      "evaluatedTs": "2026-11-09T00:27:05.405Z",
+      "worker": "0a42a756-336c-47f3-aee9-9c5095fc5f46",
       "techniques": [
+        {
+          "technique": "references-over-selectors",
+          "verdict": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:1423 The caller composes the selector and it is used directly. The engine has no accessibility walk, reference table or clear-on-navigation, and more than one match is not refused. A zero-match miss is at least recorded as SelectorMissing."
+        },
         {
           "technique": "agent-actionable-errors",
           "verdict": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:815 Navigation failures interpolate driver errors directly without stripping internals or supplying a literal recovery command."
+          "evidence": "crates/engine-browser/src/lib.rs:911 Driver text is interpolated at the call site with no next step, and the same shape recurs for new_page, the listeners and content, so there is no single rewriting door. The MCP fetch tool passes errors to the agent via e.to_string(). budget_exhausted (line 226) and StepOutcome are good partial realizations."
         },
         {
           "technique": "effect-classed-commands",
           "verdict": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:1150 Actions use a common timeout path and direct variant dispatch; no read/write/meta classification distinguishes safe retries from potentially completed mutations."
+          "evidence": "crates/engine-browser/src/lib.rs:1137 Reversibility is a caller's position in the request, not a per-command class. TransactRequest::validate checks only the idempotency key and profile, so a Click placed in steps is re-issued by both commit passes with nothing consuming a class. The structural hold-back of submit_action is sound but is not a command registry."
         },
         {
-          "technique": "references-over-selectors",
-          "verdict": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:1199 Typing resolves a supplied selector directly; searches found no accessibility-derived reference table or reference invalidation mechanism."
+          "technique": "persistent-browser-daemon",
+          "verdict": "not-applicable",
+          "evidence": "crates/engine-browser/src/lib.rs:8 Chrome is held in-process by the long-lived server, so there is no separate daemon to discover through a state file or probe for busy versus dead. The warm-session goal is met by holders and a persistent user-data-dir, and a crash is recovered on the next acquire."
         },
         {
           "technique": "socket-scoped-surface",
           "verdict": "not-applicable",
-          "evidence": "crates/engine-remote/src/lib.rs:456 The remote engine sends outbound HTTP fetch requests to peers; the context implements no tunneled browser-daemon listener or header-based local/remote classification."
+          "evidence": "crates/engine-browser/src/lib.rs:615 The engine drives Chrome through an in-process CDP handle. A search of this file for TcpListener, .bind( and remote-debugging found no listener, and nothing forwards a browser command surface. engine-remote proxies HTTP fetches to peer nodes, not browser control."
+        }
+      ],
+      "registryProposal": "The subject assumes an interactive snapshot-act loop and does not say how references-over-selectors applies to a pre-declared batch flow, where the action list is authored before any page is read and no snapshot step can precede it. A ruling on that shape (for example a separate discovery run that returns references, or an explicit exemption) would make the verdict less dependent on interpretation.",
+      "superseded": [
+        {
+          "state": "deviation",
+          "evidence": "crates/engine-browser/src/lib.rs:1185 Browser actions resolve caller-supplied CSS selectors instead of runtime references, allowing actions to target an unintended matching element.",
+          "evaluatedAt": "2026-10-17T02:53:08.696Z",
+          "worker": "f3afb305-4016-4ba1-a3e9-527792a5239b",
+          "reason": "replaced by 0a42a756-336c-47f3-aee9-9c5095fc5f46"
         }
       ]
     },

@@ -1,0 +1,66 @@
+{
+ "schema": "conform-run/1",
+ "worker": "0a42a756-336c-47f3-aee9-9c5095fc5f46",
+ "subject": "agent-browser-control",
+ "evaluatedAt": "2026-11-09T00:27:05.405443+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "web-scraping-engines",
+   "subject": "agent-browser-control",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/engine-browser/src/lib.rs:1423 Browser actions resolve a caller-written CSS selector to whichever element find_element returns, with no snapshot, runtime reference or match-count refusal, so a flow an agent enqueues through MCP can act on the wrong element of an arbitrary page.",
+   "techniques": [
+    {
+     "technique": "references-over-selectors",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:1423 The caller composes the selector and it is used directly. The engine has no accessibility walk, reference table or clear-on-navigation, and more than one match is not refused. A zero-match miss is at least recorded as SelectorMissing."
+    },
+    {
+     "technique": "agent-actionable-errors",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:911 Driver text is interpolated at the call site with no next step, and the same shape recurs for new_page, the listeners and content, so there is no single rewriting door. The MCP fetch tool passes errors to the agent via e.to_string(). budget_exhausted (line 226) and StepOutcome are good partial realizations."
+    },
+    {
+     "technique": "effect-classed-commands",
+     "verdict": "deviation",
+     "evidence": "crates/engine-browser/src/lib.rs:1137 Reversibility is a caller's position in the request, not a per-command class. TransactRequest::validate checks only the idempotency key and profile, so a Click placed in steps is re-issued by both commit passes with nothing consuming a class. The structural hold-back of submit_action is sound but is not a command registry."
+    },
+    {
+     "technique": "persistent-browser-daemon",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-browser/src/lib.rs:8 Chrome is held in-process by the long-lived server, so there is no separate daemon to discover through a state file or probe for busy versus dead. The warm-session goal is met by holders and a persistent user-data-dir, and a crash is recovered on the next acquire."
+    },
+    {
+     "technique": "socket-scoped-surface",
+     "verdict": "not-applicable",
+     "evidence": "crates/engine-browser/src/lib.rs:615 The engine drives Chrome through an in-process CDP handle. A search of this file for TcpListener, .bind( and remote-debugging found no listener, and nothing forwards a browser command surface. engine-remote proxies HTTP fetches to peer nodes, not browser control."
+    }
+   ],
+   "registryProposal": "The subject assumes an interactive snapshot-act loop and does not say how references-over-selectors applies to a pre-declared batch flow, where the action list is authored before any page is read and no snapshot step can precede it. A ruling on that shape (for example a separate discovery run that returns references, or an explicit exemption) would make the verdict less dependent on interpretation."
+  }
+ ],
+ "declined": [],
+ "consults": [
+  {
+   "ts": "2026-11-09T00:27:05.405443+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "agent-browser-control"
+   ],
+   "techniques": [
+    "agent-actionable-errors",
+    "effect-classed-commands",
+    "persistent-browser-daemon",
+    "references-over-selectors",
+    "socket-scoped-surface"
+   ],
+   "deviations": 1,
+   "context": "web-scraping-engines",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

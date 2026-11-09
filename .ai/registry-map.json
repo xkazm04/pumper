@@ -6461,12 +6461,11 @@
           "changedAt": "2026-10-22",
           "confidence": "probable",
           "state": "deviation",
-          "evidence": "crates/engine-browser/src/lib.rs:1185 Browser actions resolve caller-supplied CSS selectors instead of runtime references, allowing actions to target an unintended matching element.",
-          "evaluatedAt": "2026-10-17",
-          "evaluatedAgainst": "sha256-b2:0d439bfcafe8cabd",
-          "evaluatedRevision": 3,
-          "revisionsBehind": 2,
-          "stale": true
+          "evidence": "crates/engine-browser/src/lib.rs:1423 Browser actions resolve a caller-written CSS selector to whichever element find_element returns, with no snapshot, runtime reference or match-count refusal, so a flow an agent enqueues through MCP can act on the wrong element of an arbitrary page.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:13f62133e12a86a7",
+          "evaluatedRevision": 6,
+          "revisionsBehind": 2
         },
         {
           "subject": "web-scraping",
