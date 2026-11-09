@@ -1,0 +1,17 @@
+{
+ "schema": "conform-run/1",
+ "worker": "dee9aed3-b1df-4adc-b604-92c5f3229b43",
+ "subject": "quality-gates",
+ "evaluatedAt": "2026-11-09T02:01:19.425358+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [],
+ "declined": [
+  {
+   "subject": "quality-gates",
+   "context": "core-change-detection",
+   "reason": "evidence leans on .claude/settings.local.json, which is not a tracked file"
+  }
+ ],
+ "consults": []
+}
