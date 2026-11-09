@@ -10015,6 +10015,108 @@
         }
       ],
       "registryProposal": "refusal-names-a-reachable-remedy checks that a remedy resolves where it is read. routes/mod.rs:1041 names a recipe that exists and runs yet cannot clear the refusal, so a resolution check passes it; the technique could also require that the remedy produces the artifact the gate reads."
+    },
+    "9de42791-6e9a-4923-bc5e-c50fbc29fa9a/quality-gates": {
+      "context": "ai-extraction-engines",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-09",
+      "evaluatedTs": "2026-11-09T00:51:04.303Z",
+      "worker": "b68eb79d-fed5-44ce-9169-a4346cb72efe",
+      "techniques": [
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "deviation",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:313 Presence probe over un-normalised source; the error direction is permissive and no comment explains the raw read. Today's match is real code (plugins-src/wasm-app-template/src/lib.rs:9), so the gap is latent and narrow."
+        },
+        {
+          "technique": "gate-liveness",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:41 Missing built artifact fails the assert instead of passing as a skip; the callers assert title_present at lines 231-234."
+        },
+        {
+          "technique": "prose-rule-drift",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:60 The plugin ABI rule is a closed EXPECTED list compared in both directions, not a sentence in a doc."
+        },
+        {
+          "technique": "instrument-answers-only-its-own-question",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:184 States what the textual check cannot answer and backs it with built-artifact tests."
+        },
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "conformant",
+          "evidence": "crates/engine-claude/src/lib.rs:899 The refusal names two remedies an operator can apply: a prompt change or a config key."
+        },
+        {
+          "technique": "false-positive-economics",
+          "verdict": "conformant",
+          "evidence": "crates/engine-claude/src/lib.rs:863 Refusal set was narrowed by measured cmd.exe behaviour so real JSON schemas are not refused."
+        },
+        {
+          "technique": "vacuous-by-evaluation",
+          "verdict": "conformant",
+          "evidence": "crates/engine-claude/src/lib.rs:927 No normaliser runs ahead of the check, so a hostile value cannot be made to satisfy it."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "conformant",
+          "evidence": "crates/engine-wasm/src/lib.rs:38 In-path hook opens on instrument failure; lines 160-162 give it a typed refusal the trigger ledger records, so the withdrawal stays on record."
+        }
+      ]
+    },
+    "f4bf9d53-e7f0-48a8-ab70-c808185cdcf4/quality-gates": {
+      "context": "job-scheduler",
+      "subject": "quality-gates",
+      "bundle": "software-engineering",
+      "state": "deviation",
+      "evaluatedAt": "2026-11-09",
+      "evaluatedTs": "2026-11-09T00:51:04.303Z",
+      "worker": "b68eb79d-fed5-44ce-9169-a4346cb72efe",
+      "techniques": [
+        {
+          "technique": "match-the-resolved-artifact",
+          "verdict": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:1979 Only registry.contains_key has a control (line 1994), and that control is raw text. health_and_guard_share_one_predicate also reads non_test_source without code_only, unexplained, though line 2042 records why stripping matters."
+        },
+        {
+          "technique": "gate-liveness",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:2170 Seeded inputs prove the ledger guards' stripper and parser can go red; parse floors sit at lines 2015 and 2076."
+        },
+        {
+          "technique": "policy-projection",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:396 One admission verdict drives both the fire path and the published health value."
+        },
+        {
+          "technique": "prose-rule-drift",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:2110 The rule that ledger reasons come only from the enum is mechanised as a test."
+        },
+        {
+          "technique": "decidable-in-a-window",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:1995 The rule is scoped to one function body because a whole-file scan could not decide it."
+        },
+        {
+          "technique": "refusal-names-a-reachable-remedy",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:464 The retirement skip names the API call that resumes the schedule."
+        },
+        {
+          "technique": "unmeasurable-criteria",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/scheduler.rs:898 In-path gate opens on a failed read, which gets its own Unknown state and a warn (crates/core/src/resilience/store.rs:848). Limit: admit still resolves to Fire, so GET /schedules publishes health ok for that row."
+        },
+        {
+          "technique": "severity-by-construction",
+          "verdict": "conformant",
+          "evidence": "crates/server/src/e2e/job_budget_floor.rs:41 Names the inputs that block, and the test asserts a 422 with nothing enqueued."
+        }
+      ]
     }
   }
 }

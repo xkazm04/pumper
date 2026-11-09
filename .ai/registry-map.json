@@ -711,7 +711,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/engine-wasm/tests/plugins.rs:313 The app-crate guard proves that a crate generates against a WIT world by searching raw source, comments included, with no note justifying the raw read, so a comment naming the macro would keep it green after the macro call was gone.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "supply-chain",
@@ -5009,7 +5013,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/scheduler.rs:1979 The guard asserts five gate names absent from enrich_schedules but never asserts validate_schedule_params, schedule_blocked_by_retirement or retirement_dataset present anywhere, so renaming one leaves a needle that can no longer match and the guard stays green.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "test-harness",
