@@ -1,0 +1,158 @@
+{
+ "schema": "conform-run/1",
+ "worker": "4cd3535f-c8b1-41bd-8b3c-da53f156e015",
+ "subject": "quality-gates",
+ "evaluatedAt": "2026-11-09T00:11:01.516650+00:00",
+ "provider": "claude",
+ "model": "claude-opus-5-5",
+ "pairs": [
+  {
+   "context": "core-resilience",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/core/tests/enforcement_preview.rs:465 The inventory claims any new `enforced_state` consumer fails by construction, but it only recognises a receiver chain ending in `.health`, so a consumer reached through a local binding is neither counted nor refused and the enforcement preview under-reports what arming would do.",
+   "techniques": [
+    {
+     "technique": "unparseable-form-is-a-finding",
+     "verdict": "deviation",
+     "evidence": "crates/core/tests/enforcement_preview.rs:465 Line 509 claims a new consumer fails by construction. `let h = &state.health; h.enforced_state(..)` matches nothing and raises no finding. The form already exists in the scanned tree at crates/core/tests/resilience.rs:1053 (`soaking.enforced_state`)."
+    },
+    {
+     "technique": "unmeasurable-criteria",
+     "verdict": "deviation",
+     "evidence": "crates/core/src/resilience/invariants.rs:221 A stored regex that no longer compiles emits no InvariantCheck, so it leaves score_invariants' denominator with no reason, count or log. This is a hole in the instrument skipped silently. Reachable only if a stored pattern stops compiling. By contrast, doctor.rs:140 models Unverifiable properly."
+    },
+    {
+     "technique": "chokepoint-tag-registry",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/enforcement_preview.rs:551 Call-site rows and the preview's consequence vocabulary are checked in both directions. The negative-space limit is the deviation recorded above."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/enforcement_preview.rs:579 A seeded pair proves prose does not match and a rustfmt-wrapped chain does."
+    },
+    {
+     "technique": "false-positive-economics",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/enforcement_preview.rs:616 A misfiring first draft was fixed by narrowing the needle to a config access, and the guard was kept."
+    },
+    {
+     "technique": "severity-by-construction",
+     "verdict": "conformant",
+     "evidence": "crates/core/src/resilience/detect.rs:960 Arming is one traceable expression between config and any consequence, pinned by the reader inventory in enforcement_preview.rs."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/core/tests/enforcement_preview.rs:541 An empty or broken walk makes every declared row `gone` and goes red, despite the silent read_dir return at line 435."
+    }
+   ]
+  },
+  {
+   "context": "api-job-management",
+   "subject": "quality-gates",
+   "bundle": "software-engineering",
+   "state": "deviation",
+   "evidence": "crates/server/src/routes/mod.rs:1041 The stale-spec refusal tells the reader to run `just clients`, which only reads clients/openapi.json and regenerates client types, so following it leaves the document stale and the test red; the producer is `just openapi`.",
+   "techniques": [
+    {
+     "technique": "refusal-names-a-reachable-remedy",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/mod.rs:1041 `just clients` runs generate-clients.mjs, which takes the spec as input. The missing-file branch of the same test at line 1013 names the correct `just openapi`."
+    },
+    {
+     "technique": "unparseable-form-is-a-finding",
+     "verdict": "deviation",
+     "evidence": "crates/server/src/routes/jobs.rs:1313 The matcher needs `cost_usd` and `.sum(` on one line. rustfmt on stdin wrapped a filtered `.map(|e| e.cost_usd).sum()` chain across five lines, none holding both, so the anti-pattern the failure message names passes with no finding. error.rs:803 normalises this shape; this guard does not. No wrapped site exists today."
+    },
+    {
+     "technique": "gate-liveness",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/error.rs:427 The status scan asserts a population floor before it judges results."
+    },
+    {
+     "technique": "false-positive-economics",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/error.rs:418 A misfire on its own documentation was fixed by narrowing the scan, and the gate was kept."
+    },
+    {
+     "technique": "match-the-resolved-artifact",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/jobs.rs:1336 code_only strips comments and blanks string contents, with a seeded pair covering both directions."
+    },
+    {
+     "technique": "policy-projection",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/mod.rs:1002 The committed document every client is generated from is compared against the router's own output."
+    },
+    {
+     "technique": "prose-rule-drift",
+     "verdict": "conformant",
+     "evidence": "crates/server/src/routes/mod.rs:629 The route inventory is a test rather than a sentence in a doc."
+    }
+   ],
+   "registryProposal": "refusal-names-a-reachable-remedy checks that a remedy resolves where it is read. routes/mod.rs:1041 names a recipe that exists and runs yet cannot clear the refusal, so a resolution check passes it; the technique could also require that the remedy produces the artifact the gate reads."
+  }
+ ],
+ "declined": [
+  {
+   "subject": "quality-gates",
+   "context": "ai-extraction-engines",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "quality-gates",
+   "context": "core-change-detection",
+   "reason": "the seat returned unknown"
+  },
+  {
+   "subject": "quality-gates",
+   "context": "job-scheduler",
+   "reason": "evidence leans on e2e/schedule_decisions.rs, which is not a tracked file"
+  }
+ ],
+ "consults": [
+  {
+   "ts": "2026-11-09T00:11:01.516650+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "chokepoint-tag-registry",
+    "false-positive-economics",
+    "gate-liveness",
+    "match-the-resolved-artifact",
+    "severity-by-construction",
+    "unmeasurable-criteria",
+    "unparseable-form-is-a-finding"
+   ],
+   "deviations": 1,
+   "context": "core-resilience",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "ts": "2026-11-09T00:11:01.516650+00:00",
+   "bundle": "software-engineering",
+   "subjects": [
+    "quality-gates"
+   ],
+   "techniques": [
+    "false-positive-economics",
+    "gate-liveness",
+    "match-the-resolved-artifact",
+    "policy-projection",
+    "prose-rule-drift",
+    "refusal-names-a-reachable-remedy",
+    "unparseable-form-is-a-finding"
+   ],
+   "deviations": 1,
+   "context": "api-job-management",
+   "via": "curator-multi:claude",
+   "model": "claude-opus-5-5"
+  }
+ ]
+}

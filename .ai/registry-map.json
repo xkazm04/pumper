@@ -1078,7 +1078,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/server/src/routes/mod.rs:1041 The stale-spec refusal tells the reader to run `just clients`, which only reads clients/openapi.json and regenerates client types, so following it leaves the document stale and the test red; the producer is `just openapi`.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "ci-execution-trust",
@@ -3521,7 +3525,11 @@
           "revision": 54,
           "changedAt": "2026-10-14",
           "confidence": "probable",
-          "state": "unknown"
+          "state": "deviation",
+          "evidence": "crates/core/tests/enforcement_preview.rs:465 The inventory claims any new `enforced_state` consumer fails by construction, but it only recognises a receiver chain ending in `.health`, so a consumer reached through a local binding is neither counted nor refused and the enforcement preview under-reports what arming would do.",
+          "evaluatedAt": "2026-11-09",
+          "evaluatedAgainst": "sha256-b2:a5b34d39a4b8edd3",
+          "evaluatedRevision": 56
         },
         {
           "subject": "web-scraping",
